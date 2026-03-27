@@ -3,6 +3,7 @@
   "version": "0.1",
   "operation": "buy",
   "description": "Request cached inference matching a task description. Send as a campfire future (--future flag); the exchange fulfills with exchange:match. Budget is the maximum scrip the buyer will spend. Domain tags are composed as exchange:domain:<value> from the domain arg.",
+  "provenance_level": "anonymous",
   "signing": "member_key",
   "antecedents": "none",
   "payload_required": true,

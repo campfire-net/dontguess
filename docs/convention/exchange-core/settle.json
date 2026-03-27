@@ -3,6 +3,8 @@
   "version": "0.1",
   "operation": "settle",
   "description": "Two-phase settlement. Antecedent is the immediately preceding message in the settlement chain. Phases: buyer-accept/buyer-reject (sent by buyer after receiving match); put-accept/put-reject (sent by exchange after receiving put); deliver (exchange sends content reference to buyer); complete (buyer confirms receipt and hash); dispute (buyer contests content — triggers escrow hold). Sender roles: buyer sends buyer-accept, buyer-reject, complete, dispute; exchange operator sends put-accept, put-reject, deliver.",
+  "provenance_level": "phase-dependent",
+  "provenance_level_note": "Buyer phases (buyer-accept, buyer-reject, complete, dispute) require claimed. Operator phases (put-accept, put-reject, deliver) require present. See pkg/exchange/provenance.go settlePhaseRequiredLevel.",
   "signing": "member_key",
   "antecedents": "exactly_one(target)",
   "payload_required": true,
