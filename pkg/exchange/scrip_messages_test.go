@@ -15,6 +15,7 @@ package exchange_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -212,14 +213,47 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 		t.Fatal("expected non-empty reservation_id")
 	}
 
+	// Build the antecedent chain: buyer-accept → deliver → complete.
+	// The seller is derived from the chain; seller_key in the payload is not trusted.
+	buyerAcceptP, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsgCM := h.sendMessage(h.buyer, buyerAcceptP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	deliverP, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     inv[0].EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 1),
+		"content_size": int64(20000),
+	})
+	deliverMsgCM := h.sendMessage(h.operator, deliverP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsgCM.ID},
+	)
+
+	// Replay so antecedent chain is in state.
+	chainMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(chainMsgs)
+
 	// Pre-count settle and burn messages.
 	preSettle := countMsgsWithTag(t, h, scrip.TagScripSettle)
 	preBurn := countMsgsWithTag(t, h, scrip.TagScripBurn)
 
-	// Dispatch settle(complete).
+	// Dispatch settle(complete) — sender is operator; seller derived from chain.
 	completePayload, _ := json.Marshal(map[string]any{
 		"reservation_id": resID,
-		"seller_key":     h.seller.PublicKeyHex(),
 		"price":          salePrice,
 		"entry_id":       inv[0].EntryID,
 	})
@@ -228,7 +262,7 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 			exchange.TagSettle,
 			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
 		},
-		nil,
+		[]string{deliverMsgCM.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
