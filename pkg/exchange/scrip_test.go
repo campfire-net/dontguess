@@ -800,6 +800,157 @@ func TestDispute_MismatchedBuyerKeyRejected(t *testing.T) {
 	}
 }
 
+// TestDispute_ReservationRestoredAfterMismatch verifies that when a settle(dispute)
+// message carries a buyer_key that does NOT match the reservation's AgentKey:
+//  1. The dispute is rejected (error returned)
+//  2. The reservation is restored so the legitimate owner can still claim a refund
+//  3. A subsequent valid dispute (correct buyer_key) succeeds and refunds the buyer
+//
+// This test catches regressions in both the mismatch gate and the reservation
+// restore path — ensuring the legitimate buyer is not permanently locked out of
+// their escrowed scrip by an attacker's failed hijack attempt.
+func TestDispute_ReservationRestoredAfterMismatch(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// Seed inventory entry.
+	seedInventoryEntry(t, h, eng, "API rate limiter implementation", "code", 12000, 8400)
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	salePrice := inv[0].PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+
+	// Seed buyer with enough scrip to buy.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
+
+	// Run the engine to generate a match and reservation.
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Implement token-bucket rate limiter", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	cancel()
+
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
+	}
+
+	// Buyer's scrip is now pre-decremented.
+	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	}
+
+	ctx2 := context.Background()
+
+	// Phase 1: Attacker sends a dispute with mismatched buyer_key (seller's key).
+	// This must be rejected and the reservation must be restored.
+	attackerKey := h.seller.PublicKeyHex()
+	mismatchPayload, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"buyer_key":      attackerKey, // wrong — attacker trying to hijack the refund
+		"entry_id":       inv[0].EntryID,
+		"dispute_type":   "quality",
+	})
+	mismatchMsg := h.sendMessage(h.operator, mismatchPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(mismatchMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage (mismatch): %v", err)
+	}
+	mismatchErr := eng.DispatchForTest(rec)
+	if mismatchErr == nil {
+		t.Error("expected error from handleDispute with mismatched buyer_key, got nil")
+	}
+
+	// No scrip must flow to the attacker.
+	if cs.Balance(attackerKey) != 0 {
+		t.Errorf("attacker (mismatched key) received scrip: got %d, want 0", cs.Balance(attackerKey))
+	}
+	// Buyer's balance must be unchanged after the rejected dispute.
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterBuy {
+		t.Errorf("buyer balance changed after rejected dispute: got %d, want %d",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterBuy)
+	}
+	// The reservation must have been restored so the legitimate owner can still dispute.
+	if _, err := cs.GetReservation(ctx2, resID); err != nil {
+		t.Errorf("reservation %s must be present after rejected dispute (restore failed?): %v", resID, err)
+	}
+
+	// Phase 2: Legitimate buyer disputes with the correct key.
+	// The reservation must still be usable — scrip must be refunded to res.AgentKey.
+	validPayload, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"buyer_key":      h.buyer.PublicKeyHex(), // correct key matches res.AgentKey
+		"entry_id":       inv[0].EntryID,
+		"dispute_type":   "quality",
+	})
+	validMsg := h.sendMessage(h.operator, validPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec2, err := h.st.GetMessage(validMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage (valid): %v", err)
+	}
+	if err := eng.DispatchForTest(rec2); err != nil {
+		t.Fatalf("valid dispute after mismatch rejected: %v — reservation may not have been restored", err)
+	}
+
+	// Buyer's balance must be fully restored to pre-buy level.
+	buyerFinal := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerFinal != buyerBalanceBefore {
+		t.Errorf("buyer balance after valid dispute: got %d, want %d (full restore to pre-buy)",
+			buyerFinal, buyerBalanceBefore)
+	}
+
+	// Attacker must still have received nothing — refund went to res.AgentKey (buyer), not attacker.
+	if cs.Balance(attackerKey) != 0 {
+		t.Errorf("attacker received scrip after valid dispute: got %d, want 0", cs.Balance(attackerKey))
+	}
+
+	// Reservation must be deleted after the successful refund.
+	if _, err := cs.GetReservation(ctx2, resID); err == nil {
+		t.Errorf("reservation %s must be deleted after successful dispute refund", resID)
+	}
+}
+
 // TestSettle_FakeSellerKeyIgnored verifies that a malicious buyer cannot redirect
 // residual payment by injecting a fake seller_key into the settle(complete) payload
 // (security fix rudi-x3y).

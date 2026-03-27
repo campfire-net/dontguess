@@ -645,8 +645,14 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	// If the check fails, restore the reservation before returning — ConsumeReservation
 	// already deleted it, and the legitimate owner must still be able to claim a refund.
 	if res.AgentKey != payload.BuyerKey {
+		// Restore the atomically consumed reservation so the legitimate owner can
+		// still dispute and claim their refund. If restore fails, the reservation
+		// is permanently lost — surface an error that includes both failures so the
+		// caller has full context.
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
-			e.opts.log("engine: dispute: failed to restore reservation %s after key mismatch: %v",
+			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after key mismatch: %v",
+				payload.ReservationID[:8], restoreErr)
+			return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch AND restore failed (reservation lost): %w",
 				payload.ReservationID[:8], restoreErr)
 		}
 		return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
@@ -654,13 +660,16 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	}
 
 	// Refund the full held amount to the buyer.
-	if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.BuyerKey, scrip.BalanceKey, res.Amount, ""); err != nil {
-		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", payload.BuyerKey[:8], err)
+	// Use res.AgentKey (the trusted identity recorded at buy time), not payload.BuyerKey
+	// (attacker-controlled). The check above confirmed they match, but we always use the
+	// reservation's authoritative key as the refund target.
+	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, res.Amount, ""); err != nil {
+		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", res.AgentKey[:8], err)
 	}
 
 	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
 	refundPayload, err := json.Marshal(scrip.DisputeRefundPayload{
-		Buyer:         payload.BuyerKey,
+		Buyer:         res.AgentKey,
 		Amount:        res.Amount,
 		ReservationID: payload.ReservationID,
 		DisputeMsg:    msg.ID,
@@ -673,7 +682,7 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	}
 
 	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
-		payload.ReservationID[:8], payload.BuyerKey[:8], res.Amount)
+		payload.ReservationID[:8], res.AgentKey[:8], res.Amount)
 	return nil
 }
 
@@ -928,8 +937,8 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 		Price:            e.computePrice(entry),
 		SellerReputation: e.state.SellerReputation(entry.SellerKey),
 		PutTimestamp:     entry.PutTimestamp,
-		DisputeCount:     0, // upheld disputes: tracked via SellerStats, not per-entry here
-		HasUpheldDispute: false,
+		DisputeCount:     e.state.SellerDisputeCount(entry.SellerKey),
+		HasUpheldDispute: e.state.HasUpheldDispute(entry.EntryID),
 	}
 }
 

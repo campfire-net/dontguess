@@ -251,6 +251,11 @@ type State struct {
 	// (exchange:verdict:accepted on a settle(dispute) message) triggers the
 	// reputation penalty.
 	pendingDisputes map[string]struct{}
+
+	// upheldDisputes tracks entries where an operator has upheld a dispute
+	// (exchange:verdict:accepted). Key: entryID. Used by the Layer 0
+	// correctness gate to exclude disputed entries from match results.
+	upheldDisputes map[string]struct{}
 }
 
 // NewState creates an empty exchange state.
@@ -272,6 +277,7 @@ func NewState() *State {
 		deliverToMatch:     make(map[string]string),
 		completedEntries:   make(map[string]string),
 		pendingDisputes:    make(map[string]struct{}),
+		upheldDisputes:     make(map[string]struct{}),
 	}
 }
 
@@ -298,6 +304,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.deliverToMatch = make(map[string]string)
 	s.completedEntries = make(map[string]string)
 	s.pendingDisputes = make(map[string]struct{})
+	s.upheldDisputes = make(map[string]struct{})
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -727,6 +734,8 @@ func (s *State) applySettleDispute(msg *store.MessageRecord) {
 		return
 	}
 
+	s.upheldDisputes[entryID] = struct{}{}
+
 	entry, ok := s.inventory[entryID]
 	if !ok {
 		return
@@ -844,6 +853,27 @@ func (s *State) HasPendingDispute(entryID string) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.pendingDisputes[entryID]
 	return ok
+}
+
+// HasUpheldDispute returns true if an operator-upheld dispute (verdict:accepted)
+// has been recorded against this entry. Used by the Layer 0 correctness gate
+// to exclude disputed entries from match results.
+func (s *State) HasUpheldDispute(entryID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.upheldDisputes[entryID]
+	return ok
+}
+
+// SellerDisputeCount returns the number of upheld disputes against the seller.
+// Returns 0 for unknown sellers.
+func (s *State) SellerDisputeCount(sellerKey string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if stats, ok := s.sellers[sellerKey]; ok {
+		return stats.DisputeCount
+	}
+	return 0
 }
 
 // IsMatchDelivered returns true if a match (identified by its message ID)
