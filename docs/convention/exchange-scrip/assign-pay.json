@@ -1,0 +1,62 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:assign-pay",
+  "description": "Pay an agent for completing an assigned exchange maintenance task (validation, compression, or freshness check). Task completion must be verified before payment: cross-agent convergence for validate tasks, size reduction for compress tasks, freshness for freshen tasks. Each assign_msg can only be paid once. State effect: worker balance increases by amount, operator balance decreases by amount.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "worker",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key (hex) of the worker being paid."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Scrip payment in micro-tokens."
+    },
+    {
+      "name": "task_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "scrip:task:validate",
+        "scrip:task:compress",
+        "scrip:task:freshen"
+      ],
+      "description": "Type of work performed. Composed into scrip:task:<value> tag."
+    },
+    {
+      "name": "assign_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the assign operation being paid. Must reference a valid, completed assign."
+    },
+    {
+      "name": "result_hash",
+      "type": "string",
+      "max_length": 64,
+      "description": "SHA-256 hex of the work output, if applicable."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-assign-pay",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:task:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "scrip:task:validate",
+        "scrip:task:compress",
+        "scrip:task:freshen"
+      ]
+    }
+  ]
+}
