@@ -2,6 +2,8 @@ package exchange
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -14,7 +16,16 @@ import (
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 
 	"github.com/3dl-dev/dontguess/pkg/matching"
+	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
+
+// MatchingFeeRate is the fraction of the sale price charged as a matching fee.
+// The fee is burned (deflationary). 10% = 1/10.
+const MatchingFeeRate = 10
+
+// ResidualRate is the fraction of the sale price paid as residual to the
+// original seller. 10% = 1/10.
+const ResidualRate = 10
 
 // EngineOptions configures an exchange engine.
 type EngineOptions struct {
@@ -34,6 +45,10 @@ type EngineOptions struct {
 	// MatchIndex is the semantic matching index used to rank buy results.
 	// If nil, the engine creates a default TF-IDF index on startup.
 	MatchIndex *matching.Index
+	// ScripStore is the scrip spending store used for pre-decrement / adjust / refund
+	// on buy / settle / dispute operations. If nil, scrip checks are skipped (useful
+	// for tests that do not exercise the scrip flow).
+	ScripStore scrip.SpendingStore
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -194,6 +209,10 @@ func (e *Engine) dispatch(msg *store.MessageRecord) error {
 	case TagBuy:
 		return e.handleBuy(msg)
 	case TagSettle:
+		phase := settlePhaseFromTags(msg.Tags)
+		if phase == SettlePhaseStrDispute {
+			return e.handleDispute(msg)
+		}
 		return e.handleSettle(msg)
 	}
 	return nil
@@ -203,6 +222,10 @@ func (e *Engine) dispatch(msg *store.MessageRecord) error {
 //
 // The buy message is sent as a campfire future (--future). The engine responds
 // with --fulfills <buy-msg-id> to complete the future.
+//
+// If ScripStore is configured, the buyer's scrip balance is pre-decremented
+// by (best_price + fee) before matching. If the buyer has insufficient scrip,
+// the buy is rejected with ErrBudgetExceeded and no match is emitted.
 func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	var payload struct {
 		Task           string   `json:"task"`
@@ -324,9 +347,54 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		}
 	}
 
+	// Pre-decrement buyer's scrip before emitting the match.
+	// Amount = best price + matching fee. If no results, skip scrip.
+	var reservationID string
+	if e.opts.ScripStore != nil && len(matchResults) > 0 {
+		bestPrice := matchResults[0].Price
+		fee := bestPrice / MatchingFeeRate
+		holdAmount := bestPrice + fee
+
+		ctx := context.Background()
+		buyerKey := msg.Sender
+		bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
+		if err != nil {
+			return fmt.Errorf("scrip: GetBudget for buyer %s: %w", buyerKey[:8], err)
+		}
+		if bal < holdAmount {
+			return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
+				buyerKey[:8], scrip.ErrBudgetExceeded, bal, holdAmount)
+		}
+		_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
+		if err != nil {
+			return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", buyerKey[:8], err)
+		}
+
+		// Save reservation so settle/dispute can reference it.
+		reservationID = newReservationID()
+		res := scrip.Reservation{
+			ID:        reservationID,
+			AgentKey:  buyerKey,
+			RK:        scrip.BalanceKey,
+			ETag:      newETag,
+			Amount:    holdAmount,
+			CreatedAt: time.Now(),
+		}
+		if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
+			return fmt.Errorf("scrip: SaveReservation: %w", err)
+		}
+		e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
+			buyerKey[:8], holdAmount, reservationID[:8])
+	}
+
+	meta := map[string]any{"total_candidates": len(candidates)}
+	if reservationID != "" {
+		meta["reservation_id"] = reservationID
+	}
+
 	matchPayload, err := json.Marshal(map[string]any{
 		"results":     matchResults,
-		"search_meta": map[string]any{"total_candidates": len(candidates)},
+		"search_meta": meta,
 	})
 	if err != nil {
 		return fmt.Errorf("encoding match payload: %w", err)
@@ -339,11 +407,118 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	return e.sendOperatorMessage(matchPayload, tags, antecedents)
 }
 
-// handleSettle processes operator-side settlement phases.
-// Currently handles put-accept (automatic acceptance of puts).
+// handleSettle processes settlement messages.
+//
+// For settle(complete) phases, if ScripStore is configured, the engine:
+//   - Pays the seller their residual (price * ResidualRate / 100)
+//   - Burns the matching fee (price * MatchingFeeRate / 100)
+//   - Credits exchange revenue (remainder) to the operator
+//
+// The reservation_id in the settle payload links back to the buy-hold reservation.
 func (e *Engine) handleSettle(msg *store.MessageRecord) error {
-	// Settle messages from buyer are acknowledged but need no operator response here.
-	// The engine just ensures state is updated (done in Apply).
+	if e.opts.ScripStore == nil {
+		return nil
+	}
+
+	phase := settlePhaseFromTags(msg.Tags)
+	if phase != SettlePhaseStrComplete {
+		// Only complete phase triggers scrip movement.
+		// Other phases (buyer-accept, deliver, put-accept) are tracked in state only.
+		return nil
+	}
+
+	// Parse the complete payload.
+	var payload struct {
+		ReservationID string `json:"reservation_id"`
+		SellerKey     string `json:"seller_key"`
+		Price         int64  `json:"price"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("scrip: parsing settle(complete) payload: %w", err)
+	}
+	if payload.ReservationID == "" || payload.SellerKey == "" || payload.Price <= 0 {
+		// Not a scrip-bearing settlement — skip.
+		return nil
+	}
+
+	ctx := context.Background()
+
+	// Retrieve and delete reservation.
+	_, err := e.opts.ScripStore.GetReservation(ctx, payload.ReservationID)
+	if err != nil {
+		e.opts.log("engine: settle: reservation %s not found: %v", payload.ReservationID[:8], err)
+		return nil // reservation missing — already settled or expired
+	}
+	if err := e.opts.ScripStore.DeleteReservation(ctx, payload.ReservationID); err != nil {
+		e.opts.log("engine: settle: delete reservation %s: %v", payload.ReservationID[:8], err)
+	}
+
+	fee := payload.Price / MatchingFeeRate
+	residual := payload.Price / ResidualRate
+	exchangeRevenue := payload.Price - residual // fee already came out of the buyer's pre-decrement
+
+	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
+
+	// Credit residual to seller.
+	if residual > 0 {
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.SellerKey, scrip.BalanceKey, residual, ""); err != nil {
+			e.opts.log("engine: settle: add residual to seller %s: %v", payload.SellerKey[:8], err)
+		}
+	}
+
+	// Credit exchange revenue to operator.
+	if exchangeRevenue > 0 {
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, operatorKey, scrip.BalanceKey, exchangeRevenue, ""); err != nil {
+			e.opts.log("engine: settle: add exchange revenue to operator: %v", err)
+		}
+	}
+
+	// Log burn amount (the matching fee has been pre-decremented from the buyer;
+	// it was never credited anywhere — effectively burned by omission).
+	e.opts.log("engine: settle: reservation=%s seller=%s residual=%d fee_burned=%d exchange=%d",
+		payload.ReservationID[:8], payload.SellerKey[:8], residual, fee, exchangeRevenue)
+	return nil
+}
+
+// handleDispute processes settle(dispute) messages.
+//
+// If ScripStore is configured, the engine refunds the buyer's pre-decremented
+// scrip using the reservation_id from the dispute payload.
+func (e *Engine) handleDispute(msg *store.MessageRecord) error {
+	if e.opts.ScripStore == nil {
+		return nil
+	}
+
+	var payload struct {
+		ReservationID string `json:"reservation_id"`
+		BuyerKey      string `json:"buyer_key"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("scrip: parsing dispute payload: %w", err)
+	}
+	if payload.ReservationID == "" || payload.BuyerKey == "" {
+		return nil // not a scrip-bearing dispute
+	}
+
+	ctx := context.Background()
+
+	res, err := e.opts.ScripStore.GetReservation(ctx, payload.ReservationID)
+	if err != nil {
+		e.opts.log("engine: dispute: reservation %s not found: %v", payload.ReservationID[:8], err)
+		return nil
+	}
+
+	// Refund the full held amount to the buyer.
+	if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.BuyerKey, scrip.BalanceKey, res.Amount, ""); err != nil {
+		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", payload.BuyerKey[:8], err)
+	}
+
+	if err := e.opts.ScripStore.DeleteReservation(ctx, payload.ReservationID); err != nil {
+		e.opts.log("engine: dispute: delete reservation %s: %v", payload.ReservationID[:8], err)
+	}
+
+	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
+		payload.ReservationID[:8], payload.BuyerKey[:8], res.Amount)
 	return nil
 }
 
@@ -601,6 +776,15 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 		DisputeCount:     0, // upheld disputes: tracked via SellerStats, not per-entry here
 		HasUpheldDispute: false,
 	}
+}
+
+// newReservationID generates a random hex reservation ID.
+func newReservationID() string {
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Sprintf("rand.Read: %v", err))
+	}
+	return hex.EncodeToString(b)
 }
 
 // hasOverlap returns true if any element of a appears in b.
