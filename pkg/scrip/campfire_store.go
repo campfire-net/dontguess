@@ -62,7 +62,7 @@ type CampfireScripStore struct {
 	balances   map[string]*balanceEntry
 
 	// reservations maps reservation ID -> Reservation.
-	resMu        sync.Mutex
+	resMu        sync.RWMutex
 	reservations map[string]Reservation
 
 	// seenMsgIDs tracks processed message IDs to prevent replay of duplicates.
@@ -397,8 +397,8 @@ func (s *CampfireScripStore) SaveReservation(_ context.Context, r Reservation) e
 
 // GetReservation implements SpendingStore.
 func (s *CampfireScripStore) GetReservation(_ context.Context, id string) (Reservation, error) {
-	s.resMu.Lock()
-	defer s.resMu.Unlock()
+	s.resMu.RLock()
+	defer s.resMu.RUnlock()
 	r, ok := s.reservations[id]
 	if !ok {
 		return Reservation{}, ErrReservationNotFound

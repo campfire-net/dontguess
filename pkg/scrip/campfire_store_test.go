@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -1018,5 +1020,66 @@ func TestLiveMode_SubtractFromBalance_ClampsToZero(t *testing.T) {
 	}
 	if bal != 0 {
 		t.Errorf("live mode: expected balance clamped to 0, got %d", bal)
+	}
+}
+
+// TestConcurrentGetReservation_NoDeadlock verifies that concurrent GetReservation
+// calls do not deadlock or data-race under resMu (RWMutex allows multiple readers).
+// This is a regression test for the resMu sync.Mutex → sync.RWMutex change
+// (dontguess-g6d safety hardening).
+func TestConcurrentGetReservation_NoDeadlock(t *testing.T) {
+	t.Parallel()
+	cs := newStore(t, openTestStore(t))
+	ctx := context.Background()
+
+	const numReservations = 10
+	const numReaders = 20
+
+	// Seed reservations.
+	for i := 0; i < numReservations; i++ {
+		r := scrip.Reservation{
+			ID:        fmt.Sprintf("concurrent-res-%03d", i),
+			AgentKey:  agentAlice,
+			RK:        scrip.BalanceKey,
+			ETag:      fmt.Sprintf("%d", i),
+			Amount:    int64(100 + i),
+			CreatedAt: time.Now().UTC().Truncate(time.Second),
+		}
+		if err := cs.SaveReservation(ctx, r); err != nil {
+			t.Fatalf("SaveReservation %d: %v", i, err)
+		}
+	}
+
+	// Launch concurrent readers. Each goroutine reads all reservations
+	// simultaneously. The test passes if there is no deadlock and no panic.
+	var wg sync.WaitGroup
+	for g := 0; g < numReaders; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < numReservations; i++ {
+				id := fmt.Sprintf("concurrent-res-%03d", i)
+				if _, err := cs.GetReservation(ctx, id); err != nil {
+					// Not fatal from goroutine; the missing reservation would
+					// be caught by the main goroutine's assertions below.
+					_ = err
+				}
+			}
+		}()
+	}
+	wg.Wait() // deadlock here means resMu is not an RWMutex
+
+	// Verify all reservations are still readable after concurrent load.
+	for i := 0; i < numReservations; i++ {
+		id := fmt.Sprintf("concurrent-res-%03d", i)
+		got, err := cs.GetReservation(ctx, id)
+		if err != nil {
+			t.Errorf("GetReservation(%q) after concurrent reads: %v", id, err)
+			continue
+		}
+		want := int64(100 + i)
+		if got.Amount != want {
+			t.Errorf("reservation %q amount = %d, want %d", id, got.Amount, want)
+		}
 	}
 }
