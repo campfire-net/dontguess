@@ -69,6 +69,11 @@ type CampfireScripStore struct {
 	// Uses sync.Map for lock-free concurrent reads.
 	seenMsgIDs sync.Map
 
+	// replaying is true while Replay() is executing. subtractFromBalance uses
+	// this flag to decide whether to permit negative balances (replay trusts the
+	// log) or clamp to zero (live mode prevents permanent buyer lockout).
+	replaying bool
+
 	// totalSupply tracks total scrip ever minted.
 	totalSupply atomic.Int64
 	// totalBurned tracks total scrip destroyed.
@@ -114,10 +119,23 @@ func (s *CampfireScripStore) Replay() error {
 	s.totalSupply.Store(0)
 	s.totalBurned.Store(0)
 
+	s.replaying = true
 	for i := range msgs {
 		s.applyMessage(&msgs[i])
 	}
+	s.replaying = false
 	return nil
+}
+
+// ApplyMessage applies a single campfire message to the in-memory balance state
+// in live mode (replaying == false). It is the public entry point for processing
+// messages received after initial Replay construction. Idempotent for duplicates.
+//
+// In live mode, subtractFromBalance clamps balances to zero (underflow guard).
+// This prevents a corrupt or unexpected message from producing a negative balance
+// that would permanently block the affected buyer from spending scrip.
+func (s *CampfireScripStore) ApplyMessage(msg *store.MessageRecord) {
+	s.applyMessage(msg)
 }
 
 // applyMessage applies a single campfire message to the in-memory balance state.
@@ -459,8 +477,15 @@ func (s *CampfireScripStore) addToBalance(agentKey string, amount int64) {
 }
 
 // subtractFromBalance subtracts amount from agentKey's balance.
-// Allows negative balances during replay (the campfire log is the authority;
-// if the log is consistent, balances never go negative in practice).
+//
+// During replay (s.replaying == true) negative balances are allowed: the
+// campfire log is the authority, and if the log is consistent the balance
+// should never go negative in practice.
+//
+// In live mode (s.replaying == false) the result is clamped to zero. This
+// prevents a corrupted or inconsistent log from producing a permanent negative
+// balance that would cause every subsequent DecrementBudget to return
+// ErrBudgetExceeded (permanent buyer lockout).
 func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) {
 	s.balancesMu.Lock()
 	e, ok := s.balances[agentKey]
@@ -471,7 +496,11 @@ func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) 
 	s.balancesMu.Unlock()
 
 	e.mu.Lock()
-	e.value -= amount
+	newVal := e.value - amount
+	if !s.replaying && newVal < 0 {
+		newVal = 0
+	}
+	e.value = newVal
 	e.gen++
 	e.mu.Unlock()
 }
