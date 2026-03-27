@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -795,5 +796,150 @@ func TestDispute_MismatchedBuyerKeyRejected(t *testing.T) {
 	// The reservation must still exist (not deleted after the rejected dispute).
 	if _, err := cs.GetReservation(ctx2, resID); err != nil {
 		t.Errorf("reservation %s should still exist after rejected dispute, got: %v", resID, err)
+	}
+}
+
+// TestSettle_FakeSellerKeyIgnored verifies that a malicious buyer cannot redirect
+// residual payment by injecting a fake seller_key into the settle(complete) payload
+// (security fix rudi-x3y).
+//
+// The complete message includes a seller_key pointing to an attacker-controlled address.
+// The engine must derive the real seller from the antecedent chain (complete → deliver
+// → buyer-accept → match → entry → SellerKey) and pay the real seller, ignoring
+// the tainted payload field entirely.
+func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// Generate an attacker identity (not part of the exchange, unknown to the engine).
+	attacker, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate attacker identity: %v", err)
+	}
+
+	// Seed inventory entry (real seller = h.seller).
+	seedInventoryEntry(t, h, eng, "Go HTTP handler unit test generator", "code", 8000, 5600)
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	salePrice := inv[0].PutPrice * 120 / 100           // 6720
+	fee := salePrice / exchange.MatchingFeeRate         // 672
+	holdAmount := salePrice + fee                       // 7392
+	expectedResidual := salePrice / exchange.ResidualRate
+
+	// Seed buyer with sufficient scrip.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+
+	// Run engine to emit a match (buyer buys, engine pre-decrements and matches).
+	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Generate unit tests for Go HTTP handler", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsg := waitForMatchMessage(t, h, preMatchMsgs, 2*time.Second)
+	cancel()
+
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
+	}
+
+	// Record baseline balances.
+	realSellerBefore := cs.Balance(h.seller.PublicKeyHex())
+	attackerBefore := cs.Balance(attacker.PublicKeyHex())
+
+	// Build the antecedent chain.
+	// buyer-accept (antecedent = match message).
+	buyerAcceptP, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	// deliver (antecedent = buyer-accept message).
+	deliverP, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     inv[0].EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 1),
+		"content_size": int64(20000),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	// Replay so antecedent chain is in state.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Attacker-controlled complete message: seller_key points to attacker.
+	completeP, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"seller_key":     attacker.PublicKeyHex(), // FAKE: attacker tries to redirect payment
+		"price":          salePrice,
+		"entry_id":       inv[0].EntryID,
+	})
+	completeMsg := h.sendMessage(h.buyer, completeP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverMsg.ID}, // correct antecedent chain
+	)
+
+	// Replay and dispatch the complete message.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(completeMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+	if err := eng.DispatchForTest(rec); err != nil {
+		t.Fatalf("dispatch settle(complete): %v", err)
+	}
+
+	// The REAL seller must receive the residual.
+	realSellerAfter := cs.Balance(h.seller.PublicKeyHex())
+	if realSellerAfter != realSellerBefore+expectedResidual {
+		t.Errorf("real seller balance: got %d, want %d (before=%d + residual=%d)",
+			realSellerAfter, realSellerBefore+expectedResidual, realSellerBefore, expectedResidual)
+	}
+
+	// The ATTACKER must receive nothing.
+	attackerAfter := cs.Balance(attacker.PublicKeyHex())
+	if attackerAfter != attackerBefore {
+		t.Errorf("attacker balance: got %d, want %d (no payment should flow to fake seller)",
+			attackerAfter, attackerBefore)
 	}
 }
