@@ -261,6 +261,77 @@ func TestState_HasUpheldDispute(t *testing.T) {
 	}
 }
 
+// TestState_NonOperatorCannotUpholdDispute verifies that a non-operator sender
+// cannot apply an operator-verdict (exchange:verdict:accepted) to damage seller
+// reputation. Convention §9.5: only the operator may uphold disputes.
+//
+// Attack vector: any campfire member sends settle(dispute) with verdict:accepted
+// to reduce a target seller's reputation without authorization.
+//
+// Fix (dontguess-nte): applySettleDispute rejects verdict:accepted from
+// non-operator senders — upheldDisputes and reputation penalty are not applied.
+func TestState_NonOperatorCannotUpholdDispute(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	entryID := setupInventoryEntry(t, h, eng)
+
+	repBefore := eng.State().SellerReputation(h.seller.PublicKeyHex())
+
+	// A buyer (non-operator) sends settle(dispute) with verdict:accepted.
+	// This should NOT penalize reputation — only the operator may uphold.
+	h.sendMessage(h.buyer, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		nil,
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Reputation must be unchanged — non-operator verdict:accepted is ignored.
+	repAfter := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if repAfter != repBefore {
+		t.Errorf("non-operator verdict:accepted changed seller reputation: before=%d after=%d, want no change",
+			repBefore, repAfter)
+	}
+
+	// The dispute is still recorded as pending (filing is allowed from anyone),
+	// but must NOT be in upheldDisputes.
+	if !eng.State().HasPendingDispute(entryID) {
+		t.Error("dispute should be tracked as pending (non-operator can still file)")
+	}
+	if eng.State().HasUpheldDispute(entryID) {
+		t.Error("non-operator verdict:accepted must not mark dispute as upheld")
+	}
+
+	// Operator upholds: reputation must now change.
+	h.sendMessage(h.operator, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		nil,
+	)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	repFinal := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	const expectedPenalty = 5
+	if repFinal != repBefore-expectedPenalty {
+		t.Errorf("operator upheld dispute: reputation = %d, want %d (before=%d - penalty=%d)",
+			repFinal, repBefore-expectedPenalty, repBefore, expectedPenalty)
+	}
+	if !eng.State().HasUpheldDispute(entryID) {
+		t.Error("operator verdict:accepted must mark dispute as upheld")
+	}
+}
+
 // TestState_SellerDisputeCount verifies that SellerDisputeCount returns the
 // correct count of upheld disputes for a seller.
 func TestState_SellerDisputeCount(t *testing.T) {

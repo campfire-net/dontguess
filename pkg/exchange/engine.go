@@ -659,6 +659,25 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 			payload.ReservationID[:8], payload.BuyerKey[:8], res.AgentKey[:8])
 	}
 
+	// Sender identity gate: the campfire message sender must be either the buyer
+	// who holds the reservation, or the exchange operator processing the dispute.
+	// Convention §9.5: "dispute: sender must be the buyer."
+	// The operator is permitted because the scrip-bearing dispute is the operator's
+	// action to issue a refund after investigating the buyer's initial filing.
+	// Any other campfire member sending a dispute with a valid reservation_id is
+	// rejected — they cannot trigger a refund on behalf of another buyer.
+	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
+	if msg.Sender != res.AgentKey && msg.Sender != operatorKey {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after sender mismatch: %v",
+				payload.ReservationID[:8], restoreErr)
+			return fmt.Errorf("scrip: dispute reservation %s: sender mismatch AND restore failed (reservation lost): %w",
+				payload.ReservationID[:8], restoreErr)
+		}
+		return fmt.Errorf("scrip: dispute reservation %s: sender mismatch (sender=%s, buyer=%s)",
+			payload.ReservationID[:8], msg.Sender[:8], res.AgentKey[:8])
+	}
+
 	// Refund the full held amount to the buyer.
 	// Use res.AgentKey (the trusted identity recorded at buy time), not payload.BuyerKey
 	// (attacker-controlled). The check above confirmed they match, but we always use the

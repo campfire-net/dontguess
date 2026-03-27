@@ -1095,3 +1095,167 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 			attackerAfter, attackerBefore)
 	}
 }
+
+// TestDispute_UnauthorizedSenderRejected verifies that a campfire member who is
+// NOT the buyer cannot file a dispute on the buyer's behalf — even when they
+// provide the correct reservation_id and the correct buyer_key in the payload.
+//
+// Attack vector (convention §9.5: sender identity gate):
+//   - Attacker observes the reservation_id from the match message (it is public)
+//   - Attacker constructs a settle(dispute) with the correct reservation_id and
+//     the legitimate buyer's public key in the buyer_key field
+//   - Without the sender gate, handleDispute would accept this — payload.BuyerKey
+//     matches res.AgentKey, so the old payload-only check passes
+//   - The engine would consume the reservation and issue a refund, preventing the
+//     real buyer from ever disputing, and disrupting the market
+//
+// Fix (dontguess-nte): after the buyer_key payload check, verify msg.Sender ==
+// res.AgentKey. Any other sender is rejected, the reservation is restored, and
+// the legitimate buyer retains the ability to dispute.
+func TestDispute_UnauthorizedSenderRejected(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// Seed inventory entry.
+	seedInventoryEntry(t, h, eng, "Regex pattern for email validation", "code", 9000, 6300)
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	salePrice := inv[0].PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+
+	// Seed buyer with enough scrip for the hold.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
+
+	// Run the engine to generate a match and reservation.
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Match email address format", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	cancel()
+
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
+	}
+
+	// Buyer's scrip is pre-decremented.
+	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	}
+
+	// Generate an unauthorized third-party identity (not the buyer).
+	unauthorized, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generating unauthorized identity: %v", err)
+	}
+
+	// Unauthorized sender files a dispute. They provide the CORRECT reservation_id
+	// and the CORRECT buyer_key — only their msg.Sender is wrong.
+	// This is the attack the sender identity gate must block.
+	disputePayloadBytes, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"buyer_key":      h.buyer.PublicKeyHex(), // correct buyer key
+		"entry_id":       inv[0].EntryID,
+		"dispute_type":   "quality",
+	})
+	unauthorizedDisputeMsg := h.sendMessage(unauthorized, disputePayloadBytes,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(unauthorizedDisputeMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+
+	// Dispatch must return an error — sender identity gate must reject this.
+	dispatchErr := eng.DispatchForTest(rec)
+	if dispatchErr == nil {
+		t.Error("expected error from handleDispute with unauthorized sender, got nil")
+	}
+
+	ctx2 := context.Background()
+
+	// Buyer's balance must be unchanged — no refund issued.
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterBuy {
+		t.Errorf("buyer balance changed after unauthorized dispute: got %d, want %d (no refund expected)",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterBuy)
+	}
+
+	// Unauthorized sender must have received nothing.
+	if cs.Balance(unauthorized.PublicKeyHex()) != 0 {
+		t.Errorf("unauthorized sender received scrip: got %d, want 0", cs.Balance(unauthorized.PublicKeyHex()))
+	}
+
+	// Reservation must be restored — the legitimate buyer must still be able to dispute.
+	if _, err := cs.GetReservation(ctx2, resID); err != nil {
+		t.Errorf("reservation %s must still exist after unauthorized dispute (not restored?): %v", resID, err)
+	}
+
+	// Phase 2: Legitimate buyer can still dispute successfully after the rejected attempt.
+	validDisputePayload, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"buyer_key":      h.buyer.PublicKeyHex(),
+		"entry_id":       inv[0].EntryID,
+		"dispute_type":   "quality",
+	})
+	validDisputeMsg := h.sendMessage(h.buyer, validDisputePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec2, err := h.st.GetMessage(validDisputeMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage (valid): %v", err)
+	}
+	if err := eng.DispatchForTest(rec2); err != nil {
+		t.Fatalf("legitimate buyer dispute rejected after unauthorized attempt: %v", err)
+	}
+
+	// Buyer's scrip must be fully refunded.
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore {
+		t.Errorf("buyer balance after legitimate dispute: got %d, want %d (full refund expected)",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore)
+	}
+
+	// Reservation must be consumed after the successful refund.
+	if _, err := cs.GetReservation(ctx2, resID); err == nil {
+		t.Errorf("reservation %s must be deleted after successful buyer dispute", resID)
+	}
+}
