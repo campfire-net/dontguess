@@ -86,9 +86,13 @@ func NewEngine(opts EngineOptions) *Engine {
 	if idx == nil {
 		idx = matching.NewIndex(nil, matching.RankOptions{})
 	}
+	st := NewState()
+	if opts.OperatorIdentity != nil {
+		st.OperatorKey = operatorKeyHex(opts.OperatorIdentity.PublicKey)
+	}
 	return &Engine{
 		opts:       opts,
-		state:      NewState(),
+		state:      st,
 		matchIndex: idx,
 	}
 }

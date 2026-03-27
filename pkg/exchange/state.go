@@ -179,6 +179,11 @@ func (s *SellerStats) Reputation() int {
 type State struct {
 	mu sync.RWMutex
 
+	// OperatorKey is the hex-encoded Ed25519 public key of the exchange operator.
+	// Operator-only messages (put-accept, put-reject, match, deliver) are silently
+	// rejected when their Sender does not match this key.
+	OperatorKey string
+
 	// Inventory is keyed by EntryID (= put message ID).
 	// Includes only accepted, non-expired entries.
 	inventory map[string]*InventoryEntry
@@ -412,6 +417,9 @@ func (s *State) applyBuy(msg *store.MessageRecord) {
 // applyMatch processes an exchange:match message.
 // The match fulfills a buy future. We mark the order matched and record match→buyer.
 func (s *State) applyMatch(msg *store.MessageRecord) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -455,6 +463,9 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 
 // applySettlePutAccept moves an entry from pending to active inventory.
 func (s *State) applySettlePutAccept(msg *store.MessageRecord) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -483,6 +494,9 @@ func (s *State) applySettlePutAccept(msg *store.MessageRecord) {
 
 // applySettlePutReject removes an entry from pending inventory.
 func (s *State) applySettlePutReject(msg *store.MessageRecord) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -509,6 +523,9 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 // It marks the corresponding match as delivered in deliveredOrders and records
 // the deliver→match mapping for use by applySettleComplete.
 func (s *State) applySettleDeliver(msg *store.MessageRecord) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -678,6 +695,17 @@ func (s *State) ActiveOrders() []*ActiveOrder {
 			continue
 		}
 		out = append(out, o)
+	}
+	return out
+}
+
+// PendingPuts returns a copy of all put messages waiting for operator acceptance.
+func (s *State) PendingPuts() []*InventoryEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*InventoryEntry, 0, len(s.pendingPuts))
+	for _, e := range s.pendingPuts {
+		out = append(out, e)
 	}
 	return out
 }
