@@ -49,6 +49,9 @@ type EngineOptions struct {
 	// on buy / settle / dispute operations. If nil, scrip checks are skipped (useful
 	// for tests that do not exercise the scrip flow).
 	ScripStore scrip.SpendingStore
+	// ProvenanceChecker validates sender provenance levels before processing operations.
+	// If nil, provenance checks are skipped (useful for tests that don't exercise provenance).
+	ProvenanceChecker *ProvenanceChecker
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -209,6 +212,23 @@ func (e *Engine) poll() error {
 // dispatch routes a new message to the appropriate handler.
 func (e *Engine) dispatch(msg *store.MessageRecord) error {
 	op := exchangeOp(msg.Tags)
+
+	// Provenance gate: check sender's provenance level if checker is configured.
+	if e.opts.ProvenanceChecker != nil {
+		var phase SettlePhase
+		if op == TagSettle {
+			phase = SettlePhase(settlePhaseFromTags(msg.Tags))
+		}
+		provOp := tagToProvenanceOp(op)
+		if provOp != "" {
+			if err := e.opts.ProvenanceChecker.Check(msg.Sender, provOp, phase); err != nil {
+				e.opts.log("engine: provenance rejected msg=%s op=%s sender=%s: %v",
+					msg.ID, op, msg.Sender[:8], err)
+				return nil // silently reject — don't propagate error to poll loop
+			}
+		}
+	}
+
 	switch op {
 	case TagBuy:
 		return e.handleBuy(msg)
@@ -220,6 +240,23 @@ func (e *Engine) dispatch(msg *store.MessageRecord) error {
 		return e.handleSettle(msg)
 	}
 	return nil
+}
+
+// tagToProvenanceOp maps a campfire exchange operation tag to a provenance Operation type.
+// Returns "" for unknown/untracked operations (no provenance check needed).
+func tagToProvenanceOp(op string) Operation {
+	switch op {
+	case TagPut:
+		return OperationPut
+	case TagBuy:
+		return OperationBuy
+	case TagMatch:
+		return OperationMatch
+	case TagSettle:
+		return OperationSettle
+	default:
+		return "" // unknown operation — no provenance check
+	}
 }
 
 // handleBuy responds to an exchange:buy request with an exchange:match message.
