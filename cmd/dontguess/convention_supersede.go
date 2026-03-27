@@ -148,6 +148,15 @@ func performSupersede(
 		SupersedesID: oldMessageID,
 	}
 
+	// Step 0: Operator identity check — only the campfire creator may supersede
+	// conventions. m.CreatorPubkey is set when joining and identifies the
+	// operator. Any other campfire member that attempts to supersede is rejected
+	// immediately, before any store or network I/O.
+	if m.CreatorPubkey != "" && agentID.PublicKeyHex() != m.CreatorPubkey {
+		result.Error = fmt.Sprintf("operator check failed: only the operator (%s) may supersede conventions", shortID(m.CreatorPubkey))
+		return result, nil
+	}
+
 	// Step 1: Lint the new declaration.
 	lintResult := cfconvention.Lint(newPayload)
 	if len(lintResult.Errors) > 0 {
