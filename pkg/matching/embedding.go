@@ -32,6 +32,15 @@ type Embedder interface {
 	Similarity(a, b []float64) float64
 }
 
+// CorpusIndexer is an optional interface implemented by Embedder instances
+// that benefit from a corpus-wide IDF pass before per-entry embedding.
+// Index.Rebuild calls IndexCorpus when the embedder implements this interface.
+// Embedders that compute fixed-dimension dense vectors (e.g., all-MiniLM-L6-v2)
+// do not need to implement this interface.
+type CorpusIndexer interface {
+	IndexCorpus(docs []string)
+}
+
 // NewTFIDFEmbedder returns a corpus-free TF-IDF embedder.
 //
 // The vocabulary is built on-the-fly from the text passed to Embed.
