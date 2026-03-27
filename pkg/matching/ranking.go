@@ -149,9 +149,22 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 	// Compute task embedding.
 	taskEmb := embedder.Embed(task)
 
-	// Layer 3: count seller appearances to compute novelty boost.
-	sellerCount := make(map[string]int, len(candidates))
+	now := time.Now().UnixNano()
+	halflifeSec := opts.freshnessHalflife() * 24 * 3600
+
+	// Layer 0: Build the dispute-filtered candidate list.
+	// sellerCount for Layer 3 must be computed AFTER this filter so that
+	// disputed entries do not inflate the seller count and skew novelty scores.
+	filtered := candidates[:0:0] // zero-length slice, same backing type
 	for _, c := range candidates {
+		if !c.HasUpheldDispute {
+			filtered = append(filtered, c)
+		}
+	}
+
+	// Layer 3: count seller appearances over the filtered (non-disputed) set only.
+	sellerCount := make(map[string]int, len(filtered))
+	for _, c := range filtered {
 		sellerCount[c.SellerKey]++
 	}
 	maxSellerCount := 1
@@ -161,17 +174,9 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 		}
 	}
 
-	now := time.Now().UnixNano()
-	halflifeSec := opts.freshnessHalflife() * 24 * 3600
+	results := make([]RankedResult, 0, len(filtered))
 
-	results := make([]RankedResult, 0, len(candidates))
-
-	for _, c := range candidates {
-		// Layer 0: Correctness gate.
-		if c.HasUpheldDispute {
-			continue
-		}
-
+	for _, c := range filtered {
 		// Compute cosine similarity.
 		entryEmb := embedder.Embed(c.Description)
 		sim := embedder.Similarity(taskEmb, entryEmb)
