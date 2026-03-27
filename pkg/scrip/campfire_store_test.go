@@ -530,6 +530,12 @@ func TestReplay_SettleResidualAndBurn(t *testing.T) {
 		"match_msg":        "match-001",
 		"result_hash":      "deadbeef",
 	})
+	// The engine also emits a scrip-burn message for the matching fee.
+	// This is the sole source of totalBurned — applySettle does NOT double-count it.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-burn", map[string]any{
+		"amount": int64(50),
+		"reason": "matching-fee",
+	})
 
 	cs := newStore(t, st)
 
@@ -545,9 +551,10 @@ func TestReplay_SettleResidualAndBurn(t *testing.T) {
 	if cs.Balance(agentOperator) != 5360 {
 		t.Errorf("Operator = %d, want 5360", cs.Balance(agentOperator))
 	}
-	// TotalBurned: 50
+	// TotalBurned must equal the fee exactly once — not 2*fee.
+	// The scrip-burn message is the sole source; applySettle does not increment totalBurned.
 	if cs.TotalBurned() != 50 {
-		t.Errorf("TotalBurned = %d, want 50", cs.TotalBurned())
+		t.Errorf("TotalBurned = %d, want 50 (must not double-count)", cs.TotalBurned())
 	}
 }
 
@@ -590,6 +597,48 @@ func TestReplay_BurnOnly(t *testing.T) {
 
 	if cs.TotalBurned() != 200 {
 		t.Errorf("TotalBurned = %d, want 200", cs.TotalBurned())
+	}
+}
+
+// TestReplay_SettleBurnNoDoubleCount is the regression test for the bug where
+// applySettle incremented totalBurned AND a separate scrip-burn message also
+// incremented totalBurned, resulting in 2*fee after Replay.
+//
+// The fix: applySettle does NOT touch totalBurned. The scrip-burn message is the
+// sole source of totalBurned accounting.
+func TestReplay_SettleBurnNoDoubleCount(t *testing.T) {
+	st := openTestStore(t)
+	const fee = int64(100)
+
+	// Bob buys; hold removes scrip from buyer.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-buy-hold", map[string]any{
+		"buyer": agentBob, "amount": fee * 5, "price": fee * 4, "fee": fee,
+		"reservation_id": "res-double-001", "buy_msg": "buy-001",
+		"expires_at": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+	})
+
+	// Engine emits scrip-settle (contains fee_burned in payload).
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-settle", map[string]any{
+		"reservation_id":   "res-double-001",
+		"seller":           agentAlice,
+		"residual":         int64(40),
+		"fee_burned":       fee,
+		"exchange_revenue": int64(360),
+		"match_msg":        "match-001",
+		"result_hash":      "deadbeef",
+	})
+
+	// Engine also emits scrip-burn for the same matching fee.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-burn", map[string]any{
+		"amount": fee,
+		"reason": "matching-fee",
+	})
+
+	cs := newStore(t, st)
+
+	// totalBurned must equal fee exactly once, not 2*fee.
+	if got := cs.TotalBurned(); got != fee {
+		t.Errorf("TotalBurned = %d, want %d (double-count bug: got 2*fee)", got, fee)
 	}
 }
 
