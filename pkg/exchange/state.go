@@ -735,6 +735,34 @@ func (s *State) IsMatchDelivered(matchMsgID string) bool {
 	return ok
 }
 
+// SellerKeyForDeliver derives the seller's public key from the antecedent chain
+// starting at a deliver message ID. The chain is:
+//
+//	deliver → match (via deliverToMatch)
+//	match   → entry (via matchToEntry)
+//	entry   → seller (via inventory[entry].SellerKey)
+//
+// This is the authoritative, untainted way to find the seller for residual
+// payment — never trust a buyer-supplied seller_key field in the settle payload.
+// Returns ("", false) if any link in the chain is missing.
+func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	matchMsgID := s.deliverToMatch[deliverMsgID]
+	if matchMsgID == "" {
+		return "", false
+	}
+	entryID := s.matchToEntry[matchMsgID]
+	if entryID == "" {
+		return "", false
+	}
+	entry, ok := s.inventory[entryID]
+	if !ok {
+		return "", false
+	}
+	return entry.SellerKey, true
+}
+
 // operatorKeyHex converts a raw Ed25519 public key to its hex representation.
 func operatorKeyHex(pub []byte) string {
 	return fmt.Sprintf("%x", pub)

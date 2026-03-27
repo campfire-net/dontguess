@@ -577,9 +577,45 @@ func TestE2E_ScripBalances(t *testing.T) {
 	preSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripSettle}})
 	preBurnMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBurn}})
 
+	// Build the antecedent chain for seller key derivation:
+	//   complete → deliver → buyer-accept → match → entry → seller
+
+	// buyer-accept (antecedent = match message).
+	buyerAcceptPayloadE2E, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entry.EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsgE2E := h.sendMessage(h.buyer, buyerAcceptPayloadE2E,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	// deliver (antecedent = buyer-accept message).
+	deliverPayloadE2E, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entry.EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 999),
+		"content_size": int64(20000),
+	})
+	deliverMsgE2E := h.sendMessage(h.operator, deliverPayloadE2E,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsgE2E.ID},
+	)
+
+	// Replay to pick up buyer-accept and deliver before dispatching complete.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
 	completePayload, _ := json.Marshal(map[string]any{
 		"reservation_id": resID,
-		"seller_key":     h.seller.PublicKeyHex(),
 		"price":          salePrice,
 		"entry_id":       entry.EntryID,
 	})
@@ -588,10 +624,10 @@ func TestE2E_ScripBalances(t *testing.T) {
 			exchange.TagSettle,
 			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
 		},
-		nil,
+		[]string{deliverMsgE2E.ID},
 	)
 
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
