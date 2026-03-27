@@ -838,6 +838,13 @@ func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
 	var out []*InventoryEntry
 
 	for _, entry := range inventory {
+		// Layer 0 correctness gate: exclude entries with an operator-upheld dispute
+		// (exchange:verdict:accepted). Upheld disputes signal that the cached
+		// inference is incorrect or misrepresented — buyers must not receive them.
+		if e.state.HasUpheldDispute(entry.EntryID) {
+			continue
+		}
+
 		// Provenance revalidation gate: exclude entries flagged for re-validation
 		// due to a seller provenance downgrade (dontguess-lqp). These entries remain
 		// in inventory but are withheld from buyers until the operator clears the flag.
