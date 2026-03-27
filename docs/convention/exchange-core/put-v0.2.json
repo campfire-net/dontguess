@@ -1,0 +1,110 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.2",
+  "operation": "put",
+  "description": "Offer cached inference to the exchange. Seller submits metadata and content hash; exchange buys at a discount and responds with settle(put-accept) or settle(put-reject). Content is stored externally and referenced by SHA-256 hash. Domain tags are composed as exchange:domain:<value> from the domain arg. v0.2 adds optional priority arg for queue ordering.",
+  "signing": "member_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "description",
+      "type": "string",
+      "required": true,
+      "max_length": 4096,
+      "description": "What the cached inference does — task description, inputs, outputs. TAINTED: prompt injection vector."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "SHA-256 hash of the cached inference content in sha256:<hex64> format (e.g. sha256:abc123...64hex). TAINTED: must be verified against actual content before delivery."
+    },
+    {
+      "name": "token_cost",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 10000000,
+      "description": "Original inference cost in tokens (seller's claim). TAINTED: unverifiable without metering."
+    },
+    {
+      "name": "content_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ],
+      "description": "Category of cached inference. Composed into exchange:content-type:<value> tag."
+    },
+    {
+      "name": "domain",
+      "type": "tag_set",
+      "max_count": 5,
+      "prefix": "exchange:domain:",
+      "description": "Domain tags for discovery (e.g. 'go', 'terraform', 'security'). Each value composed into exchange:domain:<value> tag. TAINTED: seller categorization."
+    },
+    {
+      "name": "content_size",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 1000000,
+      "description": "Size of cached content in bytes."
+    },
+    {
+      "name": "ttl_hours",
+      "type": "integer",
+      "min": 1,
+      "max": 8760,
+      "description": "Seller-requested time-to-live in hours. Exchange may override based on content type, demand, and seller reputation."
+    },
+    {
+      "name": "embedding",
+      "type": "json",
+      "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2). TAINTED: exchange re-computes on a sample basis and must not rely on seller-provided embeddings without verification."
+    },
+    {
+      "name": "priority",
+      "type": "integer",
+      "min": 1,
+      "max": 10,
+      "description": "Optional submission priority (1=highest, 10=lowest). Exchange may use for queue ordering during high load. Default: no preference."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:put",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:content-type:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ]
+    },
+    {
+      "tag": "exchange:domain:*",
+      "cardinality": "at_most_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
+}
