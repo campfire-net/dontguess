@@ -508,15 +508,13 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 
 	ctx := context.Background()
 
-	// Retrieve and delete reservation.
-	_, err := e.opts.ScripStore.GetReservation(ctx, payload.ReservationID)
+	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
+	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
 	if err != nil {
 		e.opts.log("engine: settle: reservation %s not found: %v", payload.ReservationID[:8], err)
 		return nil // reservation missing — already settled or expired
 	}
-	if err := e.opts.ScripStore.DeleteReservation(ctx, payload.ReservationID); err != nil {
-		e.opts.log("engine: settle: delete reservation %s: %v", payload.ReservationID[:8], err)
-	}
+	_ = res // reservation data available for future logging/audit use
 
 	fee := payload.Price / MatchingFeeRate
 	residual := payload.Price / ResidualRate
@@ -597,7 +595,8 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 
 	ctx := context.Background()
 
-	res, err := e.opts.ScripStore.GetReservation(ctx, payload.ReservationID)
+	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
+	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
 	if err != nil {
 		e.opts.log("engine: dispute: reservation %s not found: %v", payload.ReservationID[:8], err)
 		return nil
@@ -606,7 +605,13 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	// Security check: the buyer_key in the dispute payload must match the agent key
 	// recorded in the reservation at buy time. Reject any dispute that tries to
 	// redirect the refund to a different identity.
+	// If the check fails, restore the reservation before returning — ConsumeReservation
+	// already deleted it, and the legitimate owner must still be able to claim a refund.
 	if res.AgentKey != payload.BuyerKey {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: dispute: failed to restore reservation %s after key mismatch: %v",
+				payload.ReservationID[:8], restoreErr)
+		}
 		return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
 			payload.ReservationID[:8], payload.BuyerKey[:8], res.AgentKey[:8])
 	}
@@ -614,10 +619,6 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	// Refund the full held amount to the buyer.
 	if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.BuyerKey, scrip.BalanceKey, res.Amount, ""); err != nil {
 		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", payload.BuyerKey[:8], err)
-	}
-
-	if err := e.opts.ScripStore.DeleteReservation(ctx, payload.ReservationID); err != nil {
-		e.opts.log("engine: dispute: delete reservation %s: %v", payload.ReservationID[:8], err)
 	}
 
 	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
