@@ -280,6 +280,16 @@ func tagToProvenanceOp(op string) Operation {
 // by (best_price + fee) before matching. If the buyer has insufficient scrip,
 // the buy is rejected with ErrBudgetExceeded and no match is emitted.
 func (e *Engine) handleBuy(msg *store.MessageRecord) error {
+	// Guard: if this order was already matched (a match message exists in the
+	// campfire log for this buy), return immediately. This prevents
+	// double-dispatch on engine restart when a buy message is re-applied via
+	// poll after the corresponding match was already written to the log during
+	// a previous run (fix for dontguess-vd0 / dontguess-bf0).
+	if e.state.IsOrderMatched(msg.ID) {
+		e.opts.log("engine: handleBuy skipped -- order %s already matched", msg.ID[:8])
+		return nil
+	}
+
 	var payload struct {
 		Task           string   `json:"task"`
 		Budget         int64    `json:"budget"`
