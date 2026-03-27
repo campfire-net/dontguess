@@ -57,9 +57,10 @@ func addScripMintMsg(t *testing.T, h *testHarness, agentKey string, amount int64
 
 // newCampfireScripStore creates a CampfireScripStore backed by the harness store.
 // Must be called after all mint messages are written so Replay sees them.
+// Uses the harness operator identity as the operator key.
 func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripStore {
 	t.Helper()
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -533,7 +534,7 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 	// Fresh CampfireScripStore replays the log on construction.
 	// It sees: scrip-mint (buyer gets holdAmount+extraScrip) + scrip-buy-hold (buyer loses holdAmount).
 	// Net buyer balance at restart = extraScrip. This is the pre-restart state.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (restart): %v", err)
 	}
