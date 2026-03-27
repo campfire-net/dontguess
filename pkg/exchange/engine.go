@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/campfire-net/campfire/pkg/campfire"
@@ -92,10 +93,12 @@ type Engine struct {
 	state       *State
 	matchIndex  *matching.Index
 	lastCursor  int64 // received_at cursor: last processed message's received_at
-	// ctx is the shutdown context passed to Start. Handlers use this so that
-	// in-flight scrip operations are cancelled on graceful shutdown instead of
-	// using context.Background() which ignores the shutdown signal.
-	ctx context.Context
+	// ctx is the shutdown context passed to Start. Stored atomically so that
+	// handler goroutines can read it without a data race against the Start write.
+	// Handlers use this so that in-flight scrip operations are cancelled on
+	// graceful shutdown instead of using context.Background() which ignores the
+	// shutdown signal.
+	ctx atomic.Value // stores context.Context
 	// marshalFunc overrides json.Marshal for tests that need to inject marshal failures.
 	// Nil means use the standard json.Marshal.
 	marshalFunc func(v any) ([]byte, error)
@@ -105,8 +108,8 @@ type Engine struct {
 // Falls back to context.Background() when the engine has not been started
 // (e.g., in tests that call handlers directly without Start).
 func (e *Engine) engineCtx() context.Context {
-	if e.ctx != nil {
-		return e.ctx
+	if v := e.ctx.Load(); v != nil {
+		return v.(context.Context)
 	}
 	return context.Background()
 }
@@ -150,7 +153,7 @@ func (e *Engine) MatchIndexLen() int {
 // Start replays the full message log to build initial state, processes any
 // pending orders from the replay, then runs the event loop until ctx is cancelled.
 func (e *Engine) Start(ctx context.Context) error {
-	e.ctx = ctx
+	e.ctx.Store(ctx)
 	if err := e.replayAll(); err != nil {
 		return fmt.Errorf("exchange engine replay: %w", err)
 	}
