@@ -145,7 +145,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 
 	// Verify CampfireScripStore can materialize the hold: after a full Replay,
 	// a fresh store should show the buyer's balance as reduced by holdAmount.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}
@@ -323,7 +323,7 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	}
 
 	// Verify CampfireScripStore replays correctly: seller gets residual, operator gets revenue.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}
@@ -446,7 +446,7 @@ func TestDispute_EmitsConventionMessage(t *testing.T) {
 
 	// Verify CampfireScripStore can replay the refund: fresh store should show
 	// buyer's balance restored to pre-buy level (mint - hold + refund = mint).
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}

@@ -687,7 +687,7 @@ func TestE2E_ScripBalances(t *testing.T) {
 	}
 
 	// --- Step 7: Replay — fresh store reproduces same balances ---
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("step 7 (replay): NewCampfireScripStore: %v", err)
 	}
@@ -747,7 +747,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	addScripMintMsg(t, h, operatorKey, operatorMint)
 
 	// Construct the CampfireScripStore after mint messages are in the log.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -826,7 +826,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	}
 
 	// Fresh replay: verify a new CampfireScripStore derives the same balances.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh replay): %v", err)
 	}

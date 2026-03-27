@@ -51,6 +51,11 @@ type CampfireScripStore struct {
 	campfireID string
 	st         store.Store
 
+	// OperatorKey is the public key hex of the exchange operator. When non-empty,
+	// scrip operation messages from any other sender are rejected. An empty string
+	// disables the check (backwards compat for tests that do not set an operator key).
+	OperatorKey string
+
 	// balances maps agentKey -> *balanceEntry.
 	// Populated on construction via Replay, updated on every mutation.
 	balancesMu sync.RWMutex
@@ -74,10 +79,14 @@ type CampfireScripStore struct {
 // log to build initial balance state.
 //
 // campfireID is the exchange campfire's public key hex. st is the campfire store.
-func NewCampfireScripStore(campfireID string, st store.Store) (*CampfireScripStore, error) {
+// operatorKey is the public key hex of the exchange operator; only messages from
+// this sender are accepted for scrip operations. Pass an empty string to disable
+// the check (backwards compat for tests).
+func NewCampfireScripStore(campfireID string, st store.Store, operatorKey string) (*CampfireScripStore, error) {
 	s := &CampfireScripStore{
 		campfireID:   campfireID,
 		st:           st,
+		OperatorKey:  operatorKey,
 		balances:     make(map[string]*balanceEntry),
 		reservations: make(map[string]Reservation),
 	}
@@ -121,6 +130,15 @@ func (s *CampfireScripStore) applyMessage(msg *store.MessageRecord) {
 
 	op := scripOp(msg.Tags)
 	if op == "" {
+		return
+	}
+
+	// Operator identity check: reject scrip operations from non-operator senders.
+	// All scrip messages must be signed by the exchange operator — no participant
+	// should be able to mint, burn, or move scrip on behalf of the exchange.
+	// An empty OperatorKey disables the check for backwards compatibility with tests
+	// that do not configure an operator identity.
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
 
