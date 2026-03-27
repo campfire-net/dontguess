@@ -385,6 +385,24 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		}
 		e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
 			buyerKey[:8], holdAmount, reservationID[:8])
+
+		// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
+		expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+		holdPayload, err := json.Marshal(scrip.BuyHoldPayload{
+			Buyer:         buyerKey,
+			Amount:        holdAmount,
+			Price:         bestPrice,
+			Fee:           fee,
+			ReservationID: reservationID,
+			BuyMsg:        msg.ID,
+			ExpiresAt:     expiresAt,
+		})
+		if err == nil {
+			if emitErr := e.sendOperatorMessage(holdPayload,
+				[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
+				e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
+			}
+		}
 	}
 
 	meta := map[string]any{"total_candidates": len(candidates)}
@@ -473,8 +491,38 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		}
 	}
 
-	// Log burn amount (the matching fee has been pre-decremented from the buyer;
-	// it was never credited anywhere — effectively burned by omission).
+	// Emit scrip-settle convention message so CampfireScripStore can replay it.
+	settlePayload, err := json.Marshal(scrip.SettlePayload{
+		ReservationID:   payload.ReservationID,
+		Seller:          payload.SellerKey,
+		Residual:        residual,
+		FeeBurned:       fee,
+		ExchangeRevenue: exchangeRevenue,
+		MatchMsg:        msg.ID,
+		ResultHash:      "",
+	})
+	if err == nil {
+		if emitErr := e.sendOperatorMessage(settlePayload,
+			[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
+			e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
+		}
+	}
+
+	// Emit scrip-burn for the matching fee (already removed from buyer's balance via buy-hold).
+	if fee > 0 {
+		burnPayload, err := json.Marshal(scrip.BurnPayload{
+			Amount:    fee,
+			Reason:    "matching-fee",
+			SourceMsg: msg.ID,
+		})
+		if err == nil {
+			if emitErr := e.sendOperatorMessage(burnPayload,
+				[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
+				e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
+			}
+		}
+	}
+
 	e.opts.log("engine: settle: reservation=%s seller=%s residual=%d fee_burned=%d exchange=%d",
 		payload.ReservationID[:8], payload.SellerKey[:8], residual, fee, exchangeRevenue)
 	return nil
@@ -515,6 +563,20 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 
 	if err := e.opts.ScripStore.DeleteReservation(ctx, payload.ReservationID); err != nil {
 		e.opts.log("engine: dispute: delete reservation %s: %v", payload.ReservationID[:8], err)
+	}
+
+	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
+	refundPayload, err := json.Marshal(scrip.DisputeRefundPayload{
+		Buyer:         payload.BuyerKey,
+		Amount:        res.Amount,
+		ReservationID: payload.ReservationID,
+		DisputeMsg:    msg.ID,
+	})
+	if err == nil {
+		if emitErr := e.sendOperatorMessage(refundPayload,
+			[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
+			e.opts.log("engine: warning: emit scrip-dispute-refund: %v", emitErr)
+		}
 	}
 
 	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
