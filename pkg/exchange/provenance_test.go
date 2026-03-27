@@ -128,9 +128,12 @@ func TestRequiredLevel(t *testing.T) {
 // with ErrInsufficientProvenance.
 func TestCheck_AnonymousRejectedForPut(t *testing.T) {
 	store := makeStore(t)
-	checker := exchange.NewProvenanceChecker(store)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 
-	err := checker.Check("key-anon", exchange.OperationPut, "")
+	err = checker.Check("key-anon", exchange.OperationPut, "")
 	if err == nil {
 		t.Fatal("expected ErrInsufficientProvenance for anonymous put, got nil")
 	}
@@ -143,9 +146,12 @@ func TestCheck_AnonymousRejectedForPut(t *testing.T) {
 // claimed agent sending a put succeeds.
 func TestCheck_ClaimedSucceedsForPut(t *testing.T) {
 	store := makeStore(t)
-	checker := exchange.NewProvenanceChecker(store)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 
-	err := checker.Check("key-claimed", exchange.OperationPut, "")
+	err = checker.Check("key-claimed", exchange.OperationPut, "")
 	if err != nil {
 		t.Errorf("expected claimed sender to succeed for put, got: %v", err)
 	}
@@ -154,9 +160,12 @@ func TestCheck_ClaimedSucceedsForPut(t *testing.T) {
 // TestCheck_AnonymousAcceptedForBuy confirms anonymous agents can buy.
 func TestCheck_AnonymousAcceptedForBuy(t *testing.T) {
 	store := makeStore(t)
-	checker := exchange.NewProvenanceChecker(store)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 
-	err := checker.Check("key-anon", exchange.OperationBuy, "")
+	err = checker.Check("key-anon", exchange.OperationBuy, "")
 	if err != nil {
 		t.Errorf("expected anonymous sender to succeed for buy, got: %v", err)
 	}
@@ -166,7 +175,10 @@ func TestCheck_AnonymousAcceptedForBuy(t *testing.T) {
 // to confirm the gating is correct.
 func TestCheck_ProvenanceLevelMatrix(t *testing.T) {
 	store := makeStore(t)
-	checker := exchange.NewProvenanceChecker(store)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 
 	cases := []struct {
 		name      string
@@ -225,12 +237,17 @@ func TestCheck_ProvenanceLevelMatrix(t *testing.T) {
 	}
 }
 
-// TestCheck_NilStorePanics documents the nil-store panic contract.
-func TestCheck_NilStorePanics(t *testing.T) {
-	defer func() {
-		if r := recover(); r == nil {
-			t.Error("expected panic on nil store, got none")
-		}
-	}()
-	exchange.NewProvenanceChecker(nil)
+// TestNewProvenanceChecker_NilStoreReturnsError verifies that NewProvenanceChecker
+// returns ErrNilProvenanceStore when passed a nil store (no longer panics).
+func TestNewProvenanceChecker_NilStoreReturnsError(t *testing.T) {
+	checker, err := exchange.NewProvenanceChecker(nil)
+	if err == nil {
+		t.Fatal("expected error for nil store, got nil")
+	}
+	if !errors.Is(err, exchange.ErrNilProvenanceStore) {
+		t.Errorf("expected ErrNilProvenanceStore, got: %v", err)
+	}
+	if checker != nil {
+		t.Errorf("expected nil checker on error, got non-nil")
+	}
 }
