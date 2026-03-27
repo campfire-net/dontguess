@@ -92,9 +92,23 @@ type Engine struct {
 	state       *State
 	matchIndex  *matching.Index
 	lastCursor  int64 // received_at cursor: last processed message's received_at
+	// ctx is the shutdown context passed to Start. Handlers use this so that
+	// in-flight scrip operations are cancelled on graceful shutdown instead of
+	// using context.Background() which ignores the shutdown signal.
+	ctx context.Context
 	// marshalFunc overrides json.Marshal for tests that need to inject marshal failures.
 	// Nil means use the standard json.Marshal.
 	marshalFunc func(v any) ([]byte, error)
+}
+
+// engineCtx returns the shutdown context stored at Start time.
+// Falls back to context.Background() when the engine has not been started
+// (e.g., in tests that call handlers directly without Start).
+func (e *Engine) engineCtx() context.Context {
+	if e.ctx != nil {
+		return e.ctx
+	}
+	return context.Background()
 }
 
 // marshal calls marshalFunc if set, otherwise json.Marshal.
@@ -136,6 +150,7 @@ func (e *Engine) MatchIndexLen() int {
 // Start replays the full message log to build initial state, processes any
 // pending orders from the replay, then runs the event loop until ctx is cancelled.
 func (e *Engine) Start(ctx context.Context) error {
+	e.ctx = ctx
 	if err := e.replayAll(); err != nil {
 		return fmt.Errorf("exchange engine replay: %w", err)
 	}
@@ -439,7 +454,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		fee := bestPrice / MatchingFeeRate
 		holdAmount := bestPrice + fee
 
-		ctx := context.Background()
+		ctx := e.engineCtx()
 		buyerKey := msg.Sender
 
 		// Check whether a scrip-buy-hold message already exists for this buy order.
@@ -600,7 +615,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		return nil
 	}
 
-	ctx := context.Background()
+	ctx := e.engineCtx()
 
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
 	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
@@ -727,7 +742,7 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 		return nil // not a scrip-bearing dispute
 	}
 
-	ctx := context.Background()
+	ctx := e.engineCtx()
 
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
 	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
