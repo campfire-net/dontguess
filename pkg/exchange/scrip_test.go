@@ -506,3 +506,118 @@ func TestDispute_RefundsScripToBuyer(t *testing.T) {
 		t.Errorf("expected reservation %s to be deleted after dispute refund, still present", resID)
 	}
 }
+
+// TestDispute_MismatchedBuyerKeyRejected verifies that a settle(dispute) message
+// with a buyer_key that does not match the reservation's AgentKey is rejected:
+//   - handleDispute returns an error
+//   - No refund is issued (buyer balance unchanged)
+//   - The reservation is NOT deleted (still present)
+func TestDispute_MismatchedBuyerKeyRejected(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
+
+	// Seed inventory entry.
+	seedInventoryEntry(t, h, eng, "SQL query optimizer", "code", 10000, 7000)
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	salePrice := inv[0].PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+
+	// Seed buyer with enough scrip and run a buy to get a valid reservation.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Optimize a slow SQL query", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	cancel()
+
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
+	}
+
+	// Buyer balance is now pre-decremented.
+	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	}
+
+	// Dispatch a settle(dispute) with a WRONG buyer_key (the seller's key).
+	// This simulates a crafted operator message attempting to redirect the refund.
+	mismatchedBuyerKey := h.seller.PublicKeyHex()
+	disputePayload, _ := json.Marshal(map[string]any{
+		"reservation_id": resID,
+		"buyer_key":      mismatchedBuyerKey, // wrong — should be h.buyer.PublicKeyHex()
+		"entry_id":       inv[0].EntryID,
+		"dispute_type":   "quality",
+	})
+	disputeMsg := h.sendMessage(h.operator, disputePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(disputeMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage: %v", err)
+	}
+
+	// DispatchForTest must return an error for the mismatched buyer_key.
+	dispatchErr := eng.DispatchForTest(rec)
+	if dispatchErr == nil {
+		t.Error("expected error from handleDispute with mismatched buyer_key, got nil")
+	}
+
+	ctx2 := context.Background()
+
+	// Buyer balance must be UNCHANGED — no refund was issued.
+	buyerBalanceAfterDispute := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterDispute != buyerBalanceAfterBuy {
+		t.Errorf("buyer balance changed after rejected dispute: got %d, want %d (no refund expected)",
+			buyerBalanceAfterDispute, buyerBalanceAfterBuy)
+	}
+
+	// The mismatched identity (seller) must NOT have received any scrip.
+	sellerBalance := cs.Balance(h.seller.PublicKeyHex())
+	if sellerBalance != 0 {
+		t.Errorf("seller (mismatched key) received unexpected scrip: got %d, want 0", sellerBalance)
+	}
+
+	// The reservation must still exist (not deleted after the rejected dispute).
+	if _, err := cs.GetReservation(ctx2, resID); err != nil {
+		t.Errorf("reservation %s should still exist after rejected dispute, got: %v", resID, err)
+	}
+}
