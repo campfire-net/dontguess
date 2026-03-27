@@ -1,0 +1,49 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:burn",
+  "description": "Permanently destroy scrip. Used for matching fees (deflationary pressure) and operator-initiated deflation. Only the exchange operator can burn. State effect: total supply decreases by amount. No balance is debited — the scrip was already removed from a balance via a prior operation like scrip:buy-hold. If reason is matching-fee, source_msg must reference a valid settle operation.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Scrip amount in micro-tokens to permanently destroy."
+    },
+    {
+      "name": "reason",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "scrip:reason:matching-fee",
+        "scrip:reason:operator-deflation",
+        "scrip:reason:penalty"
+      ],
+      "description": "Why scrip is burned. Composed into scrip:reason:<value> tag."
+    },
+    {
+      "name": "source_msg",
+      "type": "message_id",
+      "description": "Message ID of the operation that triggered this burn. Required when reason is matching-fee."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-burn",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:reason:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "scrip:reason:matching-fee",
+        "scrip:reason:operator-deflation",
+        "scrip:reason:penalty"
+      ]
+    }
+  ]
+}

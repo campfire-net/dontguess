@@ -1,0 +1,64 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:settle",
+  "description": "Settle a matched transaction. Completes scrip movement after a successful match: pays residual to original seller, burns the matching fee, retains exchange revenue. Invariants: price = residual + exchange_revenue; amount = price + fee_burned. reservation_id must reference an active (not settled or refunded) reservation. State effect: seller balance increases by residual, operator balance increases by exchange_revenue, fee_burned destroyed, escrow released.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "reservation_id",
+      "type": "string",
+      "required": true,
+      "max_length": 64,
+      "description": "Forge reservation from scrip:buy-hold. Must be active (not settled or refunded)."
+    },
+    {
+      "name": "seller",
+      "type": "key",
+      "required": true,
+      "description": "Original seller's Ed25519 public key (hex). Receives residual payment."
+    },
+    {
+      "name": "residual",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Residual payment to seller in micro-tokens."
+    },
+    {
+      "name": "fee_burned",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Matching fee burned in micro-tokens. Triggers a corresponding scrip:burn message."
+    },
+    {
+      "name": "exchange_revenue",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Exchange revenue retained in micro-tokens. price - residual."
+    },
+    {
+      "name": "match_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:match operation being settled."
+    },
+    {
+      "name": "result_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 64,
+      "description": "SHA-256 hex of the delivered cached result."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-settle",
+      "cardinality": "exactly_one"
+    }
+  ]
+}

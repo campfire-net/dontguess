@@ -1,0 +1,58 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:put-pay",
+  "description": "Pay seller for cached inference submitted to the exchange. Exchange buys the result at a discount. Amount must equal token_cost * discount_pct / 100 (integer division, truncate). Each put_msg can only be paid once (prevents double-pay). Operator must have sufficient balance. State effect: seller balance increases by amount, operator balance decreases by amount.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "seller",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key (hex) of the seller."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Scrip payment in micro-tokens. Must equal token_cost * discount_pct / 100."
+    },
+    {
+      "name": "token_cost",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Original inference token cost in micro-tokens (seller's claim)."
+    },
+    {
+      "name": "discount_pct",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 100,
+      "description": "Discount percentage (0-100). amount = token_cost * discount_pct / 100."
+    },
+    {
+      "name": "result_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 64,
+      "description": "SHA-256 hex of the cached inference result (without sha256: prefix)."
+    },
+    {
+      "name": "put_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the put operation being paid. Must reference a valid, unprocessed put from the seller."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-put-pay",
+      "cardinality": "exactly_one"
+    }
+  ]
+}
