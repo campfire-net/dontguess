@@ -234,6 +234,13 @@ type State struct {
 	// completedEntries tracks entry IDs and their buyers who have completed.
 	// Key: entryID -> buyerKey.
 	completedEntries map[string]string
+
+	// pendingDisputes tracks entries with filed but not-yet-upheld disputes.
+	// Key: entryID. A dispute message filed by the buyer records the entry here
+	// without penalizing seller reputation. Only an operator upheld verdict
+	// (exchange:verdict:accepted on a settle(dispute) message) triggers the
+	// reputation penalty.
+	pendingDisputes map[string]struct{}
 }
 
 // NewState creates an empty exchange state.
@@ -253,6 +260,7 @@ func NewState() *State {
 		deliveredOrders:    make(map[string]struct{}),
 		deliverToMatch:     make(map[string]string),
 		completedEntries:   make(map[string]string),
+		pendingDisputes:    make(map[string]struct{}),
 	}
 }
 
@@ -277,6 +285,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.deliveredOrders = make(map[string]struct{})
 	s.deliverToMatch = make(map[string]string)
 	s.completedEntries = make(map[string]string)
+	s.pendingDisputes = make(map[string]struct{})
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -323,6 +332,16 @@ func settlePhaseFromTags(tags []string) string {
 	for _, t := range tags {
 		if strings.HasPrefix(t, TagPhasePrefix) {
 			return strings.TrimPrefix(t, TagPhasePrefix)
+		}
+	}
+	return ""
+}
+
+// verdictFromTags extracts the exchange:verdict:* value from tags, or "" if absent.
+func verdictFromTags(tags []string) string {
+	for _, t := range tags {
+		if strings.HasPrefix(t, TagVerdictPrefix) {
+			return strings.TrimPrefix(t, TagVerdictPrefix)
 		}
 	}
 	return ""
@@ -580,7 +599,12 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 	})
 }
 
-// applySettleDispute records a dispute and penalizes the seller.
+// applySettleDispute records a dispute filing. Seller reputation is only penalized
+// when the dispute is upheld by the operator — indicated by an exchange:verdict:accepted
+// tag on the settle(dispute) message. A dispute filed by the buyer alone (no verdict
+// tag, or exchange:verdict:disputed) is tracked in pendingDisputes but does NOT
+// affect seller reputation. This prevents buyers from gaming reputation by filing
+// unlimited unreviewed disputes (convention §7.4).
 func (s *State) applySettleDispute(msg *store.MessageRecord) {
 	var payload struct {
 		EntryID     string `json:"entry_id"`
@@ -593,6 +617,16 @@ func (s *State) applySettleDispute(msg *store.MessageRecord) {
 	if entryID == "" {
 		return
 	}
+
+	// Track all filed disputes, regardless of verdict.
+	s.pendingDisputes[entryID] = struct{}{}
+
+	// Only penalize reputation on operator-upheld disputes (exchange:verdict:accepted).
+	verdict := verdictFromTags(msg.Tags)
+	if verdict != "accepted" {
+		return
+	}
+
 	entry, ok := s.inventory[entryID]
 	if !ok {
 		return
@@ -680,6 +714,15 @@ func (s *State) IsOrderMatched(orderID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.matchedOrders[orderID]
+	return ok
+}
+
+// HasPendingDispute returns true if a dispute has been filed against the entry
+// (regardless of whether it has been upheld by the operator).
+func (s *State) HasPendingDispute(entryID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.pendingDisputes[entryID]
 	return ok
 }
 
