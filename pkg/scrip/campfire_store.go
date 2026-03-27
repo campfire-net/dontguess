@@ -209,7 +209,9 @@ func (s *CampfireScripStore) applyBuyHold(msg *store.MessageRecord) {
 //	"fee_burned": <int64>, "exchange_revenue": <int64>, ... }
 //
 // Residual is added to the seller's balance; exchange_revenue to the operator's.
-// fee_burned is tracked in totalBurned. The escrow (buy-hold) was already decremented.
+// fee_burned is NOT tracked here — the engine also emits a separate scrip-burn
+// message for the matching fee, and applyBurn is the sole source of totalBurned
+// accounting. Counting it here too would double-count after Replay.
 // The operator identity is the message sender.
 func (s *CampfireScripStore) applySettle(msg *store.MessageRecord) {
 	var p struct {
@@ -227,9 +229,8 @@ func (s *CampfireScripStore) applySettle(msg *store.MessageRecord) {
 	if msg.Sender != "" && p.ExchangeRevenue > 0 {
 		s.addToBalance(msg.Sender, p.ExchangeRevenue)
 	}
-	if p.FeeBurned > 0 {
-		s.totalBurned.Add(p.FeeBurned)
-	}
+	// Do NOT increment totalBurned here. The engine emits a scrip-burn message
+	// for the matching fee; applyBurn handles totalBurned exclusively.
 }
 
 // applyAssignPay processes a scrip:assign-pay message.
