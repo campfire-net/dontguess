@@ -39,6 +39,28 @@ const (
 
 	// DefaultReputation is the starting reputation score for new sellers.
 	DefaultReputation = 50
+
+	// Input validation bounds for TAINTED fields.
+	//
+	// MaxDescriptionBytes is the maximum allowed length for a put Description
+	// field (64 KiB). Prevents OOM via oversized description strings.
+	MaxDescriptionBytes = 64 * 1024 // 64 KiB
+
+	// MaxDomainsCount is the maximum number of domain tags on a put.
+	// Convention §2 notes max 5; enforce at the state layer.
+	MaxDomainsCount = 5
+
+	// MaxTokenCost is the maximum accepted TokenCost value on a put.
+	// Prevents int overflow; capped at MaxInt32 (~2 billion tokens).
+	MaxTokenCost = int64(1<<31 - 1) // MaxInt32
+
+	// MaxTaskBytes is the maximum allowed length for a buy Task field (64 KiB).
+	// Prevents OOM via oversized task strings.
+	MaxTaskBytes = 64 * 1024 // 64 KiB
+
+	// MaxBuyMaxResults caps the MaxResults field on a buy request.
+	// Prevents OOM via large result-set allocations.
+	MaxBuyMaxResults = 100
 )
 
 // InventoryEntry is a single cache entry in the exchange inventory.
@@ -379,6 +401,18 @@ func (s *State) applyPut(msg *store.MessageRecord) {
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
+	// Validate TAINTED fields. Drop silently — the message is already on the
+	// campfire log; we cannot remove it. By not adding it to pendingPuts the
+	// operator's put-accept will find nothing to accept.
+	if len(payload.Description) > MaxDescriptionBytes {
+		return
+	}
+	if len(payload.Domains) > MaxDomainsCount {
+		return
+	}
+	if payload.TokenCost <= 0 || payload.TokenCost > MaxTokenCost {
+		return
+	}
 	entry := &InventoryEntry{
 		EntryID:      msg.ID,
 		PutMsgID:     msg.ID,
@@ -409,9 +443,16 @@ func (s *State) applyBuy(msg *store.MessageRecord) {
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
+	// Validate TAINTED fields. Drop silently — see applyPut comment.
+	if len(payload.Task) > MaxTaskBytes {
+		return
+	}
 	maxResults := payload.MaxResults
 	if maxResults <= 0 {
 		maxResults = 3
+	}
+	if maxResults > MaxBuyMaxResults {
+		return
 	}
 	order := &ActiveOrder{
 		OrderID:        msg.ID,
