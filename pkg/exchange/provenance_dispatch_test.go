@@ -186,6 +186,85 @@ func TestProvenanceDispatch_ClaimedPutAccepted(t *testing.T) {
 	}
 }
 
+// TestProvenanceDispatch_UnverifiedInventory_BuyReturnsEmpty is an integration
+// test for the provenance enforcement path at engine dispatch.
+//
+// Scenario:
+//  1. Engine is created with ProvenanceChecker enabled (minimum level: claimed).
+//  2. An unverified seller (LevelAnonymous, no attestation) attempts to seed
+//     inventory by sending a put message.
+//  3. The engine dispatches the put — the ProvenanceChecker rejects it.
+//  4. A buyer sends a buy order.
+//  5. The engine dispatches the buy — the match result must be empty because
+//     the unverified seller's entry was rejected and never entered inventory.
+//
+// This is the base-case provenance enforcement test: no downgrade, no flag —
+// just a seller that was never attested, whose entry should never be buyable.
+func TestProvenanceDispatch_UnverifiedInventory_BuyReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	ps := makeProvenanceStore(t)
+	checker, err := exchange.NewProvenanceChecker(ps)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
+	h, eng := newEngineWithProvenance(t, checker)
+
+	// Step 1: Unverified seller (key-anon, LevelAnonymous) injects a put.
+	putRec := injectPutMsg(t, h, "key-anon")
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("listing messages after put: %v", err)
+	}
+	eng.State().Replay(msgs)
+
+	// Step 2: Dispatch the put — ProvenanceChecker should reject it silently.
+	if err := eng.DispatchForTest(putRec); err != nil {
+		t.Errorf("DispatchForTest(put) returned error, want nil (silent reject): %v", err)
+	}
+
+	// Verify: inventory must be empty — the rejected put was never accepted.
+	if inv := eng.State().Inventory(); len(inv) != 0 {
+		t.Errorf("inventory should be empty after rejected put, got %d entries", len(inv))
+	}
+
+	// Step 3: Buyer sends a buy order for a task that matches the description.
+	buyRec := injectBuyMsg(t, h, "key-claimed")
+
+	msgs, err = h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("listing messages after buy: %v", err)
+	}
+	eng.State().Replay(msgs)
+
+	// Step 4: Dispatch the buy — no inventory exists, so the match is empty.
+	if err := eng.DispatchForTest(buyRec); err != nil {
+		t.Errorf("DispatchForTest(buy) returned error: %v", err)
+	}
+
+	// Step 5: Verify the match message was emitted with zero results.
+	matchMsgs, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	if err != nil {
+		t.Fatalf("listing match messages: %v", err)
+	}
+	if len(matchMsgs) == 0 {
+		t.Fatal("expected a match message to be emitted (to fulfill the buy future), got none")
+	}
+	lastMatch := matchMsgs[len(matchMsgs)-1]
+	var matchPayload struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(lastMatch.Payload, &matchPayload); err != nil {
+		t.Fatalf("unmarshal match payload: %v", err)
+	}
+	if len(matchPayload.Results) != 0 {
+		t.Errorf("expected 0 match results (unverified entry rejected), got %d (first entry_id: %s)",
+			len(matchPayload.Results), matchPayload.Results[0].EntryID)
+	}
+}
+
 // TestProvenanceDispatch_NilChecker_AllOperationsPass verifies backwards compatibility:
 // when ProvenanceChecker is nil, all operations pass through regardless of sender identity.
 func TestProvenanceDispatch_NilChecker_AllOperationsPass(t *testing.T) {
