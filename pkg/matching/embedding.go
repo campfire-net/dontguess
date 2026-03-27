@@ -10,6 +10,7 @@ import (
 	"math"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // Embedder computes a vector embedding for a text string.
@@ -63,27 +64,31 @@ func NewTFIDFEmbedder() *TFIDFEmbedder {
 }
 
 // TFIDFEmbedder is a sparse TF-IDF bag-of-words embedder.
-// Safe for concurrent reads after IndexCorpus; mutations are not concurrent-safe.
+// Safe for concurrent use. IndexCorpus, Embed, and Similarity may be called
+// from multiple goroutines simultaneously.
 type TFIDFEmbedder struct {
+	mu sync.RWMutex
+
 	// idf maps term -> inverse document frequency weight.
-	// Populated by IndexCorpus.
+	// Populated by IndexCorpus. Protected by mu.
 	idf map[string]float64
 
 	// vocabID maps term -> dense vector index.
-	// Built from IndexCorpus + subsequent Embed calls.
+	// Built from IndexCorpus + subsequent Embed calls. Protected by mu.
 	vocabID map[string]int
 }
 
 // IndexCorpus computes IDF weights from a slice of documents.
 // Must be called before Embed for meaningful TF-IDF results.
 // Calling IndexCorpus multiple times replaces the previous IDF weights.
+// Safe to call concurrently with other methods.
 func (e *TFIDFEmbedder) IndexCorpus(docs []string) {
 	N := len(docs)
 	if N == 0 {
 		return
 	}
 
-	// Count document frequency for each term.
+	// Count document frequency for each term (no lock needed — local computation).
 	df := make(map[string]int)
 	for _, doc := range docs {
 		seen := make(map[string]bool)
@@ -95,21 +100,27 @@ func (e *TFIDFEmbedder) IndexCorpus(docs []string) {
 		}
 	}
 
-	// Compute IDF: log((N+1) / (df+1)) + 1 (smoothed, avoids zero).
-	e.idf = make(map[string]float64, len(df))
+	// Build new idf and vocabID maps locally, then swap under lock.
+	newIDF := make(map[string]float64, len(df))
+	newVocab := make(map[string]int, len(df))
 	for term, count := range df {
-		e.idf[term] = math.Log(float64(N+1)/float64(count+1)) + 1.0
-		// Ensure vocabulary index exists.
-		if _, ok := e.vocabID[term]; !ok {
-			e.vocabID[term] = len(e.vocabID)
+		newIDF[term] = math.Log(float64(N+1)/float64(count+1)) + 1.0
+		if _, ok := newVocab[term]; !ok {
+			newVocab[term] = len(newVocab)
 		}
 	}
+
+	e.mu.Lock()
+	e.idf = newIDF
+	e.vocabID = newVocab
+	e.mu.Unlock()
 }
 
 // Embed returns a TF-IDF vector for the given text.
 // Returns a dense vector indexed by the internal vocabulary.
 // New terms encountered outside the corpus are assigned new vocab IDs with
 // IDF weight 1.0 (neutral — no corpus evidence).
+// Safe for concurrent use.
 func (e *TFIDFEmbedder) Embed(text string) []float64 {
 	tokens := tokenize(text)
 	if len(tokens) == 0 {
@@ -117,7 +128,7 @@ func (e *TFIDFEmbedder) Embed(text string) []float64 {
 		return []float64{}
 	}
 
-	// Compute term frequencies.
+	// Compute term frequencies (no lock needed — local computation).
 	tf := make(map[string]float64)
 	for _, tok := range tokens {
 		tf[tok]++
@@ -127,19 +138,29 @@ func (e *TFIDFEmbedder) Embed(text string) []float64 {
 		tf[k] /= total
 	}
 
-	// Assign vocab IDs to any new terms.
+	// Assign vocab IDs to any new terms under a write lock.
+	e.mu.Lock()
 	for term := range tf {
 		if _, ok := e.vocabID[term]; !ok {
 			e.vocabID[term] = len(e.vocabID)
 		}
 	}
 
-	// Build dense vector. Size = current vocabulary.
+	// Build dense vector while still holding the write lock so dim and IDs are stable.
 	dim := len(e.vocabID)
+	// Snapshot IDF values and vocab IDs needed for this embedding.
+	idfSnap := make(map[string]float64, len(tf))
+	vocabSnap := make(map[string]int, len(tf))
+	for term := range tf {
+		idfSnap[term] = e.idf[term]
+		vocabSnap[term] = e.vocabID[term]
+	}
+	e.mu.Unlock()
+
 	vec := make([]float64, dim)
 	for term, freq := range tf {
-		id := e.vocabID[term]
-		idf := e.idf[term]
+		id := vocabSnap[term]
+		idf := idfSnap[term]
 		if idf == 0 {
 			idf = 1.0 // neutral weight for unseen terms
 		}
