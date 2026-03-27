@@ -3,6 +3,7 @@
   "version": "0.1",
   "operation": "match",
   "description": "Present matching cached inference to a buyer. Sent by the exchange as fulfillment of a buy future (--fulfills <buy-msg-id>). Results are ranked by composite score: correctness gate (Layer 0 — failed entries excluded), transaction efficiency (Layer 1 — tokens saved per scrip spent), value composite (Layer 2 — confidence, freshness, reputation, diversity), and market novelty (Layer 3 — discovery boost for underrepresented sellers). An empty results array fulfills the future when no matches exist.",
+  "provenance_level": "present",
   "signing": "member_key",
   "antecedents": "exactly_one(target)",
   "payload_required": true,

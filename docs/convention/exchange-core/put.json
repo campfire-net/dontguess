@@ -3,6 +3,7 @@
   "version": "0.1",
   "operation": "put",
   "description": "Offer cached inference to the exchange. Seller submits metadata and content hash; exchange buys at a discount and responds with settle(put-accept) or settle(put-reject). Content is stored externally and referenced by SHA-256 hash. Domain tags are composed as exchange:domain:<value> from the domain arg.",
+  "provenance_level": "claimed",
   "signing": "member_key",
   "antecedents": "none",
   "payload_required": true,
