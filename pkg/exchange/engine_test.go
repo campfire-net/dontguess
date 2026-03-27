@@ -394,6 +394,103 @@ func TestState_ExpiredEntryExcludedFromInventory(t *testing.T) {
 	}
 }
 
+// TestState_ExpiredEntryExcludedFromFindCandidates tests that an entry past its
+// expiry is excluded from findCandidates (called via the buy dispatch path).
+//
+// IsExpired() is checked inside Inventory(), which findCandidates calls first.
+// This test verifies the gate is exercised end-to-end through a real buy dispatch:
+// the expired entry must not appear in the match response emitted by the engine.
+//
+// Setup: two entries — one expired, one live. The buyer's task targets the expired
+// entry's description. The live entry acts as a distractor so the engine has a
+// candidate and will emit a match message (allowing us to inspect results).
+// If the engine emits no match at all, the expired entry is still absent — pass.
+func TestState_ExpiredEntryExcludedFromFindCandidates(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Step 1: Seed an expired entry. Accept with ExpiresAt already in the past.
+	expiredPutMsg := h.sendMessage(h.seller,
+		putPayload("Python pandas pivot table aggregation analysis", "sha256:"+fmt.Sprintf("%064x", 98), "analysis", 6000, 9000),
+		[]string{exchange.TagPut, "exchange:content-type:analysis", "exchange:domain:python"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(expiredPutMsg.ID, 4200, time.Now().Add(-2*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut (expired): %v", err)
+	}
+
+	// Precondition: expired entry must NOT appear in Inventory().
+	inv := eng.State().Inventory()
+	for _, e := range inv {
+		if e.PutMsgID == expiredPutMsg.ID {
+			t.Fatalf("precondition failed: expired entry appeared in Inventory()")
+		}
+	}
+
+	// Step 2: Seed a live entry so the engine has at least one candidate and
+	// will produce a match message (giving us results to inspect).
+	livePutMsg := h.sendMessage(h.seller,
+		putPayload("Go HTTP handler unit test generator JSON validation", "sha256:"+fmt.Sprintf("%064x", 99), "code", 8000, 12000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(livePutMsg.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut (live): %v", err)
+	}
+
+	// Step 3: Buyer sends a buy whose task description targets the EXPIRED entry.
+	// If findCandidates properly excludes it, the expired entry must not appear in results.
+	h.sendMessage(h.buyer,
+		buyPayload("Python pandas pivot table aggregation analysis", 20000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Step 4: Run the engine; it will process the buy and emit a match (or no match).
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	// If the engine emitted no match at all, the expired entry is absent — pass.
+	if len(matchMsgs) <= len(preMsgs) {
+		return
+	}
+
+	// Step 5: Parse the match payload and verify the expired entry is absent.
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+	var mp struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+	for _, r := range mp.Results {
+		if r.EntryID == expiredPutMsg.ID {
+			t.Errorf("expired entry %s appeared in findCandidates match results — IsExpired() gate failed", expiredPutMsg.ID[:8])
+		}
+	}
+}
+
 // TestState_SellerReputationStartsAtDefault tests that a new seller's reputation
 // is DefaultReputation.
 func TestState_SellerReputationStartsAtDefault(t *testing.T) {
