@@ -393,6 +393,67 @@ func TestReservation_SaveOverwrite(t *testing.T) {
 	}
 }
 
+// --- ConsumeReservation ---
+
+func TestConsumeReservation_ReturnsAndDeletes(t *testing.T) {
+	cs := newStore(t, openTestStore(t))
+	ctx := context.Background()
+
+	r := scrip.Reservation{
+		ID:       "res-consume-001",
+		AgentKey: agentAlice,
+		Amount:   500,
+	}
+	if err := cs.SaveReservation(ctx, r); err != nil {
+		t.Fatalf("SaveReservation: %v", err)
+	}
+
+	got, err := cs.ConsumeReservation(ctx, r.ID)
+	if err != nil {
+		t.Fatalf("ConsumeReservation: %v", err)
+	}
+	if got != r {
+		t.Errorf("ConsumeReservation returned %+v, want %+v", got, r)
+	}
+
+	// Reservation must no longer exist after consume.
+	_, err = cs.GetReservation(ctx, r.ID)
+	if !errors.Is(err, scrip.ErrReservationNotFound) {
+		t.Errorf("expected ErrReservationNotFound after consume, got %v", err)
+	}
+}
+
+func TestConsumeReservation_SecondCallReturnsNotFound(t *testing.T) {
+	cs := newStore(t, openTestStore(t))
+	ctx := context.Background()
+
+	r := scrip.Reservation{ID: "res-consume-002", AgentKey: agentBob, Amount: 200}
+	if err := cs.SaveReservation(ctx, r); err != nil {
+		t.Fatalf("SaveReservation: %v", err)
+	}
+
+	// First consume succeeds.
+	if _, err := cs.ConsumeReservation(ctx, r.ID); err != nil {
+		t.Fatalf("first ConsumeReservation: %v", err)
+	}
+
+	// Second consume on the same ID must return ErrReservationNotFound.
+	_, err := cs.ConsumeReservation(ctx, r.ID)
+	if !errors.Is(err, scrip.ErrReservationNotFound) {
+		t.Errorf("expected ErrReservationNotFound on second consume, got %v", err)
+	}
+}
+
+func TestConsumeReservation_NotFound(t *testing.T) {
+	cs := newStore(t, openTestStore(t))
+	ctx := context.Background()
+
+	_, err := cs.ConsumeReservation(ctx, "nonexistent")
+	if !errors.Is(err, scrip.ErrReservationNotFound) {
+		t.Errorf("expected ErrReservationNotFound, got %v", err)
+	}
+}
+
 // --- Balance derivation from message log replay ---
 
 func TestReplay_MintAndBalance(t *testing.T) {

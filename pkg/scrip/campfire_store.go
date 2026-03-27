@@ -399,6 +399,20 @@ func (s *CampfireScripStore) DeleteReservation(_ context.Context, id string) err
 	return nil
 }
 
+// ConsumeReservation implements SpendingStore.
+// Atomically retrieves and deletes a reservation under resMu, eliminating the
+// TOCTOU window between GetReservation and DeleteReservation.
+func (s *CampfireScripStore) ConsumeReservation(_ context.Context, id string) (Reservation, error) {
+	s.resMu.Lock()
+	defer s.resMu.Unlock()
+	r, ok := s.reservations[id]
+	if !ok {
+		return Reservation{}, ErrReservationNotFound
+	}
+	delete(s.reservations, id)
+	return r, nil
+}
+
 // --- Supply stats ---
 
 // TotalSupply returns total scrip ever minted (micro-tokens).

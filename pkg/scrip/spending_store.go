@@ -85,6 +85,11 @@ type SpendingStore interface {
 	// DeleteReservation removes a reservation after it has been settled or refunded.
 	// Returns ErrReservationNotFound if not present.
 	DeleteReservation(ctx context.Context, id string) error
+
+	// ConsumeReservation atomically retrieves and deletes a reservation.
+	// Returns the reservation data and nil error on success.
+	// Returns ErrReservationNotFound if the reservation doesn't exist.
+	ConsumeReservation(ctx context.Context, id string) (Reservation, error)
 }
 
 // BalanceKey is the row key used for all scrip balance counters.
