@@ -110,12 +110,16 @@ type ProvenanceChecker struct {
 	store *provenance.Store
 }
 
+// ErrNilProvenanceStore is returned by NewProvenanceChecker when a nil store is provided.
+var ErrNilProvenanceStore = errors.New("exchange: provenance store must not be nil")
+
 // NewProvenanceChecker creates a ProvenanceChecker backed by the given store.
-func NewProvenanceChecker(store *provenance.Store) *ProvenanceChecker {
+// Returns ErrNilProvenanceStore if store is nil.
+func NewProvenanceChecker(store *provenance.Store) (*ProvenanceChecker, error) {
 	if store == nil {
-		panic("exchange: provenance store must not be nil")
+		return nil, ErrNilProvenanceStore
 	}
-	return &ProvenanceChecker{store: store}
+	return &ProvenanceChecker{store: store}, nil
 }
 
 // Check returns nil if the sender's provenance level meets the requirement for

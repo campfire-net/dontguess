@@ -305,3 +305,48 @@ func TestDiff_PutV1ToV2_AddOptionalArg(t *testing.T) {
 		t.Errorf("expected valid version bump, got: %v", errs)
 	}
 }
+
+// ---- parseSemver overflow guard ----
+
+// TestValidateVersionBump_OverflowInOldVersion exercises the parseSemver overflow
+// guard via ValidateVersionBump: a version component that exceeds MaxInt must
+// produce a validation error rather than silently wrapping.
+func TestValidateVersionBump_OverflowInOldVersion(t *testing.T) {
+	args := []map[string]any{
+		{"name": "description", "type": "string", "required": true},
+	}
+	// 99999999999999999999 has 20 digits — well past MaxInt64 (19 digits).
+	overflowVersion := "99999999999999999999.0.0"
+	old := buildDecl("dontguess-exchange", "put", overflowVersion, args)
+	new := buildDecl("dontguess-exchange", "put", "1.0.0", args)
+
+	diff, err := dgconv.Diff(old, new)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	// diff.OldVersion carries the raw string; ValidateVersionBump must reject it.
+	errs := dgconv.ValidateVersionBump(diff)
+	if len(errs) == 0 {
+		t.Error("expected validation error for overflow version component, got none")
+	}
+}
+
+// TestValidateVersionBump_OverflowInNewVersion exercises the overflow guard for
+// the new version string.
+func TestValidateVersionBump_OverflowInNewVersion(t *testing.T) {
+	args := []map[string]any{
+		{"name": "description", "type": "string", "required": true},
+	}
+	overflowVersion := "0.99999999999999999999.0"
+	old := buildDecl("dontguess-exchange", "put", "0.1.0", args)
+	new := buildDecl("dontguess-exchange", "put", overflowVersion, args)
+
+	diff, err := dgconv.Diff(old, new)
+	if err != nil {
+		t.Fatalf("Diff failed: %v", err)
+	}
+	errs := dgconv.ValidateVersionBump(diff)
+	if len(errs) == 0 {
+		t.Error("expected validation error for overflow version component, got none")
+	}
+}
