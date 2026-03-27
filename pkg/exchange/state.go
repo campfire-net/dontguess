@@ -817,13 +817,21 @@ func (s *State) sellerStats(sellerKey string) *SellerStats {
 }
 
 // Inventory returns a snapshot of all live (accepted, non-expired) inventory entries.
+// Each entry is a copy — callers may not mutate returned entries; changes would not
+// be reflected in state and could not be persisted.
 func (s *State) Inventory() []*InventoryEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make([]*InventoryEntry, 0, len(s.inventory))
 	for _, e := range s.inventory {
 		if !e.IsExpired() {
-			out = append(out, e)
+			cp := *e // shallow copy of the struct
+			// Deep-copy the Domains slice so callers cannot mutate internal state.
+			if len(e.Domains) > 0 {
+				cp.Domains = make([]string, len(e.Domains))
+				copy(cp.Domains, e.Domains)
+			}
+			out = append(out, &cp)
 		}
 	}
 	return out
