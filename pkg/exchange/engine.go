@@ -928,8 +928,8 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 		Price:            e.computePrice(entry),
 		SellerReputation: e.state.SellerReputation(entry.SellerKey),
 		PutTimestamp:     entry.PutTimestamp,
-		DisputeCount:     0, // upheld disputes: tracked via SellerStats, not per-entry here
-		HasUpheldDispute: false,
+		DisputeCount:     e.state.SellerDisputeCount(entry.SellerKey),
+		HasUpheldDispute: e.state.HasUpheldDispute(entry.EntryID),
 	}
 }
 

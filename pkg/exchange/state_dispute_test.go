@@ -214,3 +214,94 @@ func TestState_MultipleFiledDisputesNoReputation(t *testing.T) {
 			repBefore, repAfter)
 	}
 }
+
+// TestState_HasUpheldDispute verifies that HasUpheldDispute returns true only
+// after an operator-upheld dispute (verdict:accepted), not after a mere filing.
+func TestState_HasUpheldDispute(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	entryID := setupInventoryEntry(t, h, eng)
+
+	// Before any dispute: not upheld.
+	if eng.State().HasUpheldDispute(entryID) {
+		t.Error("HasUpheldDispute should be false before any dispute")
+	}
+
+	// Buyer files a dispute (no verdict): still not upheld.
+	h.sendMessage(h.buyer, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	if eng.State().HasUpheldDispute(entryID) {
+		t.Error("HasUpheldDispute should be false after filing without verdict")
+	}
+
+	// Operator upholds: now upheld.
+	h.sendMessage(h.operator, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		nil,
+	)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	if !eng.State().HasUpheldDispute(entryID) {
+		t.Error("HasUpheldDispute should be true after operator upholds dispute")
+	}
+}
+
+// TestState_SellerDisputeCount verifies that SellerDisputeCount returns the
+// correct count of upheld disputes for a seller.
+func TestState_SellerDisputeCount(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	entryID := setupInventoryEntry(t, h, eng)
+
+	if got := eng.State().SellerDisputeCount(h.seller.PublicKeyHex()); got != 0 {
+		t.Errorf("SellerDisputeCount before disputes = %d, want 0", got)
+	}
+
+	// File without upholding: count stays 0.
+	h.sendMessage(h.buyer, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+		},
+		nil,
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	if got := eng.State().SellerDisputeCount(h.seller.PublicKeyHex()); got != 0 {
+		t.Errorf("SellerDisputeCount after filing (no verdict) = %d, want 0", got)
+	}
+
+	// Uphold: count becomes 1.
+	h.sendMessage(h.operator, disputePayload(entryID, "content_mismatch"),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDispute,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		nil,
+	)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	if got := eng.State().SellerDisputeCount(h.seller.PublicKeyHex()); got != 1 {
+		t.Errorf("SellerDisputeCount after upheld = %d, want 1", got)
+	}
+}
