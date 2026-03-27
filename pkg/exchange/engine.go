@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 	"time"
 
@@ -791,15 +792,43 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 	return out
 }
 
+// computePriceMinPrice is the floor price returned when an entry has no valid
+// base price (TokenCost <= 0 or PutPrice <= 0 with no token cost).
+// A floor of 1 prevents zero-price entries from bypassing budget filters and
+// from receiving l1Efficiency=1.0 (free-item dominance) in the ranker.
+const computePriceMinPrice int64 = 1
+
 // computePrice returns the exchange's asking price for an entry.
 // For v0.1 this is a simple 1.2x markup over put price (20% margin).
 // The full pricing engine (dontguess-pricing) will replace this.
+//
+// Invariants:
+//   - Returns at least computePriceMinPrice (never 0 or negative).
+//   - Guards against int64 overflow for large TokenCost values.
 func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 	if entry.PutPrice > 0 {
+		// 1.2x markup: guard against overflow on very large PutPrice.
+		// MaxInt64 / 120 ≈ 7.69e16; prices above that would overflow.
+		if entry.PutPrice > math.MaxInt64/120 {
+			return math.MaxInt64
+		}
 		return entry.PutPrice * 120 / 100
 	}
-	// If no put-accept yet (pending), use 70% of token cost as a proxy.
-	return entry.TokenCost * 70 / 100
+
+	// No put-accept yet (pending): use 70% of token cost as a proxy.
+	// Guard: TokenCost <= 0 means no valid base price — return floor.
+	if entry.TokenCost <= 0 {
+		return computePriceMinPrice
+	}
+	// Guard against int64 overflow: MaxInt64 / 70 ≈ 1.32e17.
+	if entry.TokenCost > math.MaxInt64/70 {
+		return math.MaxInt64
+	}
+	price := entry.TokenCost * 70 / 100
+	if price < computePriceMinPrice {
+		return computePriceMinPrice
+	}
+	return price
 }
 
 // computeConfidence returns a composite confidence score [0,1].

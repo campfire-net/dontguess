@@ -334,6 +334,108 @@ func TestRank_DisputedEntryDoesNotInflateSellerCount(t *testing.T) {
 	}
 }
 
+// TestRank_ZeroPriceEntryDoesNotDominate verifies that a zero-price entry
+// receives EfficiencyScore=0 and does not outrank entries with valid prices.
+// Regression for dontguess-p39: the old code set l1Efficiency=1.0 for Price=0
+// entries ("free item" path), causing them to dominate rankings despite having
+// no valid scrip flow.
+func TestRank_ZeroPriceEntryDoesNotDominate(t *testing.T) {
+	t.Parallel()
+	e := NewTFIDFEmbedder()
+
+	ts := time.Now().Add(-1 * time.Hour).UnixNano()
+	desc := "Go HTTP handler unit test generator"
+
+	zeroPriceEntry := RankInput{
+		EntryID:          "zero-price",
+		SellerKey:        "seller-a",
+		Description:      desc,
+		ContentType:      "code",
+		Domains:          []string{"go"},
+		TokenCost:        10000,
+		Price:            0, // zero price — must not dominate
+		SellerReputation: 70,
+		PutTimestamp:     ts,
+	}
+	validEntry := RankInput{
+		EntryID:          "valid-price",
+		SellerKey:        "seller-b",
+		Description:      desc,
+		ContentType:      "code",
+		Domains:          []string{"go"},
+		TokenCost:        10000,
+		Price:            1000, // normal price
+		SellerReputation: 70,
+		PutTimestamp:     ts,
+	}
+
+	results := Rank("Go HTTP unit test generator", []RankInput{zeroPriceEntry, validEntry}, e, RankOptions{})
+	if len(results) < 2 {
+		t.Fatalf("expected 2 results, got %d", len(results))
+	}
+
+	var zeroResult, validResult *RankedResult
+	for i := range results {
+		switch results[i].EntryID {
+		case "zero-price":
+			zeroResult = &results[i]
+		case "valid-price":
+			validResult = &results[i]
+		}
+	}
+	if zeroResult == nil {
+		t.Fatal("zero-price entry not found in results")
+	}
+	if validResult == nil {
+		t.Fatal("valid-price entry not found in results")
+	}
+
+	// Zero-price entry must have EfficiencyScore=0.
+	if zeroResult.EfficiencyScore != 0.0 {
+		t.Errorf("zero-price EfficiencyScore = %f, want 0.0", zeroResult.EfficiencyScore)
+	}
+
+	// Zero-price entry must not outrank the valid entry.
+	// Both have the same description/similarity/reputation/freshness/domains,
+	// so ranking is determined by efficiency. Valid entry has non-zero efficiency.
+	if zeroResult.CompositeScore >= validResult.CompositeScore {
+		t.Errorf("zero-price CompositeScore (%f) should be < valid-price CompositeScore (%f)",
+			zeroResult.CompositeScore, validResult.CompositeScore)
+	}
+	if results[0].EntryID != "valid-price" {
+		t.Errorf("expected valid-price to rank first, got %q (zero-price must not dominate)",
+			results[0].EntryID)
+	}
+}
+
+// TestRank_ZeroTokenCostZeroPriceEfficiency verifies that an entry with both
+// TokenCost=0 and Price=0 gets EfficiencyScore=0 (no work, no cost — no deal).
+func TestRank_ZeroTokenCostZeroPriceEfficiency(t *testing.T) {
+	t.Parallel()
+	e := NewTFIDFEmbedder()
+
+	entry := RankInput{
+		EntryID:          "zero-both",
+		SellerKey:        "seller-a",
+		Description:      "Go HTTP handler unit test generator",
+		ContentType:      "code",
+		Domains:          []string{"go"},
+		TokenCost:        0,
+		Price:            0,
+		SellerReputation: 70,
+		PutTimestamp:     time.Now().Add(-1 * time.Hour).UnixNano(),
+	}
+
+	results := Rank("Go HTTP unit test", []RankInput{entry}, e, RankOptions{})
+	if len(results) == 0 {
+		// If filtered out, that's fine — but if present, check efficiency.
+		return
+	}
+	if results[0].EfficiencyScore != 0.0 {
+		t.Errorf("zero TokenCost+Price EfficiencyScore = %f, want 0.0", results[0].EfficiencyScore)
+	}
+}
+
 // summarizeResults returns a slice of EntryID strings for test error messages.
 func summarizeResults(results []RankedResult) []string {
 	ids := make([]string, len(results))

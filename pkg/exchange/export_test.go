@@ -8,3 +8,11 @@ import "github.com/campfire-net/campfire/pkg/store"
 func (e *Engine) DispatchForTest(msg *store.MessageRecord) error {
 	return e.dispatch(msg)
 }
+
+// ComputePriceForTest exposes computePrice for unit testing.
+func (e *Engine) ComputePriceForTest(entry *InventoryEntry) int64 {
+	return e.computePrice(entry)
+}
+
+// ComputePriceMinPriceForTest exposes the floor price constant for assertion.
+const ComputePriceMinPriceForTest = computePriceMinPrice
