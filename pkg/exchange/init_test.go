@@ -187,6 +187,57 @@ func TestInit_ConventionDeclarationsPromoted(t *testing.T) {
 	}
 }
 
+// TestInit_PutNotDoublePromoted verifies that when both put.json (v0.1) and
+// put-v0.2.json (v0.2) are present in the convention directory, only one
+// "put" declaration is promoted — the highest version wins. Double-promotion
+// would create ambiguous registry state without a supersedes chain.
+func TestInit_PutNotDoublePromoted(t *testing.T) {
+	t.Parallel()
+
+	cfHome := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	cfg, err := exchange.Init(exchange.InitOptions{
+		CFHome:           cfHome,
+		TransportBaseDir: transportDir,
+		BeaconDir:        beaconDir,
+		ConventionDir:    convDir,
+	})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	tr := fs.New(transportDir)
+	msgs, err := tr.ListMessages(cfg.ExchangeCampfireID)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+
+	// Count how many promoted messages declare operation == "put".
+	var putCount int
+	var putVersion string
+	for _, msg := range msgs {
+		decl, _, parseErr := convention.Parse(msg.Tags, msg.Payload, "", "")
+		if parseErr != nil {
+			continue
+		}
+		if decl.Operation == "put" {
+			putCount++
+			putVersion = decl.Version
+		}
+	}
+
+	if putCount != 1 {
+		t.Errorf("expected exactly 1 promoted 'put' declaration, got %d", putCount)
+	}
+	// The promoted version must be the latest (0.2), not the older 0.1.
+	if putVersion != "0.2" {
+		t.Errorf("expected promoted 'put' version 0.2, got %q", putVersion)
+	}
+}
+
 func TestInit_NamingAliasRegistered(t *testing.T) {
 	t.Parallel()
 
