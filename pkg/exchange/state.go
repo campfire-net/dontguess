@@ -452,6 +452,8 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 		s.applySettlePutReject(msg)
 	case SettlePhaseStrBuyerAccept:
 		s.applySettleBuyerAccept(msg)
+	case SettlePhaseStrBuyerReject:
+		s.applySettleBuyerReject(msg)
 	case SettlePhaseStrDeliver:
 		s.applySettleDeliver(msg)
 	case SettlePhaseStrComplete:
@@ -526,6 +528,31 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 	}
 	// Record buyer-accept → match mapping so deliver can trace the chain.
 	s.buyerAcceptToMatch[msg.ID] = matchMsgID
+}
+
+// applySettleBuyerReject records that a buyer has rejected a match.
+// The buyer walks away — the accepted order entry is removed so the buyer
+// is no longer bound to this match. The inventory entry remains available
+// for other buyers. Seller reputation is not affected (buyer chose not to buy).
+// Security: only the buyer who placed the original buy order may reject a match.
+// Convention §5.3: buyer identity gate — same pattern as applySettleBuyerAccept.
+func (s *State) applySettleBuyerReject(msg *store.MessageRecord) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	matchMsgID := msg.Antecedents[0]
+
+	// Enforce buyer identity: the sender must be the buyer who placed the
+	// original buy order that this match fulfills.
+	expectedBuyer, ok := s.matchToBuyer[matchMsgID]
+	if !ok || msg.Sender != expectedBuyer {
+		return
+	}
+
+	// Remove the accepted order so the buyer is no longer bound to this match.
+	// The inventory entry and matchedOrders entry are intentionally left intact —
+	// the match was sent (order was consumed), and the inventory remains available.
+	delete(s.acceptedOrders, matchMsgID)
 }
 
 // applySettleDeliver records that the exchange has delivered content to the buyer.
@@ -759,6 +786,15 @@ func (s *State) IsOrderMatched(orderID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.matchedOrders[orderID]
+	return ok
+}
+
+// IsMatchAccepted returns true if a match (identified by its message ID) has
+// an active buyer-accept that has not been subsequently rejected.
+func (s *State) IsMatchAccepted(matchMsgID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.acceptedOrders[matchMsgID]
 	return ok
 }
 
