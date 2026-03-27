@@ -712,6 +712,12 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 // tag, or exchange:verdict:disputed) is tracked in pendingDisputes but does NOT
 // affect seller reputation. This prevents buyers from gaming reputation by filing
 // unlimited unreviewed disputes (convention §7.4).
+//
+// Sender identity gate (dontguess-nte):
+//   - Only the operator may send a settle(dispute) with verdict:accepted.
+//     Convention §9.5 allows the operator to uphold disputes; reputation penalties
+//     require operator authorization. Any non-operator sender with verdict:accepted
+//     is silently rejected — they cannot game seller reputation.
 func (s *State) applySettleDispute(msg *store.MessageRecord) {
 	var payload struct {
 		EntryID     string `json:"entry_id"`
@@ -731,6 +737,14 @@ func (s *State) applySettleDispute(msg *store.MessageRecord) {
 	// Only penalize reputation on operator-upheld disputes (exchange:verdict:accepted).
 	verdict := verdictFromTags(msg.Tags)
 	if verdict != "accepted" {
+		return
+	}
+
+	// Sender identity gate: only the operator may uphold a dispute and apply
+	// reputation penalties. Convention §9.5: operator controls verdict:accepted.
+	// This prevents any campfire member from sending a forged settle(dispute)
+	// with verdict:accepted to damage a seller's reputation.
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
 
