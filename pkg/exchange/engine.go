@@ -357,50 +357,78 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 
 		ctx := context.Background()
 		buyerKey := msg.Sender
-		bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
-		if err != nil {
-			return fmt.Errorf("scrip: GetBudget for buyer %s: %w", buyerKey[:8], err)
-		}
-		if bal < holdAmount {
-			return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
-				buyerKey[:8], scrip.ErrBudgetExceeded, bal, holdAmount)
-		}
-		_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
-		if err != nil {
-			return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", buyerKey[:8], err)
-		}
 
-		// Save reservation so settle/dispute can reference it.
-		reservationID = newReservationID()
-		res := scrip.Reservation{
-			ID:        reservationID,
-			AgentKey:  buyerKey,
-			RK:        scrip.BalanceKey,
-			ETag:      newETag,
-			Amount:    holdAmount,
-			CreatedAt: time.Now(),
-		}
-		if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
-			return fmt.Errorf("scrip: SaveReservation: %w", err)
-		}
-		e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
-			buyerKey[:8], holdAmount, reservationID[:8])
+		// Check whether a scrip-buy-hold message already exists for this buy order.
+		// This happens when the engine restarts with pending buy orders: the buy-hold
+		// message was written to the campfire log on the previous run and the
+		// CampfireScripStore already replayed it (decrementing the buyer's balance).
+		// Re-running DecrementBudget here would double-charge the buyer.
+		existingResID := e.findExistingBuyHold(msg.ID)
 
-		// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
-		expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
-		holdPayload, err := json.Marshal(scrip.BuyHoldPayload{
-			Buyer:         buyerKey,
-			Amount:        holdAmount,
-			Price:         bestPrice,
-			Fee:           fee,
-			ReservationID: reservationID,
-			BuyMsg:        msg.ID,
-			ExpiresAt:     expiresAt,
-		})
-		if err == nil {
-			if emitErr := e.sendOperatorMessage(holdPayload,
-				[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
-				e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
+		if existingResID != "" {
+			// Buy-hold already applied via replay. Restore the in-memory reservation
+			// so settle/dispute handlers can reference it, then skip DecrementBudget.
+			reservationID = existingResID
+			_, currentETag, _ := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
+			res := scrip.Reservation{
+				ID:        reservationID,
+				AgentKey:  buyerKey,
+				RK:        scrip.BalanceKey,
+				ETag:      currentETag,
+				Amount:    holdAmount,
+				CreatedAt: time.Now(),
+			}
+			if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
+				e.opts.log("engine: warning: re-save reservation after restart %s: %v", reservationID[:8], err)
+			}
+			e.opts.log("engine: scrip buy-hold already replayed, skipping pre-decrement buyer=%s reservation=%s",
+				buyerKey[:8], reservationID[:8])
+		} else {
+			bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
+			if err != nil {
+				return fmt.Errorf("scrip: GetBudget for buyer %s: %w", buyerKey[:8], err)
+			}
+			if bal < holdAmount {
+				return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
+					buyerKey[:8], scrip.ErrBudgetExceeded, bal, holdAmount)
+			}
+			_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
+			if err != nil {
+				return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", buyerKey[:8], err)
+			}
+
+			// Save reservation so settle/dispute can reference it.
+			reservationID = newReservationID()
+			res := scrip.Reservation{
+				ID:        reservationID,
+				AgentKey:  buyerKey,
+				RK:        scrip.BalanceKey,
+				ETag:      newETag,
+				Amount:    holdAmount,
+				CreatedAt: time.Now(),
+			}
+			if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
+				return fmt.Errorf("scrip: SaveReservation: %w", err)
+			}
+			e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
+				buyerKey[:8], holdAmount, reservationID[:8])
+
+			// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
+			expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+			holdPayload, err := json.Marshal(scrip.BuyHoldPayload{
+				Buyer:         buyerKey,
+				Amount:        holdAmount,
+				Price:         bestPrice,
+				Fee:           fee,
+				ReservationID: reservationID,
+				BuyMsg:        msg.ID,
+				ExpiresAt:     expiresAt,
+			})
+			if err == nil {
+				if emitErr := e.sendOperatorMessage(holdPayload,
+					[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
+					e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
+				}
 			}
 		}
 	}
@@ -838,6 +866,35 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 		DisputeCount:     0, // upheld disputes: tracked via SellerStats, not per-entry here
 		HasUpheldDispute: false,
 	}
+}
+
+// findExistingBuyHold scans the campfire log for a scrip-buy-hold message
+// that was emitted for the given buy message ID. Returns the reservation ID
+// if found, or "" if no prior buy-hold exists.
+//
+// Called by handleBuy to detect the restart-with-pending-orders scenario:
+// if a scrip-buy-hold was already written to the log (and thus replayed by
+// CampfireScripStore into the in-memory balance), we must NOT call
+// DecrementBudget again or the buyer will be double-charged.
+func (e *Engine) findExistingBuyHold(buyMsgID string) string {
+	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0,
+		store.MessageFilter{
+			Tags:   []string{scrip.TagScripBuyHold},
+			Sender: operatorKeyHex(e.opts.OperatorIdentity.PublicKey),
+		})
+	if err != nil {
+		return ""
+	}
+	for i := range msgs {
+		var p scrip.BuyHoldPayload
+		if err := json.Unmarshal(msgs[i].Payload, &p); err != nil {
+			continue
+		}
+		if p.BuyMsg == buyMsgID && p.ReservationID != "" {
+			return p.ReservationID
+		}
+	}
+	return ""
 }
 
 // newReservationID generates a random hex reservation ID.
