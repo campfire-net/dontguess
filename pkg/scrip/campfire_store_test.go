@@ -75,9 +75,10 @@ func randomID(t *testing.T) string {
 
 // newStore creates a CampfireScripStore seeded with the given campfire messages.
 // Messages are added in order before constructing the store so Replay sees them.
+// Uses agentOperator as the operator key so only messages from that sender are applied.
 func newStore(t *testing.T, st store.Store) *scrip.CampfireScripStore {
 	t.Helper()
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st)
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -732,5 +733,114 @@ func TestFullRoundTrip_PreDecrementAdjustRefund(t *testing.T) {
 	finalBal, _, _ := cs.GetBudget(ctx, agentAlice, scrip.BalanceKey)
 	if finalBal != 4200 {
 		t.Errorf("final balance = %d, want 4200", finalBal)
+	}
+}
+
+// --- Operator identity gate ---
+
+// TestOperatorGate_ForgedMintRejected verifies that a scrip-mint message from a
+// non-operator sender does not affect any balance when OperatorKey is configured.
+func TestOperatorGate_ForgedMintRejected(t *testing.T) {
+	st := openTestStore(t)
+
+	// Forged mint: attacker (agentBob) tries to mint 9999 to themselves.
+	addMsg(t, st, testCampfireID, agentBob, "dontguess:scrip-mint", map[string]any{
+		"recipient":   agentBob,
+		"amount":      int64(9999),
+		"x402_tx_ref": "forged-tx-001",
+		"rate":        int64(1000),
+	})
+
+	// Construct store with operator key set — forged message must be ignored.
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
+	}
+
+	if bal := cs.Balance(agentBob); bal != 0 {
+		t.Errorf("forged mint accepted: Bob balance = %d, want 0", bal)
+	}
+	if cs.TotalSupply() != 0 {
+		t.Errorf("forged mint affected TotalSupply: got %d, want 0", cs.TotalSupply())
+	}
+}
+
+// TestOperatorGate_LegitimateOperatorMintAccepted verifies that a scrip-mint from
+// the configured operator key is processed normally.
+func TestOperatorGate_LegitimateOperatorMintAccepted(t *testing.T) {
+	st := openTestStore(t)
+
+	// Legitimate mint from the operator.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-mint", map[string]any{
+		"recipient":   agentAlice,
+		"amount":      int64(5000),
+		"x402_tx_ref": "legit-tx-001",
+		"rate":        int64(1000),
+	})
+
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
+	}
+
+	if bal := cs.Balance(agentAlice); bal != 5000 {
+		t.Errorf("operator mint not applied: Alice balance = %d, want 5000", bal)
+	}
+	if cs.TotalSupply() != 5000 {
+		t.Errorf("TotalSupply = %d, want 5000", cs.TotalSupply())
+	}
+}
+
+// TestOperatorGate_MixedMints verifies that forged mints are rejected while
+// legitimate operator mints are accepted, even when interleaved in the log.
+func TestOperatorGate_MixedMints(t *testing.T) {
+	st := openTestStore(t)
+
+	// Attacker mints to themselves (should be rejected).
+	addMsg(t, st, testCampfireID, agentBob, "dontguess:scrip-mint", map[string]any{
+		"recipient": agentBob, "amount": int64(9999), "x402_tx_ref": "forged-01", "rate": int64(1000),
+	})
+	// Operator mints to Alice (should be accepted).
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-mint", map[string]any{
+		"recipient": agentAlice, "amount": int64(1000), "x402_tx_ref": "legit-01", "rate": int64(1000),
+	})
+	// Attacker mints to Alice (should be rejected).
+	addMsg(t, st, testCampfireID, agentBob, "dontguess:scrip-mint", map[string]any{
+		"recipient": agentAlice, "amount": int64(8888), "x402_tx_ref": "forged-02", "rate": int64(1000),
+	})
+
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
+	}
+
+	if bal := cs.Balance(agentBob); bal != 0 {
+		t.Errorf("forged mint applied to Bob: balance = %d, want 0", bal)
+	}
+	if bal := cs.Balance(agentAlice); bal != 1000 {
+		t.Errorf("Alice balance = %d, want 1000 (only operator mint)", bal)
+	}
+	if cs.TotalSupply() != 1000 {
+		t.Errorf("TotalSupply = %d, want 1000 (only operator mint counted)", cs.TotalSupply())
+	}
+}
+
+// TestOperatorGate_EmptyKeyDisablesCheck verifies backwards compatibility:
+// when OperatorKey is empty, messages from any sender are accepted.
+func TestOperatorGate_EmptyKeyDisablesCheck(t *testing.T) {
+	st := openTestStore(t)
+
+	// Mint from a non-operator sender — should be accepted when OperatorKey is "".
+	addMsg(t, st, testCampfireID, agentBob, "dontguess:scrip-mint", map[string]any{
+		"recipient": agentAlice, "amount": int64(500), "x402_tx_ref": "any-sender", "rate": int64(1000),
+	})
+
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, "")
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
+	}
+
+	if bal := cs.Balance(agentAlice); bal != 500 {
+		t.Errorf("empty OperatorKey should accept any sender: Alice balance = %d, want 500", bal)
 	}
 }
