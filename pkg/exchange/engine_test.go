@@ -474,6 +474,117 @@ func TestState_PutRejectRemovesFromPending(t *testing.T) {
 	}
 }
 
+// TestState_SettleDeliverMarksMatchDelivered tests that a settle(deliver) message
+// transitions state so that IsMatchDelivered returns true for the match message.
+// This is a regression test for the missing SettlePhaseStrDeliver case in applySettle.
+func TestState_SettleDeliverMarksMatchDelivered(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Step 1: Seller puts an entry and operator accepts it.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Deliver-phase test entry", "sha256:"+fmt.Sprintf("%064x", 999), "code", 10000, 16000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Step 2: Buyer buys; engine emits a match.
+	h.sendMessage(h.buyer,
+		buyPayload("Unit tests for Go HTTP handler (deliver test)", 30000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= len(preMsgs) {
+		t.Fatal("no match message emitted by engine")
+	}
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+
+	var mp struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+
+	// Step 3: Buyer accepts the match.
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": mp.Results[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Before deliver: match must not be marked delivered.
+	if eng.State().IsMatchDelivered(matchMsg.ID) {
+		t.Error("match should not be marked delivered before settle(deliver)")
+	}
+
+	// Step 4: Operator sends settle(deliver).
+	deliverPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     mp.Results[0].EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 999),
+		"content_size": 16000,
+	})
+	h.sendMessage(h.operator, deliverPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// After deliver: match must be marked delivered.
+	if !eng.State().IsMatchDelivered(matchMsg.ID) {
+		t.Error("match should be marked delivered after settle(deliver)")
+	}
+
+	// Inventory entry must still be in inventory (deliver does not remove it).
+	if eng.State().GetInventoryEntry(mp.Results[0].EntryID) == nil {
+		t.Error("inventory entry should remain after deliver")
+	}
+}
+
 // hasTag checks if tags contains the given tag.
 func hasTag(tags []string, tag string) bool {
 	for _, t := range tags {
