@@ -556,6 +556,14 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 		return nil
 	}
 
+	// Security check: the buyer_key in the dispute payload must match the agent key
+	// recorded in the reservation at buy time. Reject any dispute that tries to
+	// redirect the refund to a different identity.
+	if res.AgentKey != payload.BuyerKey {
+		return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
+			payload.ReservationID[:8], payload.BuyerKey[:8], res.AgentKey[:8])
+	}
+
 	// Refund the full held amount to the buyer.
 	if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.BuyerKey, scrip.BalanceKey, res.Amount, ""); err != nil {
 		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", payload.BuyerKey[:8], err)
