@@ -93,8 +93,9 @@ func testAgent(t *testing.T) *identity.Identity {
 }
 
 // testMembership returns a minimal Membership for use with performSupersede.
-func testMembership(campfireID string) *store.Membership {
-	return &store.Membership{
+// creatorPubkey, when non-empty, sets the operator identity for the campfire.
+func testMembership(campfireID string, creatorPubkey ...string) *store.Membership {
+	m := &store.Membership{
 		CampfireID:    campfireID,
 		TransportDir:  "/tmp/dontguess-test-transport",
 		JoinProtocol:  "open",
@@ -102,6 +103,10 @@ func testMembership(campfireID string) *store.Membership {
 		JoinedAt:      time.Now().UnixNano(),
 		TransportType: "unknown", // non-filesystem → falls back to local store
 	}
+	if len(creatorPubkey) > 0 {
+		m.CreatorPubkey = creatorPubkey[0]
+	}
+	return m
 }
 
 // ---- tests ----
@@ -405,6 +410,72 @@ func TestSupersede_VersionBumpTooSmall(t *testing.T) {
 		t.Error("expected version bump error for patch-only bump with optional arg addition")
 	}
 	t.Logf("version bump validation caught: %s", result.Error)
+}
+
+// TestSupersede_NonOperatorRejected verifies that a non-operator campfire member
+// cannot supersede a convention. Only the campfire creator (operator) is allowed.
+func TestSupersede_NonOperatorRejected(t *testing.T) {
+	operatorID := testAgent(t)
+	nonOperatorID := testAgent(t)
+	s := testOpenStore(t)
+	cfID, _ := identity.Generate()
+	campfireID := cfID.PublicKeyHex()
+
+	// Promote v0.1 as the operator.
+	v1Args := []map[string]any{
+		{"name": "description", "type": "string", "required": true},
+	}
+	v1Payload := testBuildDecl("dontguess-exchange", "put", "0.1", v1Args)
+	v1ID := testWriteDeclToStore(t, s, operatorID, campfireID, v1Payload, "")
+
+	// v2 adds an optional arg (valid minor bump).
+	v2Args := []map[string]any{
+		{"name": "description", "type": "string", "required": true},
+		{"name": "priority", "type": "integer"},
+	}
+	v2Payload := testBuildDecl("dontguess-exchange", "put", "0.2", v2Args)
+
+	tmpDir := t.TempDir()
+	v2File := filepath.Join(tmpDir, "put-v0.2.json")
+	if err := os.WriteFile(v2File, v2Payload, 0600); err != nil {
+		t.Fatalf("writing v2 file: %v", err)
+	}
+
+	// Membership records the operator's pubkey as CreatorPubkey.
+	m := testMembership(campfireID, operatorID.PublicKeyHex())
+
+	// Non-operator attempts to supersede — must be rejected.
+	result, err := performSupersede(
+		v2File, v2Payload,
+		campfireID, v1ID,
+		nonOperatorID, s, m, // caller is nonOperatorID, not operator
+		false,
+	)
+	if err != nil {
+		t.Fatalf("performSupersede returned unexpected error: %v", err)
+	}
+	if result.Error == "" {
+		t.Fatal("expected non-operator supersede to be rejected, but got no error")
+	}
+	if result.MessageID != "" {
+		t.Errorf("expected no message published, got msgID=%s", result.MessageID)
+	}
+	t.Logf("non-operator supersede rejected as expected: %s", result.Error)
+
+	// Operator supersedes successfully with the same membership record.
+	result, err = performSupersede(
+		v2File, v2Payload,
+		campfireID, v1ID,
+		operatorID, s, m, // caller is operatorID
+		false,
+	)
+	if err != nil {
+		t.Fatalf("performSupersede returned error: %v", err)
+	}
+	if result.Error != "" {
+		t.Fatalf("expected operator supersede to succeed, got: %s", result.Error)
+	}
+	t.Logf("operator supersede succeeded: msgID=%s", shortID(result.MessageID))
 }
 
 // TestInjectSupersedes verifies the supersedes field is correctly injected.
