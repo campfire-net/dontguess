@@ -2,6 +2,7 @@ package matching
 
 import (
 	"math"
+	"sync"
 	"testing"
 )
 
@@ -109,4 +110,87 @@ func TestCosineSimilarity_MismatchedLength(t *testing.T) {
 	if math.Abs(sim-1.0) > 1e-9 {
 		t.Errorf("mismatched length same prefix similarity = %f, want 1.0", sim)
 	}
+}
+
+// TestTFIDFEmbedder_ConcurrentEmbed verifies that concurrent calls to Embed
+// do not produce data races on the shared vocabID map.
+// Run with: CGO_ENABLED=1 go test -race ./pkg/matching/... (requires gcc).
+// The test exercises the same race path regardless — any race will also
+// produce unpredictable results or panic under the standard scheduler.
+func TestTFIDFEmbedder_ConcurrentEmbed(t *testing.T) {
+	e := NewTFIDFEmbedder()
+	e.IndexCorpus([]string{
+		"Go HTTP handler unit test generator table-driven",
+		"Terraform AWS S3 module versioning",
+		"Python data science pandas dataframe",
+		"Kubernetes deployment yaml generator",
+	})
+
+	texts := []string{
+		"Go HTTP unit test",
+		"AWS Terraform module",
+		"pandas dataframe analysis",
+		"kubernetes yaml deploy",
+		"brand new unseen vocabulary term xyz",
+	}
+
+	const goroutines = 20
+	const iters = 50
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				text := texts[(g+i)%len(texts)]
+				v := e.Embed(text)
+				// Embed must return a non-nil slice for non-empty input.
+				if v == nil {
+					t.Errorf("Embed(%q) returned nil", text)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+// TestTFIDFEmbedder_ConcurrentSearch verifies no data race when Search is
+// called concurrently on an Index backed by a TFIDFEmbedder.
+// Run with: CGO_ENABLED=1 go test -race ./pkg/matching/... (requires gcc).
+func TestTFIDFEmbedder_ConcurrentSearch(t *testing.T) {
+	emb := NewTFIDFEmbedder()
+	entries := []RankInput{
+		{EntryID: "e1", Description: "Go HTTP handler unit test"},
+		{EntryID: "e2", Description: "Terraform AWS S3 module"},
+		{EntryID: "e3", Description: "Python pandas dataframe"},
+	}
+	idx := NewIndex(emb, RankOptions{})
+	idx.Rebuild(entries)
+
+	queries := []string{
+		"Go HTTP unit test",
+		"AWS Terraform module",
+		"pandas dataframe analysis",
+		"completely unseen query terms qwerty",
+	}
+
+	const goroutines = 20
+	const iters = 50
+
+	var wg sync.WaitGroup
+	wg.Add(goroutines)
+	for g := 0; g < goroutines; g++ {
+		g := g
+		go func() {
+			defer wg.Done()
+			for i := 0; i < iters; i++ {
+				q := queries[(g+i)%len(queries)]
+				results := idx.Search(q, 3)
+				_ = results
+			}
+		}()
+	}
+	wg.Wait()
 }
