@@ -9,6 +9,7 @@ package convention
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 )
 
@@ -271,7 +272,11 @@ func parseSemver(v string) (major, minor, patch int, err error) {
 			if c < '0' || c > '9' {
 				return 0, 0, 0, fmt.Errorf("non-numeric version component %q in %q", p, v)
 			}
-			n = n*10 + int(c-'0')
+			digit := int(c - '0')
+			if n > (math.MaxInt-digit)/10 {
+				return 0, 0, 0, fmt.Errorf("version component %q overflows int in %q", p, v)
+			}
+			n = n*10 + digit
 		}
 		vals[i] = n
 	}

@@ -112,7 +112,10 @@ func injectBuyMsg(t *testing.T, h *testHarness, senderKey string) *store.Message
 func TestProvenanceDispatch_AnonymousPutRejected(t *testing.T) {
 	t.Parallel()
 	ps := makeProvenanceStore(t)
-	checker := exchange.NewProvenanceChecker(ps)
+	checker, err := exchange.NewProvenanceChecker(ps)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 	h, eng := newEngineWithProvenance(t, checker)
 
 	// Seed some inventory so the engine has something to match against.
@@ -143,7 +146,10 @@ func TestProvenanceDispatch_AnonymousPutRejected(t *testing.T) {
 func TestProvenanceDispatch_AnonymousBuyAccepted(t *testing.T) {
 	t.Parallel()
 	ps := makeProvenanceStore(t)
-	checker := exchange.NewProvenanceChecker(ps)
+	checker, err := exchange.NewProvenanceChecker(ps)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 	h, eng := newEngineWithProvenance(t, checker)
 
 	buyRec := injectBuyMsg(t, h, "key-anon")
@@ -163,7 +169,10 @@ func TestProvenanceDispatch_AnonymousBuyAccepted(t *testing.T) {
 func TestProvenanceDispatch_ClaimedPutAccepted(t *testing.T) {
 	t.Parallel()
 	ps := makeProvenanceStore(t)
-	checker := exchange.NewProvenanceChecker(ps)
+	checker, err := exchange.NewProvenanceChecker(ps)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
 	h, eng := newEngineWithProvenance(t, checker)
 
 	putRec := injectPutMsg(t, h, "key-claimed")
