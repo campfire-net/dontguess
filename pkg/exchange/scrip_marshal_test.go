@@ -233,6 +233,17 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 		t.Errorf("operator balance changed: before=%d after=%d (expected no change on marshal failure)",
 			operatorBalBefore, operatorBalAfter)
 	}
+
+	// Reservation must be restored — ConsumeReservation ran before marshal failed, so
+	// handleSettle must call SaveReservation to put it back. Buyer cannot be locked out.
+	eng.SetMarshalFuncForTest(nil) // restore normal marshal so GetReservation works
+	gotRes, err := cs.GetReservation(context.Background(), resID)
+	if err != nil {
+		t.Errorf("reservation should be restored after settle marshal failure, but GetReservation returned: %v", err)
+	}
+	if gotRes.ID != resID {
+		t.Errorf("restored reservation ID = %q, want %q", gotRes.ID, resID)
+	}
 }
 
 // TestDispute_MarshalFailure_NoRefundNorReservationLoss verifies that if the

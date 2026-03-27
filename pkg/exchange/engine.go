@@ -568,7 +568,6 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		e.opts.log("engine: settle: reservation %s not found: %v", payload.ReservationID[:8], err)
 		return nil // reservation missing — already settled or expired
 	}
-	_ = res // reservation data available for future logging/audit use
 
 	fee := payload.Price / MatchingFeeRate
 	residual := payload.Price / ResidualRate
@@ -577,7 +576,8 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
 
 	// Marshal both convention messages BEFORE mutating scrip state.
-	// If either marshal fails, no balance mutations have occurred — return the error.
+	// If either marshal fails, restore the reservation (it was consumed above) and return
+	// the error — no balance mutations have occurred.
 	settlePayload, err := e.marshal(scrip.SettlePayload{
 		ReservationID:   payload.ReservationID,
 		Seller:          sellerKey,
@@ -588,6 +588,12 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		ResultHash:      "",
 	})
 	if err != nil {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
+				payload.ReservationID[:8], restoreErr)
+			return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
+				payload.ReservationID[:8], err)
+		}
 		return fmt.Errorf("scrip: marshal settle payload: %w", err)
 	}
 
@@ -599,6 +605,12 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 			SourceMsg: msg.ID,
 		})
 		if err != nil {
+			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
+					payload.ReservationID[:8], restoreErr)
+				return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
+					payload.ReservationID[:8], err)
+			}
 			return fmt.Errorf("scrip: marshal burn payload: %w", err)
 		}
 	}
