@@ -284,3 +284,127 @@ func TestState_Complete_WrongSenderRejected(t *testing.T) {
 		t.Errorf("impostor complete: price history len = %d, want 0", len(hist))
 	}
 }
+
+// buyerRejectPayloadFor builds a valid buyer-reject payload.
+func buyerRejectPayloadFor(entryID string) []byte {
+	p, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-reject",
+		"entry_id": entryID,
+		"accepted": false,
+		"reason":   "does not meet requirements",
+	})
+	return p
+}
+
+// TestState_BuyerReject_RemovesAcceptedOrder verifies that a settle(buyer-reject)
+// from the actual buyer removes the accepted order entry so the buyer is no
+// longer bound to the match.
+func TestState_BuyerReject_RemovesAcceptedOrder(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	matchMsg, entryID := setupMatchedOrder(t, h, eng)
+
+	// First, buyer accepts the match so acceptedOrders is populated.
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayloadFor(entryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Verify the accept was recorded.
+	if !eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Fatal("expected match to be accepted after buyer-accept")
+	}
+
+	// Buyer rejects by referencing the match (not the buyer-accept).
+	_ = buyerAcceptMsg // unused but documents the flow
+	h.sendMessage(h.buyer, buyerRejectPayloadFor(entryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerReject,
+			exchange.TagVerdictPrefix + "rejected",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// acceptedOrders entry must be removed.
+	if eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Error("buyer-reject: expected accepted order to be removed, but it remains")
+	}
+
+	// Inventory must still be live.
+	if eng.State().GetInventoryEntry(entryID) == nil {
+		t.Error("buyer-reject: inventory entry must remain after rejection")
+	}
+
+	// Seller reputation must not change.
+	if rep := eng.State().SellerReputation(h.seller.PublicKeyHex()); rep != exchange.DefaultReputation {
+		t.Errorf("buyer-reject: seller reputation = %d, want %d (default)", rep, exchange.DefaultReputation)
+	}
+
+	// No price history.
+	if hist := eng.State().PriceHistory(); len(hist) != 0 {
+		t.Errorf("buyer-reject: price history len = %d, want 0", len(hist))
+	}
+}
+
+// TestState_BuyerReject_WrongSenderIgnored verifies that a settle(buyer-reject)
+// from a sender who is NOT the original buyer is silently ignored — the
+// accepted order entry is not removed.
+func TestState_BuyerReject_WrongSenderIgnored(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	matchMsg, entryID := setupMatchedOrder(t, h, eng)
+
+	// Correct buyer accepts.
+	h.sendMessage(h.buyer, buyerAcceptPayloadFor(entryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	if !eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Fatal("expected match to be accepted after correct buyer-accept")
+	}
+
+	// Impostor attempts to reject.
+	impostor, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generating impostor identity: %v", err)
+	}
+	h.sendMessage(impostor, buyerRejectPayloadFor(entryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerReject,
+			exchange.TagVerdictPrefix + "rejected",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// The accepted order must still be present (impostor reject ignored).
+	if !eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Error("impostor buyer-reject: accepted order was removed, but should be preserved")
+	}
+}
