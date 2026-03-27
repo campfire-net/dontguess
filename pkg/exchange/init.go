@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/campfire-net/campfire/pkg/beacon"
@@ -236,18 +237,39 @@ func Init(opts InitOptions) (*Config, error) {
 	return cfg, nil
 }
 
+// declCandidate holds a parsed declaration file ready for promotion.
+type declCandidate struct {
+	path    string
+	name    string
+	payload []byte
+	// key is "convention:operation" — used for deduplication.
+	key string
+	// parsed version components for comparison.
+	major, minor, patch int
+}
+
 // promoteDeclarations reads all .json files from conventionDir (searching
 // exchange-core/ and exchange-scrip/ sub-directories), lints each, and posts
 // them as convention:operation messages to the exchange campfire transport.
 // If conventionDir is empty, the embedded declarations are used via the
 // DefaultConventionDir discovery.
+//
+// When multiple files declare the same convention+operation (e.g. put.json at
+// v0.1 and put-v0.2.json at v0.2), only the highest version is promoted.
+// Promoting an older version alongside a newer one would create ambiguous
+// registry state without a supersedes chain, so the older files are silently
+// skipped.
 func promoteDeclarations(conventionDir, campfireID string, agentID *identity.Identity, transport *fs.Transport) error {
 	dirs := declarationDirs(conventionDir)
 	if len(dirs) == 0 {
 		return fmt.Errorf("no convention declaration directories found (set ConventionDir)")
 	}
 
-	var promoted, skipped int
+	// Collect and parse all candidates, deduplicating by convention+operation.
+	// For each key we keep only the entry with the highest version.
+	winners := make(map[string]*declCandidate)
+	var skipped int
+
 	for _, dir := range dirs {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
@@ -271,19 +293,111 @@ func promoteDeclarations(conventionDir, campfireID string, agentID *identity.Ide
 				skipped++
 				continue
 			}
-			if err := sendConventionMessage(campfireID, payload, agentID, transport); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: promoting %s: %v\n", e.Name(), err)
+			cand, parseErr := parseVersionedDecl(path, e.Name(), payload)
+			if parseErr != nil {
+				fmt.Fprintf(os.Stderr, "warning: skipping %s (version parse): %v\n", e.Name(), parseErr)
 				skipped++
 				continue
 			}
-			promoted++
+			prev, exists := winners[cand.key]
+			if !exists || declGreater(cand, prev) {
+				if exists {
+					fmt.Fprintf(os.Stderr, "info: %s supersedes %s for %s (v%d.%d.%d > v%d.%d.%d)\n",
+						cand.name, prev.name, cand.key,
+						cand.major, cand.minor, cand.patch,
+						prev.major, prev.minor, prev.patch,
+					)
+				}
+				winners[cand.key] = cand
+			} else {
+				fmt.Fprintf(os.Stderr, "info: skipping %s — %s is a higher version for %s\n",
+					e.Name(), prev.name, cand.key)
+			}
 		}
+	}
+
+	// Promote the winning declaration for each operation.
+	var promoted int
+	for _, cand := range winners {
+		if err := sendConventionMessage(campfireID, cand.payload, agentID, transport); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: promoting %s: %v\n", cand.name, err)
+			skipped++
+			continue
+		}
+		promoted++
 	}
 
 	if promoted == 0 && skipped > 0 {
 		return fmt.Errorf("all %d declarations failed to promote", skipped)
 	}
 	return nil
+}
+
+// parseVersionedDecl extracts the convention, operation, and version from a
+// declaration payload, returning a declCandidate for version comparison.
+func parseVersionedDecl(path, name string, payload []byte) (*declCandidate, error) {
+	var hdr struct {
+		Convention string `json:"convention"`
+		Operation  string `json:"operation"`
+		Version    string `json:"version"`
+	}
+	if err := json.Unmarshal(payload, &hdr); err != nil {
+		return nil, fmt.Errorf("parsing JSON header: %w", err)
+	}
+	if hdr.Convention == "" || hdr.Operation == "" {
+		return nil, fmt.Errorf("missing convention or operation field")
+	}
+	major, minor, patch, err := parseDeclVersion(hdr.Version)
+	if err != nil {
+		return nil, fmt.Errorf("parsing version %q: %w", hdr.Version, err)
+	}
+	return &declCandidate{
+		path:    path,
+		name:    name,
+		payload: payload,
+		key:     hdr.Convention + ":" + hdr.Operation,
+		major:   major,
+		minor:   minor,
+		patch:   patch,
+	}, nil
+}
+
+// parseDeclVersion parses a "major.minor.patch", "major.minor", or "major"
+// version string, returning the components as integers.
+func parseDeclVersion(v string) (major, minor, patch int, err error) {
+	if v == "" {
+		return 0, 0, 0, nil // treat missing version as 0.0.0
+	}
+	parts := strings.SplitN(v, ".", 4)
+	if len(parts) > 3 {
+		return 0, 0, 0, fmt.Errorf("too many components in %q", v)
+	}
+	vals := [3]int{}
+	for i, p := range parts {
+		if p == "" {
+			return 0, 0, 0, fmt.Errorf("empty component in %q", v)
+		}
+		n := 0
+		for _, c := range p {
+			if c < '0' || c > '9' {
+				return 0, 0, 0, fmt.Errorf("non-numeric component %q in %q", p, v)
+			}
+			n = n*10 + int(c-'0')
+		}
+		vals[i] = n
+	}
+	return vals[0], vals[1], vals[2], nil
+}
+
+// declGreater reports whether a has a strictly higher version than b.
+func declGreater(a, b *declCandidate) bool {
+	if a.major != b.major {
+		return a.major > b.major
+	}
+	if a.minor != b.minor {
+		return a.minor > b.minor
+	}
+	return a.patch > b.patch
 }
 
 // declarationDirs returns the convention declaration sub-directories to scan.
