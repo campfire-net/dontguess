@@ -91,6 +91,23 @@ type InventoryEntry struct {
 	ExpiresAt time.Time
 	// PutTimestamp is the campfire-observed receipt time of the put message (nanoseconds).
 	PutTimestamp int64
+
+	// AcceptedProvenanceLevel is the seller's provenance level (0–3) at the time the
+	// put-accept was processed. Recorded so we can detect a subsequent downgrade.
+	// Zero means the level was not recorded (legacy entries accepted before this field existed).
+	AcceptedProvenanceLevel int
+
+	// NeedsRevalidation is set to true when the seller's current provenance level
+	// has dropped below AcceptedProvenanceLevel since put-accept.
+	//
+	// Semantics (dontguess-lqp): when provenance is downgraded, existing inventory
+	// entries are NOT immediately purged — they are flagged for re-validation.
+	// Rationale: purging would be irreversible and could discard legitimate content;
+	// re-validation lets the operator decide whether to keep, reprice, or expire the
+	// entry. Flagged entries are excluded from buy match results until cleared.
+	// Operators can clear the flag by calling SetEntryProvenanceLevel with the current
+	// (lower) level once satisfied the content is still acceptable.
+	NeedsRevalidation bool
 }
 
 // IsExpired returns true if the entry has passed its expiry time.
@@ -944,6 +961,54 @@ func (s *State) HasUpheldDispute(entryID string) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.upheldDisputes[entryID]
 	return ok
+}
+
+// SetEntryProvenanceLevel records the seller's provenance level for an inventory
+// entry. Call this after a put-accept with the seller's current level. The level
+// is stored as an int (0=anonymous … 3=present) to avoid coupling state.go to
+// the provenance package.
+//
+// If the entry does not exist (not yet in inventory), this is a no-op.
+func (s *State) SetEntryProvenanceLevel(entryID string, level int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if entry, ok := s.inventory[entryID]; ok {
+		entry.AcceptedProvenanceLevel = level
+	}
+}
+
+// MarkStaleProvenanceEntries scans the inventory for entries belonging to
+// sellerKey whose AcceptedProvenanceLevel exceeds currentLevel, and sets
+// NeedsRevalidation=true on each. Returns the entry IDs that were flagged.
+//
+// This should be called whenever the exchange detects that a seller's provenance
+// level has dropped (e.g., attestation expired or revoked). See InventoryEntry
+// for the chosen re-validation semantics.
+func (s *State) MarkStaleProvenanceEntries(sellerKey string, currentLevel int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var flagged []string
+	for _, entry := range s.inventory {
+		if entry.SellerKey != sellerKey {
+			continue
+		}
+		if entry.AcceptedProvenanceLevel > currentLevel {
+			entry.NeedsRevalidation = true
+			flagged = append(flagged, entry.EntryID)
+		}
+	}
+	return flagged
+}
+
+// EntryNeedsRevalidation returns true if the given entry has been flagged for
+// re-validation due to a seller provenance downgrade.
+func (s *State) EntryNeedsRevalidation(entryID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if entry, ok := s.inventory[entryID]; ok {
+		return entry.NeedsRevalidation
+	}
+	return false
 }
 
 // SellerDisputeCount returns the number of upheld disputes against the seller.

@@ -835,6 +835,13 @@ func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
 	var out []*InventoryEntry
 
 	for _, entry := range inventory {
+		// Provenance revalidation gate: exclude entries flagged for re-validation
+		// due to a seller provenance downgrade (dontguess-lqp). These entries remain
+		// in inventory but are withheld from buyers until the operator clears the flag.
+		if entry.NeedsRevalidation {
+			continue
+		}
+
 		// Budget filter: price must not exceed budget.
 		price := e.computePrice(entry)
 		if price > budget {
@@ -1020,6 +1027,7 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	if pending {
 		putSellerKey = pendingEntry.SellerKey
 	}
+	_ = putSellerKey // used below after e.state.Apply(rec)
 	e.state.mu.RUnlock()
 	if !pending {
 		return fmt.Errorf("put %s is not pending", putMsgID)
