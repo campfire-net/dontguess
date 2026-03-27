@@ -336,9 +336,15 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	// Filter semantic results to those that also passed the hard filters,
 	// preserving the semantic ranking order. Entries with no semantic score
 	// fall back to the reputation+recency sort via rankResults.
+	// partialMatchThreshold mirrors the default from matching.RankOptions.
+	// Fallback candidates (no semantic score) use this same threshold so that
+	// IsPartialMatch is consistent regardless of which path produced the result.
+	const partialMatchThreshold = 0.5
+
 	type rankedCandidate struct {
-		entry      *InventoryEntry
-		confidence float64
+		entry            *InventoryEntry
+		confidence       float64
+		isPartialMatch   bool
 		hasSemanticScore bool
 	}
 
@@ -356,6 +362,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		semanticMatches = append(semanticMatches, rankedCandidate{
 			entry:            entry,
 			confidence:       sr.Confidence,
+			isPartialMatch:   sr.IsPartialMatch,
 			hasSemanticScore: true,
 		})
 	}
@@ -373,9 +380,11 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	}
 	ranked := e.rankResults(fallbackCandidates, maxResults)
 	for _, entry := range ranked {
+		conf := e.computeConfidence(entry, payload.Task)
 		semanticMatches = append(semanticMatches, rankedCandidate{
 			entry:            entry,
-			confidence:       e.computeConfidence(entry, payload.Task),
+			confidence:       conf,
+			isPartialMatch:   conf < partialMatchThreshold,
 			hasSemanticScore: false,
 		})
 	}
@@ -395,6 +404,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		ContentType       string  `json:"content_type"`
 		Price             int64   `json:"price"`
 		Confidence        float64 `json:"confidence"`
+		IsPartialMatch    bool    `json:"is_partial_match"`
 		SellerReputation  int     `json:"seller_reputation"`
 		TokenCostOriginal int64   `json:"token_cost_original"`
 		AgeHours          int     `json:"age_hours"`
@@ -414,6 +424,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 			ContentType:       entry.ContentType,
 			Price:             e.computePrice(entry),
 			Confidence:        rc.confidence,
+			IsPartialMatch:    rc.isPartialMatch,
 			SellerReputation:  rep,
 			TokenCostOriginal: entry.TokenCost,
 			AgeHours:          ageHours,
@@ -989,7 +1000,11 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	}
 
 	e.state.mu.RLock()
-	_, pending := e.state.pendingPuts[putMsgID]
+	pendingEntry, pending := e.state.pendingPuts[putMsgID]
+	var putSellerKey string
+	if pending {
+		putSellerKey = pendingEntry.SellerKey
+	}
 	e.state.mu.RUnlock()
 	if !pending {
 		return fmt.Errorf("put %s is not pending", putMsgID)
@@ -1030,6 +1045,15 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 		e.state.Apply(rec)
 	}
 
+	// Record the seller's current provenance level against the newly accepted entry.
+	// This snapshot enables provenance downgrade detection (dontguess-lqp): if the
+	// seller's level drops below AcceptedProvenanceLevel in the future, the entry
+	// will be flagged for re-validation via MarkStaleProvenanceEntries.
+	if e.opts.ProvenanceChecker != nil && putSellerKey != "" {
+		level := int(e.opts.ProvenanceChecker.store.Level(putSellerKey))
+		e.state.SetEntryProvenanceLevel(putMsgID, level)
+	}
+
 	// Incrementally update the match index with the newly accepted entry.
 	// The entry is now live in state; add it to the index so subsequent
 	// buy requests can find it without waiting for a full Rebuild.
@@ -1042,7 +1066,6 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	}
 	return nil
 }
-
 
 // rebuildMatchIndex rebuilds the semantic match index from the current live inventory.
 // Called after replay and when the inventory changes significantly.
