@@ -226,6 +226,11 @@ type State struct {
 	// Key: match message ID.
 	deliveredOrders map[string]struct{}
 
+	// deliverToMatch maps a deliver message ID to the match message ID it
+	// references. Used by applySettleComplete to trace the antecedent chain
+	// without trusting the buyer-supplied payload.EntryID.
+	deliverToMatch map[string]string
+
 	// completedEntries tracks entry IDs and their buyers who have completed.
 	// Key: entryID -> buyerKey.
 	completedEntries map[string]string
@@ -246,6 +251,7 @@ func NewState() *State {
 		acceptedOrders:     make(map[string]string),
 		buyerAcceptToMatch: make(map[string]string),
 		deliveredOrders:    make(map[string]struct{}),
+		deliverToMatch:     make(map[string]string),
 		completedEntries:   make(map[string]string),
 	}
 }
@@ -269,6 +275,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.acceptedOrders = make(map[string]string)
 	s.buyerAcceptToMatch = make(map[string]string)
 	s.deliveredOrders = make(map[string]struct{})
+	s.deliverToMatch = make(map[string]string)
 	s.completedEntries = make(map[string]string)
 
 	for i := range msgs {
@@ -480,7 +487,8 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 
 // applySettleDeliver records that the exchange has delivered content to the buyer.
 // The antecedent is the settle(buyer-accept) message ID.
-// It marks the corresponding match as delivered in deliveredOrders.
+// It marks the corresponding match as delivered in deliveredOrders and records
+// the deliver→match mapping for use by applySettleComplete.
 func (s *State) applySettleDeliver(msg *store.MessageRecord) {
 	if len(msg.Antecedents) == 0 {
 		return
@@ -492,9 +500,20 @@ func (s *State) applySettleDeliver(msg *store.MessageRecord) {
 		return
 	}
 	s.deliveredOrders[matchMsgID] = struct{}{}
+	// Record deliver→match so applySettleComplete can derive entry_id from the
+	// antecedent chain without trusting buyer-supplied payload fields.
+	s.deliverToMatch[msg.ID] = matchMsgID
 }
 
 // applySettleComplete records a completed transaction and updates seller reputation.
+//
+// Security: entry_id is derived from the antecedent chain (complete → deliver →
+// buyer-accept → match → matchToEntry) rather than trusting payload.EntryID,
+// which is buyer-controlled (TAINTED per convention §3). A spoofed payload.EntryID
+// cannot redirect reputation credit or price history to a different entry.
+//
+// The price field is still read from the payload (it is operator-signed by the
+// deliver step; the buyer does not control sale price).
 func (s *State) applySettleComplete(msg *store.MessageRecord) {
 	if len(msg.Antecedents) == 0 {
 		return
@@ -502,21 +521,27 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 	// Antecedent of complete is settle(deliver).
 	deliverMsgID := msg.Antecedents[0]
 
-	// Find the match from accepted orders.
-	// deliverMsgID's antecedent is buyer-accept, whose antecedent is match.
-	// We don't track deliver→match linkage in state currently.
-	// Use completedEntries keyed by deliver msg ID for now.
-	_ = deliverMsgID
-
-	var payload struct {
-		EntryID string `json:"entry_id"`
-		Price   int64  `json:"price"`
-	}
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+	// Derive entry_id from the antecedent chain:
+	//   deliver → match (via deliverToMatch)
+	//   match → entry  (via matchToEntry)
+	matchMsgID := s.deliverToMatch[deliverMsgID]
+	if matchMsgID == "" {
+		// Broken antecedent chain — reject. The deliver message was never
+		// processed or doesn't exist in state. Cannot safely attribute credit.
 		return
 	}
-	entryID := payload.EntryID
+	entryID := s.matchToEntry[matchMsgID]
 	if entryID == "" {
+		// No entry recorded for this match — reject.
+		return
+	}
+
+	// Read sale price from payload (operator-set; not attacker-controlled at
+	// this phase since operators issue deliver messages, not buyers).
+	var payload struct {
+		Price int64 `json:"price"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
 

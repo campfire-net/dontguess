@@ -702,6 +702,268 @@ func TestEngine_SemanticMatchConfidenceUsedInMatchPayload(t *testing.T) {
 	}
 }
 
+// runFullFlowToDeliver runs put → put-accept → buy → match → buyer-accept →
+// deliver. Returns the match message, buyer-accept message ID, deliver message
+// ID, and the entry ID from the match payload. Used by settle(complete) tests.
+func runFullFlowToDeliver(t *testing.T, h *testHarness, eng *exchange.Engine, entryDesc string, seed int) (matchMsg store.MessageRecord, buyerAcceptMsgID, deliverMsgID, entryID string) {
+	t.Helper()
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload(entryDesc, "sha256:"+fmt.Sprintf("%064x", seed), "code", 10000, 16000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	h.sendMessage(h.buyer,
+		buyPayload(entryDesc+" (buyer task)", 30000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	go func() { _ = eng.Start(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		ms, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(ms) > len(preMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	if len(allMsgs) <= len(preMsgs) {
+		t.Fatal("no match message emitted")
+	}
+	matchMsg = allMsgs[len(allMsgs)-1]
+
+	var mp struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+	entryID = mp.Results[0].EntryID
+
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entryID,
+		"accepted": true,
+	})
+	buyerAcceptRec := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+	buyerAcceptMsgID = buyerAcceptRec.ID
+
+	deliverP, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", seed),
+		"content_size": 16000,
+	})
+	deliverRec := h.sendMessage(h.operator, deliverP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsgID},
+	)
+	deliverMsgID = deliverRec.ID
+
+	// Replay so state reflects all messages including deliver.
+	allMsgs2, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs2)
+
+	return matchMsg, buyerAcceptMsgID, deliverMsgID, entryID
+}
+
+// TestState_SettleComplete_HappyPath verifies that a well-formed settle(complete)
+// message — with the correct antecedent chain — increments seller reputation and
+// records a price history entry.
+func TestState_SettleComplete_HappyPath(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	_, _, deliverMsgID, entryID := runFullFlowToDeliver(t, h, eng, "Go concurrency pattern library", 200)
+
+	initialRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	initialHistory := eng.State().PriceHistory()
+
+	// Buyer sends settle(complete) with the correct antecedent (deliverMsgID).
+	completePayload, _ := json.Marshal(map[string]any{
+		"phase": "complete",
+		"price": int64(8500),
+	})
+	h.sendMessage(h.buyer, completePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverMsgID},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Seller reputation must have increased by 1 (SuccessCount++).
+	newRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if newRep != initialRep+1 {
+		t.Errorf("seller reputation after complete = %d, want %d", newRep, initialRep+1)
+	}
+
+	// Price history must have one new entry for the correct entry.
+	newHistory := eng.State().PriceHistory()
+	if len(newHistory) != len(initialHistory)+1 {
+		t.Fatalf("price history len = %d, want %d", len(newHistory), len(initialHistory)+1)
+	}
+	rec := newHistory[len(newHistory)-1]
+	if rec.EntryID != entryID {
+		t.Errorf("price history entry_id = %q, want %q", rec.EntryID, entryID)
+	}
+	if rec.SalePrice != 8500 {
+		t.Errorf("price history sale_price = %d, want 8500", rec.SalePrice)
+	}
+}
+
+// TestState_SettleComplete_SpoofedEntryIDRejected is the security regression test:
+// a buyer sends settle(complete) with a spoofed payload entry_id pointing at a
+// different inventory entry. Reputation and price history must be attributed to
+// the entry from the antecedent chain, NOT the spoofed one.
+//
+// Specifically: if the antecedent chain is intact, the correct entry receives
+// credit. If the deliver message ID in the antecedent does not map to any
+// match (broken chain), the complete is silently dropped.
+func TestState_SettleComplete_SpoofedEntryIDRejected(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Set up a legitimate flow for entryA (this is what the buyer actually bought).
+	_, _, deliverMsgID, entryA := runFullFlowToDeliver(t, h, eng, "Go HTTP server boilerplate", 300)
+
+	// Set up a second unrelated entry (entryB) that the buyer wants to spoof credit to.
+	putMsgB := h.sendMessage(h.seller,
+		putPayload("Rust async runtime tutorial", "sha256:"+fmt.Sprintf("%064x", 301), "code", 20000, 40000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:rust"},
+		nil,
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	if err := eng.AutoAcceptPut(putMsgB.ID, 14000, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut entryB: %v", err)
+	}
+	entryB := putMsgB.ID // EntryID == PutMsgID for accepted entries
+
+	initialRepB := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	initialHistory := eng.State().PriceHistory()
+
+	// Buyer sends settle(complete) with antecedent = deliverMsgID (correct chain
+	// for entryA), but spoofs entry_id in the payload to point at entryB.
+	completePayload, _ := json.Marshal(map[string]any{
+		"phase":    "complete",
+		"entry_id": entryB, // SPOOFED — buyer trying to credit wrong entry
+		"price":    int64(9000),
+	})
+	h.sendMessage(h.buyer, completePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverMsgID}, // correct antecedent — chain for entryA
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Price history must have exactly one new entry (for entryA, not entryB).
+	newHistory := eng.State().PriceHistory()
+	if len(newHistory) != len(initialHistory)+1 {
+		t.Fatalf("price history len = %d, want %d", len(newHistory), len(initialHistory)+1)
+	}
+	rec := newHistory[len(newHistory)-1]
+	if rec.EntryID != entryA {
+		t.Errorf("price history entry_id = %q (spoofed entryB = %q), want entryA %q",
+			rec.EntryID, entryB, entryA)
+	}
+
+	// Reputation check: seller reputation should have increased once (for entryA).
+	// If entryB were credited instead, the test would still pass reputation-wise
+	// (same seller), but the price history entry_id assertion above catches it.
+	newRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if newRep != initialRepB+1 {
+		t.Errorf("seller reputation = %d, want %d", newRep, initialRepB+1)
+	}
+}
+
+// TestState_SettleComplete_BrokenChainRejected verifies that a settle(complete)
+// whose antecedent is not a recognized deliver message is silently dropped.
+// This guards against a buyer fabricating a complete with an arbitrary antecedent.
+func TestState_SettleComplete_BrokenChainRejected(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Seed one entry so there's something to attempt to credit.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Some cached inference", "sha256:"+fmt.Sprintf("%064x", 400), "analysis", 5000, 8000),
+		[]string{exchange.TagPut, "exchange:content-type:analysis"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	initialRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	initialHistory := eng.State().PriceHistory()
+
+	// Buyer fabricates a settle(complete) with a made-up antecedent (not a real deliver).
+	completePayload, _ := json.Marshal(map[string]any{
+		"phase":    "complete",
+		"entry_id": putMsg.ID,
+		"price":    int64(5000),
+	})
+	h.sendMessage(h.buyer, completePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{"fabricated-deliver-message-id-that-does-not-exist"},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// No reputation change — complete must be silently dropped.
+	newRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if newRep != initialRep {
+		t.Errorf("seller reputation changed on broken-chain complete: got %d, want %d", newRep, initialRep)
+	}
+
+	// No price history added.
+	newHistory := eng.State().PriceHistory()
+	if len(newHistory) != len(initialHistory) {
+		t.Errorf("price history grew on broken-chain complete: got %d entries, want %d", len(newHistory), len(initialHistory))
+	}
+}
+
 // hasTag checks if tags contains the given tag.
 func hasTag(tags []string, tag string) bool {
 	for _, t := range tags {
