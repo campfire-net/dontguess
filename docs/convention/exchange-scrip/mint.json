@@ -1,0 +1,44 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:mint",
+  "description": "Create new scrip supply backed by an x402 USDC payment. Only the exchange operator (campfire key holder) can mint. The x402_tx_ref must reference a valid, unspent x402 payment. Amount must equal x402_usd_amount * rate (within 1 micro-token rounding). Each x402_tx_ref can only be used once (prevents double-mint). State effect: recipient balance increases by amount, total supply increases by amount.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "recipient",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key (hex) of the scrip recipient."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Scrip amount in micro-tokens (1 token = 1,000,000 micro-tokens)."
+    },
+    {
+      "name": "x402_tx_ref",
+      "type": "string",
+      "required": true,
+      "max_length": 256,
+      "description": "x402 transaction reference (USDC payment proof). Must be a valid, unspent payment."
+    },
+    {
+      "name": "rate",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Conversion rate used: micro-tokens per USDC cent."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-mint",
+      "cardinality": "exactly_one"
+    }
+  ]
+}

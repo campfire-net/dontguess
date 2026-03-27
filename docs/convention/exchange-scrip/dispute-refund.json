@@ -1,0 +1,43 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:dispute-refund",
+  "description": "Full refund of escrowed scrip when a dispute is resolved in the buyer's favor. Amount must equal the original scrip:buy-hold amount (full refund only — no partial refunds in v1). reservation_id must reference an active reservation. dispute_msg must reference a dispute operation resolved in buyer's favor. State effect: buyer balance increases by amount, Forge Refund(reservation_id) releases the escrow.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "buyer",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key (hex) of the buyer receiving the refund."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Full refund amount in micro-tokens. Must equal the original scrip:buy-hold amount."
+    },
+    {
+      "name": "reservation_id",
+      "type": "string",
+      "required": true,
+      "max_length": 64,
+      "description": "Forge reservation from the original scrip:buy-hold. Must be active."
+    },
+    {
+      "name": "dispute_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the dispute resolution that found in the buyer's favor."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-dispute-refund",
+      "cardinality": "exactly_one"
+    }
+  ]
+}

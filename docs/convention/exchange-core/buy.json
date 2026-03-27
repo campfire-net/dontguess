@@ -1,0 +1,93 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "buy",
+  "description": "Request cached inference matching a task description. Send as a campfire future (--future flag); the exchange fulfills with exchange:match. Budget is the maximum scrip the buyer will spend. Domain tags are composed as exchange:domain:<value> from the domain arg.",
+  "signing": "member_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "task",
+      "type": "string",
+      "required": true,
+      "max_length": 8192,
+      "description": "Description of the task the buyer needs solved. Used for semantic similarity matching against inventory."
+    },
+    {
+      "name": "budget",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 10000000,
+      "description": "Maximum scrip the buyer will spend (in token-cost units). Exchange must not present matches priced above this budget."
+    },
+    {
+      "name": "min_reputation",
+      "type": "integer",
+      "min": 0,
+      "max": 100,
+      "default": 0,
+      "description": "Minimum seller reputation score (0-100). Default: 0 (no filter)."
+    },
+    {
+      "name": "freshness_hours",
+      "type": "integer",
+      "min": 1,
+      "max": 8760,
+      "description": "Maximum age of cached inference in hours. Default: no limit."
+    },
+    {
+      "name": "content_type",
+      "type": "enum",
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ],
+      "description": "Preferred content type filter. Optional."
+    },
+    {
+      "name": "domain",
+      "type": "tag_set",
+      "max_count": 5,
+      "description": "Domain tags to narrow search (e.g. 'go', 'terraform', 'security'). Each value composed into exchange:domain:<value> tag."
+    },
+    {
+      "name": "max_results",
+      "type": "integer",
+      "min": 1,
+      "max": 10,
+      "default": 3,
+      "description": "Maximum matches to return. Default: 3."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:buy",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:content-type:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ]
+    }
+  ],
+  "rate_limit": {
+    "max": 30,
+    "per": "sender",
+    "window": "1m"
+  }
+}

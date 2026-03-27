@@ -1,0 +1,33 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "match",
+  "description": "Present matching cached inference to a buyer. Sent by the exchange as fulfillment of a buy future (--fulfills <buy-msg-id>). Results are ranked by composite score: correctness gate (Layer 0 — failed entries excluded), transaction efficiency (Layer 1 — tokens saved per scrip spent), value composite (Layer 2 — confidence, freshness, reputation, diversity), and market novelty (Layer 3 — discovery boost for underrepresented sellers). An empty results array fulfills the future when no matches exist.",
+  "signing": "member_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "results",
+      "type": "json",
+      "required": true,
+      "description": "Array of match results ranked by composite score. Each element: {entry_id: string, put_msg_id: string, seller_key: string, description: string, content_hash: string, content_type: string, price: integer, confidence: float 0.0-1.0, seller_reputation: integer 0-100, token_cost_original: integer, age_hours: integer, preview: string max 512 chars}. TAINTED: description and preview are seller-controlled."
+    },
+    {
+      "name": "search_meta",
+      "type": "json",
+      "description": "Search metadata: total candidates scanned, filter stats, timing. Optional."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:match",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 30,
+    "per": "sender",
+    "window": "1m"
+  }
+}

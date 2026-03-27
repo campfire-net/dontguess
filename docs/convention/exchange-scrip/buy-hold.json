@@ -1,0 +1,63 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:buy-hold",
+  "description": "Escrow buyer scrip for a purchase attempt. Pre-decrements buyer balance when they request a purchase via exchange:buy. Amount equals price + fee. Scrip is held in escrow until match+settle completes or expires_at is reached (auto-refund). Buyer balance must be >= amount (enforced by Forge PreDecrement — if this message exists, PreDecrement succeeded). State effect: buyer balance decreases by amount, amount held in escrow keyed by reservation_id.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "buyer",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key (hex) of the buyer."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Total hold in micro-tokens: price + fee."
+    },
+    {
+      "name": "price",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Price component in micro-tokens."
+    },
+    {
+      "name": "fee",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Matching fee component in micro-tokens."
+    },
+    {
+      "name": "reservation_id",
+      "type": "string",
+      "required": true,
+      "max_length": 64,
+      "description": "Forge SpendingLimiter reservation ID. Used to settle or refund the escrow."
+    },
+    {
+      "name": "buy_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:buy request that triggered this hold."
+    },
+    {
+      "name": "expires_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when hold auto-refunds if not settled. Must be in the future."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-buy-hold",
+      "cardinality": "exactly_one"
+    }
+  ]
+}

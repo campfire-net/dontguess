@@ -1,0 +1,109 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "settle",
+  "description": "Two-phase settlement. Antecedent is the immediately preceding message in the settlement chain. Phases: buyer-accept/buyer-reject (sent by buyer after receiving match); put-accept/put-reject (sent by exchange after receiving put); deliver (exchange sends content reference to buyer); complete (buyer confirms receipt and hash); dispute (buyer contests content — triggers escrow hold). Sender roles: buyer sends buyer-accept, buyer-reject, complete, dispute; exchange operator sends put-accept, put-reject, deliver.",
+  "signing": "member_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "phase",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:phase:buyer-accept",
+        "exchange:phase:buyer-reject",
+        "exchange:phase:put-accept",
+        "exchange:phase:put-reject",
+        "exchange:phase:deliver",
+        "exchange:phase:complete",
+        "exchange:phase:dispute"
+      ],
+      "description": "Settlement phase. Composed into exchange:phase:<value> tag."
+    },
+    {
+      "name": "entry_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Cache entry being settled."
+    },
+    {
+      "name": "accepted",
+      "type": "boolean",
+      "description": "Buyer's accept/reject decision. Used in buyer-accept and buyer-reject phases."
+    },
+    {
+      "name": "reason",
+      "type": "string",
+      "max_length": 2048,
+      "description": "Reason for rejection or dispute. Optional."
+    },
+    {
+      "name": "price",
+      "type": "integer",
+      "min": 0,
+      "description": "Agreed price in scrip (micro-tokens). Required in put-accept and complete phases."
+    },
+    {
+      "name": "content_hash_verified",
+      "type": "boolean",
+      "description": "Whether content hash was verified against delivered content. Required in complete phase."
+    },
+    {
+      "name": "dispute_type",
+      "type": "enum",
+      "values": [
+        "content_mismatch",
+        "quality_inadequate",
+        "hash_invalid",
+        "stale_content"
+      ],
+      "description": "Type of dispute. Required in dispute phase."
+    },
+    {
+      "name": "verdict",
+      "type": "enum",
+      "values": [
+        "exchange:verdict:accepted",
+        "exchange:verdict:rejected",
+        "exchange:verdict:disputed"
+      ],
+      "description": "Settlement verdict. Composed into exchange:verdict:<value> tag. Omitted for intermediate phases (deliver, put-accept, put-reject)."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:settle",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:phase:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "exchange:phase:buyer-accept",
+        "exchange:phase:buyer-reject",
+        "exchange:phase:put-accept",
+        "exchange:phase:put-reject",
+        "exchange:phase:deliver",
+        "exchange:phase:complete",
+        "exchange:phase:dispute"
+      ]
+    },
+    {
+      "tag": "exchange:verdict:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:verdict:accepted",
+        "exchange:verdict:rejected",
+        "exchange:verdict:disputed"
+      ]
+    }
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
+}

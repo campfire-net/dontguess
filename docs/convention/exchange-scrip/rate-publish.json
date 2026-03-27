@@ -1,0 +1,42 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:rate-publish",
+  "description": "Publish the operator's current x402-to-scrip conversion rate. Informational only — no scrip movement. Agents use this to decide whether to purchase scrip on this exchange. Rate changes are announced in advance (effective_at must be in the future). Antecedent is the operator's prior scrip:rate-publish message, forming a chain of rate history. State effect: none.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(self_prior)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "rate",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Conversion rate: micro-tokens per USDC cent."
+    },
+    {
+      "name": "effective_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when this rate takes effect. Must be in the future."
+    },
+    {
+      "name": "min_purchase",
+      "type": "integer",
+      "min": 1,
+      "description": "Minimum x402 purchase in USDC cents. Optional."
+    },
+    {
+      "name": "max_purchase",
+      "type": "integer",
+      "min": 1,
+      "description": "Maximum x402 purchase in USDC cents per 24-hour period. Optional."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-rate",
+      "cardinality": "exactly_one"
+    }
+  ]
+}
