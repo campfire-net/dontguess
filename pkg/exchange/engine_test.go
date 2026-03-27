@@ -585,6 +585,123 @@ func TestState_SettleDeliverMarksMatchDelivered(t *testing.T) {
 	}
 }
 
+// TestEngine_MatchIndexPopulatedAfterPutAccept verifies that the matching index
+// is populated when a put-accept is processed, so subsequent buy requests use
+// TF-IDF semantic ranking rather than the reputation-proxy fallback.
+func TestEngine_MatchIndexPopulatedAfterPutAccept(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Index starts empty.
+	if n := eng.MatchIndexLen(); n != 0 {
+		t.Errorf("initial match index len = %d, want 0", n)
+	}
+
+	// Put + accept an entry.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Go HTTP handler unit test generator", "sha256:"+fmt.Sprintf("%064x", 10), "code", 10000, 20000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Index must have one entry now.
+	if n := eng.MatchIndexLen(); n != 1 {
+		t.Errorf("match index len after put-accept = %d, want 1", n)
+	}
+}
+
+// TestEngine_SemanticMatchConfidenceUsedInMatchPayload verifies that the buy→match
+// flow uses the TF-IDF matching engine: a task semantically similar to the inventory
+// entry description yields non-zero confidence in the match payload.
+func TestEngine_SemanticMatchConfidenceUsedInMatchPayload(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Seed two entries with distinct descriptions.
+	relatedPut := h.sendMessage(h.seller,
+		putPayload("Python async HTTP scraper using aiohttp and asyncio", "sha256:"+fmt.Sprintf("%064x", 11), "code", 8000, 15000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:python"},
+		nil,
+	)
+	unrelatedPut := h.sendMessage(h.seller,
+		putPayload("Haiku about autumn leaves falling gently", "sha256:"+fmt.Sprintf("%064x", 12), "other", 500, 256),
+		[]string{exchange.TagPut, "exchange:content-type:other"},
+		nil,
+	)
+
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+	if err := eng.AutoAcceptPut(relatedPut.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut related: %v", err)
+	}
+	if err := eng.AutoAcceptPut(unrelatedPut.ID, 350, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut unrelated: %v", err)
+	}
+
+	// Buyer asks for something semantically close to the related entry.
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("Write an async web scraper in Python using aiohttp", 50000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Run engine to emit a match.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= len(preMsgs) {
+		t.Fatal("no match message emitted")
+	}
+
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+	_ = buyMsg // confirmed it triggered the match
+
+	var mp struct {
+		Results []struct {
+			EntryID    string  `json:"entry_id"`
+			Confidence float64 `json:"confidence"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+	if len(mp.Results) == 0 {
+		t.Fatal("expected at least one match result")
+	}
+
+	// The first result must be the semantically related entry.
+	if mp.Results[0].EntryID != relatedPut.ID {
+		t.Errorf("top match entry_id = %q, want semantically related entry %q",
+			mp.Results[0].EntryID, relatedPut.ID)
+	}
+
+	// Confidence must be non-zero (semantic score contributed).
+	if mp.Results[0].Confidence <= 0 {
+		t.Errorf("top match confidence = %v, want > 0", mp.Results[0].Confidence)
+	}
+}
+
 // hasTag checks if tags contains the given tag.
 func hasTag(tags []string, tag string) bool {
 	for _, t := range tags {

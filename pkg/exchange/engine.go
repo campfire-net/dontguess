@@ -12,6 +12,8 @@ import (
 	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
+
+	"github.com/3dl-dev/dontguess/pkg/matching"
 )
 
 // EngineOptions configures an exchange engine.
@@ -29,6 +31,9 @@ type EngineOptions struct {
 	PollInterval time.Duration
 	// Logger receives diagnostic log lines. If nil, logs are suppressed.
 	Logger func(format string, args ...any)
+	// MatchIndex is the semantic matching index used to rank buy results.
+	// If nil, the engine creates a default TF-IDF index on startup.
+	MatchIndex *matching.Index
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -50,23 +55,38 @@ func (o *EngineOptions) log(format string, args ...any) {
 // The engine maintains an in-memory State materialized from the message log.
 // On startup it replays the full log (Start). It then polls for new messages
 // and applies them incrementally.
+//
+// Semantic matching is performed by a matching.Index, which is rebuilt from
+// inventory on startup and updated incrementally as entries are added or removed.
 type Engine struct {
-	opts      EngineOptions
-	state     *State
-	lastCursor int64 // received_at cursor: last processed message's received_at
+	opts        EngineOptions
+	state       *State
+	matchIndex  *matching.Index
+	lastCursor  int64 // received_at cursor: last processed message's received_at
 }
 
 // NewEngine creates an exchange engine. Call Start to begin processing.
 func NewEngine(opts EngineOptions) *Engine {
+	idx := opts.MatchIndex
+	if idx == nil {
+		idx = matching.NewIndex(nil, matching.RankOptions{})
+	}
 	return &Engine{
-		opts:  opts,
-		state: NewState(),
+		opts:       opts,
+		state:      NewState(),
+		matchIndex: idx,
 	}
 }
 
 // State returns the engine's live state view.
 func (e *Engine) State() *State {
 	return e.state
+}
+
+// MatchIndexLen returns the number of entries currently in the semantic match index.
+// Useful for tests and diagnostics.
+func (e *Engine) MatchIndexLen() int {
+	return e.matchIndex.Len()
 }
 
 // Start replays the full message log to build initial state, processes any
@@ -115,7 +135,12 @@ func (e *Engine) replayAll() error {
 			e.lastCursor = m.ReceivedAt
 		}
 	}
-	e.opts.log("engine: replayed %d messages, cursor=%d", len(msgs), e.lastCursor)
+
+	// Rebuild the match index from the current live inventory.
+	e.rebuildMatchIndex()
+
+	e.opts.log("engine: replayed %d messages, cursor=%d, indexed %d entries",
+		len(msgs), e.lastCursor, e.matchIndex.Len())
 	return nil
 }
 
@@ -197,30 +222,91 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		maxResults = 3
 	}
 
-	// Search inventory for candidates.
+	// Search inventory for candidates (budget/reputation/freshness/type/domain filters).
 	candidates := e.findCandidates(msg.Sender, payload.Budget, payload.MinReputation,
 		payload.FreshnessHours, payload.ContentType, payload.Domains)
 
-	// Rank and cap results.
-	results := e.rankResults(candidates, maxResults)
+	// Semantic ranking via the match index.
+	// Search returns all candidates ranked by TF-IDF similarity + 4-layer value stack.
+	// We pass maxResults*3 to get enough candidates for the final cap after filtering.
+	semanticResults := e.matchIndex.Search(payload.Task, maxResults*3)
+
+	// Build a lookup: entryID → semantic result.
+	semanticByID := make(map[string]matching.RankedResult, len(semanticResults))
+	for _, r := range semanticResults {
+		semanticByID[r.EntryID] = r
+	}
+
+	// Filter semantic results to those that also passed the hard filters,
+	// preserving the semantic ranking order. Entries with no semantic score
+	// fall back to the reputation+recency sort via rankResults.
+	type rankedCandidate struct {
+		entry      *InventoryEntry
+		confidence float64
+		hasSemanticScore bool
+	}
+
+	var semanticMatches []rankedCandidate
+	candidateSet := make(map[string]*InventoryEntry, len(candidates))
+	for _, c := range candidates {
+		candidateSet[c.EntryID] = c
+	}
+
+	for _, sr := range semanticResults {
+		entry, ok := candidateSet[sr.EntryID]
+		if !ok {
+			continue // did not pass hard filters
+		}
+		semanticMatches = append(semanticMatches, rankedCandidate{
+			entry:            entry,
+			confidence:       sr.Confidence,
+			hasSemanticScore: true,
+		})
+	}
+
+	// Append candidates not covered by the semantic index (e.g. index not yet rebuilt).
+	covered := make(map[string]struct{}, len(semanticMatches))
+	for _, sm := range semanticMatches {
+		covered[sm.entry.EntryID] = struct{}{}
+	}
+	var fallbackCandidates []*InventoryEntry
+	for _, c := range candidates {
+		if _, ok := covered[c.EntryID]; !ok {
+			fallbackCandidates = append(fallbackCandidates, c)
+		}
+	}
+	ranked := e.rankResults(fallbackCandidates, maxResults)
+	for _, entry := range ranked {
+		semanticMatches = append(semanticMatches, rankedCandidate{
+			entry:            entry,
+			confidence:       e.computeConfidence(entry, payload.Task),
+			hasSemanticScore: false,
+		})
+	}
+
+	// Cap at maxResults.
+	if len(semanticMatches) > maxResults {
+		semanticMatches = semanticMatches[:maxResults]
+	}
 
 	// Build match payload.
 	type MatchResult struct {
-		EntryID            string  `json:"entry_id"`
-		PutMsgID           string  `json:"put_msg_id"`
-		SellerKey          string  `json:"seller_key"`
-		Description        string  `json:"description"`
-		ContentHash        string  `json:"content_hash"`
-		ContentType        string  `json:"content_type"`
-		Price              int64   `json:"price"`
-		Confidence         float64 `json:"confidence"`
-		SellerReputation   int     `json:"seller_reputation"`
-		TokenCostOriginal  int64   `json:"token_cost_original"`
-		AgeHours           int     `json:"age_hours"`
+		EntryID           string  `json:"entry_id"`
+		PutMsgID          string  `json:"put_msg_id"`
+		SellerKey         string  `json:"seller_key"`
+		Description       string  `json:"description"`
+		ContentHash       string  `json:"content_hash"`
+		ContentType       string  `json:"content_type"`
+		Price             int64   `json:"price"`
+		Confidence        float64 `json:"confidence"`
+		SellerReputation  int     `json:"seller_reputation"`
+		TokenCostOriginal int64   `json:"token_cost_original"`
+		AgeHours          int     `json:"age_hours"`
 	}
 
-	matchResults := make([]MatchResult, len(results))
-	for i, entry := range results {
+	matchResults := make([]MatchResult, len(semanticMatches))
+	for i, rc := range semanticMatches {
+		entry := rc.entry
 		ageHours := int(time.Since(time.Unix(0, entry.PutTimestamp)).Hours())
 		rep := e.state.SellerReputation(entry.SellerKey)
 		matchResults[i] = MatchResult{
@@ -231,7 +317,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 			ContentHash:       entry.ContentHash,
 			ContentType:       entry.ContentType,
 			Price:             e.computePrice(entry),
-			Confidence:        e.computeConfidence(entry, payload.Task),
+			Confidence:        rc.confidence,
 			SellerReputation:  rep,
 			TokenCostOriginal: entry.TokenCost,
 			AgeHours:          ageHours,
@@ -458,6 +544,17 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	if err == nil {
 		e.state.Apply(rec)
 	}
+
+	// Incrementally update the match index with the newly accepted entry.
+	// The entry is now live in state; add it to the index so subsequent
+	// buy requests can find it without waiting for a full Rebuild.
+	inv := e.state.Inventory()
+	for _, entry := range inv {
+		if entry.PutMsgID == putMsgID {
+			e.matchIndex.Add(e.inventoryEntryToRankInput(entry))
+			break
+		}
+	}
 	return nil
 }
 
@@ -475,6 +572,35 @@ func (e *Engine) lastSentMessage() (*store.MessageRecord, error) {
 		return nil, fmt.Errorf("no operator messages found")
 	}
 	return &msgs[len(msgs)-1], nil
+}
+
+// rebuildMatchIndex rebuilds the semantic match index from the current live inventory.
+// Called after replay and when the inventory changes significantly.
+func (e *Engine) rebuildMatchIndex() {
+	inventory := e.state.Inventory()
+	inputs := make([]matching.RankInput, len(inventory))
+	for i, entry := range inventory {
+		inputs[i] = e.inventoryEntryToRankInput(entry)
+	}
+	e.matchIndex.Rebuild(inputs)
+}
+
+// inventoryEntryToRankInput converts an InventoryEntry to a matching.RankInput.
+// Price is computed by the engine's pricing logic so the ranker sees current ask price.
+func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankInput {
+	return matching.RankInput{
+		EntryID:          entry.EntryID,
+		SellerKey:        entry.SellerKey,
+		Description:      entry.Description,
+		ContentType:      entry.ContentType,
+		Domains:          entry.Domains,
+		TokenCost:        entry.TokenCost,
+		Price:            e.computePrice(entry),
+		SellerReputation: e.state.SellerReputation(entry.SellerKey),
+		PutTimestamp:     entry.PutTimestamp,
+		DisputeCount:     0, // upheld disputes: tracked via SellerStats, not per-entry here
+		HasUpheldDispute: false,
+	}
 }
 
 // hasOverlap returns true if any element of a appears in b.
