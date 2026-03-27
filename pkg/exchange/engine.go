@@ -478,16 +478,31 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	}
 
 	// Parse the complete payload.
+	// SellerKey is intentionally NOT parsed from the payload — it is buyer-controlled
+	// (TAINTED) and must never be trusted for payment routing. The real seller is
+	// derived from the antecedent chain below (convention §3, security fix rudi-x3y).
 	var payload struct {
 		ReservationID string `json:"reservation_id"`
-		SellerKey     string `json:"seller_key"`
 		Price         int64  `json:"price"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("scrip: parsing settle(complete) payload: %w", err)
 	}
-	if payload.ReservationID == "" || payload.SellerKey == "" || payload.Price <= 0 {
+	if payload.ReservationID == "" || payload.Price <= 0 {
 		// Not a scrip-bearing settlement — skip.
+		return nil
+	}
+
+	// Derive seller from the antecedent chain: complete → deliver → match → entry → seller.
+	// msg.Antecedents[0] is the deliver message ID (the complete message references deliver).
+	if len(msg.Antecedents) == 0 {
+		e.opts.log("engine: settle: complete message has no antecedents — cannot derive seller")
+		return nil
+	}
+	deliverMsgID := msg.Antecedents[0]
+	sellerKey, ok := e.state.SellerKeyForDeliver(deliverMsgID)
+	if !ok {
+		e.opts.log("engine: settle: cannot derive seller for deliver=%s — antecedent chain broken", deliverMsgID[:8])
 		return nil
 	}
 
@@ -511,8 +526,8 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 
 	// Credit residual to seller.
 	if residual > 0 {
-		if _, _, err := e.opts.ScripStore.AddBudget(ctx, payload.SellerKey, scrip.BalanceKey, residual, ""); err != nil {
-			e.opts.log("engine: settle: add residual to seller %s: %v", payload.SellerKey[:8], err)
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, sellerKey, scrip.BalanceKey, residual, ""); err != nil {
+			e.opts.log("engine: settle: add residual to seller %s: %v", sellerKey[:8], err)
 		}
 	}
 
@@ -526,7 +541,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	// Emit scrip-settle convention message so CampfireScripStore can replay it.
 	settlePayload, err := json.Marshal(scrip.SettlePayload{
 		ReservationID:   payload.ReservationID,
-		Seller:          payload.SellerKey,
+		Seller:          sellerKey,
 		Residual:        residual,
 		FeeBurned:       fee,
 		ExchangeRevenue: exchangeRevenue,
@@ -556,7 +571,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	}
 
 	e.opts.log("engine: settle: reservation=%s seller=%s residual=%d fee_burned=%d exchange=%d",
-		payload.ReservationID[:8], payload.SellerKey[:8], residual, fee, exchangeRevenue)
+		payload.ReservationID[:8], sellerKey[:8], residual, fee, exchangeRevenue)
 	return nil
 }
 

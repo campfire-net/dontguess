@@ -352,23 +352,59 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
 	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
 
-	// Manually dispatch a settle(complete) message with the reservation_id.
+	// Build the antecedent chain required for seller derivation:
+	//   complete → deliver → match (via buyer-accept) → entry → seller
+
+	// buyer-accept (antecedent = match message).
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	// deliver (antecedent = buyer-accept message).
+	deliverMsgPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     inv[0].EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 999),
+		"content_size": int64(20000),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverMsgPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	// Replay all messages so the antecedent chain is in state.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// complete (antecedent = deliver message).
 	completePayload, _ := json.Marshal(map[string]any{
 		"reservation_id": res.ID,
-		"seller_key":     h.seller.PublicKeyHex(),
 		"price":          salePrice,
 		"entry_id":       inv[0].EntryID,
 	})
-	completeMsg := h.sendMessage(h.operator, completePayload,
+	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
 			exchange.TagSettle,
 			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
 		},
-		nil,
+		[]string{deliverMsg.ID},
 	)
 
-	// Apply to state and dispatch.
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	// Apply complete to state and dispatch.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {

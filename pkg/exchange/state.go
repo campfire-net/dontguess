@@ -505,11 +505,21 @@ func (s *State) applySettlePutReject(msg *store.MessageRecord) {
 }
 
 // applySettleBuyerAccept records that a buyer has accepted a match.
+// Security: only the buyer who placed the original buy order may accept a match.
+// Any other sender is silently rejected (convention §5.3: buyer identity gate).
 func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
 	matchMsgID := msg.Antecedents[0]
+
+	// Enforce buyer identity: the sender must be the buyer who placed the
+	// original buy order that this match fulfills.
+	expectedBuyer, ok := s.matchToBuyer[matchMsgID]
+	if !ok || msg.Sender != expectedBuyer {
+		return
+	}
+
 	entryID := s.matchToEntry[matchMsgID]
 	if entryID != "" {
 		s.acceptedOrders[matchMsgID] = entryID
@@ -569,6 +579,13 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 	entryID := s.matchToEntry[matchMsgID]
 	if entryID == "" {
 		// No entry recorded for this match — reject.
+		return
+	}
+
+	// Enforce buyer identity: the sender must be the original buyer.
+	// The match message recorded the expected buyer key in matchToBuyer.
+	expectedBuyer, ok := s.matchToBuyer[matchMsgID]
+	if !ok || msg.Sender != expectedBuyer {
 		return
 	}
 
@@ -761,6 +778,34 @@ func (s *State) IsMatchDelivered(matchMsgID string) bool {
 	defer s.mu.RUnlock()
 	_, ok := s.deliveredOrders[matchMsgID]
 	return ok
+}
+
+// SellerKeyForDeliver derives the seller's public key from the antecedent chain
+// starting at a deliver message ID. The chain is:
+//
+//	deliver → match (via deliverToMatch)
+//	match   → entry (via matchToEntry)
+//	entry   → seller (via inventory[entry].SellerKey)
+//
+// This is the authoritative, untainted way to find the seller for residual
+// payment — never trust a buyer-supplied seller_key field in the settle payload.
+// Returns ("", false) if any link in the chain is missing.
+func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	matchMsgID := s.deliverToMatch[deliverMsgID]
+	if matchMsgID == "" {
+		return "", false
+	}
+	entryID := s.matchToEntry[matchMsgID]
+	if entryID == "" {
+		return "", false
+	}
+	entry, ok := s.inventory[entryID]
+	if !ok {
+		return "", false
+	}
+	return entry.SellerKey, true
 }
 
 // operatorKeyHex converts a raw Ed25519 public key to its hex representation.
