@@ -49,12 +49,12 @@ func (idx *Index) Rebuild(entries []RankInput) {
 	defer idx.mu.Unlock()
 
 	// Re-prime IDF weights from the new corpus if the embedder supports it.
-	if tfidf, ok := idx.embedder.(*TFIDFEmbedder); ok {
+	if ci, ok := idx.embedder.(CorpusIndexer); ok {
 		docs := make([]string, len(entries))
 		for i, e := range entries {
 			docs[i] = e.Description
 		}
-		tfidf.IndexCorpus(docs)
+		ci.IndexCorpus(docs)
 	}
 
 	idx.entries = make([]indexedEntry, 0, len(entries))

@@ -151,6 +151,50 @@ func TestIndex_EmptyIndexReturnsNil(t *testing.T) {
 	}
 }
 
+// stubEmbedder is a minimal Embedder implementation that does NOT implement
+// CorpusIndexer. It uses a fixed 1-dimensional embedding so it never panics
+// on Rebuild regardless of the entry corpus.
+type stubEmbedder struct {
+	embedCalls int
+}
+
+func (s *stubEmbedder) Embed(_ string) []float64 {
+	s.embedCalls++
+	return []float64{1.0}
+}
+
+func (s *stubEmbedder) Similarity(a, b []float64) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+	return 1.0
+}
+
+// TestIndex_RebuildWithNonTFIDFEmbedder verifies that Rebuild does not panic
+// and correctly indexes entries when given an Embedder that does not implement
+// CorpusIndexer (i.e., no concrete type assertion to *TFIDFEmbedder).
+func TestIndex_RebuildWithNonTFIDFEmbedder(t *testing.T) {
+	t.Parallel()
+
+	emb := &stubEmbedder{}
+	idx := matching.NewIndex(emb, matching.RankOptions{})
+
+	entries := []matching.RankInput{
+		{EntryID: "a", SellerKey: "s1", Description: "foo bar baz", ContentType: "code", Domains: []string{"go"}, TokenCost: 1000, Price: 100, SellerReputation: 70, PutTimestamp: time.Now().Add(-1 * time.Hour).UnixNano()},
+		{EntryID: "b", SellerKey: "s2", Description: "qux quux corge", ContentType: "code", Domains: []string{"go"}, TokenCost: 1000, Price: 100, SellerReputation: 70, PutTimestamp: time.Now().Add(-2 * time.Hour).UnixNano()},
+	}
+
+	// Must not panic.
+	idx.Rebuild(entries)
+
+	if idx.Len() != 2 {
+		t.Fatalf("after Rebuild, len = %d, want 2", idx.Len())
+	}
+	if emb.embedCalls != 2 {
+		t.Errorf("Embed called %d times during Rebuild, want 2", emb.embedCalls)
+	}
+}
+
 func entryIDs(results []matching.RankedResult) []string {
 	ids := make([]string, len(results))
 	for i, r := range results {
