@@ -68,6 +68,27 @@ func addMsg(t *testing.T, st store.Store, campfireID, sender, op string, payload
 	}
 }
 
+// buildMsg constructs a MessageRecord without inserting it into the store.
+// Used to test ApplyMessage (live-mode path) directly.
+func buildMsg(t *testing.T, campfireID, sender, op string, payload any, tags ...string) store.MessageRecord {
+	t.Helper()
+	rawPayload, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	allTags := append([]string{op}, tags...)
+	return store.MessageRecord{
+		ID:         randomID(t),
+		CampfireID: campfireID,
+		Sender:     sender,
+		Payload:    rawPayload,
+		Tags:       allTags,
+		Timestamp:  time.Now().UnixNano(),
+		ReceivedAt: time.Now().UnixNano(),
+		Signature:  []byte{0x00},
+	}
+}
+
 func randomID(t *testing.T) string {
 	t.Helper()
 	return time.Now().Format("20060102150405.999999999") + t.Name()
@@ -903,5 +924,99 @@ func TestOperatorGate_EmptyKeyDisablesCheck(t *testing.T) {
 
 	if bal := cs.Balance(agentAlice); bal != 500 {
 		t.Errorf("empty OperatorKey should accept any sender: Alice balance = %d, want 500", bal)
+	}
+}
+
+// --- Underflow guard: subtractFromBalance in live vs replay mode ---
+
+// TestReplay_NegativeBalanceAllowed verifies that during replay the balance is
+// allowed to go negative when the log contains a subtract without a prior mint.
+// This preserves replay fidelity: the campfire log is the authority.
+func TestReplay_NegativeBalanceAllowed(t *testing.T) {
+	st := openTestStore(t)
+
+	// buy-hold without a prior mint — replay must not reject it.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-buy-hold", map[string]any{
+		"buyer":  agentAlice,
+		"amount": int64(500),
+	})
+
+	cs := newStore(t, st)
+
+	// Balance must be -500 (negative allowed in replay mode).
+	if bal := cs.Balance(agentAlice); bal != -500 {
+		t.Errorf("replay: expected negative balance -500, got %d", bal)
+	}
+}
+
+// TestReplay_NegativeBalance_SubsequentDecrementBudgetFails verifies the lockout
+// scenario: if replay produced a negative balance, DecrementBudget must return
+// ErrBudgetExceeded — not a panic or silent success.
+func TestReplay_NegativeBalance_SubsequentDecrementBudgetFails(t *testing.T) {
+	st := openTestStore(t)
+
+	// buy-hold without a prior mint → negative balance after replay.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-buy-hold", map[string]any{
+		"buyer":  agentAlice,
+		"amount": int64(500),
+	})
+
+	cs := newStore(t, st)
+	ctx := context.Background()
+
+	// GetBudget returns the (negative) balance and a valid ETag.
+	bal, etag, err := cs.GetBudget(ctx, agentAlice, scrip.BalanceKey)
+	if err != nil {
+		t.Fatalf("GetBudget: %v", err)
+	}
+	if bal >= 0 {
+		t.Fatalf("precondition: expected negative balance, got %d", bal)
+	}
+
+	// DecrementBudget must reject even a small amount — balance is already negative.
+	_, _, err = cs.DecrementBudget(ctx, agentAlice, scrip.BalanceKey, 1, etag)
+	if !errors.Is(err, scrip.ErrBudgetExceeded) {
+		t.Errorf("expected ErrBudgetExceeded for negative-balance agent, got %v", err)
+	}
+}
+
+// TestLiveMode_SubtractFromBalance_ClampsToZero verifies the underflow guard:
+// a buy-hold message received in live mode (post-Replay, replaying=false) must
+// clamp the balance to zero rather than going negative. This prevents a corrupt
+// or unexpected live message from causing permanent buyer lockout.
+//
+// We test this via ApplyMessage, which processes a single message in live mode
+// (replaying=false). Contrast with TestReplay_NegativeBalanceAllowed which shows
+// that replay mode permits negative balances.
+func TestLiveMode_SubtractFromBalance_ClampsToZero(t *testing.T) {
+	st := openTestStore(t)
+
+	// Mint 200 to Alice so she has a positive balance post-replay.
+	addMsg(t, st, testCampfireID, agentOperator, "dontguess:scrip-mint", map[string]any{
+		"recipient":   agentAlice,
+		"amount":      int64(200),
+		"x402_tx_ref": "tx-live-clamp",
+		"rate":        int64(1000),
+	})
+
+	cs := newStore(t, st)
+	if cs.Balance(agentAlice) != 200 {
+		t.Fatalf("precondition: Alice balance = %d, want 200", cs.Balance(agentAlice))
+	}
+
+	// Construct a buy-hold message that would drive Alice 300 below zero (500 > 200).
+	// Apply it via ApplyMessage — this runs in live mode (replaying=false).
+	liveMsg := buildMsg(t, testCampfireID, agentOperator, "dontguess:scrip-buy-hold", map[string]any{
+		"buyer":  agentAlice,
+		"amount": int64(500),
+	})
+	cs.ApplyMessage(&liveMsg)
+
+	bal := cs.Balance(agentAlice)
+	if bal < 0 {
+		t.Errorf("live mode: balance went negative (%d); underflow guard not applied", bal)
+	}
+	if bal != 0 {
+		t.Errorf("live mode: expected balance clamped to 0, got %d", bal)
 	}
 }
