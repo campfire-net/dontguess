@@ -702,6 +702,107 @@ func TestEngine_SemanticMatchConfidenceUsedInMatchPayload(t *testing.T) {
 	}
 }
 
+// TestEngine_IsPartialMatchForwardedToWirePayload verifies that IsPartialMatch
+// from the matching engine is included in the exchange:match wire payload
+// (dontguess-snb).
+//
+// The fix: IsPartialMatch from RankedResult (matching engine) was not propagated
+// to the MatchResult wire struct. Buyers had no way to know a result was a partial
+// match (low confidence). This test verifies the field is present in the payload
+// and that its value correctly reflects the confidence threshold: a result with
+// confidence >= 0.5 must have is_partial_match=false; a result with confidence
+// < 0.5 must have is_partial_match=true.
+func TestEngine_IsPartialMatchForwardedToWirePayload(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Put one entry closely matching the buy task.
+	closePut := h.sendMessage(h.seller,
+		putPayload("Go HTTP handler unit test generator table-driven tests", "sha256:"+fmt.Sprintf("%064x", 42), "code", 10000, 16000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(closePut.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Buyer asks for something closely matching the seeded entry.
+	h.sendMessage(h.buyer,
+		buyPayload("Write unit tests for a Go HTTP handler using table-driven style", 50000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Run engine until match message appears.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= len(preMsgs) {
+		t.Fatal("no match message emitted")
+	}
+
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+
+	// Parse match payload. is_partial_match must be present as a JSON field.
+	var mp struct {
+		Results []struct {
+			EntryID        string  `json:"entry_id"`
+			Confidence     float64 `json:"confidence"`
+			IsPartialMatch bool    `json:"is_partial_match"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+	if len(mp.Results) == 0 {
+		t.Fatal("expected at least one match result")
+	}
+
+	// Verify is_partial_match appears in raw JSON as a boolean field.
+	var rawPayload map[string]any
+	if err := json.Unmarshal(matchMsg.Payload, &rawPayload); err != nil {
+		t.Fatalf("parsing raw payload: %v", err)
+	}
+	rawResults, _ := rawPayload["results"].([]any)
+	if len(rawResults) == 0 {
+		t.Fatal("no results in raw payload")
+	}
+	firstResult, _ := rawResults[0].(map[string]any)
+	if _, exists := firstResult["is_partial_match"]; !exists {
+		t.Error("is_partial_match field missing from match result wire payload")
+	}
+
+	// Invariant: is_partial_match must agree with confidence < 0.5 (the threshold
+	// defined in matching.RankOptions.PartialMatchThreshold).
+	const partialThreshold = 0.5
+	for _, r := range mp.Results {
+		expectedPartial := r.Confidence < partialThreshold
+		if r.IsPartialMatch != expectedPartial {
+			t.Errorf("entry %s: confidence=%f, is_partial_match=%v, want %v (threshold %g)",
+				r.EntryID[:8], r.Confidence, r.IsPartialMatch, expectedPartial, partialThreshold)
+		}
+	}
+}
+
 // runFullFlowToDeliver runs put → put-accept → buy → match → buyer-accept →
 // deliver. Returns the match message, buyer-accept message ID, deliver message
 // ID, and the entry ID from the match payload. Used by settle(complete) tests.
