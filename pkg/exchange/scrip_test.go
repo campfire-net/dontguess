@@ -400,6 +400,146 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	}
 }
 
+// TestRestart_NoDoublePredecrement verifies that dispatchPendingOrders does NOT
+// double-charge a buyer whose buy order was pending when the engine restarted.
+//
+// Scenario (simulates a crash between buy-hold emission and match emission):
+//  1. Seed state: inventory entry accepted, buyer has scrip.
+//  2. Buyer sends a buy message. Engine would process it but we simulate a crash:
+//     we manually insert the dontguess:scrip-buy-hold message into the store
+//     WITHOUT a corresponding match message. This is exactly the state left
+//     by a crash after buy-hold was persisted but before match was emitted.
+//  3. Engine starts (simulating restart): replayAll rebuilds state — buy order
+//     is active (no match), CampfireScripStore replays buy-hold (balance decremented).
+//  4. dispatchPendingOrders fires, calls handleBuy for the active order.
+//  5. BUG (before fix): handleBuy calls DecrementBudget again — double charge.
+//     FIX: handleBuy detects the existing buy-hold in the log and skips DecrementBudget.
+//
+// Done condition: buyer balance after Start() reflects exactly ONE pre-decrement, not two.
+func TestRestart_NoDoublePredecrement(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+
+	// Use a scrip store to seed balances; we'll reconstruct it after injecting crash state.
+	cs0 := newCampfireScripStore(t, h)
+	eng0 := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs0,
+		Logger:           func(format string, args ...any) { t.Logf("[eng0] "+format, args...) },
+	})
+
+	// Seed one inventory entry via AutoAcceptPut (real campfire messages).
+	seedInventoryEntry(t, h, eng0, "Restart test: go http handler", "code", 8000, 5600)
+	inv := eng0.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	salePrice := inv[0].PutPrice * 120 / 100 // 6720
+	fee := salePrice / exchange.MatchingFeeRate  // 672
+	holdAmount := salePrice + fee                // 7392
+
+	// Seed buyer with 2*holdAmount + extraScrip so that after replay (one hold) the balance
+	// is holdAmount+extraScrip — still enough for DecrementBudget to succeed if called again.
+	// This is the critical condition: if balance after replay is >= holdAmount, the bug
+	// causes a second decrement and the buyer ends up at extraScrip instead of holdAmount+extraScrip.
+	const extraScrip = int64(3000)
+	// Give the buyer 2*holdAmount + extraScrip so that after log replay (which decrements
+	// by holdAmount via the injected buy-hold), the balance is holdAmount+extraScrip.
+	// That is still >= holdAmount, so WITHOUT the fix, a second DecrementBudget would
+	// succeed and take another holdAmount, leaving the buyer with only extraScrip.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), 2*holdAmount+extraScrip)
+
+	// Buyer sends a buy message (written directly into the store, simulating
+	// a message that arrived before the engine started).
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("Generate Go HTTP handler unit tests", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Simulate crash: manually inject a scrip-buy-hold message into the campfire store
+	// as if the engine processed the buy and wrote the hold but then crashed before
+	// writing the match. No exchange:match message is present in the log.
+	const crashReservationID = "deadbeefdeadbeefdeadbeefdeadbeef"
+	buyHoldPayload, err := json.Marshal(scrip.BuyHoldPayload{
+		Buyer:         h.buyer.PublicKeyHex(),
+		Amount:        holdAmount,
+		Price:         salePrice,
+		Fee:           fee,
+		ReservationID: crashReservationID,
+		BuyMsg:        buyMsg.ID,
+		ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
+	})
+	if err != nil {
+		t.Fatalf("marshal buy-hold payload: %v", err)
+	}
+	crashHoldRec := store.MessageRecord{
+		ID:         "crash-buy-hold-" + buyMsg.ID,
+		CampfireID: h.cfID,
+		Sender:     h.operator.PublicKeyHex(), // operator-signed, as the engine would emit
+		Payload:    buyHoldPayload,
+		Tags:       []string{scrip.TagScripBuyHold},
+		Timestamp:  time.Now().UnixNano(),
+		ReceivedAt: time.Now().UnixNano(),
+		Signature:  []byte{0x01},
+	}
+	if _, err := h.st.AddMessage(crashHoldRec); err != nil {
+		t.Fatalf("inject crash buy-hold message: %v", err)
+	}
+
+	// --- Simulate restart ---
+	//
+	// Fresh CampfireScripStore replays the log on construction.
+	// It sees: scrip-mint (buyer gets holdAmount+extraScrip) + scrip-buy-hold (buyer loses holdAmount).
+	// Net buyer balance at restart = extraScrip. This is the pre-restart state.
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore (restart): %v", err)
+	}
+
+	// After replay: mint(2*holdAmount+extraScrip) - buy-hold(holdAmount) = holdAmount+extraScrip.
+	balanceAtRestart := cs.Balance(h.buyer.PublicKeyHex())
+	if balanceAtRestart != holdAmount+extraScrip {
+		t.Fatalf("buyer balance at restart (after log replay): got %d, want %d — buy-hold should be in log",
+			balanceAtRestart, holdAmount+extraScrip)
+	}
+
+	// Start the engine (simulating a fresh restart).
+	// replayAll rebuilds state: buy order is active (no match in log),
+	// dispatchPendingOrders calls handleBuy for it.
+	// The fix: handleBuy finds the existing buy-hold in the log and skips DecrementBudget.
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[eng-restart] "+format, args...) },
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	// Allow time for replayAll + dispatchPendingOrders to complete.
+	time.Sleep(400 * time.Millisecond)
+	cancel()
+
+	// Buyer's balance must be holdAmount+extraScrip — exactly ONE decrement total (from log replay).
+	// If double-charged, it would be extraScrip = holdAmount+extraScrip - holdAmount.
+	// With mint=2*holdAmount+extraScrip: replay decrements once → holdAmount+extraScrip.
+	// A second decrement in dispatchPendingOrders would take another holdAmount → extraScrip. Wrong.
+	balanceAfterRestart := cs.Balance(h.buyer.PublicKeyHex())
+	if balanceAfterRestart != holdAmount+extraScrip {
+		t.Errorf("buyer balance after restart+dispatchPendingOrders: got %d, want %d (exactly one pre-decrement, not two; double-charge would give %d)",
+			balanceAfterRestart, holdAmount+extraScrip, extraScrip)
+	}
+}
+
 // TestDispute_RefundsScripToBuyer verifies that when a settle(dispute) message
 // is dispatched with a valid reservation_id, the engine:
 //   - Refunds the full pre-decremented amount to the buyer
