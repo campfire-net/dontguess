@@ -22,3 +22,5 @@ func (e *Engine) ComputePriceForTest(entry *InventoryEntry) int64 {
 
 // ComputePriceMinPriceForTest exposes the floor price constant for assertion.
 const ComputePriceMinPriceForTest = computePriceMinPrice
+// ShortKeyForTest exposes shortKey for white-box testing.
+func ShortKeyForTest(key string) string { return shortKey(key) }
