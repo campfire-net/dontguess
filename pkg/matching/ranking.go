@@ -189,14 +189,14 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 		// Layer 1: Transaction efficiency.
 		// Efficiency = tokens_saved / price.
 		// We normalize by dividing by a reference value (1000 tokens/scrip) to keep [0,1].
-		// If price is 0, treat as high efficiency (edge case — free item).
+		// If price is 0, treat as zero efficiency: a zero-price entry has no valid scrip
+		// flow and must not dominate rankings via the free-item path.
+		// If TokenCost is also 0, efficiency is 0 (no work represented).
 		var l1Efficiency float64
-		if c.Price > 0 {
+		if c.Price > 0 && c.TokenCost > 0 {
 			ratio := float64(c.TokenCost) / float64(c.Price)
 			// Normalize: ratio of 10 (great deal) → 1.0; ratio < 1 (poor deal) → < 0.1.
 			l1Efficiency = math.Min(ratio/10.0, 1.0)
-		} else {
-			l1Efficiency = 1.0
 		}
 
 		// Layer 2: Value composite.
