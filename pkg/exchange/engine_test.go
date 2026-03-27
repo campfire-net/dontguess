@@ -973,3 +973,91 @@ func hasTag(tags []string, tag string) bool {
 	}
 	return false
 }
+
+// TestEngine_RestartNoDuplicateMatchForAlreadyMatchedOrder verifies that when
+// the engine restarts with a buy order that was already matched in a prior run,
+// it does not emit a second match message (regression test for dontguess-vd0 /
+// dontguess-bf0: double-dispatch of buy orders on restart).
+//
+// Scenario:
+//  1. Seed inventory (put + put-accept).
+//  2. Buyer sends a buy message.
+//  3. Engine "run 1" starts, replays log, dispatches pending buy → emits match.
+//  4. Simulate restart: create a new engine from the same store (same message
+//     log, now including the match from run 1).
+//  5. Start "run 2" engine (replayAll → dispatchPendingOrders → poll loop).
+//  6. Assert still exactly one match in the store (no double-dispatch).
+func TestEngine_RestartNoDuplicateMatchForAlreadyMatchedOrder(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+
+	// Step 1: seed one inventory entry.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("REST API error handler generator", "sha256:"+fmt.Sprintf("%064x", 7001), "code", 12000, 20000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	eng1 := h.newEngine()
+	if err := eng1.AutoAcceptPut(putMsg.ID, 8400, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Step 2: buyer sends buy message.
+	_ = h.sendMessage(h.buyer,
+		buyPayload("Generate REST API error handler for Go HTTP server", 30000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Count match messages before run 1.
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagMatch},
+	})
+	preCount := len(preMsgs)
+
+	// Step 3: run engine 1 until a match appears.
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel1()
+	go func() { _ = eng1.Start(ctx1) }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+			Tags: []string{exchange.TagMatch},
+		})
+		if len(msgs) > preCount {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel1()
+
+	afterRun1, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagMatch},
+	})
+	if len(afterRun1) != preCount+1 {
+		t.Fatalf("run 1: expected %d match messages, got %d", preCount+1, len(afterRun1))
+	}
+
+	// Steps 4+5: simulate restart — new engine, same store, same log.
+	// replayAll sees buy + match → matchedOrders is populated.
+	// dispatchPendingOrders: ActiveOrders() returns empty (order matched).
+	// poll loop runs; IsOrderMatched guard in handleBuy prevents re-dispatch.
+	eng2 := h.newEngine()
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+	defer cancel2()
+	go func() { _ = eng2.Start(ctx2) }()
+
+	// Allow enough time for at least one poll cycle.
+	time.Sleep(700 * time.Millisecond)
+	cancel2()
+
+	// Step 6: assert exactly one match total — no double-dispatch.
+	afterRun2, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagMatch},
+	})
+	if len(afterRun2) != preCount+1 {
+		t.Errorf("restart double-dispatch: expected %d match messages after restart, got %d",
+			preCount+1, len(afterRun2))
+	}
+}
