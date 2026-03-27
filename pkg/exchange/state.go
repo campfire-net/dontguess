@@ -217,6 +217,11 @@ type State struct {
 	// Key: buy message ID. Value: entry ID accepted.
 	acceptedOrders map[string]string
 
+	// buyerAcceptToMatch maps a buyer-accept message ID to the match message ID
+	// it accepted. Used by applySettleDeliver to find the match from the deliver
+	// antecedent chain.
+	buyerAcceptToMatch map[string]string
+
 	// deliveredOrders tracks match message IDs that have received a deliver.
 	// Key: match message ID.
 	deliveredOrders map[string]struct{}
@@ -229,18 +234,19 @@ type State struct {
 // NewState creates an empty exchange state.
 func NewState() *State {
 	return &State{
-		inventory:        make(map[string]*InventoryEntry),
-		pendingPuts:      make(map[string]*InventoryEntry),
-		activeOrders:     make(map[string]*ActiveOrder),
-		priceHistory:     nil,
-		sellers:          make(map[string]*SellerStats),
-		matchedOrders:    make(map[string]struct{}),
-		putToEntry:       make(map[string]string),
-		matchToBuyer:     make(map[string]string),
-		matchToEntry:     make(map[string]string),
-		acceptedOrders:   make(map[string]string),
-		deliveredOrders:  make(map[string]struct{}),
-		completedEntries: make(map[string]string),
+		inventory:          make(map[string]*InventoryEntry),
+		pendingPuts:        make(map[string]*InventoryEntry),
+		activeOrders:       make(map[string]*ActiveOrder),
+		priceHistory:       nil,
+		sellers:            make(map[string]*SellerStats),
+		matchedOrders:      make(map[string]struct{}),
+		putToEntry:         make(map[string]string),
+		matchToBuyer:       make(map[string]string),
+		matchToEntry:       make(map[string]string),
+		acceptedOrders:     make(map[string]string),
+		buyerAcceptToMatch: make(map[string]string),
+		deliveredOrders:    make(map[string]struct{}),
+		completedEntries:   make(map[string]string),
 	}
 }
 
@@ -261,6 +267,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.matchToBuyer = make(map[string]string)
 	s.matchToEntry = make(map[string]string)
 	s.acceptedOrders = make(map[string]string)
+	s.buyerAcceptToMatch = make(map[string]string)
 	s.deliveredOrders = make(map[string]struct{})
 	s.completedEntries = make(map[string]string)
 
@@ -411,6 +418,8 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 		s.applySettlePutReject(msg)
 	case SettlePhaseStrBuyerAccept:
 		s.applySettleBuyerAccept(msg)
+	case SettlePhaseStrDeliver:
+		s.applySettleDeliver(msg)
 	case SettlePhaseStrComplete:
 		s.applySettleComplete(msg)
 	case SettlePhaseStrDispute:
@@ -465,6 +474,24 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 	if entryID != "" {
 		s.acceptedOrders[matchMsgID] = entryID
 	}
+	// Record buyer-accept → match mapping so deliver can trace the chain.
+	s.buyerAcceptToMatch[msg.ID] = matchMsgID
+}
+
+// applySettleDeliver records that the exchange has delivered content to the buyer.
+// The antecedent is the settle(buyer-accept) message ID.
+// It marks the corresponding match as delivered in deliveredOrders.
+func (s *State) applySettleDeliver(msg *store.MessageRecord) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	// Antecedent is the buyer-accept message. Trace to the match message.
+	buyerAcceptMsgID := msg.Antecedents[0]
+	matchMsgID := s.buyerAcceptToMatch[buyerAcceptMsgID]
+	if matchMsgID == "" {
+		return
+	}
+	s.deliveredOrders[matchMsgID] = struct{}{}
 }
 
 // applySettleComplete records a completed transaction and updates seller reputation.
@@ -628,6 +655,15 @@ func (s *State) IsOrderMatched(orderID string) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	_, ok := s.matchedOrders[orderID]
+	return ok
+}
+
+// IsMatchDelivered returns true if a match (identified by its message ID)
+// has received a settle(deliver) from the exchange operator.
+func (s *State) IsMatchDelivered(matchMsgID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.deliveredOrders[matchMsgID]
 	return ok
 }
 
