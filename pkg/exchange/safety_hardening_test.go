@@ -7,7 +7,9 @@ package exchange_test
 //   3. resMu is RWMutex (structural — tested via concurrent GetReservation)
 
 import (
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 )
@@ -42,36 +44,48 @@ func TestShortKey_NeverPanicsOnShortInput(t *testing.T) {
 // Inventory() are independent copies — mutating a returned entry must not
 // affect state.
 func TestInventory_ReturnsCopies(t *testing.T) {
-	st := exchange.NewState()
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
 
-	// Use the internal helper via Replay to seed one inventory entry.
-	// We do this by building a minimal message sequence: put → put-accept.
-	// Rather than replaying full messages (too much setup), we test the copy
-	// guarantee by verifying the domains slice is independent.
-	//
-	// We use the exported applyLocked path indirectly via Replay.
-	// Since we need a live entry, we call the helpers in engine_test harness.
-	// Here we test the guarantee via the State's public API by examining
-	// what Inventory returns after a domains mutation.
-	//
-	// This test uses a workaround: it seeds state via Replay with a mock
-	// message list. The simplest approach is to verify that after mutation
-	// of a returned entry's Domains, a second Inventory() call is unaffected.
+	// Seed one inventory entry: put → put-accept.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Domains copy test entry", "sha256:"+fmt.Sprintf("%064x", 42), "code", 10000, 8192),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
 
-	// Since State internals are package-private, we build a minimal engine
-	// harness the same way other state tests do.
-	_ = st // NewState is exported; full Replay test is in engine_test.go
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
 
-	// We verify the copy semantics are exercised in the engine integration
-	// test TestState_PutAppearsInInventoryAfterAccept by checking that the
-	// Domains field is independently modifiable. Here we do a unit-level
-	// proof using the newTestHarness path is in engine_test.go (same package).
-	//
-	// The key invariant: InventoryEntry.Domains is a fresh slice each call.
-	// We cannot directly test this from the external test package without
-	// a full harness, so we document the guarantee and rely on the engine
-	// integration test below.
-	t.Log("Inventory copy semantics verified by integration tests in engine_test.go")
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(168*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Get inventory and record the domains from the first call.
+	inv1 := eng.State().Inventory()
+	if len(inv1) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv1))
+	}
+	originalDomains := make([]string, len(inv1[0].Domains))
+	copy(originalDomains, inv1[0].Domains)
+
+	// Mutate the returned entry's Domains slice.
+	inv1[0].Domains = append(inv1[0].Domains, "MUTATED")
+
+	// Second Inventory() call must not see the mutation.
+	inv2 := eng.State().Inventory()
+	if len(inv2) != 1 {
+		t.Fatalf("expected 1 inventory entry on second call, got %d", len(inv2))
+	}
+	if len(inv2[0].Domains) != len(originalDomains) {
+		t.Errorf("internal Domains mutated by caller: got %v, want %v", inv2[0].Domains, originalDomains)
+	}
+	for i, d := range originalDomains {
+		if inv2[0].Domains[i] != d {
+			t.Errorf("Domains[%d] = %q, want %q", i, inv2[0].Domains[i], d)
+		}
+	}
 }
 
 // TestInventory_DomainsAreCopied is a white-box test in the internal package.
@@ -79,17 +93,14 @@ func TestInventory_ReturnsCopies(t *testing.T) {
 
 // TestResMu_ConcurrentGetReservation verifies that concurrent GetReservation
 // calls do not deadlock now that resMu is RWMutex (multiple readers allowed).
-// This is a structural/regression test — if resMu were still sync.Mutex,
-// parallel RLock calls would not deadlock, but concurrent exclusive locks would
-// serialize. The test verifies no deadlock occurs under concurrent load.
+// This test is in pkg/scrip/campfire_store_test.go where the store is accessible.
+// See TestConcurrentGetReservation_NoDeadlock in that file.
 func TestResMu_ConcurrentGetReservation(t *testing.T) {
-	// This test is exercised via the scrip package's CampfireScripStore.
-	// Since we're in the exchange_test package, we cannot directly instantiate
-	// a CampfireScripStore without a campfire. The resMu change is validated
-	// by the existing scrip package tests running with -race.
-	//
-	// Concurrent GetReservation is tested in pkg/scrip/campfire_store_test.go.
-	t.Log("resMu RWMutex concurrent-read test delegated to pkg/scrip tests")
+	// resMu is in CampfireScripStore (pkg/scrip), not in the exchange package.
+	// The concurrent read regression test lives in pkg/scrip/campfire_store_test.go
+	// as TestConcurrentGetReservation_NoDeadlock, which exercises SaveReservation
+	// and GetReservation from multiple goroutines simultaneously.
+	t.Log("resMu RWMutex test: see TestConcurrentGetReservation_NoDeadlock in pkg/scrip/campfire_store_test.go")
 }
 
 // TestShortKey_ExactEight ensures an 8-char key is returned unchanged.
@@ -115,14 +126,56 @@ func TestShortKey_LongHexKey(t *testing.T) {
 
 // TestInventoryEntryCopyIndependence seeds a state with a real entry and
 // verifies that mutations to the returned slice entries are not reflected
-// in a subsequent Inventory() call.
+// in a subsequent Inventory() call. This specifically targets the Domains
+// slice deep-copy (shallow struct copy would miss slice mutations).
 func TestInventoryEntryCopyIndependence(t *testing.T) {
-	// We cannot directly call State.applyPut from the external test package.
-	// The copy invariant is enforced structurally in state.go (Inventory builds
-	// a copy via `cp := *e` and deep-copies Domains). This is a compile-time
-	// structural guarantee; the integration tests in engine_test.go confirm it
-	// behaviorally via the full put → put-accept → Inventory flow.
-	t.Log("Domains copy independence verified structurally in state.go and via engine integration tests")
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Seed an inventory entry with multiple domains.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Copy independence test", "sha256:"+fmt.Sprintf("%064x", 77), "analysis", 5000, 4096),
+		[]string{exchange.TagPut, "exchange:content-type:analysis", "exchange:domain:go", "exchange:domain:testing"},
+		nil,
+	)
+
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(48*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// First call: capture domains, then corrupt the returned slice in-place.
+	inv1 := eng.State().Inventory()
+	if len(inv1) == 0 {
+		t.Fatal("no inventory entry after put-accept")
+	}
+	// Record length before corruption.
+	lenBefore := len(inv1[0].Domains)
+
+	// Corrupt: append a sentinel and overwrite the first element.
+	inv1[0].Domains = append(inv1[0].Domains, "CORRUPT")
+	if len(inv1[0].Domains) > 0 {
+		inv1[0].Domains[0] = "CORRUPT"
+	}
+
+	// Second call must return the original, unmodified domains.
+	inv2 := eng.State().Inventory()
+	if len(inv2) == 0 {
+		t.Fatal("no inventory entry on second call")
+	}
+	if len(inv2[0].Domains) != lenBefore {
+		t.Errorf("Domains length changed: got %d, want %d — internal state was mutated",
+			len(inv2[0].Domains), lenBefore)
+	}
+	for _, d := range inv2[0].Domains {
+		if d == "CORRUPT" {
+			t.Errorf("internal Domains contains CORRUPT sentinel — copy not deep enough: %v", inv2[0].Domains)
+			break
+		}
+	}
 }
 
 // Ensure ShortKeyForTest is used.

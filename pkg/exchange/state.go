@@ -278,6 +278,12 @@ type State struct {
 	// (exchange:verdict:accepted). Key: entryID. Used by the Layer 0
 	// correctness gate to exclude disputed entries from match results.
 	upheldDisputes map[string]struct{}
+
+	// completedSettlements tracks settle(complete) message IDs that have
+	// already been processed. Guards applySettleComplete against double-application
+	// when Apply is called multiple times with the same message (e.g., duplicate
+	// delivery). Key: settle(complete) message ID.
+	completedSettlements map[string]struct{}
 }
 
 // NewState creates an empty exchange state.
@@ -298,8 +304,9 @@ func NewState() *State {
 		deliveredOrders:    make(map[string]struct{}),
 		deliverToMatch:     make(map[string]string),
 		completedEntries:   make(map[string]string),
-		pendingDisputes:    make(map[string]struct{}),
-		upheldDisputes:     make(map[string]struct{}),
+		pendingDisputes:      make(map[string]struct{}),
+		upheldDisputes:       make(map[string]struct{}),
+		completedSettlements: make(map[string]struct{}),
 	}
 }
 
@@ -327,6 +334,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.completedEntries = make(map[string]string)
 	s.pendingDisputes = make(map[string]struct{})
 	s.upheldDisputes = make(map[string]struct{})
+	s.completedSettlements = make(map[string]struct{})
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -675,6 +683,13 @@ func (s *State) applySettleDeliver(msg *store.MessageRecord) {
 // The price field is still read from the payload (it is operator-signed by the
 // deliver step; the buyer does not control sale price).
 func (s *State) applySettleComplete(msg *store.MessageRecord) {
+	// Idempotency guard: if this settle(complete) message has already been
+	// applied, skip it. Protects against double-application when Apply is
+	// called multiple times with the same message (e.g., duplicate delivery).
+	if _, seen := s.completedSettlements[msg.ID]; seen {
+		return
+	}
+
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -711,6 +726,9 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
+
+	// Mark this message as processed before mutating any state.
+	s.completedSettlements[msg.ID] = struct{}{}
 
 	buyerKey := msg.Sender
 	s.completedEntries[deliverMsgID] = buyerKey
