@@ -68,6 +68,16 @@ func (o *EngineOptions) log(format string, args ...any) {
 	}
 }
 
+// shortKey returns the first 8 characters of key for use in log messages.
+// It never panics on short strings — keys shorter than 8 characters are
+// returned as-is. This prevents the [:8] panic on malformed or truncated keys.
+func shortKey(key string) string {
+	if len(key) <= 8 {
+		return key
+	}
+	return key[:8]
+}
+
 // Engine subscribes to the exchange campfire, processes convention messages,
 // and emits response messages (match, settle) back to the campfire.
 //
@@ -235,7 +245,7 @@ func (e *Engine) dispatch(msg *store.MessageRecord) error {
 		if provOp != "" {
 			if err := e.opts.ProvenanceChecker.Check(msg.Sender, provOp, phase); err != nil {
 				e.opts.log("engine: provenance rejected msg=%s op=%s sender=%s: %v",
-					msg.ID, op, msg.Sender[:8], err)
+					msg.ID, op, shortKey(msg.Sender), err)
 				return nil // silently reject — don't propagate error to poll loop
 			}
 		}
@@ -432,18 +442,18 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 				CreatedAt: time.Now(),
 			}
 			if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
-				e.opts.log("engine: warning: re-save reservation after restart %s: %v", reservationID[:8], err)
+				e.opts.log("engine: warning: re-save reservation after restart %s: %v", shortKey(reservationID), err)
 			}
 			e.opts.log("engine: scrip buy-hold already replayed, skipping pre-decrement buyer=%s reservation=%s",
-				buyerKey[:8], reservationID[:8])
+				shortKey(buyerKey), shortKey(reservationID))
 		} else {
 			bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
 			if err != nil {
-				return fmt.Errorf("scrip: GetBudget for buyer %s: %w", buyerKey[:8], err)
+				return fmt.Errorf("scrip: GetBudget for buyer %s: %w", shortKey(buyerKey), err)
 			}
 			if bal < holdAmount {
 				return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
-					buyerKey[:8], scrip.ErrBudgetExceeded, bal, holdAmount)
+					shortKey(buyerKey), scrip.ErrBudgetExceeded, bal, holdAmount)
 			}
 
 			// Marshal the buy-hold convention message BEFORE mutating scrip state.
@@ -465,7 +475,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 
 			_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
 			if err != nil {
-				return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", buyerKey[:8], err)
+				return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", shortKey(buyerKey), err)
 			}
 
 			// Save reservation so settle/dispute can reference it.
@@ -481,10 +491,10 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 				return fmt.Errorf("scrip: SaveReservation: %w", err)
 			}
 			e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
-				buyerKey[:8], holdAmount, reservationID[:8])
+				shortKey(buyerKey), holdAmount, shortKey(reservationID))
 
 			// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
-			if emitErr := e.sendOperatorMessage(holdPayload,
+			if _, emitErr := e.sendOperatorMessage(holdPayload,
 				[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
 				e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
 			}
@@ -508,7 +518,8 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	// Antecedent is the buy message; --fulfills semantics use the antecedent.
 	antecedents := []string{msg.ID}
 
-	return e.sendOperatorMessage(matchPayload, tags, antecedents)
+	_, err = e.sendOperatorMessage(matchPayload, tags, antecedents)
+	return err
 }
 
 // handleSettle processes settlement messages.
@@ -542,9 +553,17 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("scrip: parsing settle(complete) payload: %w", err)
 	}
-	if payload.ReservationID == "" || payload.Price <= 0 {
-		// Not a scrip-bearing settlement — skip.
-		return nil
+	// Validate price and reservation_id.
+	// Split the check: missing reservation_id is a silent skip (no scrip involved).
+	// A non-positive price with a reservation_id is a hard rejection (security fix dontguess-ica).
+	if payload.ReservationID == "" {
+		return nil // no reservation_id — not a scrip-bearing settlement
+	}
+	if payload.Price <= 0 {
+		e.opts.log("engine: settle: reservation %s rejected — price=%d (must be >0)",
+			shortKey(payload.ReservationID), payload.Price)
+		return fmt.Errorf("scrip: settle reservation %s: price must be positive, got %d",
+			shortKey(payload.ReservationID), payload.Price)
 	}
 
 	// Derive seller from the antecedent chain: complete → deliver → match → entry → seller.
@@ -556,7 +575,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	deliverMsgID := msg.Antecedents[0]
 	sellerKey, ok := e.state.SellerKeyForDeliver(deliverMsgID)
 	if !ok {
-		e.opts.log("engine: settle: cannot derive seller for deliver=%s — antecedent chain broken", deliverMsgID[:8])
+		e.opts.log("engine: settle: cannot derive seller for deliver=%s — antecedent chain broken", shortKey(deliverMsgID))
 		return nil
 	}
 
@@ -565,8 +584,27 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
 	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
 	if err != nil {
-		e.opts.log("engine: settle: reservation %s not found: %v", payload.ReservationID[:8], err)
+		e.opts.log("engine: settle: reservation %s not found: %v", shortKey(payload.ReservationID), err)
 		return nil // reservation missing — already settled or expired
+	}
+
+	// Cross-check payload.Price against res.Amount to prevent market manipulation.
+	// At buy time, the engine set res.Amount = price + price/MatchingFeeRate.
+	// If payload.Price (buyer-controlled) differs from what was pre-approved,
+	// the buyer is attempting to inflate or deflate the seller credit. Reject.
+	// Security fix: dontguess-ica (dontguess-3oo, dontguess-z2a).
+	expectedHold := payload.Price + payload.Price/MatchingFeeRate
+	if expectedHold != res.Amount {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after price mismatch: %v",
+				shortKey(payload.ReservationID), restoreErr)
+			return fmt.Errorf("scrip: settle reservation %s: price mismatch AND restore failed: payload=%d expected_hold=%d res.Amount=%d",
+				shortKey(payload.ReservationID), payload.Price, expectedHold, res.Amount)
+		}
+		e.opts.log("engine: settle: reservation %s rejected — price mismatch payload=%d expected_hold=%d res.Amount=%d",
+			shortKey(payload.ReservationID), payload.Price, expectedHold, res.Amount)
+		return fmt.Errorf("scrip: settle reservation %s: payload.Price=%d inconsistent with reservation amount=%d",
+			shortKey(payload.ReservationID), payload.Price, res.Amount)
 	}
 
 	fee := payload.Price / MatchingFeeRate
@@ -590,9 +628,9 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	if err != nil {
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 			return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
-				payload.ReservationID[:8], err)
+				shortKey(payload.ReservationID), err)
 		}
 		return fmt.Errorf("scrip: marshal settle payload: %w", err)
 	}
@@ -607,9 +645,9 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		if err != nil {
 			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-					payload.ReservationID[:8], restoreErr)
+					shortKey(payload.ReservationID), restoreErr)
 				return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
-					payload.ReservationID[:8], err)
+					shortKey(payload.ReservationID), err)
 			}
 			return fmt.Errorf("scrip: marshal burn payload: %w", err)
 		}
@@ -618,7 +656,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	// Credit residual to seller.
 	if residual > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, sellerKey, scrip.BalanceKey, residual, ""); err != nil {
-			e.opts.log("engine: settle: add residual to seller %s: %v", sellerKey[:8], err)
+			e.opts.log("engine: settle: add residual to seller %s: %v", shortKey(sellerKey), err)
 		}
 	}
 
@@ -630,21 +668,21 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	}
 
 	// Emit scrip-settle convention message so CampfireScripStore can replay it.
-	if emitErr := e.sendOperatorMessage(settlePayload,
+	if _, emitErr := e.sendOperatorMessage(settlePayload,
 		[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
 		e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
 	}
 
 	// Emit scrip-burn for the matching fee (already removed from buyer's balance via buy-hold).
 	if len(burnPayload) > 0 {
-		if emitErr := e.sendOperatorMessage(burnPayload,
+		if _, emitErr := e.sendOperatorMessage(burnPayload,
 			[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
 			e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
 		}
 	}
 
 	e.opts.log("engine: settle: reservation=%s seller=%s residual=%d fee_burned=%d exchange=%d",
-		payload.ReservationID[:8], sellerKey[:8], residual, fee, exchangeRevenue)
+		shortKey(payload.ReservationID), shortKey(sellerKey), residual, fee, exchangeRevenue)
 	return nil
 }
 
@@ -673,7 +711,7 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
 	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
 	if err != nil {
-		e.opts.log("engine: dispute: reservation %s not found: %v", payload.ReservationID[:8], err)
+		e.opts.log("engine: dispute: reservation %s not found: %v", shortKey(payload.ReservationID), err)
 		return nil
 	}
 
@@ -689,12 +727,12 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 		// caller has full context.
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after key mismatch: %v",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 			return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch AND restore failed (reservation lost): %w",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 		}
 		return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
-			payload.ReservationID[:8], payload.BuyerKey[:8], res.AgentKey[:8])
+			shortKey(payload.ReservationID), shortKey(payload.BuyerKey), shortKey(res.AgentKey))
 	}
 
 	// Sender identity gate: the campfire message sender must be either the buyer
@@ -708,12 +746,12 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	if msg.Sender != res.AgentKey && msg.Sender != operatorKey {
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after sender mismatch: %v",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 			return fmt.Errorf("scrip: dispute reservation %s: sender mismatch AND restore failed (reservation lost): %w",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 		}
 		return fmt.Errorf("scrip: dispute reservation %s: sender mismatch (sender=%s, buyer=%s)",
-			payload.ReservationID[:8], msg.Sender[:8], res.AgentKey[:8])
+			shortKey(payload.ReservationID), shortKey(msg.Sender), shortKey(res.AgentKey))
 	}
 
 	// Marshal the convention message BEFORE mutating scrip state.
@@ -727,9 +765,9 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	if err != nil {
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 			return fmt.Errorf("scrip: dispute reservation %s: marshal failed AND restore failed (reservation lost): %w",
-				payload.ReservationID[:8], restoreErr)
+				shortKey(payload.ReservationID), restoreErr)
 		}
 		return fmt.Errorf("scrip: marshal dispute-refund payload: %w", err)
 	}
@@ -739,17 +777,17 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	// (attacker-controlled). The check above confirmed they match, but we always use the
 	// reservation's authoritative key as the refund target.
 	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, res.Amount, ""); err != nil {
-		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", res.AgentKey[:8], err)
+		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", shortKey(res.AgentKey), err)
 	}
 
 	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
-	if emitErr := e.sendOperatorMessage(refundPayload,
+	if _, emitErr := e.sendOperatorMessage(refundPayload,
 		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
 		e.opts.log("engine: warning: emit scrip-dispute-refund: %v", emitErr)
 	}
 
 	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
-		payload.ReservationID[:8], res.AgentKey[:8], res.Amount)
+		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
 	return nil
 }
 
@@ -887,21 +925,21 @@ func (e *Engine) computeConfidence(entry *InventoryEntry, _ string) float64 {
 
 // sendOperatorMessage creates, signs, and writes an operator-signed message to
 // the exchange campfire transport.
-func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) error {
+func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) (*store.MessageRecord, error) {
 	op := e.opts.OperatorIdentity
 	msg, err := message.NewMessage(op.PrivateKey, op.PublicKey, payload, tags, antecedents)
 	if err != nil {
-		return fmt.Errorf("creating operator message: %w", err)
+		return nil, fmt.Errorf("creating operator message: %w", err)
 	}
 
 	// Add provenance hop from the exchange campfire.
 	state, err := e.opts.Transport.ReadState(e.opts.CampfireID)
 	if err != nil {
-		return fmt.Errorf("reading campfire state for hop: %w", err)
+		return nil, fmt.Errorf("reading campfire state for hop: %w", err)
 	}
 	members, err := e.opts.Transport.ListMembers(e.opts.CampfireID)
 	if err != nil {
-		return fmt.Errorf("listing members for hop: %w", err)
+		return nil, fmt.Errorf("listing members for hop: %w", err)
 	}
 	cf := state.ToCampfire(members)
 	if err := msg.AddHop(
@@ -910,11 +948,11 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 		state.JoinProtocol, state.ReceptionRequirements,
 		campfire.RoleFull,
 	); err != nil {
-		return fmt.Errorf("adding provenance hop: %w", err)
+		return nil, fmt.Errorf("adding provenance hop: %w", err)
 	}
 
 	if err := e.opts.Transport.WriteMessage(e.opts.CampfireID, msg); err != nil {
-		return fmt.Errorf("writing operator message: %w", err)
+		return nil, fmt.Errorf("writing operator message: %w", err)
 	}
 
 	// Persist to the store so subsequent polls see it.
@@ -924,7 +962,7 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 		e.opts.log("engine: warning: adding message to store: %v", err)
 	}
 
-	return nil
+	return &rec, nil
 }
 
 // AutoAcceptPut sends a settle(put-accept) for a pending put message, accepting
@@ -969,13 +1007,16 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	}
 	antecedents := []string{putMsgID}
 
-	if err := e.sendOperatorMessage(payload, tags, antecedents); err != nil {
+	// sendOperatorMessage returns the persisted record directly — no need to
+	// re-query the store. This avoids the race where lastSentMessage could
+	// return a concurrently-written message instead of the one we just sent.
+	rec, err := e.sendOperatorMessage(payload, tags, antecedents)
+	if err != nil {
 		return err
 	}
 
 	// Apply immediately so state is consistent before the next poll.
-	rec, err := e.lastSentMessage()
-	if err == nil {
+	if rec != nil {
 		e.state.Apply(rec)
 	}
 
@@ -992,21 +1033,6 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	return nil
 }
 
-// lastSentMessage retrieves the most recent message sent to this campfire.
-// Used to apply a just-sent operator message to state immediately.
-func (e *Engine) lastSentMessage() (*store.MessageRecord, error) {
-	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0,
-		store.MessageFilter{
-			Sender: operatorKeyHex(e.opts.OperatorIdentity.PublicKey),
-		})
-	if err != nil {
-		return nil, err
-	}
-	if len(msgs) == 0 {
-		return nil, fmt.Errorf("no operator messages found")
-	}
-	return &msgs[len(msgs)-1], nil
-}
 
 // rebuildMatchIndex rebuilds the semantic match index from the current live inventory.
 // Called after replay and when the inventory changes significantly.
