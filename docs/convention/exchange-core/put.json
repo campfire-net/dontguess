@@ -19,8 +19,7 @@
       "type": "string",
       "required": true,
       "max_length": 128,
-      "pattern": "^sha256:[a-f0-9]{64}$",
-      "description": "SHA-256 hash of the cached inference content. TAINTED: must be verified against actual content before delivery."
+      "description": "SHA-256 hash of the cached inference content in sha256:<hex64> format (e.g. sha256:abc123...64hex). TAINTED: must be verified against actual content before delivery."
     },
     {
       "name": "token_cost",
@@ -49,6 +48,7 @@
       "name": "domain",
       "type": "tag_set",
       "max_count": 5,
+      "prefix": "exchange:domain:",
       "description": "Domain tags for discovery (e.g. 'go', 'terraform', 'security'). Each value composed into exchange:domain:<value> tag. TAINTED: seller categorization."
     },
     {
@@ -89,6 +89,10 @@
         "exchange:content-type:review",
         "exchange:content-type:other"
       ]
+    },
+    {
+      "tag": "exchange:domain:*",
+      "cardinality": "at_most_one"
     }
   ],
   "rate_limit": {

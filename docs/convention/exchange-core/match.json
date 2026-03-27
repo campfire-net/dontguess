@@ -8,6 +8,12 @@
   "payload_required": true,
   "args": [
     {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the buy request this match fulfills."
+    },
+    {
       "name": "results",
       "type": "json",
       "required": true,

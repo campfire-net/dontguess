@@ -55,6 +55,7 @@
       "name": "domain",
       "type": "tag_set",
       "max_count": 5,
+      "prefix": "exchange:domain:",
       "description": "Domain tags to narrow search (e.g. 'go', 'terraform', 'security'). Each value composed into exchange:domain:<value> tag."
     },
     {
@@ -83,6 +84,10 @@
         "exchange:content-type:review",
         "exchange:content-type:other"
       ]
+    },
+    {
+      "tag": "exchange:domain:*",
+      "cardinality": "at_most_one"
     }
   ],
   "rate_limit": {

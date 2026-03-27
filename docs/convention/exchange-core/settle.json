@@ -8,6 +8,12 @@
   "payload_required": true,
   "args": [
     {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the preceding message in the settlement chain (match, prior settle phase, or deliver)."
+    },
+    {
       "name": "phase",
       "type": "enum",
       "required": true,
