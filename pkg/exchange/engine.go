@@ -82,6 +82,17 @@ type Engine struct {
 	state       *State
 	matchIndex  *matching.Index
 	lastCursor  int64 // received_at cursor: last processed message's received_at
+	// marshalFunc overrides json.Marshal for tests that need to inject marshal failures.
+	// Nil means use the standard json.Marshal.
+	marshalFunc func(v any) ([]byte, error)
+}
+
+// marshal calls marshalFunc if set, otherwise json.Marshal.
+func (e *Engine) marshal(v any) ([]byte, error) {
+	if e.marshalFunc != nil {
+		return e.marshalFunc(v)
+	}
+	return json.Marshal(v)
 }
 
 // NewEngine creates an exchange engine. Call Start to begin processing.
@@ -434,13 +445,30 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 				return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
 					buyerKey[:8], scrip.ErrBudgetExceeded, bal, holdAmount)
 			}
+
+			// Marshal the buy-hold convention message BEFORE mutating scrip state.
+			// If marshal fails, no balance mutation has occurred — return the error.
+			reservationID = newReservationID()
+			expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+			holdPayload, err := e.marshal(scrip.BuyHoldPayload{
+				Buyer:         buyerKey,
+				Amount:        holdAmount,
+				Price:         bestPrice,
+				Fee:           fee,
+				ReservationID: reservationID,
+				BuyMsg:        msg.ID,
+				ExpiresAt:     expiresAt,
+			})
+			if err != nil {
+				return fmt.Errorf("scrip: marshal buy-hold payload: %w", err)
+			}
+
 			_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
 			if err != nil {
 				return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", buyerKey[:8], err)
 			}
 
 			// Save reservation so settle/dispute can reference it.
-			reservationID = newReservationID()
 			res := scrip.Reservation{
 				ID:        reservationID,
 				AgentKey:  buyerKey,
@@ -456,21 +484,9 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 				buyerKey[:8], holdAmount, reservationID[:8])
 
 			// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
-			expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
-			holdPayload, err := json.Marshal(scrip.BuyHoldPayload{
-				Buyer:         buyerKey,
-				Amount:        holdAmount,
-				Price:         bestPrice,
-				Fee:           fee,
-				ReservationID: reservationID,
-				BuyMsg:        msg.ID,
-				ExpiresAt:     expiresAt,
-			})
-			if err == nil {
-				if emitErr := e.sendOperatorMessage(holdPayload,
-					[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
-					e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
-				}
+			if emitErr := e.sendOperatorMessage(holdPayload,
+				[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
+				e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
 			}
 		}
 	}
@@ -480,7 +496,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		meta["reservation_id"] = reservationID
 	}
 
-	matchPayload, err := json.Marshal(map[string]any{
+	matchPayload, err := e.marshal(map[string]any{
 		"results":     matchResults,
 		"search_meta": meta,
 	})
@@ -560,6 +576,33 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 
 	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
 
+	// Marshal both convention messages BEFORE mutating scrip state.
+	// If either marshal fails, no balance mutations have occurred — return the error.
+	settlePayload, err := e.marshal(scrip.SettlePayload{
+		ReservationID:   payload.ReservationID,
+		Seller:          sellerKey,
+		Residual:        residual,
+		FeeBurned:       fee,
+		ExchangeRevenue: exchangeRevenue,
+		MatchMsg:        msg.ID,
+		ResultHash:      "",
+	})
+	if err != nil {
+		return fmt.Errorf("scrip: marshal settle payload: %w", err)
+	}
+
+	var burnPayload []byte
+	if fee > 0 {
+		burnPayload, err = e.marshal(scrip.BurnPayload{
+			Amount:    fee,
+			Reason:    "matching-fee",
+			SourceMsg: msg.ID,
+		})
+		if err != nil {
+			return fmt.Errorf("scrip: marshal burn payload: %w", err)
+		}
+	}
+
 	// Credit residual to seller.
 	if residual > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, sellerKey, scrip.BalanceKey, residual, ""); err != nil {
@@ -575,34 +618,16 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	}
 
 	// Emit scrip-settle convention message so CampfireScripStore can replay it.
-	settlePayload, err := json.Marshal(scrip.SettlePayload{
-		ReservationID:   payload.ReservationID,
-		Seller:          sellerKey,
-		Residual:        residual,
-		FeeBurned:       fee,
-		ExchangeRevenue: exchangeRevenue,
-		MatchMsg:        msg.ID,
-		ResultHash:      "",
-	})
-	if err == nil {
-		if emitErr := e.sendOperatorMessage(settlePayload,
-			[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
-			e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
-		}
+	if emitErr := e.sendOperatorMessage(settlePayload,
+		[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
+		e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
 	}
 
 	// Emit scrip-burn for the matching fee (already removed from buyer's balance via buy-hold).
-	if fee > 0 {
-		burnPayload, err := json.Marshal(scrip.BurnPayload{
-			Amount:    fee,
-			Reason:    "matching-fee",
-			SourceMsg: msg.ID,
-		})
-		if err == nil {
-			if emitErr := e.sendOperatorMessage(burnPayload,
-				[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
-				e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
-			}
+	if len(burnPayload) > 0 {
+		if emitErr := e.sendOperatorMessage(burnPayload,
+			[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
+			e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
 		}
 	}
 
@@ -679,6 +704,24 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 			payload.ReservationID[:8], msg.Sender[:8], res.AgentKey[:8])
 	}
 
+	// Marshal the convention message BEFORE mutating scrip state.
+	// If marshal fails, restore the reservation (it was consumed above) and return the error.
+	refundPayload, err := e.marshal(scrip.DisputeRefundPayload{
+		Buyer:         res.AgentKey,
+		Amount:        res.Amount,
+		ReservationID: payload.ReservationID,
+		DisputeMsg:    msg.ID,
+	})
+	if err != nil {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after marshal failure: %v",
+				payload.ReservationID[:8], restoreErr)
+			return fmt.Errorf("scrip: dispute reservation %s: marshal failed AND restore failed (reservation lost): %w",
+				payload.ReservationID[:8], restoreErr)
+		}
+		return fmt.Errorf("scrip: marshal dispute-refund payload: %w", err)
+	}
+
 	// Refund the full held amount to the buyer.
 	// Use res.AgentKey (the trusted identity recorded at buy time), not payload.BuyerKey
 	// (attacker-controlled). The check above confirmed they match, but we always use the
@@ -688,17 +731,9 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	}
 
 	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
-	refundPayload, err := json.Marshal(scrip.DisputeRefundPayload{
-		Buyer:         res.AgentKey,
-		Amount:        res.Amount,
-		ReservationID: payload.ReservationID,
-		DisputeMsg:    msg.ID,
-	})
-	if err == nil {
-		if emitErr := e.sendOperatorMessage(refundPayload,
-			[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
-			e.opts.log("engine: warning: emit scrip-dispute-refund: %v", emitErr)
-		}
+	if emitErr := e.sendOperatorMessage(refundPayload,
+		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
+		e.opts.log("engine: warning: emit scrip-dispute-refund: %v", emitErr)
 	}
 
 	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
