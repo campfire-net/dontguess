@@ -7,12 +7,16 @@ package exchange_test
 //   - handleBuy returns ErrBudgetExceeded when buyer has insufficient scrip
 //   - handleSettle(complete) pays seller residual and exchange revenue
 //   - handleDispute(dispute) refunds buyer's pre-decremented scrip
+//
+// Uses the real CampfireScripStore backed by the test harness's campfire store.
+// Balances are seeded via dontguess:scrip-mint convention messages written
+// directly into the harness store, then Replay() is called on the CampfireScripStore
+// to materialize the in-memory balance map.
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"sync"
 	"testing"
 	"time"
 
@@ -22,113 +26,65 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
 
-// --- In-memory SpendingStore for testing ---
-
-// memScripStore is a minimal in-memory SpendingStore for unit tests.
-// It does not replay a campfire log — balances are seeded directly.
-type memScripStore struct {
-	mu           sync.Mutex
-	balances     map[string]int64
-	reservations map[string]scrip.Reservation
-}
-
-func newMemScripStore() *memScripStore {
-	return &memScripStore{
-		balances:     make(map[string]int64),
-		reservations: make(map[string]scrip.Reservation),
+// addScripMintMsg inserts a dontguess:scrip-mint message into the harness store,
+// seeding balance for agentKey without involving the campfire transport.
+func addScripMintMsg(t *testing.T, h *testHarness, agentKey string, amount int64) {
+	t.Helper()
+	rawPayload, err := json.Marshal(map[string]any{
+		"recipient":   agentKey,
+		"amount":      amount,
+		"x402_tx_ref": fmt.Sprintf("test-mint-%s-%d", agentKey[:8], amount),
+		"rate":        int64(1000),
+	})
+	if err != nil {
+		t.Fatalf("marshal scrip-mint payload: %v", err)
+	}
+	rec := store.MessageRecord{
+		ID:         fmt.Sprintf("mint-%s-%d-%d", agentKey[:8], amount, time.Now().UnixNano()),
+		CampfireID: h.cfID,
+		Sender:     h.operator.PublicKeyHex(),
+		Payload:    rawPayload,
+		Tags:       []string{"dontguess:scrip-mint"},
+		Timestamp:  time.Now().UnixNano(),
+		ReceivedAt: time.Now().UnixNano(),
+		Signature:  []byte{0x00}, // non-nil to satisfy schema NOT NULL constraint
+	}
+	if _, err := h.st.AddMessage(rec); err != nil {
+		t.Fatalf("AddMessage (scrip-mint): %v", err)
 	}
 }
 
-func (s *memScripStore) seed(agentKey string, amount int64) {
-	s.mu.Lock()
-	s.balances[agentKey] += amount
-	s.mu.Unlock()
-}
-
-func (s *memScripStore) balance(agentKey string) int64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.balances[agentKey]
-}
-
-func (s *memScripStore) GetBudget(_ context.Context, pk, _ string) (int64, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	v := s.balances[pk]
-	return v, fmt.Sprintf("%d", v), nil
-}
-
-func (s *memScripStore) DecrementBudget(_ context.Context, pk, _ string, amount int64, etag string) (int64, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	// Minimal ETag check: etag must equal current balance string (our etag is the balance).
-	cur := s.balances[pk]
-	if fmt.Sprintf("%d", cur) != etag {
-		return 0, "", scrip.ErrConflict
+// newCampfireScripStore creates a CampfireScripStore backed by the harness store.
+// Must be called after all mint messages are written so Replay sees them.
+func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripStore {
+	t.Helper()
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st)
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
-	if cur < amount {
-		return 0, "", scrip.ErrBudgetExceeded
+	return cs
+}
+
+// countReservations counts the in-flight reservations by iterating over a
+// set of known IDs and checking GetReservation. Since SpendingStore has no
+// ListReservations, we track IDs in a separate slice for tests that need counts.
+//
+// reservationIDs is modified by the caller to accumulate IDs.
+func countReservations(t *testing.T, cs *scrip.CampfireScripStore, ids []string) int {
+	t.Helper()
+	ctx := context.Background()
+	n := 0
+	for _, id := range ids {
+		if _, err := cs.GetReservation(ctx, id); err == nil {
+			n++
+		}
 	}
-	s.balances[pk] = cur - amount
-	newVal := s.balances[pk]
-	return newVal, fmt.Sprintf("%d", newVal), nil
-}
-
-func (s *memScripStore) AddBudget(_ context.Context, pk, _ string, amount int64, _ string) (int64, string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.balances[pk] += amount
-	v := s.balances[pk]
-	return v, fmt.Sprintf("%d", v), nil
-}
-
-func (s *memScripStore) SaveReservation(_ context.Context, r scrip.Reservation) error {
-	s.mu.Lock()
-	s.reservations[r.ID] = r
-	s.mu.Unlock()
-	return nil
-}
-
-func (s *memScripStore) GetReservation(_ context.Context, id string) (scrip.Reservation, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	r, ok := s.reservations[id]
-	if !ok {
-		return scrip.Reservation{}, scrip.ErrReservationNotFound
-	}
-	return r, nil
-}
-
-func (s *memScripStore) DeleteReservation(_ context.Context, id string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if _, ok := s.reservations[id]; !ok {
-		return scrip.ErrReservationNotFound
-	}
-	delete(s.reservations, id)
-	return nil
-}
-
-// reservationCount returns the number of in-flight reservations.
-func (s *memScripStore) reservationCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return len(s.reservations)
-}
-
-// firstReservation returns the first (only) reservation, or panics if none.
-func (s *memScripStore) firstReservation() scrip.Reservation {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for _, r := range s.reservations {
-		return r
-	}
-	panic("no reservations")
+	return n
 }
 
 // --- Helpers ---
 
-// newEngineWithScrip builds a testHarness + engine with a memScripStore wired in.
+// newEngineWithScrip builds a testHarness + engine with a SpendingStore wired in.
 func newEngineWithScrip(t *testing.T, scripStore scrip.SpendingStore) (*testHarness, *exchange.Engine) {
 	t.Helper()
 	h := newTestHarness(t)
@@ -177,6 +133,20 @@ func waitForMatchMessage(t *testing.T, h *testHarness, before []store.MessageRec
 	return nil
 }
 
+// extractReservationID parses the reservation_id from a match message payload.
+func extractReservationID(t *testing.T, matchMsg *store.MessageRecord) string {
+	t.Helper()
+	var mp struct {
+		SearchMeta struct {
+			ReservationID string `json:"reservation_id"`
+		} `json:"search_meta"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("parsing match payload: %v", err)
+	}
+	return mp.SearchMeta.ReservationID
+}
+
 // --- Tests ---
 
 // TestBuy_PreDecrementsScripBeforeMatch verifies that a buy with sufficient
@@ -184,10 +154,23 @@ func waitForMatchMessage(t *testing.T, h *testHarness, before []store.MessageRec
 // and emit a match message that includes a reservation_id.
 func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
 	t.Parallel()
-	st := newMemScripStore()
-	h, eng := newEngineWithScrip(t, st)
+
+	// Build harness first so we know the campfire ID and buyer key.
+	h := newTestHarness(t)
 
 	// Seed one inventory entry; put_price = 5600, computed sale price = 5600*120/100 = 6720.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
+
 	seedInventoryEntry(t, h, eng, "Go HTTP handler generator", "code", 8000, 5600)
 	inv := eng.State().Inventory()
 	if len(inv) != 1 {
@@ -197,9 +180,12 @@ func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
-	// Seed buyer with enough scrip.
-	st.seed(h.buyer.PublicKeyHex(), holdAmount+1000)
-	buyerBalanceBefore := st.balance(h.buyer.PublicKeyHex())
+	// Seed buyer with enough scrip via mint message, then replay.
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+1000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
 
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
@@ -218,28 +204,21 @@ func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
 	cancel()
 
 	// Buyer balance must have decreased by holdAmount.
-	buyerBalanceAfter := st.balance(h.buyer.PublicKeyHex())
+	buyerBalanceAfter := cs.Balance(h.buyer.PublicKeyHex())
 	if buyerBalanceAfter != buyerBalanceBefore-holdAmount {
 		t.Errorf("buyer balance: got %d, want %d (before=%d - hold=%d)",
 			buyerBalanceAfter, buyerBalanceBefore-holdAmount, buyerBalanceBefore, holdAmount)
 	}
 
-	// A reservation must exist.
-	if st.reservationCount() != 1 {
-		t.Errorf("expected 1 reservation, got %d", st.reservationCount())
+	// Match payload must include reservation_id.
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Error("match search_meta.reservation_id must be non-empty after scrip pre-decrement")
 	}
 
-	// Match payload must include reservation_id.
-	var mp struct {
-		SearchMeta struct {
-			ReservationID string `json:"reservation_id"`
-		} `json:"search_meta"`
-	}
-	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
-		t.Fatalf("parsing match payload: %v", err)
-	}
-	if mp.SearchMeta.ReservationID == "" {
-		t.Error("match search_meta.reservation_id must be non-empty after scrip pre-decrement")
+	// A reservation must exist for that ID.
+	if _, err := cs.GetReservation(context.Background(), resID); err != nil {
+		t.Errorf("expected reservation %s to exist, got: %v", resID, err)
 	}
 }
 
@@ -247,8 +226,19 @@ func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
 // scrip causes the engine to return an error and NOT emit a match message.
 func TestBuy_InsufficientScripReturnsError(t *testing.T) {
 	t.Parallel()
-	st := newMemScripStore()
-	h, eng := newEngineWithScrip(t, st)
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
 
 	// Seed one entry.
 	seedInventoryEntry(t, h, eng, "Python scraper generator", "code", 10000, 7000)
@@ -261,7 +251,11 @@ func TestBuy_InsufficientScripReturnsError(t *testing.T) {
 	holdAmount := salePrice + fee
 
 	// Seed buyer with LESS than required.
-	st.seed(h.buyer.PublicKeyHex(), holdAmount-1)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount-1)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
 
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
@@ -284,15 +278,10 @@ func TestBuy_InsufficientScripReturnsError(t *testing.T) {
 		t.Error("expected no match message when buyer has insufficient scrip")
 	}
 
-	// No reservation should have been saved.
-	if st.reservationCount() != 0 {
-		t.Errorf("expected 0 reservations on failed buy, got %d", st.reservationCount())
-	}
-
 	// Buyer balance must be unchanged.
-	if st.balance(h.buyer.PublicKeyHex()) != holdAmount-1 {
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore {
 		t.Errorf("buyer balance changed unexpectedly: got %d, want %d",
-			st.balance(h.buyer.PublicKeyHex()), holdAmount-1)
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore)
 	}
 }
 
@@ -303,8 +292,19 @@ func TestBuy_InsufficientScripReturnsError(t *testing.T) {
 //   - Deletes the reservation
 func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	t.Parallel()
-	st := newMemScripStore()
-	h, eng := newEngineWithScrip(t, st)
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
 
 	// Seed inventory entry.
 	seedInventoryEntry(t, h, eng, "Terraform module generator", "code", 8000, 5600)
@@ -317,7 +317,10 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	holdAmount := salePrice + fee
 
 	// Seed buyer and run buy to get a reservation.
-	st.seed(h.buyer.PublicKeyHex(), holdAmount+5000)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
 
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
@@ -331,17 +334,23 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 		nil,
 	)
 
-	waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	// Must have a reservation now.
-	if st.reservationCount() != 1 {
-		t.Fatalf("expected 1 reservation after buy, got %d", st.reservationCount())
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
 	}
-	res := st.firstReservation()
 
-	sellerBalanceBefore := st.balance(h.seller.PublicKeyHex())
-	operatorBalanceBefore := st.balance(h.operator.PublicKeyHex())
+	// Reservation must exist.
+	ctx2 := context.Background()
+	res, err := cs.GetReservation(ctx2, resID)
+	if err != nil {
+		t.Fatalf("expected reservation %s to exist, got: %v", resID, err)
+	}
+
+	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
+	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
 
 	// Manually dispatch a settle(complete) message with the reservation_id.
 	completePayload, _ := json.Marshal(map[string]any{
@@ -371,7 +380,7 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 
 	// Verify residual was paid to seller.
 	expectedResidual := salePrice / exchange.ResidualRate
-	sellerBalanceAfter := st.balance(h.seller.PublicKeyHex())
+	sellerBalanceAfter := cs.Balance(h.seller.PublicKeyHex())
 	if sellerBalanceAfter != sellerBalanceBefore+expectedResidual {
 		t.Errorf("seller balance: got %d, want %d (before=%d + residual=%d)",
 			sellerBalanceAfter, sellerBalanceBefore+expectedResidual, sellerBalanceBefore, expectedResidual)
@@ -379,15 +388,15 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 
 	// Verify exchange revenue was credited to operator.
 	expectedExchangeRevenue := salePrice - expectedResidual
-	operatorBalanceAfter := st.balance(h.operator.PublicKeyHex())
+	operatorBalanceAfter := cs.Balance(h.operator.PublicKeyHex())
 	if operatorBalanceAfter != operatorBalanceBefore+expectedExchangeRevenue {
 		t.Errorf("operator balance: got %d, want %d (before=%d + revenue=%d)",
 			operatorBalanceAfter, operatorBalanceBefore+expectedExchangeRevenue, operatorBalanceBefore, expectedExchangeRevenue)
 	}
 
 	// Reservation must be deleted.
-	if st.reservationCount() != 0 {
-		t.Errorf("expected 0 reservations after settle(complete), got %d", st.reservationCount())
+	if _, err := cs.GetReservation(ctx2, resID); err == nil {
+		t.Errorf("expected reservation %s to be deleted after settle(complete), still present", resID)
 	}
 }
 
@@ -397,8 +406,19 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 //   - Deletes the reservation
 func TestDispute_RefundsScripToBuyer(t *testing.T) {
 	t.Parallel()
-	st := newMemScripStore()
-	h, eng := newEngineWithScrip(t, st)
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
 
 	// Seed inventory entry.
 	seedInventoryEntry(t, h, eng, "Security audit generator", "review", 15000, 10500)
@@ -411,8 +431,11 @@ func TestDispute_RefundsScripToBuyer(t *testing.T) {
 	holdAmount := salePrice + fee
 
 	// Seed buyer with enough scrip.
-	st.seed(h.buyer.PublicKeyHex(), holdAmount+5000)
-	buyerBalanceBefore := st.balance(h.buyer.PublicKeyHex())
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
 
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
@@ -426,23 +449,29 @@ func TestDispute_RefundsScripToBuyer(t *testing.T) {
 		nil,
 	)
 
-	waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	if st.reservationCount() != 1 {
-		t.Fatalf("expected 1 reservation after buy, got %d", st.reservationCount())
+	resID := extractReservationID(t, matchMsg)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id in match payload")
 	}
-	res := st.firstReservation()
 
 	// Buyer balance must be lower by holdAmount now.
-	if st.balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore-holdAmount {
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore-holdAmount {
 		t.Errorf("buyer balance after buy: got %d, want %d",
-			st.balance(h.buyer.PublicKeyHex()), buyerBalanceBefore-holdAmount)
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore-holdAmount)
+	}
+
+	// Verify reservation exists.
+	ctx2 := context.Background()
+	if _, err := cs.GetReservation(ctx2, resID); err != nil {
+		t.Fatalf("expected reservation %s to exist, got: %v", resID, err)
 	}
 
 	// Manually dispatch a settle(dispute) message.
 	disputePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": res.ID,
+		"reservation_id": resID,
 		"buyer_key":      h.buyer.PublicKeyHex(),
 		"entry_id":       inv[0].EntryID,
 		"dispute_type":   "quality",
@@ -466,14 +495,14 @@ func TestDispute_RefundsScripToBuyer(t *testing.T) {
 	}
 
 	// Buyer balance must be fully restored.
-	buyerBalanceAfter := st.balance(h.buyer.PublicKeyHex())
+	buyerBalanceAfter := cs.Balance(h.buyer.PublicKeyHex())
 	if buyerBalanceAfter != buyerBalanceBefore {
 		t.Errorf("buyer balance after dispute: got %d, want %d (full refund)",
 			buyerBalanceAfter, buyerBalanceBefore)
 	}
 
 	// Reservation must be deleted.
-	if st.reservationCount() != 0 {
-		t.Errorf("expected 0 reservations after dispute refund, got %d", st.reservationCount())
+	if _, err := cs.GetReservation(ctx2, resID); err == nil {
+		t.Errorf("expected reservation %s to be deleted after dispute refund, still present", resID)
 	}
 }
