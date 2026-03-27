@@ -216,7 +216,12 @@ type State struct {
 
 	// matchToEntry maps a match message ID to the entry it offered.
 	// Used to find the entry when a buyer settles.
+	// After buyer-accept selects a specific entry, this is updated to that entry.
 	matchToEntry map[string]string
+
+	// matchToResults maps a match message ID to all offered entry IDs.
+	// Used by applySettleBuyerAccept to validate the buyer's selected entry_id.
+	matchToResults map[string][]string
 
 	// settleCounts tracks buy message IDs that have a settle(buyer-accept).
 	// Key: buy message ID. Value: entry ID accepted.
@@ -260,6 +265,7 @@ func NewState() *State {
 		putToEntry:         make(map[string]string),
 		matchToBuyer:       make(map[string]string),
 		matchToEntry:       make(map[string]string),
+		matchToResults:     make(map[string][]string),
 		acceptedOrders:     make(map[string]string),
 		buyerAcceptToMatch: make(map[string]string),
 		deliveredOrders:    make(map[string]struct{}),
@@ -285,6 +291,7 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.putToEntry = make(map[string]string)
 	s.matchToBuyer = make(map[string]string)
 	s.matchToEntry = make(map[string]string)
+	s.matchToResults = make(map[string][]string)
 	s.acceptedOrders = make(map[string]string)
 	s.buyerAcceptToMatch = make(map[string]string)
 	s.deliveredOrders = make(map[string]struct{})
@@ -431,7 +438,9 @@ func (s *State) applyMatch(msg *store.MessageRecord) {
 		s.matchToBuyer[msg.ID] = order.BuyerKey
 	}
 
-	// Extract first result's entry_id for match→entry mapping.
+	// Extract all result entry_ids.
+	// matchToResults tracks the full set for buyer-accept validation.
+	// matchToEntry is pre-populated with the first result as the default selection.
 	var payload struct {
 		Results []struct {
 			EntryID string `json:"entry_id"`
@@ -439,6 +448,13 @@ func (s *State) applyMatch(msg *store.MessageRecord) {
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err == nil && len(payload.Results) > 0 {
 		s.matchToEntry[msg.ID] = payload.Results[0].EntryID
+		entryIDs := make([]string, 0, len(payload.Results))
+		for _, r := range payload.Results {
+			if r.EntryID != "" {
+				entryIDs = append(entryIDs, r.EntryID)
+			}
+		}
+		s.matchToResults[msg.ID] = entryIDs
 	}
 }
 
@@ -520,9 +536,32 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 		return
 	}
 
-	entryID := s.matchToEntry[matchMsgID]
-	if entryID != "" {
-		s.acceptedOrders[matchMsgID] = entryID
+	// Parse selected entry_id from buyer-accept payload.
+	var payload struct {
+		EntryID string `json:"entry_id"`
+	}
+	var selectedEntry string
+	if err := json.Unmarshal(msg.Payload, &payload); err == nil && payload.EntryID != "" {
+		// Validate that the selected entry_id is one of the offered results.
+		if validResults, ok := s.matchToResults[matchMsgID]; ok {
+			for _, eid := range validResults {
+				if eid == payload.EntryID {
+					selectedEntry = payload.EntryID
+					break
+				}
+			}
+		}
+	}
+	// Fall back to first result if no valid selection provided.
+	if selectedEntry == "" {
+		selectedEntry = s.matchToEntry[matchMsgID]
+	}
+
+	if selectedEntry != "" {
+		s.acceptedOrders[matchMsgID] = selectedEntry
+		// Update matchToEntry to the selected entry so the downstream chain
+		// (deliver → complete) resolves to the buyer's chosen entry.
+		s.matchToEntry[matchMsgID] = selectedEntry
 	}
 	// Record buyer-accept → match mapping so deliver can trace the chain.
 	s.buyerAcceptToMatch[msg.ID] = matchMsgID
