@@ -1,0 +1,53 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign-reject",
+  "description": "Reject completed maintenance work. No scrip is paid. For convergence tasks: fires when all 3 workers disagree (no 2-of-3 majority); the assignment is re-posted with an escalated bounty (1.5x). For algorithmic tasks: fires when metrics fail (compression < 30% reduction, similarity < 0.85, or enrichment improvement < 20%). Rejection counts toward the worker's reject rate (> 50% in last 10 = ineligible for future claims).",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:assign-complete message being rejected."
+    },
+    {
+      "name": "reason",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "convergence_no_majority",
+        "insufficient_reduction",
+        "low_similarity",
+        "insufficient_enrichment",
+        "invalid_output",
+        "timeout"
+      ],
+      "description": "Reason for rejection."
+    },
+    {
+      "name": "reason_detail",
+      "type": "string",
+      "max_length": 1024,
+      "description": "Human-readable detail about the rejection reason. E.g., 'size reduction was 18%, minimum 30%' or 'all 3 verdicts differ: pass, fail, pass-with-caveats'."
+    },
+    {
+      "name": "escalate",
+      "type": "boolean",
+      "description": "Whether the assignment should be re-posted with a higher bounty. True when convergence_no_majority and the entry is high-value."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign-reject",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 100,
+    "per": "sender",
+    "window": "1h"
+  }
+}
