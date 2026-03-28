@@ -55,8 +55,6 @@ func TestPreviewDeterministic(t *testing.T) {
 		Content:     content,
 		ContentType: "analysis",
 		EntryID:     "entry-abc",
-		BuyerKey:    "buyer-xyz",
-		MatchID:     "match-123",
 	}
 
 	r1, err := pa.Assemble(req)
@@ -81,10 +79,13 @@ func TestPreviewDeterministic(t *testing.T) {
 	}
 }
 
-// TestPreviewDeterministicSeedDriven verifies that chunk positions are driven by the seed
-// (entryID, buyerKey, matchID), not by random state or content alone.
-// - Same seed + different content → positions are seed-driven (not content-hash-driven).
-// - Same content + different seeds → different chunk positions.
+// TestPreviewDeterministicSeedDriven verifies that chunk positions are driven by the
+// entry_id seed only (dontguess-nh4 fix).
+//
+// Properties:
+//   - Same entry_id + same content → same chunk positions (deterministic).
+//   - Different entry_ids + same content → different chunk positions.
+//   - Buyer identity and match ID do not affect chunk selection.
 func TestPreviewDeterministicSeedDriven(t *testing.T) {
 	// Build two different contents of the same size so chunk count is equal.
 	contentA := generateProse(2000)
@@ -92,21 +93,19 @@ func TestPreviewDeterministicSeedDriven(t *testing.T) {
 	contentB := []byte(strings.ReplaceAll(string(contentA), "word", "text"))
 
 	entryID := "entry-seed-test"
-	buyerKey := "buyer-seed-test"
-	matchID := "match-seed-test"
 
-	// Same seed, different content — positions should differ (content is different).
-	rA, err := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	// Same entry_id, different content — both results must be individually deterministic.
+	rA, err := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID})
 	if err != nil {
 		t.Fatalf("Assemble A: %v", err)
 	}
-	rB, err := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	rB, err := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID})
 	if err != nil {
 		t.Fatalf("Assemble B: %v", err)
 	}
 	// Both results must be deterministic when called again with the same inputs.
-	rA2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
-	rB2, _ := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	rA2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID})
+	rB2, _ := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID})
 	for i := range rA.Chunks {
 		if rA.Chunks[i].StartByte != rA2.Chunks[i].StartByte {
 			t.Errorf("content A not deterministic: chunk %d start %d vs %d", i, rA.Chunks[i].StartByte, rA2.Chunks[i].StartByte)
@@ -118,9 +117,9 @@ func TestPreviewDeterministicSeedDriven(t *testing.T) {
 		}
 	}
 
-	// Same content + different seeds → different chunk positions.
-	rSeed1, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "e1", BuyerKey: "b1", MatchID: "m1"})
-	rSeed2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "e2", BuyerKey: "b2", MatchID: "m2"})
+	// Same content + different entry_ids → different chunk positions.
+	rSeed1, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "entry-one"})
+	rSeed2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "entry-two"})
 	allSame := true
 	if len(rSeed1.Chunks) == len(rSeed2.Chunks) {
 		for i := range rSeed1.Chunks {
@@ -133,7 +132,7 @@ func TestPreviewDeterministicSeedDriven(t *testing.T) {
 		allSame = false
 	}
 	if allSame {
-		t.Error("same content + different seeds produced identical chunk positions — seeding is broken")
+		t.Error("same content + different entry_ids produced identical chunk positions — seeding is broken")
 	}
 	_ = rA
 	_ = rB
@@ -142,8 +141,8 @@ func TestPreviewDeterministicSeedDriven(t *testing.T) {
 func TestPreviewDifferentSeeds(t *testing.T) {
 	content := generateProse(2000)
 
-	req1 := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e1", BuyerKey: "b1", MatchID: "m1"}
-	req2 := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e2", BuyerKey: "b2", MatchID: "m2"}
+	req1 := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e1"}
+	req2 := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e2"}
 
 	r1, _ := pa.Assemble(req1)
 	r2, _ := pa.Assemble(req2)
@@ -170,7 +169,7 @@ func TestPreviewDifferentSeeds(t *testing.T) {
 
 func TestPreviewFiveChunksLargeContent(t *testing.T) {
 	content := generateProse(3000) // well above 500-token threshold
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -184,7 +183,7 @@ func TestPreviewFiveChunksLargeContent(t *testing.T) {
 func TestPreviewReducedChunksSmallContent(t *testing.T) {
 	// ~250 tokens: fits 2 min-100-token chunks (250/100 = 2)
 	content := generateProse(250)
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -269,7 +268,7 @@ func TestPreviewChunkCountAtBoundaries(t *testing.T) {
 				t.Fatalf("makeExactTokenContent(%d) produced %d tokens (len=%d) — helper is wrong",
 					tc.tokens, actualTokens, len(content))
 			}
-			req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+			req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 			r, err := pa.Assemble(req)
 			if err != nil {
 				t.Fatalf("Assemble: %v", err)
@@ -292,7 +291,7 @@ func TestPreviewChunkCountAtBoundaries(t *testing.T) {
 func TestPreviewSingleChunkBelowMinTokens(t *testing.T) {
 	// Content with < 100 tokens (< 400 bytes)
 	content := []byte(strings.Repeat("a ", 40)) // 40 "words" ≈ 80 bytes ≈ 20 tokens
-	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -311,7 +310,7 @@ func TestPreviewSingleChunkBelowMinTokens(t *testing.T) {
 }
 
 func TestPreviewEmptyContent(t *testing.T) {
-	req := PreviewRequest{Content: []byte{}, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: []byte{}, ContentType: "other", EntryID: "e"}
 	r, err := pa.Assemble(req)
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
@@ -322,7 +321,7 @@ func TestPreviewEmptyContent(t *testing.T) {
 }
 
 func TestPreviewNilContent(t *testing.T) {
-	req := PreviewRequest{Content: nil, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: nil, ContentType: "other", EntryID: "e"}
 	r, err := pa.Assemble(req)
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
@@ -335,7 +334,7 @@ func TestPreviewNilContent(t *testing.T) {
 func TestPreviewSingleLine(t *testing.T) {
 	// A single very long line with no newlines — boundary detection falls back to 0/len
 	content := []byte(strings.Repeat("word ", 600)) // ~600 words ≈ 600 tokens
-	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -362,7 +361,7 @@ func TestPreviewSingleLine(t *testing.T) {
 func TestPreviewCodeBoundaries(t *testing.T) {
 	// Generate code with dense func declarations to ensure many boundaries.
 	content := generateCode(1500)
-	req := PreviewRequest{Content: content, ContentType: "code", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "code", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -419,7 +418,7 @@ func TestPreviewCodeBoundaries(t *testing.T) {
 // TestPreviewPlanParagraphBoundaries verifies 'plan' content snaps to paragraph boundaries.
 func TestPreviewPlanParagraphBoundaries(t *testing.T) {
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "plan", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "plan", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -442,7 +441,7 @@ func TestPreviewPlanParagraphBoundaries(t *testing.T) {
 // TestPreviewReviewParagraphBoundaries verifies 'review' content snaps to paragraph boundaries.
 func TestPreviewReviewParagraphBoundaries(t *testing.T) {
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "review", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "review", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -470,7 +469,7 @@ func TestPreviewOtherNewlineBoundaries(t *testing.T) {
 		sb.WriteString(fmt.Sprintf("line %d: some content here for padding purposes\n", i))
 	}
 	content := []byte(sb.String())
-	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -493,7 +492,7 @@ func TestPreviewOtherNewlineBoundaries(t *testing.T) {
 func TestPreviewProseParagraphBoundaries(t *testing.T) {
 	// Prose with clear paragraph boundaries
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "summary", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "summary", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -516,7 +515,7 @@ func TestPreviewProseParagraphBoundaries(t *testing.T) {
 
 func TestPreviewDataLineBoundaries(t *testing.T) {
 	content := generateData(2000)
-	req := PreviewRequest{Content: content, ContentType: "data", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "data", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -541,7 +540,7 @@ func TestPreviewDataLineBoundaries(t *testing.T) {
 func TestPreviewMinTokensEnforced(t *testing.T) {
 	// Large content but we want to verify each chunk meets the minimum
 	content := generateProse(3000)
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -559,7 +558,7 @@ func TestPreviewMinTokensEnforced(t *testing.T) {
 
 func TestPreviewChunkBoundsValid(t *testing.T) {
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -585,7 +584,7 @@ func TestPreviewChunkBoundsValid(t *testing.T) {
 
 func TestPreviewTokenSummary(t *testing.T) {
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -615,23 +614,22 @@ func TestPreviewTokenSummary(t *testing.T) {
 // ---- Seed derivation ----
 
 func TestDeriveSeedUniqueness(t *testing.T) {
-	// Different inputs must produce different seeds
+	// Different entry_ids must produce different seeds.
+	// After dontguess-nh4: seed is derived from entry_id only.
 	seeds := map[uint64]string{}
-	cases := [][3]string{
-		{"entry-1", "buyer-1", "match-1"},
-		{"entry-2", "buyer-1", "match-1"},
-		{"entry-1", "buyer-2", "match-1"},
-		{"entry-1", "buyer-1", "match-2"},
-		{"", "", ""},
-		{"a", "b", "c"},
+	cases := []string{
+		"entry-1",
+		"entry-2",
+		"entry-abc",
+		"a",
+		"entry-long-identifier-with-extra-characters",
 	}
-	for _, tc := range cases {
-		s := deriveSeed(tc[0], tc[1], tc[2])
-		key := fmt.Sprintf("%s|%s|%s", tc[0], tc[1], tc[2])
+	for _, entryID := range cases {
+		s := deriveSeed(entryID)
 		if prev, ok := seeds[s]; ok {
-			t.Errorf("seed collision: %s and %s both produce %d", key, prev, s)
+			t.Errorf("seed collision: %q and %q both produce %d", entryID, prev, s)
 		}
-		seeds[s] = key
+		seeds[s] = entryID
 	}
 }
 
@@ -698,7 +696,7 @@ func TestXorShift64ZeroSeedFallback(t *testing.T) {
 // and are monotonically increasing alongside StartByte.
 func TestPreviewChunkIndexAssigned(t *testing.T) {
 	content := generateProse(2000)
-	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e"}
 
 	r, err := pa.Assemble(req)
 	if err != nil {
@@ -740,101 +738,91 @@ func TestPreviewChunkIndexAssigned(t *testing.T) {
 	}
 }
 
-// ---- Anti-reconstruction exposure bound (Finding 5) ----
+// ---- Anti-reconstruction: same entry_id invariant (dontguess-nh4) ----
 
-// TestPreviewAntiReconstructionExposureBound documents the exposure bound when
-// the same (entryID, buyerKey) are used across many different matchIDs.
+// TestPreviewSameEntryIDSamePreviewForAllBuyers verifies the core security property
+// fixed in dontguess-nh4: the same entry_id always produces the same preview,
+// regardless of buyer identity or match ID.
 //
-// Design intent: each matchID is a separate transaction — different chunks per match
-// is intentional economic friction. This test does NOT assert that reconstruction is
-// impossible; it documents how much of the content is exposed across N transactions,
-// so the bound is known and visible as a test assertion.
+// Before the fix, seed = SHA256(entry_id + buyer_key + match_id). Different buyers
+// or different match IDs produced different chunk selections, enabling reconstruction:
+// an attacker could create many buy orders and collect different preview slices to
+// reconstruct full content without paying.
 //
-// The test asserts that no single matchID alone reveals the full content (each
-// transaction is still partial), while acknowledging that N transactions together
-// may cover a larger fraction.
-func TestPreviewAntiReconstructionExposureBound(t *testing.T) {
-	const numMatchIDs = 50
+// After the fix, seed = SHA256(entry_id) only. All buyers see the same chunks.
+// Reconstruction via multiple buy orders is blocked.
+func TestPreviewSameEntryIDSamePreviewForAllBuyers(t *testing.T) {
+	content := generateProse(2000)
+	entryID := "entry-reconstruction-guard-test"
+
+	// Canonical preview: what the entry looks like to all buyers.
+	canonical, err := pa.Assemble(PreviewRequest{
+		Content:     content,
+		ContentType: "analysis",
+		EntryID:     entryID,
+	})
+	if err != nil {
+		t.Fatalf("canonical Assemble: %v", err)
+	}
+	if len(canonical.Chunks) == 0 {
+		t.Fatal("canonical preview produced no chunks")
+	}
+
+	// Simulate multiple buyers requesting the same entry preview.
+	// All must receive exactly the same chunks regardless of buyer identity.
+	for i := 0; i < 10; i++ {
+		r, err2 := pa.Assemble(PreviewRequest{
+			Content:     content,
+			ContentType: "analysis",
+			EntryID:     entryID,
+		})
+		if err2 != nil {
+			t.Fatalf("Assemble buyer %d: %v", i, err2)
+		}
+		if len(r.Chunks) != len(canonical.Chunks) {
+			t.Errorf("buyer %d: got %d chunks, want %d", i, len(r.Chunks), len(canonical.Chunks))
+			continue
+		}
+		for j, c := range r.Chunks {
+			if c.StartByte != canonical.Chunks[j].StartByte || c.Content != canonical.Chunks[j].Content {
+				t.Errorf("buyer %d chunk %d: differs from canonical", i, j)
+			}
+		}
+	}
+}
+
+// TestPreviewExposureBoundPerEntry documents the single-entry exposure bound.
+// With seed = entry_id only, the exposure per entry is fixed at ~20% per preview.
+func TestPreviewExposureBoundPerEntry(t *testing.T) {
 	content := generateProse(2000)
 	contentLen := len(content)
 
+	r, err := pa.Assemble(PreviewRequest{
+		Content:     content,
+		ContentType: "analysis",
+		EntryID:     "entry-exposure-bound-test",
+	})
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+
 	exposed := make([]bool, contentLen)
-	exposedPerMatch := make([]int, numMatchIDs)
-
-	for i := 0; i < numMatchIDs; i++ {
-		matchID := fmt.Sprintf("match-%04d", i)
-		req := PreviewRequest{
-			Content:     content,
-			ContentType: "analysis",
-			EntryID:     "entry-reconstruct-test",
-			BuyerKey:    "buyer-reconstruct-test",
-			MatchID:     matchID,
-		}
-		r, err := pa.Assemble(req)
-		if err != nil {
-			t.Fatalf("Assemble matchID=%s: %v", matchID, err)
-		}
-
-		matchExposed := 0
-		for _, c := range r.Chunks {
-			for b := c.StartByte; b < c.EndByte && b < contentLen; b++ {
-				if !exposed[b] {
-					exposed[b] = true
-				}
-				matchExposed++
+	totalBytes := 0
+	for _, c := range r.Chunks {
+		for b := c.StartByte; b < c.EndByte && b < contentLen; b++ {
+			if !exposed[b] {
+				exposed[b] = true
 			}
-		}
-		exposedPerMatch[i] = matchExposed
-	}
-
-	// Count total unique bytes exposed.
-	totalExposed := 0
-	for _, v := range exposed {
-		if v {
-			totalExposed++
+			totalBytes++
 		}
 	}
-	exposurePct := float64(totalExposed) / float64(contentLen) * 100.0
+	exposurePct := float64(totalBytes) / float64(contentLen) * 100.0
+	t.Logf("single-entry exposure: %d bytes (%.1f%%) of %d total", totalBytes, exposurePct, contentLen)
 
-	// Each individual match must expose less than 30% of content (the 5×4%=20% target,
-	// with some headroom for minimum-token enforcement extension).
-	for i, me := range exposedPerMatch {
-		pct := float64(me) / float64(contentLen) * 100.0
-		if pct > 30.0 {
-			t.Errorf("match %d exposed %.1f%% of content (>30%%), single-match exposure too high", i, pct)
-		}
+	if exposurePct > 30.0 {
+		t.Errorf("single preview exposed %.1f%% (>30%%)", exposurePct)
 	}
-
-	// Document the cumulative bound. We don't assert a hard upper limit on cumulative
-	// exposure (it's expected to grow with N), but we log it so regressions are visible.
-	t.Logf("exposure bound: %d unique bytes (%.1f%%) exposed across %d match transactions (content=%d bytes)",
-		totalExposed, exposurePct, numMatchIDs, contentLen)
-
-	// The cumulative exposure across 50 transactions should not exceed 100% trivially —
-	// if it does within 50 matchIDs the chunking is effectively reconstructing the full content.
-	// With 5 chunks × 4% = 20% per match, even with no overlap, 50 matches × 20% = 1000%
-	// of theoretical coverage, so by ~5 matches we'd expect near-full coverage unless
-	// the chunking varies well. This is an intentional design trade-off, not a bug.
-	// We assert instead that unique byte coverage grows (chunks are actually different):
-	if numMatchIDs > 1 {
-		// Verify at least 2 distinct matchIDs produced different chunks (non-constant chunking).
-		req0 := PreviewRequest{Content: content, ContentType: "analysis",
-			EntryID: "entry-reconstruct-test", BuyerKey: "buyer-reconstruct-test", MatchID: "match-0000"}
-		req1 := PreviewRequest{Content: content, ContentType: "analysis",
-			EntryID: "entry-reconstruct-test", BuyerKey: "buyer-reconstruct-test", MatchID: "match-0001"}
-		r0, _ := pa.Assemble(req0)
-		r1, _ := pa.Assemble(req1)
-		identical := len(r0.Chunks) == len(r1.Chunks)
-		if identical {
-			for i := range r0.Chunks {
-				if r0.Chunks[i].StartByte != r1.Chunks[i].StartByte {
-					identical = false
-					break
-				}
-			}
-		}
-		if identical {
-			t.Error("different matchIDs produced identical chunk positions — matchID is not influencing chunking")
-		}
+	if exposurePct < 10.0 {
+		t.Errorf("single preview exposed only %.1f%% (<10%%) -- degenerate chunking", exposurePct)
 	}
 }

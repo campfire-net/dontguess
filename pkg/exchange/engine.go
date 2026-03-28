@@ -881,8 +881,7 @@ func (e *Engine) handleSettlePreviewRequest(msg *store.MessageRecord) error {
 		Content:     nil, // stub: real content delivery is a future concern
 		ContentType: entry.ContentType,
 		EntryID:     entry.EntryID,
-		BuyerKey:    msg.Sender,
-		MatchID:     matchMsgID,
+		// Seed is entry_id only — all buyers see the same deterministic preview.
 	})
 	if err != nil {
 		return fmt.Errorf("engine: preview-request: assemble preview for entry %s: %w", shortKey(entry.EntryID), err)
