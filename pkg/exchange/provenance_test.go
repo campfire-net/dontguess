@@ -9,13 +9,20 @@ import (
 	"github.com/campfire-net/campfire/pkg/provenance"
 )
 
+// testClock is a fixed point in time used as the reference "now" in all
+// makeStore-based tests. Using a fixed clock makes freshness assertions
+// deterministic — no test can flake due to wall-clock drift.
+var testClock = time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
 // makeStore returns a provenance.Store with a trusted verifier and a set of keys
-// at specific levels:
+// at specific levels as evaluated at testClock:
 //
 //	"key-anon"        → LevelAnonymous (0) — no attestation
 //	"key-claimed"     → LevelClaimed  (1) — self-claimed profile
-//	"key-contactable" → LevelContactable (2) — attested by trusted verifier (stale)
-//	"key-present"     → LevelPresent  (3) — attested by trusted verifier (fresh)
+//	"key-contactable" → LevelContactable (2) — attested by trusted verifier (stale relative to testClock)
+//	"key-present"     → LevelPresent  (3) — attested by trusted verifier (fresh relative to testClock)
+//
+// Freshness is evaluated using CheckAt(…, testClock) — see TestCheckAt_FreshnessAtFixedClock.
 func makeStore(t *testing.T) *provenance.Store {
 	t.Helper()
 
@@ -29,9 +36,9 @@ func makeStore(t *testing.T) *provenance.Store {
 	// key-claimed: self-asserted profile → level 1
 	store.SetSelfClaimed("key-claimed")
 
-	// key-contactable: attested by trusted verifier but attestation is older than
-	// freshness window → level 2 (contactable, not present)
-	stale := time.Now().Add(-30 * 24 * time.Hour) // 30 days ago — outside 7-day window
+	// key-contactable: attested 30 days before testClock — outside 7-day freshness window
+	// → level 2 (contactable, not present) when evaluated at testClock.
+	stale := testClock.Add(-30 * 24 * time.Hour)
 	err := store.AddAttestation(&provenance.Attestation{
 		ID:          "att-contactable",
 		TargetKey:   "key-contactable",
@@ -43,8 +50,9 @@ func makeStore(t *testing.T) *provenance.Store {
 		t.Fatalf("AddAttestation key-contactable: %v", err)
 	}
 
-	// key-present: attested by trusted verifier within freshness window → level 3
-	fresh := time.Now().Add(-1 * time.Hour) // 1 hour ago — within 7-day window
+	// key-present: attested 1 hour before testClock — within 7-day freshness window
+	// → level 3 (present) when evaluated at testClock.
+	fresh := testClock.Add(-1 * time.Hour)
 	err = store.AddAttestation(&provenance.Attestation{
 		ID:          "att-present",
 		TargetKey:   "key-present",
@@ -223,7 +231,9 @@ func TestCheck_ProvenanceLevelMatrix(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := checker.Check(tc.senderKey, tc.op, tc.phase)
+			// Use CheckAt with the fixed testClock so freshness is deterministic:
+			// key-present is "fresh" at testClock; key-contactable is "stale".
+			err := checker.CheckAt(tc.senderKey, tc.op, tc.phase, testClock)
 			if tc.wantErr && err == nil {
 				t.Errorf("expected rejection, got nil")
 			}
@@ -263,6 +273,50 @@ func TestCheck_UnknownKeyDefaultsToAnonymous(t *testing.T) {
 	}
 	if !errors.Is(err, exchange.ErrInsufficientProvenance) {
 		t.Errorf("expected ErrInsufficientProvenance, got: %v", err)
+	}
+}
+
+// TestCheckAt_FreshnessAtFixedClock demonstrates the primary value of CheckAt:
+// deterministic freshness evaluation. It verifies that:
+//
+//  1. At testClock, key-present (attested 1 hour before testClock) is LevelPresent
+//     and passes operations that require LevelPresent (e.g., match, mint).
+//  2. At a time far after the attestation (outside the 7-day freshness window),
+//     the same key drops to LevelContactable and is rejected for present-only ops.
+//
+// Without CheckAt, the second scenario can only be tested by manipulating the
+// wall clock or waiting — both are unsuitable for fast unit tests.
+func TestCheckAt_FreshnessAtFixedClock(t *testing.T) {
+	store := makeStore(t)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
+
+	// At testClock: key-present is fresh (attested testClock-1h, window=7d) → LevelPresent.
+	// Operations requiring LevelPresent (mint, match) must succeed.
+	if err := checker.CheckAt("key-present", exchange.OperationMint, "", testClock); err != nil {
+		t.Errorf("CheckAt(testClock): expected key-present to pass mint at testClock, got: %v", err)
+	}
+	if err := checker.CheckAt("key-present", exchange.OperationMatch, "", testClock); err != nil {
+		t.Errorf("CheckAt(testClock): expected key-present to pass match at testClock, got: %v", err)
+	}
+
+	// 30 days after testClock: attestation is now 30 days+1 hour old — outside the
+	// 7-day freshness window → key-present drops to LevelContactable.
+	futureTime := testClock.Add(30 * 24 * time.Hour)
+
+	// Present-only ops must now be rejected.
+	err = checker.CheckAt("key-present", exchange.OperationMint, "", futureTime)
+	if err == nil {
+		t.Error("CheckAt(futureTime): expected ErrInsufficientProvenance for mint, got nil")
+	} else if !errors.Is(err, exchange.ErrInsufficientProvenance) {
+		t.Errorf("CheckAt(futureTime): expected ErrInsufficientProvenance, got: %v", err)
+	}
+
+	// But operations requiring only LevelContactable must still succeed.
+	if err := checker.CheckAt("key-present", exchange.OperationAssign, "", futureTime); err != nil {
+		t.Errorf("CheckAt(futureTime): expected key-present to pass assign (contactable), got: %v", err)
 	}
 }
 
