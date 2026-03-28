@@ -1,0 +1,56 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign-accept",
+  "description": "Accept completed maintenance work and trigger scrip:assign-pay. For convergence tasks (validate, freshen): fires after 2-of-3 workers agree on the verdict; all 3 workers are paid regardless of individual verdict (incentivizes honest reporting). For algorithmic tasks (compress): fires when size reduction >= 30% AND semantic similarity >= 0.85. For algorithmic tasks (enrich): fires when metadata completeness improvement >= 20%. Each assign-accept references one assign-complete and triggers one scrip:assign-pay.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:assign-complete message being accepted."
+    },
+    {
+      "name": "bounty_paid",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Scrip bounty paid to this worker in micro-tokens. Must match the original assignment's bounty."
+    },
+    {
+      "name": "convergence_verdict",
+      "type": "enum",
+      "values": [
+        "exchange:assign-verdict:pass",
+        "exchange:assign-verdict:fail",
+        "exchange:assign-verdict:fresh",
+        "exchange:assign-verdict:stale"
+      ],
+      "description": "The majority verdict from convergence validation. Included for validate and freshen tasks. Indicates the consensus, not this individual worker's verdict."
+    },
+    {
+      "name": "validation_method",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "convergence",
+        "algorithmic"
+      ],
+      "description": "How the work was validated. convergence: 2-of-3 agreement. algorithmic: automated metric check."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign-accept",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 100,
+    "per": "sender",
+    "window": "1h"
+  }
+}

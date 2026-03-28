@@ -1,0 +1,128 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign",
+  "description": "Post a maintenance task (validation, compression, freshness check, or enrichment) with a scrip bounty. The exchange operator identifies entries needing maintenance and posts assignments for agents to claim. Bounty is proportional to entry value, capped by task type. For validate and freshen tasks, 3 agents are assigned (convergence validation). For compress and enrich tasks, 1 agent is assigned (algorithmic validation). Assignment expires after 24 hours if unclaimed. Sent with --future; fulfilled by assign-accept after convergence or algorithmic validation passes.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "future": true,
+  "payload_required": true,
+  "args": [
+    {
+      "name": "entry_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Cache entry ID being maintained. Must reference a valid, accepted entry in inventory."
+    },
+    {
+      "name": "task_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:assign-type:validate",
+        "exchange:assign-type:compress",
+        "exchange:assign-type:freshen",
+        "exchange:assign-type:enrich"
+      ],
+      "description": "Type of maintenance work. Composed into exchange:assign-type:<value> tag."
+    },
+    {
+      "name": "bounty",
+      "type": "integer",
+      "required": true,
+      "min": 50000,
+      "max": 10000000,
+      "description": "Scrip bounty in micro-tokens paid to each worker upon accepted completion. For convergence tasks (validate, freshen), this is the per-agent bounty (total cost = bounty * 3)."
+    },
+    {
+      "name": "entry_value",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Current market value of the entry in micro-tokens (median of last 5 sale prices, or put-accept price if never sold). Used to audit bounty proportionality."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the entry content to be maintained. Workers use this to retrieve the content."
+    },
+    {
+      "name": "description",
+      "type": "string",
+      "required": true,
+      "max_length": 4096,
+      "description": "Task description: what the worker needs to do and what the entry contains. Includes the original entry description for context."
+    },
+    {
+      "name": "slots",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 3,
+      "description": "Number of workers needed. 3 for validate and freshen (convergence). 1 for compress and enrich (algorithmic)."
+    },
+    {
+      "name": "claim_timeout_minutes",
+      "type": "integer",
+      "min": 5,
+      "max": 30,
+      "description": "Minutes a worker has to complete after claiming. Default: 15. Extended to 30 for compress tasks on entries > 50,000 tokens."
+    },
+    {
+      "name": "priority",
+      "type": "enum",
+      "values": [
+        "exchange:assign-priority:p0",
+        "exchange:assign-priority:p1",
+        "exchange:assign-priority:p2",
+        "exchange:assign-priority:p3"
+      ],
+      "description": "Task priority. p0: post-dispute re-validation (urgent). p1: high-value entry maintenance. p2: routine maintenance. p3: cold-start enrichment. Composed into exchange:assign-priority:<value> tag."
+    },
+    {
+      "name": "expires_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when the assignment expires if not claimed. Default: 24 hours from creation."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:assign-type:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "exchange:assign-type:validate",
+        "exchange:assign-type:compress",
+        "exchange:assign-type:freshen",
+        "exchange:assign-type:enrich"
+      ]
+    },
+    {
+      "tag": "exchange:assign-entry:*",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:assign-priority:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:assign-priority:p0",
+        "exchange:assign-priority:p1",
+        "exchange:assign-priority:p2",
+        "exchange:assign-priority:p3"
+      ]
+    }
+  ],
+  "rate_limit": {
+    "max": 100,
+    "per": "sender",
+    "window": "1h"
+  }
+}
