@@ -237,6 +237,35 @@ func TestCheck_ProvenanceLevelMatrix(t *testing.T) {
 	}
 }
 
+// TestCheck_UnknownKeyDefaultsToAnonymous verifies that an unknown key
+// (never registered, never attested, not self-claimed) defaults to anonymous
+// level and is accepted for anonymous operations like buy.
+func TestCheck_UnknownKeyDefaultsToAnonymous(t *testing.T) {
+	store := makeStore(t)
+	checker, err := exchange.NewProvenanceChecker(store)
+	if err != nil {
+		t.Fatalf("NewProvenanceChecker: %v", err)
+	}
+
+	// "unknown-key-xyz" has no record in the store — should default to anonymous (level 0)
+	unknownKey := "unknown-key-xyz"
+
+	// Should succeed for anonymous operations (buy, reads)
+	err = checker.Check(unknownKey, exchange.OperationBuy, "")
+	if err != nil {
+		t.Errorf("expected unknown key to default to anonymous for buy, got: %v", err)
+	}
+
+	// Should fail for non-anonymous operations (put requires claimed level 1)
+	err = checker.Check(unknownKey, exchange.OperationPut, "")
+	if err == nil {
+		t.Fatalf("expected ErrInsufficientProvenance for unknown key on put, got nil")
+	}
+	if !errors.Is(err, exchange.ErrInsufficientProvenance) {
+		t.Errorf("expected ErrInsufficientProvenance, got: %v", err)
+	}
+}
+
 // TestNewProvenanceChecker_NilStoreReturnsError verifies that NewProvenanceChecker
 // returns ErrNilProvenanceStore when passed a nil store (no longer panics).
 func TestNewProvenanceChecker_NilStoreReturnsError(t *testing.T) {
