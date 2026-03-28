@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/campfire-net/campfire/pkg/store"
+
+	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
 
 // Tag constants for exchange convention operations.
@@ -173,6 +175,30 @@ type PriceRecord struct {
 	SalePrice int64
 	// Timestamp is when the settlement occurred (nanoseconds).
 	Timestamp int64
+}
+
+// PriceAdjustment is a dynamic price multiplier written by the fast pricing loop.
+// A multiplier of 1.0 means no adjustment. Values above 1.0 increase the price;
+// values below 1.0 decrease it. The adjustment expires at ExpiresAt; stale
+// adjustments are treated as 1.0x by computePrice.
+type PriceAdjustment struct {
+	// Multiplier is the price scaling factor (e.g., 1.5 = +50%, 0.8 = -20%).
+	// Must be > 0. Values <= 0 are ignored (treated as 1.0).
+	Multiplier float64
+	// ExpiresAt is when this adjustment becomes stale and is ignored.
+	// Zero ExpiresAt means the adjustment never expires (use with care in tests).
+	ExpiresAt time.Time
+	// VelocityPerHour is the demand velocity (purchases per hour) that drove
+	// this adjustment. Stored for diagnostics and medium-loop input.
+	VelocityPerHour float64
+	// VolumeSurplus is the ratio of actual demand to expected demand for this entry.
+	// > 1.0 = demand above baseline, < 1.0 = below baseline.
+	VolumeSurplus float64
+}
+
+// IsExpired returns true if the adjustment's ExpiresAt is non-zero and past.
+func (a *PriceAdjustment) IsExpired() bool {
+	return !a.ExpiresAt.IsZero() && time.Now().After(a.ExpiresAt)
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -347,6 +373,18 @@ type State struct {
 	// entryConversionCount tracks conversions per entry. Key: entryID.
 	// Incremented in applySettleBuyerAccept when the buyer accepts via the preview path.
 	entryConversionCount map[string]int
+
+	// priceAdjustments holds dynamic price multipliers written by the fast pricing loop.
+	// Key: entryID. The multiplier is applied on top of computePrice's base result.
+	// Stale adjustments (past ExpiresAt) are treated as 1.0x by computePrice.
+	// Not reset on Replay — externally written, not derived from the campfire log.
+	priceAdjustments map[string]PriceAdjustment
+
+	// matchToBuyHold indexes match message IDs to reservation IDs from
+	// scrip-buy-hold messages. Populated by applyScripBuyHold during Replay/Apply.
+	// O(1) alternative to scanning the full log in findExistingBuyerAcceptHold.
+	// Key: matchMsgID (BuyMsg field from BuyHoldPayload). Value: reservationID.
+	matchToBuyHold map[string]string
 }
 
 // NewState creates an empty exchange state.
@@ -375,6 +413,8 @@ func NewState() *State {
 		smallContentDisputes:  make(map[string]int),
 		entryPreviewCount:     make(map[string]int),
 		entryConversionCount:  make(map[string]int),
+		priceAdjustments:      make(map[string]PriceAdjustment),
+		matchToBuyHold:        make(map[string]string),
 	}
 }
 
@@ -408,6 +448,9 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.smallContentDisputes = make(map[string]int)
 	s.entryPreviewCount = make(map[string]int)
 	s.entryConversionCount = make(map[string]int)
+	s.matchToBuyHold = make(map[string]string)
+	// Note: priceAdjustments is NOT reset on Replay â it holds runtime state
+	// from the fast pricing loop, not derived from the campfire log.
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -434,7 +477,38 @@ func (s *State) applyLocked(msg *store.MessageRecord) {
 		s.applyMatch(msg)
 	case TagSettle:
 		s.applySettle(msg)
+	default:
+		// Handle scrip convention messages that are not exchange operations.
+		for _, tag := range msg.Tags {
+			if tag == scrip.TagScripBuyHold {
+				s.applyScripBuyHold(msg)
+				return
+			}
+		}
 	}
+}
+
+// applyScripBuyHold indexes a scrip-buy-hold message into matchToBuyHold.
+// Enables O(1) lookup in GetBuyHoldReservation, replacing the O(n) log scan
+// previously done by findExistingBuyerAcceptHold.
+func (s *State) applyScripBuyHold(msg *store.MessageRecord) {
+	var p scrip.BuyHoldPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	if p.BuyMsg == "" || p.ReservationID == "" {
+		return
+	}
+	s.matchToBuyHold[p.BuyMsg] = p.ReservationID
+}
+
+// GetBuyHoldReservation returns the reservation ID for a prior scrip-buy-hold
+// message matching the given match message ID, or "" if none exists.
+// O(1) â replaces the O(n) log scan in findExistingBuyerAcceptHold.
+func (s *State) GetBuyHoldReservation(matchMsgID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.matchToBuyHold[matchMsgID]
 }
 
 // exchangeOp returns the exchange operation tag from a message's tag list,
@@ -1330,4 +1404,39 @@ func decodeHexKey(hexKey string) []byte {
 		return nil
 	}
 	return b
+}
+
+// SetPriceAdjustment writes a dynamic price adjustment for an entry.
+// Overwrites any prior adjustment for the same entry.
+// Called by the fast pricing loop after each computation cycle.
+func (s *State) SetPriceAdjustment(entryID string, adj PriceAdjustment) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.priceAdjustments[entryID] = adj
+}
+
+// GetPriceAdjustment returns the active price adjustment for an entry.
+// Returns a 1.0x adjustment if none exists or the stored adjustment has expired.
+func (s *State) GetPriceAdjustment(entryID string) PriceAdjustment {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	adj, ok := s.priceAdjustments[entryID]
+	if !ok || adj.IsExpired() || adj.Multiplier <= 0 {
+		return PriceAdjustment{Multiplier: 1.0}
+	}
+	return adj
+}
+
+// AllPriceAdjustments returns a snapshot of all active (non-expired) price adjustments.
+// Used by the medium loop and for diagnostics.
+func (s *State) AllPriceAdjustments() map[string]PriceAdjustment {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]PriceAdjustment, len(s.priceAdjustments))
+	for id, adj := range s.priceAdjustments {
+		if !adj.IsExpired() && adj.Multiplier > 0 {
+			out[id] = adj
+		}
+	}
+	return out
 }
