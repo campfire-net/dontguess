@@ -1,10 +1,10 @@
 {
   "convention": "dontguess-exchange",
-  "version": "0.1",
+  "version": "0.2",
   "operation": "settle",
-  "description": "Two-phase settlement. Antecedent is the immediately preceding message in the settlement chain. Phases: buyer-accept/buyer-reject (sent by buyer after receiving match); put-accept/put-reject (sent by exchange after receiving put); deliver (exchange sends content reference to buyer); complete (buyer confirms receipt and hash); dispute (buyer contests content — triggers escrow hold). Sender roles: buyer sends buyer-accept, buyer-reject, complete, dispute; exchange operator sends put-accept, put-reject, deliver.",
+  "description": "Multi-phase settlement with preview support. Antecedent is the immediately preceding message in the settlement chain. Phases: preview-request (buyer requests content preview after match); preview (exchange delivers randomized preview chunks to buyer); buyer-accept/buyer-reject (sent by buyer — after preview for content >= 500 tokens, after match for content < 500 tokens); put-accept/put-reject (sent by exchange after receiving put); deliver (exchange sends full content to buyer); complete (buyer confirms receipt and hash); dispute (buyer contests content — legacy, see small-content-dispute); small-content-dispute (buyer disputes content < 500 tokens — auto-refund, no operator verdict, -3 reputation per refund). Sender roles: buyer sends preview-request, buyer-accept, buyer-reject, complete, dispute, small-content-dispute; exchange operator sends put-accept, put-reject, preview, deliver.",
   "provenance_level": "phase-dependent",
-  "provenance_level_note": "Buyer phases (buyer-accept, buyer-reject, complete, dispute) require claimed. Operator phases (put-accept, put-reject, deliver) require present. See pkg/exchange/provenance.go settlePhaseRequiredLevel.",
+  "provenance_level_note": "Buyer phases (preview-request, buyer-accept, buyer-reject, complete, dispute, small-content-dispute) require claimed. Operator phases (put-accept, put-reject, preview, deliver) require present. See pkg/exchange/provenance.go settlePhaseRequiredLevel.",
   "signing": "member_key",
   "antecedents": "exactly_one(target)",
   "payload_required": true,
@@ -13,20 +13,23 @@
       "name": "target",
       "type": "message_id",
       "required": true,
-      "description": "Message ID of the preceding message in the settlement chain (match, prior settle phase, or deliver)."
+      "description": "Message ID of the preceding message in the settlement chain. For preview-request: the exchange:match message. For preview: the settle(preview-request) message. For buyer-accept/buyer-reject: the settle(preview) message (>= 500 tokens) or the exchange:match message (< 500 tokens). For deliver: the settle(buyer-accept) message. For complete/dispute/small-content-dispute: the settle(deliver) message."
     },
     {
       "name": "phase",
       "type": "enum",
       "required": true,
       "values": [
+        "exchange:phase:preview-request",
+        "exchange:phase:preview",
         "exchange:phase:buyer-accept",
         "exchange:phase:buyer-reject",
         "exchange:phase:put-accept",
         "exchange:phase:put-reject",
         "exchange:phase:deliver",
         "exchange:phase:complete",
-        "exchange:phase:dispute"
+        "exchange:phase:dispute",
+        "exchange:phase:small-content-dispute"
       ],
       "description": "Settlement phase. Composed into exchange:phase:<value> tag."
     },
@@ -52,7 +55,7 @@
       "name": "price",
       "type": "integer",
       "min": 0,
-      "description": "Agreed price in scrip (micro-tokens). Required in put-accept and complete phases."
+      "description": "Agreed price in scrip (micro-tokens). Required in put-accept and complete phases. In preview phase, this is the purchase_price (price for unseen content after preview discount)."
     },
     {
       "name": "content_hash_verified",
@@ -68,7 +71,7 @@
         "hash_invalid",
         "stale_content"
       ],
-      "description": "Type of dispute. Required in dispute phase."
+      "description": "Type of dispute. Required in dispute phase. Not used in small-content-dispute (which is unconditional)."
     },
     {
       "name": "verdict",
@@ -76,9 +79,46 @@
       "values": [
         "exchange:verdict:accepted",
         "exchange:verdict:rejected",
-        "exchange:verdict:disputed"
+        "exchange:verdict:disputed",
+        "exchange:verdict:auto-refunded"
       ],
-      "description": "Settlement verdict. Composed into exchange:verdict:<value> tag. Omitted for intermediate phases (deliver, put-accept, put-reject)."
+      "description": "Settlement verdict. Composed into exchange:verdict:<value> tag. Omitted for intermediate phases (deliver, put-accept, put-reject, preview-request, preview). auto-refunded is used for small-content-dispute."
+    },
+    {
+      "name": "preview_chunks",
+      "type": "json",
+      "description": "Array of preview chunk objects, each with {content: string, position: integer, length: integer}. Required in preview phase. The exchange assembles 5 non-overlapping random chunks totaling 15-25% of the entry content. Chunks respect content-type boundaries (function-level for code, paragraph-level for prose, record-level for data)."
+    },
+    {
+      "name": "preview_chunk_count",
+      "type": "integer",
+      "min": 1,
+      "max": 10,
+      "description": "Number of preview chunks delivered. Required in preview phase. Typically 5."
+    },
+    {
+      "name": "content_type",
+      "type": "enum",
+      "values": ["code", "analysis", "summary", "plan", "data", "review", "other"],
+      "description": "Content type used for chunking strategy in preview phase. Determines chunk boundary rules: code uses function/block boundaries, prose uses paragraph boundaries, data uses record boundaries. Required in preview phase."
+    },
+    {
+      "name": "base_price",
+      "type": "integer",
+      "min": 0,
+      "description": "Full price of the entry before preview discount. Included in preview phase so the buyer can infer the preview fraction: preview_fraction = 1 - (price / base_price)."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the full content. Included in preview phase for later verification at complete time."
+    },
+    {
+      "name": "auto_refund",
+      "type": "boolean",
+      "description": "Whether this dispute triggers an automatic full refund. Always true for small-content-dispute phase. No operator verdict required."
     }
   ],
   "produces_tags": [
@@ -90,13 +130,16 @@
       "tag": "exchange:phase:*",
       "cardinality": "exactly_one",
       "values": [
+        "exchange:phase:preview-request",
+        "exchange:phase:preview",
         "exchange:phase:buyer-accept",
         "exchange:phase:buyer-reject",
         "exchange:phase:put-accept",
         "exchange:phase:put-reject",
         "exchange:phase:deliver",
         "exchange:phase:complete",
-        "exchange:phase:dispute"
+        "exchange:phase:dispute",
+        "exchange:phase:small-content-dispute"
       ]
     },
     {
@@ -105,7 +148,8 @@
       "values": [
         "exchange:verdict:accepted",
         "exchange:verdict:rejected",
-        "exchange:verdict:disputed"
+        "exchange:verdict:disputed",
+        "exchange:verdict:auto-refunded"
       ]
     }
   ],
