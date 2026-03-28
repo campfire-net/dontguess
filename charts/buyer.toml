@@ -1,0 +1,35 @@
+# DontGuess Exchange Buyer — ClankerOS chart
+# Searches the exchange for cached inference and buys it instead of computing.
+
+[identity]
+name = "dontguess-buyer"
+type = "trader"
+description = "Buyer agent — searches and purchases cached inference from the exchange"
+key_file = "~/.clankeros/automata/dontguess-buyer/identity.json"
+
+[worksource]
+type = "ready"
+campfire_id = ""
+
+[budget]
+max_tokens_per_session = 300000
+max_tokens_per_task = 80000
+
+[capabilities]
+gate_policy = "ungated"
+tool_allowlist = ["bash", "read", "write", "glob", "grep"]
+
+[lifecycle]
+max_workers = 2
+time_limit = "15m"
+poll_interval = "5s"
+
+[campfire]
+transport_dir = "/tmp/campfire"
+
+[exchange]
+campfire_id = ""
+operator_key = ""
+
+[agent]
+spec = ".claude/agents/exchange-buyer.md"

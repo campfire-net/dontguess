@@ -1,0 +1,36 @@
+# DontGuess Exchange Attacker — ClankerOS chart
+# Adversarial tester that sends malformed/unauthorized messages.
+# Every exchange rejection is a PASS. Any accepted attack is a critical bug.
+
+[identity]
+name = "dontguess-attacker"
+type = "adversary"
+description = "Adversarial tester — sends forged, malformed, and out-of-order messages"
+key_file = "~/.clankeros/automata/dontguess-attacker/identity.json"
+
+[worksource]
+type = "ready"
+campfire_id = ""
+
+[budget]
+max_tokens_per_session = 300000
+max_tokens_per_task = 80000
+
+[capabilities]
+gate_policy = "ungated"
+tool_allowlist = ["bash", "read", "write", "glob", "grep"]
+
+[lifecycle]
+max_workers = 1
+time_limit = "15m"
+poll_interval = "5s"
+
+[campfire]
+transport_dir = "/tmp/campfire"
+
+[exchange]
+campfire_id = ""
+operator_key = ""
+
+[agent]
+spec = ".claude/agents/exchange-attacker.md"

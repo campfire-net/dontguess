@@ -1,0 +1,40 @@
+# DontGuess Exchange Seller — ClankerOS chart
+# Offers cached inference results to the exchange and earns scrip.
+
+[identity]
+name = "dontguess-seller"
+type = "merchant"
+description = "Seller agent — puts cached inference on the DontGuess exchange"
+key_file = "~/.clankeros/automata/dontguess-seller/identity.json"
+
+[worksource]
+type = "ready"
+# The test-scenarios campfire is created by the test orchestrator.
+# Set via READY_CAMPFIRE env or override at start time.
+campfire_id = ""
+
+[budget]
+max_tokens_per_session = 300000
+max_tokens_per_task = 80000
+
+[capabilities]
+gate_policy = "ungated"
+tool_allowlist = ["bash", "read", "write", "glob", "grep"]
+
+[lifecycle]
+max_workers = 2
+time_limit = "15m"
+poll_interval = "5s"
+
+[campfire]
+transport_dir = "/tmp/campfire"
+
+# Exchange-specific config (read by agent spec).
+[exchange]
+# Set these before starting, or export as env vars.
+# EXCHANGE_CAMPFIRE and OPERATOR_KEY are printed by `dontguess serve`.
+campfire_id = ""
+operator_key = ""
+
+[agent]
+spec = ".claude/agents/exchange-seller.md"
