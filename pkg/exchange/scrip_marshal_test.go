@@ -57,7 +57,7 @@ func TestBuyerAccept_MarshalFailure_NoBudgetDecrement(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -151,7 +151,7 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 

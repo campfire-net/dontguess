@@ -3,6 +3,7 @@ package exchange_test
 import (
 	"math"
 	"testing"
+	"time"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 )
@@ -102,5 +103,153 @@ func TestComputePrice_SmallTokenCostFloor(t *testing.T) {
 	if price < exchange.ComputePriceMinPriceForTest {
 		t.Errorf("computePrice(TokenCost=1) = %d, want >= floor=%d",
 			price, exchange.ComputePriceMinPriceForTest)
+	}
+}
+
+// --- Inventory signal tests (dontguess-r13) ---
+
+// TestComputePrice_BasePrice_PutPriceUsedWhenPresent verifies that PutPrice is
+// used as the base when present (post-put-accept).
+// PutPrice=1000, fresh entry, rep=50 (default) -> repFactor=1.0.
+// All other multipliers=1.0. Expected: 1000 * 1.2 = 1200.
+func TestComputePrice_BasePrice_PutPriceUsedWhenPresent(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		PutPrice:  1000,
+		TokenCost: 5000,
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1200 {
+		t.Errorf("computePrice(PutPrice=1000, fresh entry, default rep) = %d, want 1200", price)
+	}
+}
+
+// TestComputePrice_BasePrice_TokenCostFallback verifies the pre-accept proxy:
+// TokenCost * 0.7 when PutPrice=0. TokenCost=1000, rep=50 -> price=700.
+func TestComputePrice_BasePrice_TokenCostFallback(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		TokenCost: 1000,
+		PutPrice:  0,
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 700 {
+		t.Errorf("computePrice(TokenCost=1000, PutPrice=0) = %d, want 700", price)
+	}
+}
+
+// TestComputePrice_AgeFactor_StaleEntryLowerPrice verifies that an entry older
+// than 60 days gets the minimum ageFactor (0.5x), halving the price.
+// PutPrice=1000 -> base=1200. Stale (>=60d) -> ageFactor=0.5 -> price=600.
+func TestComputePrice_AgeFactor_StaleEntryLowerPrice(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	freshEntry := &exchange.InventoryEntry{
+		PutPrice:     1000,
+		PutTimestamp: time.Now().UnixNano(),
+	}
+	staleEntry := &exchange.InventoryEntry{
+		PutPrice:     1000,
+		PutTimestamp: time.Now().Add(-90 * 24 * time.Hour).UnixNano(),
+	}
+
+	freshPrice := eng.ComputePriceForTest(freshEntry)
+	stalePrice := eng.ComputePriceForTest(staleEntry)
+
+	if stalePrice >= freshPrice {
+		t.Errorf("stale entry price %d >= fresh entry price %d: age decay not applied", stalePrice, freshPrice)
+	}
+	if stalePrice != 600 {
+		t.Errorf("computePrice(stale 90d, PutPrice=1000) = %d, want 600 (0.5x ageFactor)", stalePrice)
+	}
+}
+
+// TestComputePrice_AgeFactor_ZeroTimestampNoDecay verifies that PutTimestamp=0
+// (legacy / pending) is treated as brand-new (ageFactor=1.0, no decay).
+// PutTimestamp=0 should produce the same price as no-timestamp entries; verified
+// by comparing against a clearly stale entry (price must be >= stale price).
+func TestComputePrice_AgeFactor_ZeroTimestampNoDecay(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	zeroTimestamp := &exchange.InventoryEntry{
+		PutPrice:     1000,
+		PutTimestamp: 0,
+	}
+	staleEntry := &exchange.InventoryEntry{
+		PutPrice:     1000,
+		PutTimestamp: time.Now().Add(-90 * 24 * time.Hour).UnixNano(),
+	}
+
+	zeroPrice := eng.ComputePriceForTest(zeroTimestamp)
+	stalePrice := eng.ComputePriceForTest(staleEntry)
+
+	if zeroPrice < stalePrice {
+		t.Errorf("PutTimestamp=0 price=%d < stale price=%d: zero timestamp should not decay", zeroPrice, stalePrice)
+	}
+	// PutTimestamp=0 -> ageFactor=1.0 -> price=1200 (same as no-decay baseline).
+	if zeroPrice != 1200 {
+		t.Errorf("PutTimestamp=0 price=%d, want 1200 (no decay)", zeroPrice)
+	}
+}
+
+// TestComputePrice_ContentSize_LargerContentHigherPrice verifies that a 100KB
+// entry has a higher price than a zero-size entry.
+// PutPrice=1000, size=100KB: sizeBonus=0.30 (cap) -> sizeFactor=1.30 -> price=1560.
+func TestComputePrice_ContentSize_LargerContentHigherPrice(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	noSize := &exchange.InventoryEntry{PutPrice: 1000, ContentSize: 0}
+	largeContent := &exchange.InventoryEntry{PutPrice: 1000, ContentSize: 102400} // 100 KB
+
+	noSizePrice := eng.ComputePriceForTest(noSize)
+	largePrice := eng.ComputePriceForTest(largeContent)
+
+	if largePrice <= noSizePrice {
+		t.Errorf("large content price %d <= no-size price %d: size factor not applied", largePrice, noSizePrice)
+	}
+	if largePrice != 1560 {
+		t.Errorf("computePrice(PutPrice=1000, ContentSize=100KB) = %d, want 1560", largePrice)
+	}
+}
+
+// TestComputePrice_ContentSize_Cap verifies that the content size bonus is
+// capped at 30% for content >=100KB.
+func TestComputePrice_ContentSize_Cap(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	atCap := &exchange.InventoryEntry{PutPrice: 1000, ContentSize: 102400}   // 100 KB
+	overCap := &exchange.InventoryEntry{PutPrice: 1000, ContentSize: 1024000} // 1000 KB
+
+	priceAtCap := eng.ComputePriceForTest(atCap)
+	priceOverCap := eng.ComputePriceForTest(overCap)
+
+	if priceAtCap != priceOverCap {
+		t.Errorf("size cap not working: atCap=%d, overCap=%d (should be equal)", priceAtCap, priceOverCap)
+	}
+}
+
+// TestComputePrice_AllSignals_FreshEntryBaseline verifies the canonical baseline:
+// PutPrice=1000, PutTimestamp=0 (no decay), no ContentSize, no demand, seller unknown
+// (rep defaults to DefaultReputation=50 -> repFactor=1.0). Expected: 1200.
+func TestComputePrice_AllSignals_FreshEntryBaseline(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	// PutTimestamp=0 means no age decay (legacy/pending entry treatment).
+	entry := &exchange.InventoryEntry{
+		PutPrice:     1000,
+		PutTimestamp: 0,
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1200 {
+		t.Errorf("computePrice(baseline) = %d, want 1200", price)
 	}
 }

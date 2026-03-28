@@ -684,7 +684,7 @@ func TestSmallContentDispute_ScripRefundPath(t *testing.T) {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
 	entryID := inv[0].EntryID
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -855,7 +855,7 @@ func TestSmallContentDispute_MissingEntry_SilentlyDropped(t *testing.T) {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
 	entryID := inv[0].EntryID
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 

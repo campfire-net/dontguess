@@ -1289,6 +1289,35 @@ func (s *State) EntryForDeliver(deliverMsgID string) (*InventoryEntry, bool) {
 	return &cp, true
 }
 
+// EntryDemandCount returns the number of distinct buyers who have completed a
+// purchase of the given entry. Used as a demand signal for pricing.
+// Returns 0 for unknown entries.
+func (s *State) EntryDemandCount(entryID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, ok := s.inventory[entryID]
+	if !ok {
+		return 0
+	}
+	stats, ok := s.sellers[entry.SellerKey]
+	if !ok {
+		return 0
+	}
+	buyers, ok := stats.EntryBuyerMap[entryID]
+	if !ok {
+		return 0
+	}
+	return len(buyers)
+}
+
+// EntryPreviewCount returns the number of previews served for the given entry.
+// Returns 0 for unknown entries.
+func (s *State) EntryPreviewCount(entryID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.entryPreviewCount[entryID]
+}
+
 // operatorKeyHex converts a raw Ed25519 public key to its hex representation.
 func operatorKeyHex(pub []byte) string {
 	return fmt.Sprintf("%x", pub)
