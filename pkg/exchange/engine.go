@@ -102,6 +102,10 @@ type Engine struct {
 	// marshalFunc overrides json.Marshal for tests that need to inject marshal failures.
 	// Nil means use the standard json.Marshal.
 	marshalFunc func(v any) ([]byte, error)
+	// matchToReservation maps a match message ID to the scrip reservation ID created
+	// at buyer-accept time. The settle(complete) handler uses this to locate the
+	// reservation without trusting buyer-supplied payload data.
+	matchToReservation map[string]string
 }
 
 // engineCtx returns the shutdown context stored at Start time.
@@ -133,9 +137,10 @@ func NewEngine(opts EngineOptions) *Engine {
 		st.OperatorKey = operatorKeyHex(opts.OperatorIdentity.PublicKey)
 	}
 	return &Engine{
-		opts:       opts,
-		state:      st,
-		matchIndex: idx,
+		opts:               opts,
+		state:              st,
+		matchIndex:         idx,
+		matchToReservation: make(map[string]string),
 	}
 }
 
@@ -449,101 +454,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 		}
 	}
 
-	// Pre-decrement buyer's scrip before emitting the match.
-	// Amount = best price + matching fee. If no results, skip scrip.
-	var reservationID string
-	if e.opts.ScripStore != nil && len(matchResults) > 0 {
-		bestPrice := matchResults[0].Price
-		fee := bestPrice / MatchingFeeRate
-		holdAmount := bestPrice + fee
-
-		ctx := e.engineCtx()
-		buyerKey := msg.Sender
-
-		// Check whether a scrip-buy-hold message already exists for this buy order.
-		// This happens when the engine restarts with pending buy orders: the buy-hold
-		// message was written to the campfire log on the previous run and the
-		// CampfireScripStore already replayed it (decrementing the buyer's balance).
-		// Re-running DecrementBudget here would double-charge the buyer.
-		existingResID := e.findExistingBuyHold(msg.ID)
-
-		if existingResID != "" {
-			// Buy-hold already applied via replay. Restore the in-memory reservation
-			// so settle/dispute handlers can reference it, then skip DecrementBudget.
-			reservationID = existingResID
-			_, currentETag, _ := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
-			res := scrip.Reservation{
-				ID:        reservationID,
-				AgentKey:  buyerKey,
-				RK:        scrip.BalanceKey,
-				ETag:      currentETag,
-				Amount:    holdAmount,
-				CreatedAt: time.Now(),
-			}
-			if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
-				e.opts.log("engine: warning: re-save reservation after restart %s: %v", shortKey(reservationID), err)
-			}
-			e.opts.log("engine: scrip buy-hold already replayed, skipping pre-decrement buyer=%s reservation=%s",
-				shortKey(buyerKey), shortKey(reservationID))
-		} else {
-			bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
-			if err != nil {
-				return fmt.Errorf("scrip: GetBudget for buyer %s: %w", shortKey(buyerKey), err)
-			}
-			if bal < holdAmount {
-				return fmt.Errorf("scrip: buyer %s: %w (balance=%d, required=%d)",
-					shortKey(buyerKey), scrip.ErrBudgetExceeded, bal, holdAmount)
-			}
-
-			// Marshal the buy-hold convention message BEFORE mutating scrip state.
-			// If marshal fails, no balance mutation has occurred — return the error.
-			reservationID = newReservationID()
-			expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
-			holdPayload, err := e.marshal(scrip.BuyHoldPayload{
-				Buyer:         buyerKey,
-				Amount:        holdAmount,
-				Price:         bestPrice,
-				Fee:           fee,
-				ReservationID: reservationID,
-				BuyMsg:        msg.ID,
-				ExpiresAt:     expiresAt,
-			})
-			if err != nil {
-				return fmt.Errorf("scrip: marshal buy-hold payload: %w", err)
-			}
-
-			_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
-			if err != nil {
-				return fmt.Errorf("scrip: DecrementBudget for buyer %s: %w", shortKey(buyerKey), err)
-			}
-
-			// Save reservation so settle/dispute can reference it.
-			res := scrip.Reservation{
-				ID:        reservationID,
-				AgentKey:  buyerKey,
-				RK:        scrip.BalanceKey,
-				ETag:      newETag,
-				Amount:    holdAmount,
-				CreatedAt: time.Now(),
-			}
-			if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
-				return fmt.Errorf("scrip: SaveReservation: %w", err)
-			}
-			e.opts.log("engine: scrip pre-decremented buyer=%s hold=%d reservation=%s",
-				shortKey(buyerKey), holdAmount, shortKey(reservationID))
-
-			// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
-			if _, emitErr := e.sendOperatorMessage(holdPayload,
-				[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
-				e.opts.log("engine: warning: emit scrip-buy-hold: %v", emitErr)
-			}
-		}
-	}
-
 	meta := map[string]any{"total_candidates": len(candidates)}
-	if reservationID != "" {
-		meta["reservation_id"] = reservationID
-	}
 
 	matchPayload, err := e.marshal(map[string]any{
 		"results":     matchResults,
@@ -557,11 +468,28 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	// Antecedent is the buy message; --fulfills semantics use the antecedent.
 	antecedents := []string{msg.ID}
 
-	_, err = e.sendOperatorMessage(matchPayload, tags, antecedents)
-	return err
+	matchRec, err := e.sendOperatorMessage(matchPayload, tags, antecedents)
+	if err != nil {
+		return err
+	}
+
+	// Apply the match message to state immediately so downstream handlers (e.g.
+	// buyer-accept) can reference it via matchToBuyer / matchToEntry without
+	// requiring an explicit Replay call. This matters in the engine's poll() loop:
+	// poll() only subscribes to TagPut/TagBuy/TagSettle, so match messages emitted
+	// here would not otherwise be Applied until the next full replayAll().
+	if matchRec != nil {
+		e.state.Apply(matchRec)
+	}
+	return nil
 }
 
 // handleSettle processes settlement messages.
+//
+// For settle(buyer-accept) phases, if ScripStore is configured, the engine:
+//   - Checks the buyer's scrip balance (fails if insufficient)
+//   - Pre-decrements the buyer's balance by (price + fee)
+//   - Stores the reservation ID in matchToReservation for the complete handler
 //
 // For settle(complete) phases, if ScripStore is configured, the engine:
 //   - Pays the seller their residual (price * ResidualRate / 100)
@@ -571,8 +499,6 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 // For settle(preview-request) phases, the engine generates a content preview
 // using PreviewAssembler and responds with a settle(preview) message. The
 // preview antecedent is the preview-request message ID.
-//
-// The reservation_id in the settle payload links back to the buy-hold reservation.
 func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	phase := settlePhaseFromTags(msg.Tags)
 
@@ -590,34 +516,16 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		return nil
 	}
 
-	if phase != SettlePhaseStrComplete {
-		// Only complete phase triggers scrip movement.
-		// Other phases (buyer-accept, deliver, put-accept) are tracked in state only.
-		return nil
+	// Handle buyer-accept: scrip hold happens here (not at buy time).
+	// This is the "preview-before-purchase" model — scrip is only locked when
+	// the buyer has seen the preview and decided to proceed.
+	if phase == SettlePhaseStrBuyerAccept {
+		return e.handleSettleBuyerAcceptScrip(msg)
 	}
 
-	// Parse the complete payload.
-	// SellerKey is intentionally NOT parsed from the payload — it is buyer-controlled
-	// (TAINTED) and must never be trusted for payment routing. The real seller is
-	// derived from the antecedent chain below (convention §3, security fix rudi-x3y).
-	var payload struct {
-		ReservationID string `json:"reservation_id"`
-		Price         int64  `json:"price"`
-	}
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		return fmt.Errorf("scrip: parsing settle(complete) payload: %w", err)
-	}
-	// Validate price and reservation_id.
-	// Split the check: missing reservation_id is a silent skip (no scrip involved).
-	// A non-positive price with a reservation_id is a hard rejection (security fix dontguess-ica).
-	if payload.ReservationID == "" {
-		return nil // no reservation_id — not a scrip-bearing settlement
-	}
-	if payload.Price <= 0 {
-		e.opts.log("engine: settle: reservation %s rejected — price=%d (must be >0)",
-			shortKey(payload.ReservationID), payload.Price)
-		return fmt.Errorf("scrip: settle reservation %s: price must be positive, got %d",
-			shortKey(payload.ReservationID), payload.Price)
+	if phase != SettlePhaseStrComplete {
+		// Other phases (deliver, put-accept) are tracked in state only.
+		return nil
 	}
 
 	// Derive seller from the antecedent chain: complete → deliver → match → entry → seller.
@@ -633,37 +541,41 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		return nil
 	}
 
+	// Derive match message ID from the deliver antecedent chain to look up the
+	// reservation created at buyer-accept time.
+	matchMsgID, ok := e.state.MatchForDeliver(deliverMsgID)
+	if !ok {
+		e.opts.log("engine: settle: cannot derive match for deliver=%s — antecedent chain broken", shortKey(deliverMsgID))
+		return nil
+	}
+
+	// Look up the reservation created at buyer-accept time (not from buyer payload).
+	// This is secure: the reservation ID is engine-owned, not buyer-supplied.
+	reservationID, hasReservation := e.matchToReservation[matchMsgID]
+	if !hasReservation || reservationID == "" {
+		e.opts.log("engine: settle: no reservation found for match=%s — buyer-accept scrip hold may not have run", shortKey(matchMsgID))
+		return nil // no scrip-bearing buyer-accept — skip scrip settlement
+	}
+
 	ctx := e.engineCtx()
 
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
-	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
+	res, err := e.opts.ScripStore.ConsumeReservation(ctx, reservationID)
 	if err != nil {
-		e.opts.log("engine: settle: reservation %s not found: %v", shortKey(payload.ReservationID), err)
+		e.opts.log("engine: settle: reservation %s not found: %v", shortKey(reservationID), err)
 		return nil // reservation missing — already settled or expired
 	}
 
-	// Cross-check payload.Price against res.Amount to prevent market manipulation.
-	// At buy time, the engine set res.Amount = price + price/MatchingFeeRate.
-	// If payload.Price (buyer-controlled) differs from what was pre-approved,
-	// the buyer is attempting to inflate or deflate the seller credit. Reject.
-	// Security fix: dontguess-ica (dontguess-3oo, dontguess-z2a).
-	expectedHold := payload.Price + payload.Price/MatchingFeeRate
-	if expectedHold != res.Amount {
-		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
-			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after price mismatch: %v",
-				shortKey(payload.ReservationID), restoreErr)
-			return fmt.Errorf("scrip: settle reservation %s: price mismatch AND restore failed: payload=%d expected_hold=%d res.Amount=%d",
-				shortKey(payload.ReservationID), payload.Price, expectedHold, res.Amount)
-		}
-		e.opts.log("engine: settle: reservation %s rejected — price mismatch payload=%d expected_hold=%d res.Amount=%d",
-			shortKey(payload.ReservationID), payload.Price, expectedHold, res.Amount)
-		return fmt.Errorf("scrip: settle reservation %s: payload.Price=%d inconsistent with reservation amount=%d",
-			shortKey(payload.ReservationID), payload.Price, res.Amount)
-	}
-
-	fee := payload.Price / MatchingFeeRate
-	residual := payload.Price / ResidualRate
-	exchangeRevenue := payload.Price - residual // fee already came out of the buyer's pre-decrement
+	// Derive price from the reservation amount: res.Amount = price + price/MatchingFeeRate.
+	// We do NOT trust price from the buyer-controlled complete payload.
+	// The price was locked at buyer-accept time; use it directly from the reservation.
+	// The fee is res.Amount - price, i.e., price/MatchingFeeRate.
+	// Recover price: res.Amount = price * (1 + 1/MatchingFeeRate) = price * (MatchingFeeRate+1)/MatchingFeeRate
+	// => price = res.Amount * MatchingFeeRate / (MatchingFeeRate+1)
+	price := res.Amount * MatchingFeeRate / (MatchingFeeRate + 1)
+	fee := price / MatchingFeeRate
+	residual := price / ResidualRate
+	exchangeRevenue := price - residual // fee already came out of the buyer's pre-decrement
 
 	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
 
@@ -671,7 +583,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	// If either marshal fails, restore the reservation (it was consumed above) and return
 	// the error — no balance mutations have occurred.
 	settlePayload, err := e.marshal(scrip.SettlePayload{
-		ReservationID:   payload.ReservationID,
+		ReservationID:   reservationID,
 		Seller:          sellerKey,
 		Residual:        residual,
 		FeeBurned:       fee,
@@ -682,9 +594,9 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	if err != nil {
 		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-				shortKey(payload.ReservationID), restoreErr)
+				shortKey(reservationID), restoreErr)
 			return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
-				shortKey(payload.ReservationID), err)
+				shortKey(reservationID), err)
 		}
 		return fmt.Errorf("scrip: marshal settle payload: %w", err)
 	}
@@ -699,9 +611,9 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		if err != nil {
 			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
 				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-					shortKey(payload.ReservationID), restoreErr)
+					shortKey(reservationID), restoreErr)
 				return fmt.Errorf("scrip: settle reservation %s: marshal failed AND restore failed (reservation lost): %w",
-					shortKey(payload.ReservationID), err)
+					shortKey(reservationID), err)
 			}
 			return fmt.Errorf("scrip: marshal burn payload: %w", err)
 		}
@@ -727,7 +639,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
 	}
 
-	// Emit scrip-burn for the matching fee (already removed from buyer's balance via buy-hold).
+	// Emit scrip-burn for the matching fee (already removed from buyer's balance via buyer-accept hold).
 	if len(burnPayload) > 0 {
 		if _, emitErr := e.sendOperatorMessage(burnPayload,
 			[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
@@ -735,8 +647,172 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 		}
 	}
 
-	e.opts.log("engine: settle: reservation=%s seller=%s residual=%d fee_burned=%d exchange=%d",
-		shortKey(payload.ReservationID), shortKey(sellerKey), residual, fee, exchangeRevenue)
+	// Clean up engine-side mapping now that the reservation is consumed.
+	delete(e.matchToReservation, matchMsgID)
+
+	e.opts.log("engine: settle: reservation=%s seller=%s price=%d residual=%d fee_burned=%d exchange=%d",
+		shortKey(reservationID), shortKey(sellerKey), price, residual, fee, exchangeRevenue)
+	return nil
+}
+
+// handleSettleBuyerAcceptScrip performs the scrip hold when a buyer sends a
+// settle(buyer-accept) message. This is the "preview-before-purchase" model:
+// scrip is locked when the buyer has reviewed the preview and decided to proceed,
+// not at buy time.
+//
+// On success:
+//   - Buyer's balance is decremented by (price + fee)
+//   - A reservation is saved in ScripStore
+//   - The reservation ID is stored in matchToReservation[matchMsgID]
+//   - A scrip-buy-hold convention message is emitted for CampfireScripStore replay
+//
+// The match message ID is resolved from the antecedent chain:
+//
+//	buyer-accept → preview (optional) → match
+//
+// This mirrors the antecedent resolution in state.applySettleBuyerAccept.
+func (e *Engine) handleSettleBuyerAcceptScrip(msg *store.MessageRecord) error {
+	if len(msg.Antecedents) == 0 {
+		e.opts.log("engine: buyer-accept scrip: no antecedents, ignoring msg=%s", shortKey(msg.ID))
+		return nil
+	}
+	antecedentID := msg.Antecedents[0]
+
+	// Resolve the match message ID from the antecedent.
+	// Try preview path first (antecedent is a preview message).
+	e.state.mu.RLock()
+	matchMsgID, hasMatch := e.state.previewToMatch[antecedentID]
+	if !hasMatch {
+		// Legacy/small-content path: antecedent is the match message directly.
+		matchMsgID = antecedentID
+		// Validate that this is a known match (security: reject spoofed buyer-accept).
+		_, hasMatch = e.state.matchToBuyer[matchMsgID]
+	}
+	expectedBuyer, _ := e.state.matchToBuyer[matchMsgID]
+	e.state.mu.RUnlock()
+
+	if !hasMatch {
+		e.opts.log("engine: buyer-accept scrip: unknown match %s, ignoring", shortKey(matchMsgID))
+		return nil
+	}
+
+	// Enforce buyer identity: only the original buyer may trigger a scrip hold.
+	if msg.Sender != expectedBuyer {
+		e.opts.log("engine: buyer-accept scrip: sender %s is not buyer for match %s, ignoring",
+			shortKey(msg.Sender), shortKey(matchMsgID))
+		return nil
+	}
+
+	// Idempotency: if a hold already exists for this match, skip.
+	// This handles the restart-with-pending-orders scenario: the buyer-accept-hold
+	// message was written to the campfire log on a previous run and CampfireScripStore
+	// has already replayed it. Re-running DecrementBudget would double-charge the buyer.
+	if existingResID := e.findExistingBuyerAcceptHold(matchMsgID); existingResID != "" {
+		// Restore in-memory reservation so complete/dispute handlers can reference it.
+		ctx := e.engineCtx()
+		_, currentETag, _ := e.opts.ScripStore.GetBudget(ctx, msg.Sender, scrip.BalanceKey)
+		// Look up the entry price to reconstruct holdAmount.
+		e.state.mu.RLock()
+		entryID := e.state.matchToEntry[matchMsgID]
+		e.state.mu.RUnlock()
+		entry := e.state.GetInventoryEntry(entryID)
+		var holdAmount int64
+		if entry != nil {
+			p := e.computePrice(entry)
+			holdAmount = p + p/MatchingFeeRate
+		}
+		res := scrip.Reservation{
+			ID:        existingResID,
+			AgentKey:  msg.Sender,
+			RK:        scrip.BalanceKey,
+			ETag:      currentETag,
+			Amount:    holdAmount,
+			CreatedAt: time.Now(),
+		}
+		if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
+			e.opts.log("engine: buyer-accept scrip: warning: re-save reservation after restart %s: %v",
+				shortKey(existingResID), err)
+		}
+		e.matchToReservation[matchMsgID] = existingResID
+		e.opts.log("engine: buyer-accept scrip: hold already replayed, skipping pre-decrement buyer=%s reservation=%s",
+			shortKey(msg.Sender), shortKey(existingResID))
+		return nil
+	}
+
+	// Determine the price for the entry offered in this match.
+	e.state.mu.RLock()
+	entryID := e.state.matchToEntry[matchMsgID]
+	e.state.mu.RUnlock()
+	entry := e.state.GetInventoryEntry(entryID)
+	if entry == nil {
+		e.opts.log("engine: buyer-accept scrip: entry %s not found for match %s, ignoring",
+			shortKey(entryID), shortKey(matchMsgID))
+		return nil
+	}
+
+	bestPrice := e.computePrice(entry)
+	fee := bestPrice / MatchingFeeRate
+	holdAmount := bestPrice + fee
+
+	ctx := e.engineCtx()
+	buyerKey := msg.Sender
+
+	bal, etag, err := e.opts.ScripStore.GetBudget(ctx, buyerKey, scrip.BalanceKey)
+	if err != nil {
+		return fmt.Errorf("scrip: buyer-accept: GetBudget for buyer %s: %w", shortKey(buyerKey), err)
+	}
+	if bal < holdAmount {
+		return fmt.Errorf("scrip: buyer-accept: buyer %s: %w (balance=%d, required=%d)",
+			shortKey(buyerKey), scrip.ErrBudgetExceeded, bal, holdAmount)
+	}
+
+	// Marshal the buy-hold convention message BEFORE mutating scrip state.
+	reservationID := newReservationID()
+	expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	holdPayload, err := e.marshal(scrip.BuyHoldPayload{
+		Buyer:         buyerKey,
+		Amount:        holdAmount,
+		Price:         bestPrice,
+		Fee:           fee,
+		ReservationID: reservationID,
+		BuyMsg:        matchMsgID, // references the match message (historical field name)
+		ExpiresAt:     expiresAt,
+	})
+	if err != nil {
+		return fmt.Errorf("scrip: marshal buyer-accept buy-hold payload: %w", err)
+	}
+
+	_, newETag, err := e.opts.ScripStore.DecrementBudget(ctx, buyerKey, scrip.BalanceKey, holdAmount, etag)
+	if err != nil {
+		return fmt.Errorf("scrip: buyer-accept: DecrementBudget for buyer %s: %w", shortKey(buyerKey), err)
+	}
+
+	// Save reservation so settle(complete) and dispute handlers can reference it.
+	res := scrip.Reservation{
+		ID:        reservationID,
+		AgentKey:  buyerKey,
+		RK:        scrip.BalanceKey,
+		ETag:      newETag,
+		Amount:    holdAmount,
+		CreatedAt: time.Now(),
+	}
+	if err := e.opts.ScripStore.SaveReservation(ctx, res); err != nil {
+		return fmt.Errorf("scrip: buyer-accept: SaveReservation: %w", err)
+	}
+
+	// Record the reservation so the complete handler can find it.
+	e.matchToReservation[matchMsgID] = reservationID
+
+	e.opts.log("engine: buyer-accept scrip: pre-decremented buyer=%s hold=%d reservation=%s match=%s",
+		shortKey(buyerKey), holdAmount, shortKey(reservationID), shortKey(matchMsgID))
+
+	// Emit scrip-buy-hold convention message so CampfireScripStore can replay it.
+	// The BuyMsg field references the match message ID (the antecedent resolution anchor).
+	if _, emitErr := e.sendOperatorMessage(holdPayload,
+		[]string{scrip.TagScripBuyHold}, []string{msg.ID}); emitErr != nil {
+		e.opts.log("engine: warning: emit scrip-buy-hold (buyer-accept): %v", emitErr)
+	}
+
 	return nil
 }
 
@@ -1364,15 +1440,18 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 	}
 }
 
-// findExistingBuyHold scans the campfire log for a scrip-buy-hold message
-// that was emitted for the given buy message ID. Returns the reservation ID
+// findExistingBuyerAcceptHold scans the campfire log for a scrip-buy-hold message
+// that was emitted for the given match message ID. Returns the reservation ID
 // if found, or "" if no prior buy-hold exists.
 //
-// Called by handleBuy to detect the restart-with-pending-orders scenario:
-// if a scrip-buy-hold was already written to the log (and thus replayed by
-// CampfireScripStore into the in-memory balance), we must NOT call
-// DecrementBudget again or the buyer will be double-charged.
-func (e *Engine) findExistingBuyHold(buyMsgID string) string {
+// Called by handleSettleBuyerAcceptScrip to detect the restart-with-pending-orders
+// scenario: if a scrip-buy-hold was already written to the log (and thus replayed by
+// CampfireScripStore into the in-memory balance), we must NOT call DecrementBudget
+// again or the buyer will be double-charged.
+//
+// The BuyMsg field in BuyHoldPayload stores the match message ID (the anchor used
+// to look up the reservation during settlement).
+func (e *Engine) findExistingBuyerAcceptHold(matchMsgID string) string {
 	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0,
 		store.MessageFilter{
 			Tags:   []string{scrip.TagScripBuyHold},
@@ -1386,7 +1465,7 @@ func (e *Engine) findExistingBuyHold(buyMsgID string) string {
 		if err := json.Unmarshal(msgs[i].Payload, &p); err != nil {
 			continue
 		}
-		if p.BuyMsg == buyMsgID && p.ReservationID != "" {
+		if p.BuyMsg == matchMsgID && p.ReservationID != "" {
 			return p.ReservationID
 		}
 	}

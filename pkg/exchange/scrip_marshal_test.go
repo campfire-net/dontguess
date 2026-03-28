@@ -35,9 +35,9 @@ func failMarshal(v any) ([]byte, error) {
 	return nil, errMarshalInjected
 }
 
-// TestBuy_MarshalFailure_NoBudgetDecrement verifies that if the scrip-buy-hold
-// convention message cannot be marshalled, no balance decrement occurs.
-func TestBuy_MarshalFailure_NoBudgetDecrement(t *testing.T) {
+// TestBuyerAccept_MarshalFailure_NoBudgetDecrement verifies that if the scrip-buy-hold
+// convention message cannot be marshalled during buyer-accept, no balance decrement occurs.
+func TestBuyerAccept_MarshalFailure_NoBudgetDecrement(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
@@ -68,28 +68,53 @@ func TestBuy_MarshalFailure_NoBudgetDecrement(t *testing.T) {
 	}
 	balanceBefore := cs.Balance(h.buyer.PublicKeyHex())
 
-	// Inject buy message into the store.
-	buyMsg := h.sendMessage(h.buyer,
+	// Run engine to generate a match.
+	preMatch, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
 		buyPayload("Generate Go HTTP handler unit tests", salePrice+5000),
 		[]string{exchange.TagBuy},
 		nil,
 	)
 
-	// Reload engine state so the buy message is visible.
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	matchMsg := waitForMatchMessage(t, h, preMatch, 2*time.Second)
+	cancel()
 
-	// Inject a failing marshal function.
+	// Buyer balance must be unchanged after buy (no hold at buy time).
+	if cs.Balance(h.buyer.PublicKeyHex()) != balanceBefore {
+		t.Errorf("buyer balance changed after buy: before=%d after=%d (expected no change)",
+			balanceBefore, cs.Balance(h.buyer.PublicKeyHex()))
+	}
+
+	// Inject a failing marshal function, then send buyer-accept.
 	eng.SetMarshalFuncForTest(failMarshal)
 
-	rec, err := h.st.GetMessage(buyMsg.ID)
+	buyerAcceptP, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
 	if err != nil || rec == nil {
-		t.Fatalf("GetMessage buy: %v", err)
+		t.Fatalf("GetMessage buyer-accept: %v", err)
 	}
 
 	dispatchErr := eng.DispatchForTest(rec)
 	if dispatchErr == nil {
-		t.Fatal("expected handleBuy to return error on marshal failure, got nil")
+		t.Fatal("expected handleSettleBuyerAcceptScrip to return error on marshal failure, got nil")
 	}
 	if !errors.Is(dispatchErr, errMarshalInjected) {
 		t.Errorf("expected errMarshalInjected in error chain, got: %v", dispatchErr)
@@ -151,25 +176,16 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMatch, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Build antecedent chain: buyer-accept → deliver (to establish seller identity).
+	// buyer-accept dispatched WITHOUT failing marshal (hold must succeed first).
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Build antecedent chain: buyer-accept → deliver (to establish seller identity).
-	buyerAcceptP, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": inv[0].EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptP,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
 	deliverP, _ := json.Marshal(map[string]any{
 		"phase":        "deliver",
 		"entry_id":     inv[0].EntryID,
@@ -194,10 +210,10 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 	// Inject failing marshal, then dispatch settle(complete).
 	eng.SetMarshalFuncForTest(failMarshal)
 
+	// Note: reservation_id is NOT in the complete payload — engine looks it up internally.
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": resID,
-		"price":          salePrice,
-		"entry_id":       inv[0].EntryID,
+		"price":    salePrice,
+		"entry_id": inv[0].EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -294,12 +310,16 @@ func TestDispute_MarshalFailure_NoRefundNorReservationLoss(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMatch, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// buyer-accept dispatched WITHOUT failing marshal (hold must succeed first).
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Record buyer balance after buy-hold (decremented by holdAmount).
+	// Record buyer balance after buyer-accept hold (decremented by holdAmount).
 	buyerBalBeforeDispute := cs.Balance(h.buyer.PublicKeyHex())
 
 	// Inject failing marshal, then dispatch settle(dispute).

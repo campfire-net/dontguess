@@ -463,14 +463,14 @@ func TestE2E_EmptyMatch(t *testing.T) {
 // TestE2E_ScripBalances exercises the complete exchange flow with a real
 // CampfireScripStore wired into the engine, asserting scrip balances at each step:
 //
-//  1. Mint:         buyer receives scrip via scrip-mint convention message
-//  2. Put-accept:   seller receives scrip-put-pay; operator balance decremented
-//  3. Buy:          buyer balance decremented by (price + fee); reservation created
-//  4. Match:        campfire log contains scrip-buy-hold message
-//  5. Settle:       seller receives residual; operator receives exchange revenue;
+//  1. Mint:          buyer receives scrip via scrip-mint convention message
+//  2. Put-accept:    seller receives scrip-put-pay; operator balance decremented
+//  3. Buy:           buyer balance UNCHANGED (no pre-decrement; hold deferred to buyer-accept)
+//  4. Buyer-accept:  buyer balance decremented by (price + fee); scrip-buy-hold emitted
+//  5. Settle:        seller receives residual; operator receives exchange revenue;
 //     fee is burned; reservation is deleted
-//  6. Campfire log: scrip-buy-hold, scrip-settle, scrip-burn messages all present
-//  7. Replay:       fresh CampfireScripStore reproduces the same balances from the log
+//  6. Campfire log:  scrip-buy-hold, scrip-settle, scrip-burn messages all present
+//  7. Replay:        fresh CampfireScripStore reproduces the same balances from the log
 func TestE2E_ScripBalances(t *testing.T) {
 	t.Parallel()
 
@@ -542,32 +542,43 @@ func TestE2E_ScripBalances(t *testing.T) {
 		nil,
 	)
 
-	// Wait for match message (engine processed the buy and pre-decremented).
+	// Wait for match message (engine processed the buy — no scrip hold at buy time).
 	matchMsg := waitForMatchMessage(t, h, preMatchMsgs, 2*time.Second)
 	cancel()
 
-	// Step 3 assertion: buyer balance decremented by holdAmount.
+	// Step 3 assertion: buyer balance UNCHANGED after buy (hold deferred to buyer-accept).
 	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
-	if buyerBalanceAfterBuy != buyerBalanceAfterMint-holdAmount {
-		t.Errorf("step 3 (buy): buyer balance = %d, want %d (mint=%d - hold=%d)",
-			buyerBalanceAfterBuy, buyerBalanceAfterMint-holdAmount, buyerBalanceAfterMint, holdAmount)
+	if buyerBalanceAfterBuy != buyerBalanceAfterMint {
+		t.Errorf("step 3 (buy): buyer balance = %d, want %d (no pre-decrement at buy time)",
+			buyerBalanceAfterBuy, buyerBalanceAfterMint)
 	}
 
-	// --- Step 4: Match — campfire log has scrip-buy-hold message ---
+	// --- Step 4: Buyer-accept — triggers scrip hold; campfire log gets scrip-buy-hold ---
+	// Dispatch buyer-accept through engine to trigger handleSettleBuyerAcceptScrip.
+	buyerAcceptMsgE2E := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, entry.EntryID)
+
+	// Buy-hold message must appear after buyer-accept.
 	afterBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
 	if len(afterBuyHoldMsgs) <= len(preBuyHoldMsgs) {
-		t.Error("step 4 (match): expected scrip-buy-hold message in campfire log")
+		t.Error("step 4 (buyer-accept): expected scrip-buy-hold message in campfire log after buyer-accept")
 	}
 
-	// Extract reservation_id from match payload.
-	resID := extractReservationID(t, matchMsg)
+	// Buyer balance must be decremented by holdAmount after buyer-accept.
+	buyerBalanceAfterAccept := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterAccept != buyerBalanceAfterMint-holdAmount {
+		t.Errorf("step 4 (buyer-accept): buyer balance = %d, want %d (mint=%d - hold=%d)",
+			buyerBalanceAfterAccept, buyerBalanceAfterMint-holdAmount, buyerBalanceAfterMint, holdAmount)
+	}
+
+	// Extract reservation_id from the scrip-buy-hold log message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("step 4 (match): reservation_id must be non-empty in match search_meta")
+		t.Fatal("step 4 (buyer-accept): reservation_id must be non-empty in scrip-buy-hold log")
 	}
 
 	// Reservation must exist in the store.
 	if _, err := cs.GetReservation(context.Background(), resID); err != nil {
-		t.Fatalf("step 4 (match): reservation %s must exist after buy: %v", resID[:8], err)
+		t.Fatalf("step 4 (buyer-accept): reservation %s must exist after buyer-accept: %v", resID[:8], err)
 	}
 
 	// --- Step 5: Settle(complete) — scrip flows to seller and operator ---
@@ -576,24 +587,6 @@ func TestE2E_ScripBalances(t *testing.T) {
 
 	preSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripSettle}})
 	preBurnMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBurn}})
-
-	// Build the antecedent chain for seller key derivation:
-	//   complete → deliver → buyer-accept → match → entry → seller
-
-	// buyer-accept (antecedent = match message).
-	buyerAcceptPayloadE2E, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": entry.EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsgE2E := h.sendMessage(h.buyer, buyerAcceptPayloadE2E,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
 
 	// deliver (antecedent = buyer-accept message).
 	deliverPayloadE2E, _ := json.Marshal(map[string]any{
@@ -610,14 +603,13 @@ func TestE2E_ScripBalances(t *testing.T) {
 		[]string{buyerAcceptMsgE2E.ID},
 	)
 
-	// Replay to pick up buyer-accept and deliver before dispatching complete.
+	// Replay to pick up deliver before dispatching complete.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 
+	// Price is derived from the reservation (locked at buyer-accept), not from payload.
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": resID,
-		"price":          salePrice,
-		"entry_id":       entry.EntryID,
+		"entry_id": entry.EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
