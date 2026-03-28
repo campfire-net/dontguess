@@ -40,5 +40,10 @@
       "tag": "dontguess:scrip-mint",
       "cardinality": "exactly_one"
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 10,
+    "per": "sender",
+    "window": "1h"
+  }
 }

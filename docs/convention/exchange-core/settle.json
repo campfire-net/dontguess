@@ -66,12 +66,12 @@
       "name": "dispute_type",
       "type": "enum",
       "values": [
-        "content_mismatch",
-        "quality_inadequate",
-        "hash_invalid",
-        "stale_content"
+        "exchange:dispute-type:content_mismatch",
+        "exchange:dispute-type:quality_inadequate",
+        "exchange:dispute-type:hash_invalid",
+        "exchange:dispute-type:stale_content"
       ],
-      "description": "Type of dispute. Required in dispute phase. Not used in small-content-dispute (which is unconditional)."
+      "description": "Type of dispute. Required in dispute phase. Composed into exchange:dispute-type:<value> tag. Not used in small-content-dispute (which is unconditional)."
     },
     {
       "name": "verdict",
@@ -150,6 +150,16 @@
         "exchange:verdict:rejected",
         "exchange:verdict:disputed",
         "exchange:verdict:auto-refunded"
+      ]
+    },
+    {
+      "tag": "exchange:dispute-type:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:dispute-type:content_mismatch",
+        "exchange:dispute-type:quality_inadequate",
+        "exchange:dispute-type:hash_invalid",
+        "exchange:dispute-type:stale_content"
       ]
     }
   ],

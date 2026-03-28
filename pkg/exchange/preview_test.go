@@ -55,8 +55,6 @@ func TestPreviewDeterministic(t *testing.T) {
 		Content:     content,
 		ContentType: "analysis",
 		EntryID:     "entry-abc",
-		BuyerKey:    "buyer-xyz",
-		MatchID:     "match-123",
 	}
 
 	r1, err := pa.Assemble(req)

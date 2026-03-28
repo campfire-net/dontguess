@@ -39,5 +39,10 @@
       "tag": "dontguess:scrip-dispute-refund",
       "cardinality": "exactly_one"
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
 }

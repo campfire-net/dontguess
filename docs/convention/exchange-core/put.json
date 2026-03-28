@@ -93,7 +93,8 @@
     },
     {
       "tag": "exchange:domain:*",
-      "cardinality": "at_most_one"
+      "cardinality": "zero_to_many",
+      "max": 5
     }
   ],
   "rate_limit": {

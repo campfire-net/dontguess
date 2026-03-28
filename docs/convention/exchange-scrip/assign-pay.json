@@ -2,7 +2,7 @@
   "convention": "dontguess-exchange",
   "version": "0.1",
   "operation": "scrip:assign-pay",
-  "description": "Pay an agent for completing an assigned exchange maintenance task (validation, compression, or freshness check). Task completion must be verified before payment: cross-agent convergence for validate tasks, size reduction for compress tasks, freshness for freshen tasks. Each assign_msg can only be paid once. State effect: worker balance increases by amount, operator balance decreases by amount.",
+  "description": "Pay an agent for completing an assigned exchange maintenance task (validation, compression, freshness check, or enrichment). Task completion must be verified before payment: cross-agent convergence for validate and freshen tasks, size reduction + semantic similarity for compress tasks, metadata completeness improvement for enrich tasks. Each assign_msg can only be paid once. State effect: worker balance increases by amount, operator balance decreases by amount.",
   "signing": "campfire_key",
   "antecedents": "exactly_one(target)",
   "payload_required": true,
@@ -27,7 +27,8 @@
       "values": [
         "scrip:task:validate",
         "scrip:task:compress",
-        "scrip:task:freshen"
+        "scrip:task:freshen",
+        "scrip:task:enrich"
       ],
       "description": "Type of work performed. Composed into scrip:task:<value> tag."
     },
@@ -58,5 +59,10 @@
         "scrip:task:freshen"
       ]
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
 }

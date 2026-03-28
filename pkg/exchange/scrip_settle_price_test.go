@@ -42,7 +42,7 @@ func buildSettleChainForPriceTests(
 		t.Fatal("buildSettleChainForPriceTests: no inventory entries")
 	}
 	entry := inv[0]
-	salePrice = entry.PutPrice * 120 / 100
+	salePrice = eng.ComputePriceForTest(entry)
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -204,7 +204,7 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	if len(inv) == 0 {
 		t.Fatal("no inventory entries")
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 

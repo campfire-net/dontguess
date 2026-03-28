@@ -60,5 +60,10 @@
       "tag": "dontguess:scrip-settle",
       "cardinality": "exactly_one"
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
 }

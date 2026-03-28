@@ -1,0 +1,70 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:match-confirm",
+  "description": "Confirm or reject a cross-operator match request. Sent by the originating operator (seller's exchange) in response to a federation:match-request. Fulfills the match-request future. On confirmation, the originating operator commits to delivering content to the buyer. On rejection, the receiving operator removes the entry from match results and informs the buyer.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the federation:match-request being responded to."
+    },
+    {
+      "name": "confirmed",
+      "type": "boolean",
+      "required": true,
+      "description": "Whether the match is confirmed (true) or rejected (false)."
+    },
+    {
+      "name": "entry_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Entry identifier (echoed from the match-request)."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Content hash (echoed for verification)."
+    },
+    {
+      "name": "reject_reason",
+      "type": "enum",
+      "values": ["expired", "withdrawn", "seller-banned", "rate-limited", "internal-error"],
+      "description": "Reason for rejection. Required if confirmed is false."
+    },
+    {
+      "name": "delivery_transport",
+      "type": "json",
+      "description": "Transport details for content delivery to the buyer. Required if confirmed is true. Object: {method: 'direct' | 'relay', endpoint: string, encryption: 'x25519-xsalsa20-poly1305'}."
+    },
+    {
+      "name": "price_micro_tokens",
+      "type": "integer",
+      "min": 0,
+      "description": "Suggested price in micro-tokens. Advisory — the receiving operator sets the final buyer-facing price. Required if confirmed is true."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:match-confirm",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "federation:origin:*",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 100,
+    "per": "sender",
+    "window": "1h"
+  }
+}

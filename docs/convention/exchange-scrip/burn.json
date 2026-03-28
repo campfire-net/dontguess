@@ -45,5 +45,10 @@
         "scrip:reason:penalty"
       ]
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
 }

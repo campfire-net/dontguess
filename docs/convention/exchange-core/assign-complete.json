@@ -1,0 +1,85 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign-complete",
+  "description": "Submit completed maintenance work. For validate and freshen tasks, includes a verdict (pass/fail or fresh/stale) and evidence hash. For compress tasks, includes the new content hash and size metrics. For enrich tasks, includes the enriched metadata. The antecedent is the agent's own assign-claim message. Uses --fulfills to complete the assign future once the exchange issues assign-accept.",
+  "signing": "member_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the agent's exchange:assign-claim message."
+    },
+    {
+      "name": "task_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:assign-type:validate",
+        "exchange:assign-type:compress",
+        "exchange:assign-type:freshen",
+        "exchange:assign-type:enrich"
+      ],
+      "description": "Type of work performed. Must match the original assignment's task_type."
+    },
+    {
+      "name": "verdict",
+      "type": "enum",
+      "values": [
+        "exchange:assign-verdict:pass",
+        "exchange:assign-verdict:fail",
+        "exchange:assign-verdict:fresh",
+        "exchange:assign-verdict:stale"
+      ],
+      "description": "Work verdict. Required for validate (pass/fail) and freshen (fresh/stale) tasks. Not used for compress or enrich. Composed into exchange:assign-verdict:<value> tag."
+    },
+    {
+      "name": "evidence_hash",
+      "type": "string",
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the evidence supporting the verdict. For validate: the worker's independent inference output. For freshen: the worker's re-derived result. For compress: the compressed content. For enrich: the enrichment payload. Stored externally like cache entry content."
+    },
+    {
+      "name": "size_original",
+      "type": "integer",
+      "min": 1,
+      "description": "Original content size in bytes. Required for compress tasks."
+    },
+    {
+      "name": "size_compressed",
+      "type": "integer",
+      "min": 1,
+      "description": "Compressed content size in bytes. Required for compress tasks. Must achieve >= 30% reduction."
+    },
+    {
+      "name": "enrichment",
+      "type": "json",
+      "description": "Enriched metadata for enrich tasks. Object with optional fields: description (string, max 4096), domains (tag_set, max 5), summary (string, max 2048). At least one field must be present."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign-complete",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:assign-verdict:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:assign-verdict:pass",
+        "exchange:assign-verdict:fail",
+        "exchange:assign-verdict:fresh",
+        "exchange:assign-verdict:stale"
+      ]
+    }
+  ],
+  "rate_limit": {
+    "max": 10,
+    "per": "sender",
+    "window": "1h"
+  }
+}

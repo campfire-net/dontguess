@@ -59,5 +59,10 @@
       "tag": "dontguess:scrip-buy-hold",
       "cardinality": "exactly_one"
     }
-  ]
+  ],
+  "rate_limit": {
+    "max": 30,
+    "per": "sender",
+    "window": "1m"
+  }
 }

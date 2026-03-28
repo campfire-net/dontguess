@@ -1,0 +1,57 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:accept",
+  "description": "Accept a federation proposal from another exchange operator. The accept message references the propose message as its antecedent, forming the bilateral agreement. Both operators are now federated under the agreed terms. The acceptor may include counter-terms (e.g. different trust floor or rate limit for their direction), which override the proposal terms for the acceptor's outbound inventory.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the federation:propose message being accepted."
+    },
+    {
+      "name": "convention_version",
+      "type": "string",
+      "required": true,
+      "max_length": 16,
+      "description": "Exchange convention version this operator supports. Must be compatible with the proposer's version."
+    },
+    {
+      "name": "trust_floor",
+      "type": "integer",
+      "required": false,
+      "min": 0,
+      "max": 100,
+      "description": "Counter-term: minimum seller reputation for entries THIS operator shares outbound. If omitted, uses the proposer's trust_floor."
+    },
+    {
+      "name": "rate_limit_per_hour",
+      "type": "integer",
+      "required": false,
+      "min": 1,
+      "max": 10000,
+      "description": "Counter-term: maximum inventory-offer messages per hour THIS operator will send. If omitted, uses the proposer's rate_limit_per_hour."
+    },
+    {
+      "name": "inventory_scope",
+      "type": "json",
+      "required": false,
+      "description": "Counter-term: inventory sharing filter for THIS operator's outbound inventory. If omitted, uses the proposer's inventory_scope."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:accept",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 5,
+    "per": "sender",
+    "window": "24h"
+  }
+}
