@@ -1223,10 +1223,19 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 		sizeFactor = 1.0 + sizeBonus
 	}
 
-	// Step 6: compound all multipliers
-	price := base * demandFactor * ageFactor * repFactor * sizeFactor
+	// Step 6: dynamic price adjustment from the fast pricing loop.
+	// If no active adjustment exists (cold start, no loop yet, expired TTL), the
+	// multiplier returned by GetPriceAdjustment is 1.0 — a no-op.
+	fastAdj := e.state.GetPriceAdjustment(entry.EntryID)
+	fastFactor := fastAdj.Multiplier
+	if fastFactor <= 0 {
+		fastFactor = 1.0
+	}
 
-	// Step 7: clamp and round (nearest-integer, not truncate, for stable results)
+	// Step 7: compound all multipliers
+	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor
+
+	// Step 8: clamp and round (nearest-integer, not truncate, for stable results)
 	rounded := math.Round(price)
 	if rounded < float64(computePriceMinPrice) {
 		return computePriceMinPrice
@@ -1395,36 +1404,19 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 	}
 }
 
-// findExistingBuyerAcceptHold scans the campfire log for a scrip-buy-hold message
-// that was emitted for the given match message ID. Returns the reservation ID
-// if found, or "" if no prior buy-hold exists.
+// findExistingBuyerAcceptHold returns the reservation ID for a prior scrip-buy-hold
+// message matching the given match message ID, or "" if none exists.
 //
 // Called by handleSettleBuyerAcceptScrip to detect the restart-with-pending-orders
 // scenario: if a scrip-buy-hold was already written to the log (and thus replayed by
 // CampfireScripStore into the in-memory balance), we must NOT call DecrementBudget
 // again or the buyer will be double-charged.
 //
-// The BuyMsg field in BuyHoldPayload stores the match message ID (the anchor used
-// to look up the reservation during settlement).
+// Uses the state matchToBuyHold index for O(1) lookup.
+// State.Replay() populates the index by applying all scrip-buy-hold messages
+// via applyScripBuyHold â no full log scan needed at query time.
 func (e *Engine) findExistingBuyerAcceptHold(matchMsgID string) string {
-	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0,
-		store.MessageFilter{
-			Tags:   []string{scrip.TagScripBuyHold},
-			Sender: operatorKeyHex(e.opts.OperatorIdentity.PublicKey),
-		})
-	if err != nil {
-		return ""
-	}
-	for i := range msgs {
-		var p scrip.BuyHoldPayload
-		if err := json.Unmarshal(msgs[i].Payload, &p); err != nil {
-			continue
-		}
-		if p.BuyMsg == matchMsgID && p.ReservationID != "" {
-			return p.ReservationID
-		}
-	}
-	return ""
+	return e.state.GetBuyHoldReservation(matchMsgID)
 }
 
 // newReservationID generates a random hex reservation ID.
