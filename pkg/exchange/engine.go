@@ -344,6 +344,9 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	if payload.Budget == 0 && payload.MaxPrice > 0 {
 		payload.Budget = payload.MaxPrice
 	}
+	// Normalize tag-prefixed enum values from convention dispatch.
+	payload.ContentType = stripTagPrefix(payload.ContentType, "exchange:content-type:")
+	payload.Domains = stripDomainPrefixes(payload.Domains)
 
 	maxResults := payload.MaxResults
 	if maxResults <= 0 {

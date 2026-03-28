@@ -564,8 +564,8 @@ func (s *State) applyPut(msg *store.MessageRecord) {
 		SellerKey:    msg.Sender,
 		Description:  payload.Description,
 		ContentHash:  payload.ContentHash,
-		ContentType:  payload.ContentType,
-		Domains:      payload.Domains,
+		ContentType:  stripTagPrefix(payload.ContentType, "exchange:content-type:"),
+		Domains:      stripDomainPrefixes(payload.Domains),
 		TokenCost:    payload.TokenCost,
 		ContentSize:  payload.ContentSize,
 		PutTimestamp: msg.Timestamp,
@@ -606,8 +606,8 @@ func (s *State) applyBuy(msg *store.MessageRecord) {
 		Budget:         payload.Budget,
 		MinReputation:  payload.MinReputation,
 		FreshnessHours: payload.FreshnessHours,
-		ContentType:    payload.ContentType,
-		Domains:        payload.Domains,
+		ContentType:    stripTagPrefix(payload.ContentType, "exchange:content-type:"),
+		Domains:        stripDomainPrefixes(payload.Domains),
 		MaxResults:     maxResults,
 		CreatedAt:      msg.Timestamp,
 	}
@@ -1474,6 +1474,26 @@ func (s *State) AllSellerKeys() []string {
 	out := make([]string, 0, len(seen))
 	for k := range seen {
 		out = append(out, k)
+	}
+	return out
+}
+
+// stripTagPrefix removes a convention tag prefix from a value if present.
+// Convention dispatch sends full tag form (e.g. "exchange:content-type:analysis")
+// where the engine expects bare enum values ("analysis"). Accept both.
+func stripTagPrefix(val, prefix string) string {
+	if strings.HasPrefix(val, prefix) {
+		return val[len(prefix):]
+	}
+	return val
+}
+
+// stripDomainPrefixes normalizes domain values, stripping "exchange:domain:"
+// prefix if convention dispatch sent the full tag form.
+func stripDomainPrefixes(domains []string) []string {
+	out := make([]string, len(domains))
+	for i, d := range domains {
+		out[i] = stripTagPrefix(d, "exchange:domain:")
 	}
 	return out
 }
