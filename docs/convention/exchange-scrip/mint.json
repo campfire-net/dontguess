@@ -39,6 +39,10 @@
     {
       "tag": "dontguess:scrip-mint",
       "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:amount:*",
+      "cardinality": "exactly_one"
     }
   ]
 }
