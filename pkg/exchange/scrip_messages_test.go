@@ -75,7 +75,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -191,11 +191,12 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
-	expectedResidual := salePrice / exchange.ResidualRate
-	expectedExchangeRevenue := salePrice - expectedResidual
+	enginePrice := holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
+	expectedResidual := enginePrice / exchange.ResidualRate
+	expectedExchangeRevenue := enginePrice - expectedResidual
 
 	// Seed buyer with sufficient scrip and run buy to get a reservation.
 	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)

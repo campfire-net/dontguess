@@ -497,11 +497,12 @@ func TestE2E_ScripBalances(t *testing.T) {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
 	entry := inv[0]
-	salePrice := entry.PutPrice * 120 / 100 // 6720
-	fee := salePrice / exchange.MatchingFeeRate    // 672
-	holdAmount := salePrice + fee                  // 7392
-	expectedResidual := salePrice / exchange.ResidualRate       // 672
-	expectedExchangeRevenue := salePrice - expectedResidual     // 6048
+	salePrice := eng.ComputePriceForTest(entry)
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+	enginePrice := holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
+	expectedResidual := enginePrice / exchange.ResidualRate
+	expectedExchangeRevenue := enginePrice - expectedResidual
 
 	// --- Step 1: Mint — buyer receives scrip ---
 	const buyerExtra = int64(5000)
@@ -783,7 +784,7 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	}
 
 	// Mint enough scrip for the buyer to cover the purchase.
-	salePrice := entry.PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(entry)
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 	const buyerExtra = int64(500)
@@ -1161,11 +1162,12 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	}
 
 	// Compute expected scrip amounts.
-	salePrice := putPrice * 120 / 100                       // 8400
-	fee := salePrice / exchange.MatchingFeeRate             // 840
-	holdAmount := salePrice + fee                           // 9240
-	expectedResidual := salePrice / exchange.ResidualRate   // 840
-	expectedExchangeRevenue := salePrice - expectedResidual // 7560
+	salePrice := eng.ComputePriceForTest(entry)
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+	enginePrice := holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
+	expectedResidual := enginePrice / exchange.ResidualRate
+	expectedExchangeRevenue := enginePrice - expectedResidual
 
 	// Mint scrip for the buyer so it can afford the purchase.
 	const buyerExtra = int64(3000)

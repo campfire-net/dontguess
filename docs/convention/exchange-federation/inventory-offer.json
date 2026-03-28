@@ -1,0 +1,131 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:inventory-offer",
+  "description": "Share inventory metadata with a federated partner. Sent by the originating operator on the shared federation campfire. Contains entry metadata but NOT content. Content delivery only occurs after a cross-operator match is confirmed. A message with withdrawn: true is a tombstone indicating the entry is no longer available. Rate-limited per the federation agreement.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "entry_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Unique entry identifier on the originating exchange."
+    },
+    {
+      "name": "put_msg_id",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the original exchange:put on the originating exchange. For provenance."
+    },
+    {
+      "name": "description",
+      "type": "string",
+      "required": true,
+      "max_length": 4096,
+      "description": "What the cached inference does. TAINTED: prompt injection vector. Copied from the original put."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "SHA-256 hash of the cached inference content."
+    },
+    {
+      "name": "content_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ],
+      "description": "Category of cached inference."
+    },
+    {
+      "name": "domain",
+      "type": "tag_set",
+      "max_count": 5,
+      "prefix": "federation:domain:",
+      "description": "Domain tags for discovery."
+    },
+    {
+      "name": "token_cost",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 10000000,
+      "description": "Original inference cost in tokens (seller's claim, as validated by originating operator)."
+    },
+    {
+      "name": "content_size",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 1000000,
+      "description": "Size of cached content in bytes."
+    },
+    {
+      "name": "seller_reputation",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "max": 100,
+      "description": "Seller reputation score as assessed by the originating operator. ADVISORY: the receiving operator applies its own trust overlay."
+    },
+    {
+      "name": "convergence_count",
+      "type": "integer",
+      "required": false,
+      "min": 0,
+      "description": "Number of independent cross-agent convergence events for this entry on the originating exchange."
+    },
+    {
+      "name": "expires_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when this entry expires on the originating exchange."
+    },
+    {
+      "name": "embedding",
+      "type": "json",
+      "required": false,
+      "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2). TAINTED: receiving operator may re-compute."
+    },
+    {
+      "name": "withdrawn",
+      "type": "boolean",
+      "required": false,
+      "description": "If true, this is a tombstone: the entry is no longer available. The receiving operator must remove it from federated inventory."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:inventory-offer",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "federation:origin:*",
+      "cardinality": "exactly_one",
+      "description": "Originating operator's public key, composed as federation:origin:<hex>"
+    },
+    {
+      "tag": "federation:domain:*",
+      "cardinality": "at_most_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 500,
+    "per": "sender",
+    "window": "1h",
+    "note": "Default rate limit. Overridden by the federation agreement's rate_limit_per_hour."
+  }
+}
