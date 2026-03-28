@@ -37,6 +37,10 @@
       "cardinality": "exactly_one"
     },
     {
+      "tag": "scrip:amount:*",
+      "cardinality": "exactly_one"
+    },
+    {
       "tag": "scrip:reason:*",
       "cardinality": "exactly_one",
       "values": [
