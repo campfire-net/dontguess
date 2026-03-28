@@ -37,6 +37,21 @@ var allowedTagPatterns = []tagPattern{
 	{exact: "exchange:settle"},
 	{prefix: "exchange:phase:", allowedSuffixes: phaseSuffixes},
 	{prefix: "exchange:verdict:", allowedSuffixes: verdictSuffixes},
+	{prefix: "exchange:dispute-type:", allowedSuffixes: disputeTypeSuffixes},
+	// exchange-core/assign.json
+	{exact: "exchange:assign"},
+	{prefix: "exchange:assign-type:", allowedSuffixes: assignTypeSuffixes},
+	{prefix: "exchange:assign-entry:"},
+	{prefix: "exchange:assign-priority:", allowedSuffixes: assignPrioritySuffixes},
+	// exchange-core/assign-accept.json
+	{exact: "exchange:assign-accept"},
+	// exchange-core/assign-claim.json
+	{exact: "exchange:assign-claim"},
+	// exchange-core/assign-complete.json
+	{exact: "exchange:assign-complete"},
+	{prefix: "exchange:assign-verdict:", allowedSuffixes: assignVerdictSuffixes},
+	// exchange-core/assign-reject.json
+	{exact: "exchange:assign-reject"},
 	// exchange-scrip/assign-pay.json
 	{exact: "dontguess:scrip-assign-pay"},
 	{prefix: "scrip:task:", allowedSuffixes: taskSuffixes},
@@ -182,6 +197,38 @@ var BurnReasonValues = func() []string {
 	}
 	return v
 }()
+
+// disputeTypeSuffixes are the bare suffix values for exchange:dispute-type:*.
+var disputeTypeSuffixes = []string{
+	"content_mismatch",
+	"quality_inadequate",
+	"hash_invalid",
+	"stale_content",
+}
+
+// assignTypeSuffixes are the bare suffix values for exchange:assign-type:*.
+var assignTypeSuffixes = []string{
+	"validate",
+	"compress",
+	"freshen",
+	"enrich",
+}
+
+// assignPrioritySuffixes are the bare suffix values for exchange:assign-priority:*.
+var assignPrioritySuffixes = []string{
+	"p0",
+	"p1",
+	"p2",
+	"p3",
+}
+
+// assignVerdictSuffixes are the bare suffix values for exchange:assign-verdict:*.
+var assignVerdictSuffixes = []string{
+	"pass",
+	"fail",
+	"fresh",
+	"stale",
+}
 
 // DisputeTypeValues are the raw values for settle.dispute_type (not tag-based).
 var DisputeTypeValues = []string{
