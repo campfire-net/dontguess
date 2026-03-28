@@ -1017,6 +1017,16 @@ func (s *State) applySettlePreviewRequest(msg *store.MessageRecord) {
 	if s.previewsByEntry[entryID] == nil {
 		s.previewsByEntry[entryID] = make(map[string]string)
 	}
+
+	// Reject duplicate preview-requests: if this buyer already has a tracked
+	// preview-request for this entry/match, silently ignore the duplicate.
+	// Counting duplicates in previewCountByMatch would inflate the rate-limit
+	// counter and cause the engine to emit a second preview response for the same
+	// buyer/match pair — both wasteful and a content-reconstruction risk.
+	if existing := s.previewsByEntry[entryID][buyerKey]; existing == matchMsgID {
+		return
+	}
+
 	s.previewsByEntry[entryID][buyerKey] = matchMsgID
 
 	// Track preview count per match.

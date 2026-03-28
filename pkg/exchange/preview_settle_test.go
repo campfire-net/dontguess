@@ -250,8 +250,9 @@ func TestPreviewResponse_NonOperatorIgnored(t *testing.T) {
 	}
 }
 
-// TestBuyerAccept_ViaPreviewAntecedent verifies the preview-before-purchase path:
-// buyer-accept with a preview message as antecedent resolves to the correct match.
+// TestBuyerAccept_ViaPreviewAntecedent verifies the full preview-before-purchase chain:
+// buyer-accept via preview antecedent → deliver → complete → completedEntries populated,
+// price record created, and seller reputation updated.
 func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
@@ -299,6 +300,49 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 	// The match should now be accepted (acceptedOrders populated).
 	if !eng.State().IsMatchAccepted(matchRec.ID) {
 		t.Error("expected match to be accepted after buyer-accept via preview antecedent")
+	}
+
+	// Operator delivers content. Antecedent is the buyer-accept message.
+	deliverMsg := h.sendMessage(h.operator,
+		deliverPayloadFor(entryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{acceptMsg.ID},
+	)
+	deliverRec, _ := h.st.GetMessage(deliverMsg.ID)
+	eng.State().Apply(deliverRec)
+
+	// Buyer completes. Antecedent is the deliver message.
+	completeMsg := h.sendMessage(h.buyer,
+		completePayloadFor(entryID, 7000),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{deliverMsg.ID},
+	)
+	completeRec, _ := h.st.GetMessage(completeMsg.ID)
+	eng.State().Apply(completeRec)
+
+	// Re-sync state from the store to pick up all messages.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// After complete: seller reputation must be above the default.
+	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if rep <= exchange.DefaultReputation {
+		t.Errorf("preview path complete: seller reputation = %d, want > %d", rep, exchange.DefaultReputation)
+	}
+
+	// Price history must have exactly one record for this entry.
+	hist := eng.State().PriceHistory()
+	if len(hist) != 1 {
+		t.Errorf("preview path complete: price history len = %d, want 1", len(hist))
+	} else if hist[0].EntryID != entryID {
+		t.Errorf("preview path complete: price history entry_id = %q, want %q", hist[0].EntryID, entryID)
 	}
 }
 
@@ -421,5 +465,180 @@ func TestEngineDispatch_PreviewRequest_InvalidAntecedent_NoResponse(t *testing.T
 	if len(postMsgs) != preCount {
 		t.Errorf("engine emitted %d extra settle messages for invalid preview-request, want 0",
 			len(postMsgs)-preCount)
+	}
+}
+
+// TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated verifies that the
+// engine passes correct metadata fields (ContentType, BuyerKey, MatchID) to
+// PreviewAssembler when handling a preview-request.
+//
+// Content delivery is not wired at this stage — the engine uses nil content and
+// PreviewAssembler returns an empty chunk slice. What we can verify is that the
+// emitted preview payload correctly reflects metadata derived from the inventory
+// entry (ContentType) and the match message (MatchID traced from antecedent chain).
+//
+// Known gap: BuyerKey and MatchID are used only for deterministic seeding
+// (deriveSeed) and have no observable effect when Content is nil. Once content
+// delivery is wired, a follow-up test should verify seed-derived chunk positions
+// differ across (BuyerKey, MatchID) pairs.
+func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	matchRec, entryID := buildMatchedState(t, h, eng)
+
+	// Determine the expected ContentType from the inventory.
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("expected inventory entry")
+	}
+	expectedContentType := inv[0].ContentType // "analysis" as set in buildMatchedState
+
+	// Buyer sends preview-request.
+	preqMsg := h.sendMessage(h.buyer,
+		previewRequestPayload(entryID),
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchRec.ID},
+	)
+	preqRec, _ := h.st.GetMessage(preqMsg.ID)
+	eng.State().Apply(preqRec)
+
+	if err := eng.DispatchForTest(preqRec); err != nil {
+		t.Fatalf("DispatchForTest preview-request: %v", err)
+	}
+
+	// Find the emitted preview message.
+	postMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	var previewMsg *store.MessageRecord
+	for i := range postMsgs {
+		m := &postMsgs[i]
+		for _, tag := range m.Tags {
+			if tag == exchange.TagPhasePrefix+exchange.SettlePhaseStrPreview {
+				previewMsg = m
+				break
+			}
+		}
+		if previewMsg != nil {
+			break
+		}
+	}
+	if previewMsg == nil {
+		t.Fatal("no settle(preview) message found after dispatch")
+	}
+
+	// Parse the preview payload.
+	var payload struct {
+		EntryID      string `json:"entry_id"`
+		ContentType  string `json:"content_type"`
+		TotalTokens  int    `json:"total_tokens"`
+		PreviewTokens int   `json:"preview_tokens"`
+		Chunks       []any  `json:"chunks"`
+	}
+	if err := json.Unmarshal(previewMsg.Payload, &payload); err != nil {
+		t.Fatalf("parsing preview payload: %v", err)
+	}
+
+	// ContentType in the payload must match the inventory entry's ContentType.
+	// This verifies the engine read entry.ContentType and passed it to the assembler.
+	if payload.ContentType != expectedContentType {
+		t.Errorf("preview payload content_type = %q, want %q (from inventory entry)",
+			payload.ContentType, expectedContentType)
+	}
+
+	// entry_id must reference the correct inventory entry.
+	if payload.EntryID != entryID {
+		t.Errorf("preview payload entry_id = %q, want %q", payload.EntryID, entryID)
+	}
+
+	// Antecedent must be the preview-request — confirming the engine used msg.ID
+	// (= preview-request ID) as the antecedent and thus has the correct MatchID
+	// traceable from the preview-request antecedent chain.
+	if len(previewMsg.Antecedents) == 0 || previewMsg.Antecedents[0] != preqMsg.ID {
+		t.Errorf("preview antecedent = %v, want [%s] (preview-request)", previewMsg.Antecedents, preqMsg.ID)
+	}
+
+	// With nil content, the assembler produces zero chunks. Verify the payload
+	// reflects this rather than garbage data, confirming the assembler was called
+	// and its result was faithfully serialized.
+	if payload.TotalTokens != 0 {
+		t.Errorf("preview payload total_tokens = %d with nil content, want 0", payload.TotalTokens)
+	}
+	if len(payload.Chunks) != 0 {
+		t.Errorf("preview payload chunks len = %d with nil content, want 0", len(payload.Chunks))
+	}
+}
+
+// TestPreviewRequest_DuplicateRejected verifies that a second preview-request from
+// the same buyer for the same match is rejected at the state layer.
+//
+// Behavior (intended): a duplicate preview-request is a no-op. The state must not
+// increment previewCountByMatch a second time, and the second preview-request must
+// not be tracked in previewRequestToMatch (so the engine will not respond to it).
+//
+// Rationale: previewCountByMatch is used for rate limiting and anti-reconstruction
+// detection. Counting duplicates from the same buyer would incorrectly inflate the
+// rate-limit counter and could trigger false positives. The overwrite of
+// previewsByEntry[entryID][buyerKey] is benign (same value), but the count
+// increment is not — it would double-respond with two preview messages for the
+// same buyer/match pair, which is both wasteful and a reconstruction risk.
+func TestPreviewRequest_DuplicateRejected(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	matchRec, entryID := buildMatchedState(t, h, eng)
+
+	// Buyer sends first preview-request.
+	preqMsg1 := h.sendMessage(h.buyer,
+		previewRequestPayload(entryID),
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchRec.ID},
+	)
+	preqRec1, _ := h.st.GetMessage(preqMsg1.ID)
+	eng.State().Apply(preqRec1)
+
+	// Verify first request is tracked.
+	countByMatch := eng.State().PreviewCountByMatchForTest()
+	if got := countByMatch[matchRec.ID]; got != 1 {
+		t.Fatalf("after first preview-request: previewCountByMatch = %d, want 1", got)
+	}
+
+	// Buyer sends a duplicate preview-request for the same match.
+	preqMsg2 := h.sendMessage(h.buyer,
+		previewRequestPayload(entryID),
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchRec.ID},
+	)
+	preqRec2, _ := h.st.GetMessage(preqMsg2.ID)
+	eng.State().Apply(preqRec2)
+
+	// previewCountByMatch must still be 1 — duplicate does not increment.
+	countByMatch = eng.State().PreviewCountByMatchForTest()
+	if got := countByMatch[matchRec.ID]; got != 1 {
+		t.Errorf("after duplicate preview-request: previewCountByMatch = %d, want 1 (duplicate must not increment)",
+			got)
+	}
+
+	// The second preview-request must NOT be in previewRequestToMatch.
+	// If it were tracked, the engine would respond with a second preview — which
+	// is both wasteful and a potential reconstruction vector.
+	reqToMatch := eng.State().PreviewRequestToMatchForTest()
+	if _, ok := reqToMatch[preqMsg2.ID]; ok {
+		t.Error("duplicate preview-request must not be tracked in previewRequestToMatch")
+	}
+
+	// The first request must still be correctly tracked (not clobbered).
+	if got := reqToMatch[preqMsg1.ID]; got != matchRec.ID {
+		t.Errorf("first preview-request tracking clobbered: previewRequestToMatch[preqMsg1] = %q, want %q",
+			got, matchRec.ID)
+	}
+
+	// previewsByEntry must still map to the correct match (the overwrite is the same
+	// value, so it must equal the original matchRec.ID).
+	buyerKey := h.buyer.PublicKeyHex()
+	byEntry := eng.State().PreviewsByEntryForTest()
+	if got := byEntry[entryID][buyerKey]; got != matchRec.ID {
+		t.Errorf("previewsByEntry[entry][buyer] = %q after duplicate, want %q", got, matchRec.ID)
 	}
 }

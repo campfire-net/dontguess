@@ -73,3 +73,11 @@ func (s *State) PreviewToMatchForTest() map[string]string {
 	}
 	return out
 }
+
+// DeleteInventoryEntryForTest removes an entry from the inventory map.
+// Used only in tests that simulate expiry-between-deliver-and-dispute scenarios.
+func (s *State) DeleteInventoryEntryForTest(entryID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inventory, entryID)
+}
