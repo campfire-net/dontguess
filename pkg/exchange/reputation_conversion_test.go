@@ -526,6 +526,143 @@ func TestReputation_LowConversionEntries(t *testing.T) {
 	}
 }
 
+// TestReputation_ZeroConversion verifies that 0% conversion (10+ previews, 0 accepts)
+// produces the formula floor bonus of -10.
+func TestReputation_ZeroConversion(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Zero-conversion inference", "sha256:"+fmt.Sprintf("%064x", 10001), "code", 10000, 50000),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+	inv := eng.State().Inventory()
+	entryID := inv[0].EntryID
+
+	// 10 distinct buyers, 0 convert.
+	for i := 0; i < 10; i++ {
+		generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("zero-%d", i))
+	}
+
+	// 10 previews, 0 conversions = 0% conversion rate.
+	// conversionBonus = int((0.0 - 0.5) * 20) = int(-10.0) = -10
+	// Score = 50 - 10 = 40.
+	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	want := exchange.DefaultReputation - 10
+	if rep != want {
+		t.Errorf("0%% conversion reputation = %d, want %d", rep, want)
+	}
+}
+
+// TestReputation_FullConversion verifies that 100% conversion (10+ previews, all accept)
+// produces the formula ceiling bonus of +10.
+func TestReputation_FullConversion(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Full-conversion inference", "sha256:"+fmt.Sprintf("%064x", 10002), "code", 10000, 50000),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+	inv := eng.State().Inventory()
+	entryID := inv[0].EntryID
+
+	// 10 distinct buyers, all convert.
+	type buyerPreview struct {
+		previewReqID string
+		buyer        *identity.Identity
+	}
+	bps := make([]buyerPreview, 10)
+	for i := 0; i < 10; i++ {
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("full-%d", i))
+		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
+	}
+	for i := 0; i < 10; i++ {
+		emitPreviewAndAccept(t, h, eng, entryID, bps[i].previewReqID, bps[i].buyer)
+	}
+
+	// 10 previews, 10 conversions = 100%.
+	// conversionBonus = int((1.0 - 0.5) * 20) = int(10.0) = 10
+	// Score = 50 + 10 = 60.
+	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	want := exchange.DefaultReputation + 10
+	if rep != want {
+		t.Errorf("100%% conversion reputation = %d, want %d", rep, want)
+	}
+}
+
+// TestReputation_LowConversionEntries_AtExactBoundary verifies that an entry with
+// exactly maxRate conversion is NOT included (strict < comparison).
+func TestReputation_LowConversionEntries_AtExactBoundary(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Boundary conversion entry", "sha256:"+fmt.Sprintf("%064x", 10003), "code", 10000, 50000),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(msgs)
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+	inv := eng.State().Inventory()
+	entryID := inv[0].EntryID
+
+	// 10 distinct buyers, 3 convert = 30% rate.
+	type buyerPreview struct {
+		previewReqID string
+		buyer        *identity.Identity
+	}
+	bps := make([]buyerPreview, 10)
+	for i := 0; i < 10; i++ {
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("bnd-%d", i))
+		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
+	}
+	for i := 0; i < 3; i++ {
+		emitPreviewAndAccept(t, h, eng, entryID, bps[i].previewReqID, bps[i].buyer)
+	}
+
+	// At exactly maxRate=0.3 (3/10 = 0.3), strict < means NOT included.
+	low := eng.State().LowConversionEntries(10, 0.3)
+	for _, id := range low {
+		if id == entryID {
+			t.Errorf("entry at exactly 30%% rate should NOT be in LowConversionEntries(maxRate=0.3) — strict < comparison")
+		}
+	}
+
+	// At maxRate=0.31, it SHOULD be included (0.3 < 0.31).
+	low2 := eng.State().LowConversionEntries(10, 0.31)
+	found := false
+	for _, id := range low2 {
+		if id == entryID {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("entry at 30%% rate should be in LowConversionEntries(maxRate=0.31)")
+	}
+}
+
 // TestReputation_SmallContentPenaltyPreserved verifies that the small-content refund
 // penalty still applies correctly with the new model.
 func TestReputation_SmallContentPenaltyPreserved(t *testing.T) {
