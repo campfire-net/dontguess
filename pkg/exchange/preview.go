@@ -16,9 +16,7 @@ type PreviewAssembler struct{}
 type PreviewRequest struct {
 	Content     []byte // Full content
 	ContentType string // "code", "analysis", "summary", "plan", "data", "review", "other"
-	EntryID     string // For deterministic seeding
-	BuyerKey    string // For deterministic seeding
-	MatchID     string // For deterministic seeding
+	EntryID     string // For deterministic seeding — seed is derived from EntryID only
 }
 
 // PreviewResult holds the assembled preview chunks.
@@ -65,7 +63,7 @@ func (pa *PreviewAssembler) Assemble(req PreviewRequest) (PreviewResult, error) 
 		}, nil
 	}
 
-	seed := deriveSeed(req.EntryID, req.BuyerKey, req.MatchID)
+	seed := deriveSeed(req.EntryID)
 	boundaries := findBoundaries(req.Content, req.ContentType)
 
 	// Determine how many chunks to produce based on content size
@@ -97,9 +95,11 @@ func estimateTokens(content []byte) int {
 	return (len(content) + 3) / 4
 }
 
-// deriveSeed computes a deterministic uint64 seed from the three identifier strings.
-func deriveSeed(entryID, buyerKey, matchID string) uint64 {
-	h := sha256.Sum256([]byte(entryID + "\x00" + buyerKey + "\x00" + matchID))
+// deriveSeed computes a deterministic uint64 seed from the entry ID only.
+// Seeding on entry_id ensures all buyers see the same preview for a given entry,
+// preventing reconstruction attacks via multiple buy orders with different match IDs.
+func deriveSeed(entryID string) uint64 {
+	h := sha256.Sum256([]byte(entryID))
 	return binary.LittleEndian.Uint64(h[:8])
 }
 
