@@ -230,7 +230,7 @@ func TestBuyerAccept_DecrementsScripAfterPreview(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100 // computePrice logic: 20% markup
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -327,7 +327,7 @@ func TestBuyerAccept_InsufficientScripReturnsError(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -427,7 +427,7 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 
@@ -519,7 +519,8 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	}
 
 	// Verify residual was paid to seller.
-	expectedResidual := salePrice / exchange.ResidualRate
+	enginePrice := holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
+	expectedResidual := enginePrice / exchange.ResidualRate
 	sellerBalanceAfter := cs.Balance(h.seller.PublicKeyHex())
 	if sellerBalanceAfter != sellerBalanceBefore+expectedResidual {
 		t.Errorf("seller balance: got %d, want %d (before=%d + residual=%d)",
@@ -527,7 +528,7 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	}
 
 	// Verify exchange revenue was credited to operator.
-	expectedExchangeRevenue := salePrice - expectedResidual
+	expectedExchangeRevenue := enginePrice - expectedResidual
 	operatorBalanceAfter := cs.Balance(h.operator.PublicKeyHex())
 	if operatorBalanceAfter != operatorBalanceBefore+expectedExchangeRevenue {
 		t.Errorf("operator balance: got %d, want %d (before=%d + revenue=%d)",
@@ -578,7 +579,7 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100 // 6720
+	salePrice := eng0.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate  // 672
 	holdAmount := salePrice + fee                // 7392
 
@@ -733,7 +734,7 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
 	}
-	salePrice := inv[0].PutPrice * 120 / 100           // 6720
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate         // 672
 	holdAmount := salePrice + fee                       // 7392
 	expectedResidual := salePrice / exchange.ResidualRate

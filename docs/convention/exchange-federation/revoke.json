@@ -1,0 +1,54 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:revoke",
+  "description": "Revoke a federation agreement. Either operator can revoke at any time. Effects: federated inventory from the revoked partner is immediately removed from match results; in-flight cross-operator matches complete normally (escrow already committed); outstanding inter-operator balance must still be settled. The shared campfire remains readable for audit but no new inventory or match messages are accepted.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the federation:accept that established the agreement being revoked."
+    },
+    {
+      "name": "reason",
+      "type": "enum",
+      "required": true,
+      "values": ["trust-below-threshold", "reconciliation-default", "rate-limit-violation", "manual", "inventory-quality", "operator-shutdown"],
+      "description": "Reason for revocation."
+    },
+    {
+      "name": "reason_detail",
+      "type": "string",
+      "required": false,
+      "max_length": 2048,
+      "description": "Human-readable explanation for the revocation."
+    },
+    {
+      "name": "outstanding_balance",
+      "type": "integer",
+      "required": false,
+      "description": "Outstanding inter-operator balance in micro-tokens at the time of revocation. Positive means the revoking operator is owed; negative means the revoking operator owes."
+    },
+    {
+      "name": "effective_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when the revocation takes effect. Must be now or in the future (max 24 hours). In-flight matches initiated before this timestamp complete normally."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:revoke",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 1,
+    "per": "sender",
+    "window": "1h"
+  }
+}

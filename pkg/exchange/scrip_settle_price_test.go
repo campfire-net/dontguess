@@ -42,9 +42,12 @@ func buildSettleChainForPriceTests(
 		t.Fatal("buildSettleChainForPriceTests: no inventory entries")
 	}
 	entry := inv[0]
-	salePrice = entry.PutPrice * 120 / 100
+	salePrice = eng.ComputePriceForTest(entry)
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
+	// Return the engine-recovered price (not the computed salePrice) so callers can
+	// derive consistent residual/revenue expectations matching the engine's own formula.
+	salePrice = holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
 
 	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
 	if err := cs.Replay(); err != nil {
@@ -204,7 +207,7 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	if len(inv) == 0 {
 		t.Fatal("no inventory entries")
 	}
-	salePrice := inv[0].PutPrice * 120 / 100
+	salePrice := eng.ComputePriceForTest(inv[0])
 	fee := salePrice / exchange.MatchingFeeRate
 	holdAmount := salePrice + fee
 

@@ -1,0 +1,53 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:match-request",
+  "description": "Request a cross-operator match from a federated partner. Sent by the receiving operator (buyer's exchange) after a buyer accepts a federated inventory entry. The originating operator validates that the entry is still available and responds with federation:match-confirm. This is sent as a campfire future; the originating operator fulfills it with match-confirm.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "entry_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Entry identifier on the originating exchange (from the inventory-offer)."
+    },
+    {
+      "name": "inventory_offer_msg",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the federation:inventory-offer that surfaced this entry."
+    },
+    {
+      "name": "buyer_key",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key of the buyer. Content will be encrypted to this key for delivery."
+    },
+    {
+      "name": "content_hash",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "pattern": "^sha256:[a-f0-9]{64}$",
+      "description": "Expected content hash (from inventory-offer). Used to verify entry identity."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:match-request",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "federation:origin:*",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 100,
+    "per": "sender",
+    "window": "1h"
+  }
+}

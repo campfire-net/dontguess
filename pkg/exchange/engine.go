@@ -1155,36 +1155,86 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 const computePriceMinPrice int64 = 1
 
 // computePrice returns the exchange's asking price for an entry.
-// For v0.1 this is a simple 1.2x markup over put price (20% margin).
-// The full pricing engine (dontguess-pricing) will replace this.
+//
+// Base price: PutPrice * 1.2 (20% operator margin) when a put-accept exists,
+// otherwise TokenCost * 0.7 (seller's 70% share as a proxy pending acceptance).
+//
+// Four inventory signals adjust the base price:
+//   - Demand count: +10% per distinct completed buyer, capped at +100%.
+//   - Age decay: decays from 1.0 to 0.5 linearly over 60 days (PutTimestamp=0 = no decay).
+//   - Reputation: rep=0 -> 0.8x, rep=50 -> 1.0x, rep=100 -> 1.2x.
+//   - Content size: +0.3% per KB, capped at +30% (>=100KB).
 //
 // Invariants:
 //   - Returns at least computePriceMinPrice (never 0 or negative).
-//   - Guards against int64 overflow for large TokenCost values.
+//   - Guards against int64 overflow for large TokenCost and PutPrice values.
 func (e *Engine) computePrice(entry *InventoryEntry) int64 {
+	// Step 1: base price
+	var base float64
 	if entry.PutPrice > 0 {
-		// 1.2x markup: guard against overflow on very large PutPrice.
-		// MaxInt64 / 120 ≈ 7.69e16; prices above that would overflow.
 		if entry.PutPrice > math.MaxInt64/120 {
 			return math.MaxInt64
 		}
-		return entry.PutPrice * 120 / 100
+		base = float64(entry.PutPrice) * 1.20
+	} else {
+		if entry.TokenCost <= 0 {
+			return computePriceMinPrice
+		}
+		if entry.TokenCost > math.MaxInt64/70 {
+			return math.MaxInt64
+		}
+		base = float64(entry.TokenCost) * 0.70
+		if base < float64(computePriceMinPrice) {
+			base = float64(computePriceMinPrice)
+		}
 	}
 
-	// No put-accept yet (pending): use 70% of token cost as a proxy.
-	// Guard: TokenCost <= 0 means no valid base price — return floor.
-	if entry.TokenCost <= 0 {
+	// Step 2: demand multiplier (+10% per buyer, capped at +100%)
+	demandCount := e.state.EntryDemandCount(entry.EntryID)
+	if demandCount > 10 {
+		demandCount = 10
+	}
+	demandFactor := 1.0 + float64(demandCount)*0.10
+
+	// Step 3: age decay (PutTimestamp=0 means no decay)
+	ageFactor := 1.0
+	if entry.PutTimestamp > 0 {
+		ageSec := float64(time.Now().UnixNano()-entry.PutTimestamp) / 1e9
+		const sixtyDays = 60 * 24 * 3600.0
+		decay := ageSec / sixtyDays
+		if decay > 1.0 {
+			decay = 1.0
+		}
+		ageFactor = 1.0 - 0.5*decay
+	}
+
+	// Step 4: reputation multiplier (rep=0->0.8x, rep=50->1.0x, rep=100->1.2x)
+	rep := e.state.SellerReputation(entry.SellerKey)
+	repFactor := 0.8 + float64(rep)/100.0*0.4
+
+	// Step 5: content size multiplier (+0.3% per KB, capped at +30%)
+	sizeFactor := 1.0
+	if entry.ContentSize > 0 {
+		sizeKB := float64(entry.ContentSize) / 1024.0
+		sizeBonus := sizeKB * 0.003
+		if sizeBonus > 0.30 {
+			sizeBonus = 0.30
+		}
+		sizeFactor = 1.0 + sizeBonus
+	}
+
+	// Step 6: compound all multipliers
+	price := base * demandFactor * ageFactor * repFactor * sizeFactor
+
+	// Step 7: clamp and round (nearest-integer, not truncate, for stable results)
+	rounded := math.Round(price)
+	if rounded < float64(computePriceMinPrice) {
 		return computePriceMinPrice
 	}
-	// Guard against int64 overflow: MaxInt64 / 70 ≈ 1.32e17.
-	if entry.TokenCost > math.MaxInt64/70 {
+	if rounded >= float64(math.MaxInt64) {
 		return math.MaxInt64
 	}
-	price := entry.TokenCost * 70 / 100
-	if price < computePriceMinPrice {
-		return computePriceMinPrice
-	}
-	return price
+	return int64(rounded)
 }
 
 // computeConfidence returns a composite confidence score [0,1].

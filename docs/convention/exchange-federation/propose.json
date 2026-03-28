@@ -1,0 +1,78 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:propose",
+  "description": "Propose a federation agreement to another exchange operator. The proposer creates a shared campfire and sends the proposal on it. The proposal specifies inventory sharing scope, trust floor, settlement terms, rate limits, and cross-operator matching fee. The target operator accepts or ignores the proposal. A proposal without a corresponding accept within 72 hours is void.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target_operator",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key of the target exchange operator."
+    },
+    {
+      "name": "convention_version",
+      "type": "string",
+      "required": true,
+      "max_length": 16,
+      "description": "Exchange convention version this operator supports (e.g. '0.2')."
+    },
+    {
+      "name": "inventory_scope",
+      "type": "json",
+      "required": true,
+      "description": "Inventory sharing filter. Object with optional fields: content_types (array of enum), domains (array of string), or 'all': true for unrestricted sharing."
+    },
+    {
+      "name": "trust_floor",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "max": 100,
+      "description": "Minimum local seller reputation score (0-100) for an entry to be shared. Entries below this threshold are not offered to the federation partner."
+    },
+    {
+      "name": "settlement_terms",
+      "type": "json",
+      "required": true,
+      "description": "Settlement configuration. Object: {rail: 'x402' | 'bilateral-credit' | 'deferred-netting', reconcile_interval_hours: integer, max_outstanding_micro_tokens: integer}."
+    },
+    {
+      "name": "rate_limit_per_hour",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 10000,
+      "description": "Maximum federation:inventory-offer messages per hour this operator will send."
+    },
+    {
+      "name": "cross_operator_fee_pct",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "max": 50,
+      "description": "Cross-operator matching fee as a percentage of the match price. Paid by the receiving operator to the originating operator per completed cross-operator match."
+    },
+    {
+      "name": "exchange_beacon",
+      "type": "string",
+      "required": false,
+      "max_length": 512,
+      "description": "URI of the proposer's exchange beacon for out-of-band verification (e.g. DNS TXT record, HTTP well-known URL)."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:propose",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 5,
+    "per": "sender",
+    "window": "24h"
+  }
+}
