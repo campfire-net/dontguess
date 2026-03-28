@@ -99,7 +99,15 @@
     {
       "name": "content_type",
       "type": "enum",
-      "values": ["code", "analysis", "summary", "plan", "data", "review", "other"],
+      "values": [
+        "code",
+        "analysis",
+        "summary",
+        "plan",
+        "data",
+        "review",
+        "other"
+      ],
       "description": "Content type used for chunking strategy in preview phase. Determines chunk boundary rules: code uses function/block boundaries, prose uses paragraph boundaries, data uses record boundaries. Required in preview phase."
     },
     {
@@ -150,6 +158,16 @@
         "exchange:verdict:rejected",
         "exchange:verdict:disputed",
         "exchange:verdict:auto-refunded"
+      ]
+    },
+    {
+      "tag": "exchange:dispute-type:*",
+      "cardinality": "at_most_one",
+      "values": [
+        "exchange:dispute-type:content_mismatch",
+        "exchange:dispute-type:quality_inadequate",
+        "exchange:dispute-type:hash_invalid",
+        "exchange:dispute-type:stale_content"
       ]
     }
   ],

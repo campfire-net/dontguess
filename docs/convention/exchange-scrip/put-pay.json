@@ -39,8 +39,8 @@
       "name": "result_hash",
       "type": "string",
       "required": true,
-      "max_length": 64,
-      "description": "SHA-256 hex of the cached inference result (without sha256: prefix)."
+      "max_length": 71,
+      "description": "SHA-256 of the cached inference result in sha256:<hex64> format (e.g. sha256:abc...64hex)."
     },
     {
       "name": "put_msg",
