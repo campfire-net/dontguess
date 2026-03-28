@@ -1441,6 +1441,24 @@ func (s *State) AllPriceAdjustments() map[string]PriceAdjustment {
 	return out
 }
 
+// TaskCompletionRate returns the fraction of buyer-accepted orders that have
+// reached the settle(complete) state. This is the Layer 0 correctness metric
+// used by the value stack gate: a regression here (rate drops significantly)
+// causes the stack to reject any pending loop adjustments.
+//
+// Returns 1.0 (perfect) when there are no accepted orders yet (cold start).
+// The numerator is completed settlements; the denominator is all accepted orders.
+func (s *State) TaskCompletionRate() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	accepted := len(s.acceptedOrders)
+	if accepted == 0 {
+		return 1.0 // cold start: no accepted orders yet, treat as healthy
+	}
+	completed := len(s.completedSettlements)
+	return float64(completed) / float64(accepted)
+}
+
 // AllSellerKeys returns the deduplicated set of seller public keys that have
 // at least one live inventory entry. Used by the medium loop for per-seller
 // reputation and residual computation.
