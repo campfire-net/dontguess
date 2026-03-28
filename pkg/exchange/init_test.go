@@ -376,6 +376,34 @@ func TestInit_Idempotent(t *testing.T) {
 	}
 }
 
+// TestRatePublishConvention_ZeroOrOneSelfPrior verifies that the rate-publish
+// convention declaration uses zero_or_one(self_prior) and parses without error.
+// This ensures the genesis case (first rate-publish has no prior) is valid.
+func TestRatePublishConvention_ZeroOrOneSelfPrior(t *testing.T) {
+	t.Parallel()
+	convDir := conventionDir(t)
+	payload, err := os.ReadFile(filepath.Join(convDir, "exchange-scrip", "rate-publish.json"))
+	if err != nil {
+		t.Fatalf("reading rate-publish.json: %v", err)
+	}
+
+	decl, result, err := convention.Parse(
+		[]string{convention.ConventionOperationTag},
+		payload,
+		"campfire-key", // sender == campfire key for campfire_key operations
+		"campfire-key",
+	)
+	if err != nil {
+		t.Fatalf("Parse(rate-publish.json): %v", err)
+	}
+	if !result.Valid {
+		t.Fatalf("rate-publish.json failed conformance: %v", result.Warnings)
+	}
+	if decl.Antecedents != "zero_or_one(self_prior)" {
+		t.Errorf("rate-publish antecedents = %q, want %q", decl.Antecedents, "zero_or_one(self_prior)")
+	}
+}
+
 func TestInit_ForceReinitializes(t *testing.T) {
 	t.Parallel()
 
