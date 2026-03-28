@@ -1283,6 +1283,19 @@ func (s *State) IsMatchDelivered(matchMsgID string) bool {
 // This is the authoritative, untainted way to find the seller for residual
 // payment — never trust a buyer-supplied seller_key field in the settle payload.
 // Returns ("", false) if any link in the chain is missing.
+// MatchForDeliver returns the match message ID that a deliver message references.
+// Used by the settle(complete) handler to locate the reservation created at
+// buyer-accept time via the engine's matchToReservation map.
+func (s *State) MatchForDeliver(deliverMsgID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	matchMsgID := s.deliverToMatch[deliverMsgID]
+	if matchMsgID == "" {
+		return "", false
+	}
+	return matchMsgID, true
+}
+
 func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()

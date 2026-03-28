@@ -23,9 +23,9 @@ import (
 )
 
 // buildSettleChainForPriceTests seeds an inventory entry, runs a buy to get a
-// reservation, then constructs the buyer-accept + deliver message chain and
-// replays state. Returns the reservation, deliver message, and sale price.
-// The caller can then issue a complete message with an arbitrary price.
+// match, dispatches buyer-accept (triggering the scrip hold), then constructs
+// the deliver message chain and replays state. Returns the reservation (from
+// the buy-hold log), deliver message, and sale price.
 func buildSettleChainForPriceTests(
 	t *testing.T,
 	h *testHarness,
@@ -66,9 +66,13 @@ func buildSettleChainForPriceTests(
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// buyer-accept triggers the scrip hold.
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, entry.EntryID)
+
+	// Get the reservation from the scrip-buy-hold message emitted during buyer-accept.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("buildSettleChainForPriceTests: expected non-empty reservation_id in match payload")
+		t.Fatal("buildSettleChainForPriceTests: expected non-empty reservation_id after buyer-accept")
 	}
 
 	var err error
@@ -76,21 +80,6 @@ func buildSettleChainForPriceTests(
 	if err != nil {
 		t.Fatalf("buildSettleChainForPriceTests: reservation %s not found: %v", resID, err)
 	}
-
-	// buyer-accept.
-	buyerAcceptPayload, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": entry.EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
 
 	// deliver.
 	deliverPayload, _ := json.Marshal(map[string]any{
@@ -113,16 +102,15 @@ func buildSettleChainForPriceTests(
 	return res, deliverMsg, salePrice
 }
 
-// TestSettle_PriceMismatchRejected verifies that a settle(complete) with a
-// payload.Price that does not match the reservation amount is rejected, and
-// the reservation is restored (no scrip movement, no double-spend).
+// TestSettle_PriceLockedAtBuyerAcceptTime verifies that the price used for
+// settlement is the one locked in the reservation at buyer-accept time, not
+// whatever the buyer sends in the complete payload.
 //
-// Security fix (dontguess-ica / dontguess-3oo / dontguess-z2a):
-// A malicious buyer could inflate payload.Price to increase seller credit
-// paid from the exchange's pre-approved reservation, effectively draining
-// the exchange. The cross-check ensures payload.Price is consistent with
-// the pre-approved res.Amount before any scrip moves.
-func TestSettle_PriceMismatchRejected(t *testing.T) {
+// Security property (dontguess-dl3 preview-before-purchase model):
+// Price is locked when the buyer reviews the preview and accepts. Any buyer-
+// controlled price field in the complete payload is ignored. The engine derives
+// settlement amounts exclusively from the reservation created at buyer-accept.
+func TestSettle_PriceLockedAtBuyerAcceptTime(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
@@ -141,11 +129,12 @@ func TestSettle_PriceMismatchRejected(t *testing.T) {
 	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
 	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
 
-	// Send complete with an inflated price (2x the real sale price).
+	// Send complete with an inflated price (2x the real sale price) in the payload.
+	// The engine must ignore this and use the price from the reservation.
 	inflatedPrice := salePrice * 2
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": res.ID,
-		"price":          inflatedPrice,
+		"price":    inflatedPrice, // buyer-supplied, must be ignored
+		"entry_id": res.ID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -162,35 +151,41 @@ func TestSettle_PriceMismatchRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if dispatchErr := eng.DispatchForTest(rec); dispatchErr == nil {
-		t.Error("expected error for price mismatch, got nil")
+	// Complete must succeed using the reservation-locked price, not the inflated payload price.
+	if dispatchErr := eng.DispatchForTest(rec); dispatchErr != nil {
+		t.Fatalf("expected settle(complete) to succeed using reservation price, got: %v", dispatchErr)
 	}
 
-	// No scrip movement.
-	if cs.Balance(h.seller.PublicKeyHex()) != sellerBalanceBefore {
-		t.Errorf("seller balance changed on price-mismatch settle: got %d, want %d",
-			cs.Balance(h.seller.PublicKeyHex()), sellerBalanceBefore)
-	}
-	if cs.Balance(h.operator.PublicKeyHex()) != operatorBalanceBefore {
-		t.Errorf("operator balance changed on price-mismatch settle: got %d, want %d",
-			cs.Balance(h.operator.PublicKeyHex()), operatorBalanceBefore)
+	// Seller must receive residual based on the real sale price (from reservation), NOT inflated.
+	expectedResidual := salePrice / exchange.ResidualRate
+	if cs.Balance(h.seller.PublicKeyHex()) != sellerBalanceBefore+expectedResidual {
+		t.Errorf("seller balance: got %d, want %d (residual from locked price, not payload)",
+			cs.Balance(h.seller.PublicKeyHex()), sellerBalanceBefore+expectedResidual)
 	}
 
-	// Reservation must be restored (not consumed).
-	if _, err := cs.GetReservation(context.Background(), res.ID); err != nil {
-		t.Errorf("reservation %s must be restored after price mismatch, got: %v", res.ID[:8], err)
+	// Operator revenue must be based on the real sale price.
+	expectedRevenue := salePrice - expectedResidual
+	if cs.Balance(h.operator.PublicKeyHex()) != operatorBalanceBefore+expectedRevenue {
+		t.Errorf("operator balance: got %d, want %d (revenue from locked price, not payload)",
+			cs.Balance(h.operator.PublicKeyHex()), operatorBalanceBefore+expectedRevenue)
+	}
+
+	// Reservation must be consumed after successful settle.
+	if _, err := cs.GetReservation(context.Background(), res.ID); err == nil {
+		t.Errorf("reservation %s must be consumed after settle(complete)", res.ID[:8])
 	}
 }
 
-// TestSettle_PriceZeroWithReservationRejected verifies that a settle(complete)
-// with price=0 and a non-empty reservation_id is rejected.
+// TestSettle_CompleteWithoutBuyerAcceptIsSkipped verifies that a settle(complete)
+// message for which no buyer-accept scrip hold exists is silently skipped (no scrip
+// movement, no error). This prevents a buyer from receiving cached inference for free
+// by skipping the buyer-accept step and sending a complete directly.
 //
-// Security fix (dontguess-ica / dontguess-qfv):
-// Without this check, price=0 would skip scrip movement (the old code path)
-// while state still records the completed transaction — leaving the reservation
-// dangling and the buyer having received cached inference for free (the
-// reservation hold was never consumed, but the transaction was credited).
-func TestSettle_PriceZeroWithReservationRejected(t *testing.T) {
+// In the preview-before-purchase model, scrip is locked at buyer-accept time.
+// The complete handler looks up the reservation from the engine's matchToReservation
+// map. If the buyer never sent a buyer-accept (or it was rejected), no reservation
+// exists for that match and the complete is a no-op.
+func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
@@ -204,15 +199,75 @@ func TestSettle_PriceZeroWithReservationRejected(t *testing.T) {
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
-	res, deliverMsg, _ := buildSettleChainForPriceTests(t, h, eng, cs, "Docker compose generator", 6000)
+	seedInventoryEntry(t, h, eng, "Docker compose generator skip test", "code", 12000, 6000)
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("no inventory entries")
+	}
+	salePrice := inv[0].PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+5000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("docker compose generator test", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	cancel()
+
+	// Send buyer-accept to get the state chain built (antecedent for deliver).
+	// BUT do NOT dispatch buyer-accept through the engine — so no scrip hold.
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+
+	deliverPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     inv[0].EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 42),
+		"content_size": int64(10000),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	// Replay state (buyer-accept in state, but NOT dispatched through engine).
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
 
 	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
 	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
 
-	// Send complete with price=0.
+	// Send complete without a prior engine-dispatched buyer-accept.
+	// The engine has no reservation for this match → silently skip.
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": res.ID,
-		"price":          int64(0),
+		"entry_id": inv[0].EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -222,29 +277,25 @@ func TestSettle_PriceZeroWithReservationRejected(t *testing.T) {
 		[]string{deliverMsg.ID},
 	)
 
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if dispatchErr := eng.DispatchForTest(rec); dispatchErr == nil {
-		t.Error("expected error for price=0 with non-empty reservation_id, got nil")
+	// Must not return an error — missing reservation is a silent skip.
+	if dispatchErr := eng.DispatchForTest(rec); dispatchErr != nil {
+		t.Errorf("expected silent skip for complete without buyer-accept, got error: %v", dispatchErr)
 	}
 
 	// No scrip movement.
 	if cs.Balance(h.seller.PublicKeyHex()) != sellerBalanceBefore {
-		t.Errorf("seller balance changed on price=0 settle: got %d, want %d",
+		t.Errorf("seller balance changed on no-reservation complete: got %d, want %d",
 			cs.Balance(h.seller.PublicKeyHex()), sellerBalanceBefore)
 	}
 	if cs.Balance(h.operator.PublicKeyHex()) != operatorBalanceBefore {
-		t.Errorf("operator balance changed on price=0 settle: got %d, want %d",
+		t.Errorf("operator balance changed on no-reservation complete: got %d, want %d",
 			cs.Balance(h.operator.PublicKeyHex()), operatorBalanceBefore)
-	}
-
-	// Reservation must still exist (was not consumed because price was rejected early).
-	if _, err := cs.GetReservation(context.Background(), res.ID); err != nil {
-		t.Errorf("reservation %s must remain after price=0 rejection, got: %v", res.ID[:8], err)
 	}
 }

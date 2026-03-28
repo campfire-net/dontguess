@@ -135,26 +135,78 @@ func waitForMatchMessage(t *testing.T, h *testHarness, before []store.MessageRec
 	return nil
 }
 
-// extractReservationID parses the reservation_id from a match message payload.
-func extractReservationID(t *testing.T, matchMsg *store.MessageRecord) string {
+// extractReservationIDFromLog scans the campfire log for the most recent
+// scrip-buy-hold message and returns its reservation_id.
+// Used after a buyer-accept step triggers the scrip hold (reservation is no
+// longer in the match payload — it is created at buyer-accept time).
+func extractReservationIDFromLog(t *testing.T, h *testHarness) string {
 	t.Helper()
-	var mp struct {
-		SearchMeta struct {
-			ReservationID string `json:"reservation_id"`
-		} `json:"search_meta"`
+	msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(msgs) == 0 {
+		return ""
 	}
-	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
-		t.Fatalf("parsing match payload: %v", err)
+	last := msgs[len(msgs)-1]
+	var p scrip.BuyHoldPayload
+	if err := json.Unmarshal(last.Payload, &p); err != nil {
+		t.Fatalf("parsing scrip-buy-hold payload: %v", err)
 	}
-	return mp.SearchMeta.ReservationID
+	return p.ReservationID
+}
+
+// sendBuyerAccept sends a settle(buyer-accept) message and dispatches it via
+// DispatchForTest, triggering the scrip hold. Returns the buyer-accept message.
+// The antecedent is matchMsgID (direct match path, no preview).
+func sendBuyerAcceptAndDispatch(t *testing.T, h *testHarness, eng *exchange.Engine, matchMsgID, entryID string) *store.MessageRecord {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entryID,
+		"accepted": true,
+	})
+	msg := h.sendMessage(h.buyer, payload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsgID},
+	)
+	// Replay state so engine sees the buyer-accept before dispatching.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage buyer-accept: %v", err)
+	}
+	if err := eng.DispatchForTest(rec); err != nil {
+		t.Fatalf("DispatchForTest buyer-accept: %v", err)
+	}
+	return msg
+}
+
+// waitForBuyHoldMessage polls until a new scrip-buy-hold message appears, returns the last one.
+func waitForBuyHoldMessage(t *testing.T, h *testHarness, before []store.MessageRecord, timeout time.Duration) *store.MessageRecord {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+		if len(msgs) > len(before) {
+			last := msgs[len(msgs)-1]
+			return &last
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("timed out waiting for scrip-buy-hold message")
+	return nil
 }
 
 // --- Tests ---
 
-// TestBuy_PreDecrementsScripBeforeMatch verifies that a buy with sufficient
-// scrip causes the engine to pre-decrement the buyer's balance by (price + fee)
-// and emit a match message that includes a reservation_id.
-func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
+// TestBuyerAccept_DecrementsScripAfterPreview verifies that a buyer-accept with
+// sufficient scrip causes the engine to decrement the buyer's balance by (price + fee)
+// and emit a scrip-buy-hold convention message. The buy step itself does NOT lock scrip;
+// scrip is locked only when the buyer accepts after reviewing the preview.
+func TestBuyerAccept_DecrementsScripAfterPreview(t *testing.T) {
 	t.Parallel()
 
 	// Build harness first so we know the campfire ID and buyer key.
@@ -205,28 +257,55 @@ func TestBuy_PreDecrementsScripBeforeMatch(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
+	// Buyer balance must be UNCHANGED after buy — scrip not locked yet.
+	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterBuy != buyerBalanceBefore {
+		t.Errorf("buyer balance after buy: got %d, want %d (no hold at buy time)",
+			buyerBalanceAfterBuy, buyerBalanceBefore)
+	}
+
+	// Match payload must NOT include reservation_id (hold not created yet).
+	var mp struct {
+		SearchMeta struct {
+			ReservationID string `json:"reservation_id"`
+		} `json:"search_meta"`
+	}
+	_ = json.Unmarshal(matchMsg.Payload, &mp)
+	if mp.SearchMeta.ReservationID != "" {
+		t.Error("match search_meta.reservation_id must be empty — scrip hold not created at buy time")
+	}
+
+	// Buyer sends buyer-accept → engine creates scrip hold.
+	preBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
 	// Buyer balance must have decreased by holdAmount.
 	buyerBalanceAfter := cs.Balance(h.buyer.PublicKeyHex())
 	if buyerBalanceAfter != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance: got %d, want %d (before=%d - hold=%d)",
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d (before=%d - hold=%d)",
 			buyerBalanceAfter, buyerBalanceBefore-holdAmount, buyerBalanceBefore, holdAmount)
 	}
 
-	// Match payload must include reservation_id.
-	resID := extractReservationID(t, matchMsg)
-	if resID == "" {
-		t.Error("match search_meta.reservation_id must be non-empty after scrip pre-decrement")
+	// A scrip-buy-hold message must be in the log.
+	afterBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(afterBuyHoldMsgs) <= len(preBuyHoldMsgs) {
+		t.Error("scrip-buy-hold message must be emitted after buyer-accept")
 	}
 
-	// A reservation must exist for that ID.
+	// A reservation must exist for the hold.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Error("reservation_id must be non-empty after buyer-accept scrip hold")
+	}
 	if _, err := cs.GetReservation(context.Background(), resID); err != nil {
 		t.Errorf("expected reservation %s to exist, got: %v", resID, err)
 	}
 }
 
-// TestBuy_InsufficientScripReturnsError verifies that a buy with insufficient
-// scrip causes the engine to return an error and NOT emit a match message.
-func TestBuy_InsufficientScripReturnsError(t *testing.T) {
+// TestBuyerAccept_InsufficientScripReturnsError verifies that a buyer-accept with
+// insufficient scrip causes the engine to return an error and NOT create a reservation.
+// The buy step itself succeeds (no balance check at buy time) — only buyer-accept checks.
+func TestBuyerAccept_InsufficientScripReturnsError(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
@@ -271,13 +350,47 @@ func TestBuy_InsufficientScripReturnsError(t *testing.T) {
 		nil,
 	)
 
-	// Wait the full timeout — no match should appear.
-	time.Sleep(1 * time.Second)
+	// Buy should succeed — a match message should appear.
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	afterMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	if len(afterMsgs) > len(preMsgs) {
-		t.Error("expected no match message when buyer has insufficient scrip")
+	// Buyer balance must be unchanged after buy (no hold at buy time).
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore {
+		t.Errorf("buyer balance changed after buy (should not): got %d, want %d",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore)
+	}
+
+	// Send buyer-accept — this should fail because buyer has insufficient scrip.
+	preBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage buyer-accept: %v", err)
+	}
+	dispatchErr := eng.DispatchForTest(rec)
+	if dispatchErr == nil {
+		t.Error("expected error from buyer-accept with insufficient scrip, got nil")
+	}
+
+	// No scrip-buy-hold message should have been emitted.
+	afterBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(afterBuyHoldMsgs) > len(preBuyHoldMsgs) {
+		t.Error("expected no scrip-buy-hold message when buyer has insufficient scrip")
 	}
 
 	// Buyer balance must be unchanged.
@@ -339,38 +452,26 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
-	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
-	}
-
-	// Reservation must exist.
-	ctx2 := context.Background()
-	res, err := cs.GetReservation(ctx2, resID)
-	if err != nil {
-		t.Fatalf("expected reservation %s to exist, got: %v", resID, err)
-	}
-
 	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
 	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
 
 	// Build the antecedent chain required for seller derivation:
 	//   complete → deliver → match (via buyer-accept) → entry → seller
 
-	// buyer-accept (antecedent = match message).
-	buyerAcceptPayload, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": inv[0].EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
+	// buyer-accept (antecedent = match message) — this triggers the scrip hold.
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message emitted during buyer-accept.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id after buyer-accept scrip hold")
+	}
+
+	// Reservation must exist.
+	ctx2 := context.Background()
+	if _, err := cs.GetReservation(ctx2, resID); err != nil {
+		t.Fatalf("expected reservation %s to exist, got: %v", resID, err)
+	}
 
 	// deliver (antecedent = buyer-accept message).
 	deliverMsgPayload, _ := json.Marshal(map[string]any{
@@ -392,10 +493,11 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	eng.State().Replay(allMsgs)
 
 	// complete (antecedent = deliver message).
+	// Note: reservation_id is NOT in the complete payload — it is looked up by the
+	// engine via matchToReservation[matchMsgID] derived from the antecedent chain.
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": res.ID,
-		"price":          salePrice,
-		"entry_id":       inv[0].EntryID,
+		"price":    salePrice,
+		"entry_id": inv[0].EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -438,28 +540,28 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	}
 }
 
-// TestRestart_NoDoublePredecrement verifies that dispatchPendingOrders does NOT
-// double-charge a buyer whose buy order was pending when the engine restarted.
+// TestRestart_NoDoubleHoldOnBuyerAccept verifies that if a scrip-buy-hold was
+// already written to the campfire log for a buyer-accept (e.g., emitted before
+// the engine crashed and restarted), re-dispatching the buyer-accept does NOT
+// issue a second DecrementBudget call.
 //
-// Scenario (simulates a crash between buy-hold emission and match emission):
-//  1. Seed state: inventory entry accepted, buyer has scrip.
-//  2. Buyer sends a buy message. Engine would process it but we simulate a crash:
-//     we manually insert the dontguess:scrip-buy-hold message into the store
-//     WITHOUT a corresponding match message. This is exactly the state left
-//     by a crash after buy-hold was persisted but before match was emitted.
-//  3. Engine starts (simulating restart): replayAll rebuilds state — buy order
-//     is active (no match), CampfireScripStore replays buy-hold (balance decremented).
-//  4. dispatchPendingOrders fires, calls handleBuy for the active order.
-//  5. BUG (before fix): handleBuy calls DecrementBudget again — double charge.
-//     FIX: handleBuy detects the existing buy-hold in the log and skips DecrementBudget.
+// Scenario (simulates a crash between buy-hold emission and deliver/complete):
+//  1. Seed state: inventory entry accepted, buyer has scrip; buy → match in log.
+//  2. Buyer sends a buyer-accept message. Engine writes scrip-buy-hold but crashes.
+//     Inject a scrip-buy-hold message into the log manually (buy-hold anchored to
+//     match message ID), with no deliver or complete in the log yet.
+//  3. Engine restarts: CampfireScripStore replays log → buyer balance decremented once.
+//  4. dispatchPendingOrders fires. The buy order is already matched, so handleBuy skips.
+//     But state replays the buyer-accept, which triggers handleSettleBuyerAcceptScrip.
+//     BUG (without fix): DecrementBudget fires again → double charge.
+//     FIX: findExistingBuyerAcceptHold finds the log entry and restores reservation.
 //
-// Done condition: buyer balance after Start() reflects exactly ONE pre-decrement, not two.
-func TestRestart_NoDoublePredecrement(t *testing.T) {
+// Done condition: buyer balance reflects exactly ONE decrement, not two.
+func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
 
-	// Use a scrip store to seed balances; we'll reconstruct it after injecting crash state.
 	cs0 := newCampfireScripStore(t, h)
 	eng0 := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
@@ -470,8 +572,8 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 		Logger:           func(format string, args ...any) { t.Logf("[eng0] "+format, args...) },
 	})
 
-	// Seed one inventory entry via AutoAcceptPut (real campfire messages).
-	seedInventoryEntry(t, h, eng0, "Restart test: go http handler", "code", 8000, 5600)
+	// Seed one inventory entry.
+	seedInventoryEntry(t, h, eng0, "Restart test: buyer-accept hold", "code", 8000, 5600)
 	inv := eng0.State().Inventory()
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
@@ -480,28 +582,46 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 	fee := salePrice / exchange.MatchingFeeRate  // 672
 	holdAmount := salePrice + fee                // 7392
 
-	// Seed buyer with 2*holdAmount + extraScrip so that after replay (one hold) the balance
-	// is holdAmount+extraScrip — still enough for DecrementBudget to succeed if called again.
-	// This is the critical condition: if balance after replay is >= holdAmount, the bug
-	// causes a second decrement and the buyer ends up at extraScrip instead of holdAmount+extraScrip.
+	// Seed buyer with 2*holdAmount + extraScrip so that after replay (one hold) the
+	// balance is holdAmount+extraScrip — still >= holdAmount, so without the fix a
+	// second DecrementBudget would succeed and double-charge the buyer.
 	const extraScrip = int64(3000)
-	// Give the buyer 2*holdAmount + extraScrip so that after log replay (which decrements
-	// by holdAmount via the injected buy-hold), the balance is holdAmount+extraScrip.
-	// That is still >= holdAmount, so WITHOUT the fix, a second DecrementBudget would
-	// succeed and take another holdAmount, leaving the buyer with only extraScrip.
 	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), 2*holdAmount+extraScrip)
 
-	// Buyer sends a buy message (written directly into the store, simulating
-	// a message that arrived before the engine started).
-	buyMsg := h.sendMessage(h.buyer,
-		buyPayload("Generate Go HTTP handler unit tests", salePrice+5000),
+	// Run a buy → match to get a real match message in the log.
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	ctx0, cancel0 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel0()
+	go func() { _ = eng0.Start(ctx0) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Restart test Go HTTP handler", salePrice+5000),
 		[]string{exchange.TagBuy},
 		nil,
 	)
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
+	cancel0()
 
-	// Simulate crash: manually inject a scrip-buy-hold message into the campfire store
-	// as if the engine processed the buy and wrote the hold but then crashed before
-	// writing the match. No exchange:match message is present in the log.
+	// Buyer sends a buyer-accept message into the log (not yet dispatched).
+	buyerAcceptPayload0, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": inv[0].EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload0,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID},
+	)
+	_ = buyerAcceptMsg
+
+	// Simulate crash: manually inject a scrip-buy-hold message as if the engine wrote
+	// it for the buyer-accept but crashed before completing the flow.
+	// BuyMsg = matchMsg.ID (the anchor used by findExistingBuyerAcceptHold).
 	const crashReservationID = "deadbeefdeadbeefdeadbeefdeadbeef"
 	buyHoldPayload, err := json.Marshal(scrip.BuyHoldPayload{
 		Buyer:         h.buyer.PublicKeyHex(),
@@ -509,16 +629,16 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 		Price:         salePrice,
 		Fee:           fee,
 		ReservationID: crashReservationID,
-		BuyMsg:        buyMsg.ID,
+		BuyMsg:        matchMsg.ID, // anchored to match message ID (buyer-accept convention)
 		ExpiresAt:     time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
 	})
 	if err != nil {
 		t.Fatalf("marshal buy-hold payload: %v", err)
 	}
 	crashHoldRec := store.MessageRecord{
-		ID:         "crash-buy-hold-" + buyMsg.ID,
+		ID:         "crash-buy-hold-" + matchMsg.ID,
 		CampfireID: h.cfID,
-		Sender:     h.operator.PublicKeyHex(), // operator-signed, as the engine would emit
+		Sender:     h.operator.PublicKeyHex(),
 		Payload:    buyHoldPayload,
 		Tags:       []string{scrip.TagScripBuyHold},
 		Timestamp:  time.Now().UnixNano(),
@@ -530,26 +650,21 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 	}
 
 	// --- Simulate restart ---
-	//
-	// Fresh CampfireScripStore replays the log on construction.
-	// It sees: scrip-mint (buyer gets holdAmount+extraScrip) + scrip-buy-hold (buyer loses holdAmount).
-	// Net buyer balance at restart = extraScrip. This is the pre-restart state.
+	// Fresh CampfireScripStore replays: mint(2*holdAmount+extraScrip) - buy-hold(holdAmount).
+	// => balance = holdAmount+extraScrip.
 	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (restart): %v", err)
 	}
-
-	// After replay: mint(2*holdAmount+extraScrip) - buy-hold(holdAmount) = holdAmount+extraScrip.
 	balanceAtRestart := cs.Balance(h.buyer.PublicKeyHex())
 	if balanceAtRestart != holdAmount+extraScrip {
-		t.Fatalf("buyer balance at restart (after log replay): got %d, want %d — buy-hold should be in log",
+		t.Fatalf("buyer balance at restart (after log replay): got %d, want %d",
 			balanceAtRestart, holdAmount+extraScrip)
 	}
 
-	// Start the engine (simulating a fresh restart).
-	// replayAll rebuilds state: buy order is active (no match in log),
-	// dispatchPendingOrders calls handleBuy for it.
-	// The fix: handleBuy finds the existing buy-hold in the log and skips DecrementBudget.
+	// Start the restarted engine. It will replay all messages including buyer-accept,
+	// which triggers handleSettleBuyerAcceptScrip.
+	// The fix: findExistingBuyerAcceptHold finds the log entry and skips DecrementBudget.
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
@@ -559,21 +674,27 @@ func TestRestart_NoDoublePredecrement(t *testing.T) {
 		Logger:           func(format string, args ...any) { t.Logf("[eng-restart] "+format, args...) },
 	})
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	go func() { _ = eng.Start(ctx) }()
+	// Replay state so the engine processes the buyer-accept during dispatch.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
 
-	// Allow time for replayAll + dispatchPendingOrders to complete.
-	time.Sleep(400 * time.Millisecond)
-	cancel()
+	// Dispatch the buyer-accept: the fix should detect the existing buy-hold and skip.
+	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage buyer-accept: %v", err)
+	}
+	if err := eng.DispatchForTest(rec); err != nil {
+		// An error here means the double-charge path failed the second DecrementBudget
+		// (which would happen if balance was already at 0 or negative). Not the test
+		// scenario we want, but still an error to surface.
+		t.Fatalf("DispatchForTest buyer-accept on restart: %v", err)
+	}
 
-	// Buyer's balance must be holdAmount+extraScrip — exactly ONE decrement total (from log replay).
-	// If double-charged, it would be extraScrip = holdAmount+extraScrip - holdAmount.
-	// With mint=2*holdAmount+extraScrip: replay decrements once → holdAmount+extraScrip.
-	// A second decrement in dispatchPendingOrders would take another holdAmount → extraScrip. Wrong.
+	// Buyer's balance must be holdAmount+extraScrip — exactly ONE decrement total.
+	// If double-charged: holdAmount+extraScrip - holdAmount = extraScrip.
 	balanceAfterRestart := cs.Balance(h.buyer.PublicKeyHex())
 	if balanceAfterRestart != holdAmount+extraScrip {
-		t.Errorf("buyer balance after restart+dispatchPendingOrders: got %d, want %d (exactly one pre-decrement, not two; double-charge would give %d)",
+		t.Errorf("buyer balance after restart dispatch: got %d, want %d (exactly one hold, not two; double-charge would give %d)",
 			balanceAfterRestart, holdAmount+extraScrip, extraScrip)
 	}
 }
@@ -630,15 +751,25 @@ func TestDispute_RefundsScripToBuyer(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
-	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
+	// Buyer balance must be UNCHANGED after buy (no hold at buy time).
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore {
+		t.Errorf("buyer balance after buy: got %d, want %d (no hold at buy time)",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore)
 	}
 
-	// Buyer balance must be lower by holdAmount now.
+	// Buyer-accept triggers the scrip hold.
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Buyer balance must be lower by holdAmount after buyer-accept.
 	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance after buy: got %d, want %d",
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d",
 			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore-holdAmount)
+	}
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
 	// Verify reservation exists.
@@ -738,15 +869,19 @@ func TestDispute_MismatchedBuyerKeyRejected(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Buyer-accept triggers the scrip hold.
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Buyer balance is now pre-decremented.
-	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
-	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	// Buyer balance is now decremented after buyer-accept.
+	buyerBalanceAfterAccept := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterAccept != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d", buyerBalanceAfterAccept, buyerBalanceBefore-holdAmount)
 	}
 
 	// Dispatch a settle(dispute) with a WRONG buyer_key (the seller's key).
@@ -783,9 +918,9 @@ func TestDispute_MismatchedBuyerKeyRejected(t *testing.T) {
 
 	// Buyer balance must be UNCHANGED — no refund was issued.
 	buyerBalanceAfterDispute := cs.Balance(h.buyer.PublicKeyHex())
-	if buyerBalanceAfterDispute != buyerBalanceAfterBuy {
+	if buyerBalanceAfterDispute != buyerBalanceAfterAccept {
 		t.Errorf("buyer balance changed after rejected dispute: got %d, want %d (no refund expected)",
-			buyerBalanceAfterDispute, buyerBalanceAfterBuy)
+			buyerBalanceAfterDispute, buyerBalanceAfterAccept)
 	}
 
 	// The mismatched identity (seller) must NOT have received any scrip.
@@ -854,15 +989,19 @@ func TestDispute_ReservationRestoredAfterMismatch(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Buyer-accept triggers the scrip hold.
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Buyer's scrip is now pre-decremented.
-	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
-	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	// Buyer's scrip is now decremented after buyer-accept.
+	buyerBalanceAfterAccept := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterAccept != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d", buyerBalanceAfterAccept, buyerBalanceBefore-holdAmount)
 	}
 
 	ctx2 := context.Background()
@@ -899,9 +1038,9 @@ func TestDispute_ReservationRestoredAfterMismatch(t *testing.T) {
 		t.Errorf("attacker (mismatched key) received scrip: got %d, want 0", cs.Balance(attackerKey))
 	}
 	// Buyer's balance must be unchanged after the rejected dispute.
-	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterBuy {
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterAccept {
 		t.Errorf("buyer balance changed after rejected dispute: got %d, want %d",
-			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterBuy)
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterAccept)
 	}
 	// The reservation must have been restored so the legitimate owner can still dispute.
 	if _, err := cs.GetReservation(ctx2, resID); err != nil {
@@ -1011,30 +1150,13 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMatchMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
-	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
-	}
-
 	// Record baseline balances.
 	realSellerBefore := cs.Balance(h.seller.PublicKeyHex())
 	attackerBefore := cs.Balance(attacker.PublicKeyHex())
 
 	// Build the antecedent chain.
-	// buyer-accept (antecedent = match message).
-	buyerAcceptP, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": inv[0].EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptP,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
+	// buyer-accept (antecedent = match message) — triggers scrip hold.
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
 
 	// deliver (antecedent = buyer-accept message).
 	deliverP, _ := json.Marshal(map[string]any{
@@ -1056,11 +1178,12 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 	eng.State().Replay(allMsgs)
 
 	// Attacker-controlled complete message: seller_key points to attacker.
+	// Note: reservation_id is NOT in the complete payload — engine looks it up internally.
+	// The engine must ignore the fake seller_key and use the antecedent chain instead.
 	completeP, _ := json.Marshal(map[string]any{
-		"reservation_id": resID,
-		"seller_key":     attacker.PublicKeyHex(), // FAKE: attacker tries to redirect payment
-		"price":          salePrice,
-		"entry_id":       inv[0].EntryID,
+		"seller_key": attacker.PublicKeyHex(), // FAKE: attacker tries to redirect payment
+		"price":      salePrice,
+		"entry_id":   inv[0].EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completeP,
 		[]string{
@@ -1158,15 +1281,19 @@ func TestDispute_UnauthorizedSenderRejected(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Buyer-accept triggers the scrip hold.
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get the reservation ID from the scrip-buy-hold message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Buyer's scrip is pre-decremented.
-	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
-	if buyerBalanceAfterBuy != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance after buy: got %d, want %d", buyerBalanceAfterBuy, buyerBalanceBefore-holdAmount)
+	// Buyer's scrip is decremented after buyer-accept.
+	buyerBalanceAfterAccept := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterAccept != buyerBalanceBefore-holdAmount {
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d", buyerBalanceAfterAccept, buyerBalanceBefore-holdAmount)
 	}
 
 	// Generate an unauthorized third-party identity (not the buyer).
@@ -1208,9 +1335,9 @@ func TestDispute_UnauthorizedSenderRejected(t *testing.T) {
 	ctx2 := context.Background()
 
 	// Buyer's balance must be unchanged — no refund issued.
-	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterBuy {
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceAfterAccept {
 		t.Errorf("buyer balance changed after unauthorized dispute: got %d, want %d (no refund expected)",
-			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterBuy)
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceAfterAccept)
 	}
 
 	// Unauthorized sender must have received nothing.

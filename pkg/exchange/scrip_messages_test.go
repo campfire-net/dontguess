@@ -7,7 +7,7 @@ package exchange_test
 // replay state from the message log.
 //
 // These tests verify:
-//   - handleBuy emits a dontguess:scrip-buy-hold message with the correct payload
+//   - handleSettleBuyerAcceptScrip emits a dontguess:scrip-buy-hold message at buyer-accept time
 //   - handleSettle(complete) emits dontguess:scrip-settle and dontguess:scrip-burn messages
 //   - handleDispute emits a dontguess:scrip-dispute-refund message
 //   - All emitted payloads are parseable by CampfireScripStore after a full Replay
@@ -49,8 +49,12 @@ func countMsgsWithTag(t *testing.T, h *testHarness, tag string) int {
 	return len(msgs)
 }
 
-// TestBuyHold_EmitsConventionMessage verifies that handleBuy emits a
+// TestBuyHold_EmitsConventionMessage verifies that handleSettleBuyerAcceptScrip emits a
 // dontguess:scrip-buy-hold message parseable by CampfireScripStore.
+//
+// The buy-hold is emitted at buyer-accept time (preview-before-purchase model),
+// not at buy time. The engine must emit the hold when the buyer dispatches
+// buyer-accept after reviewing the preview.
 func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	t.Parallel()
 
@@ -84,6 +88,8 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	preBuyHold := countMsgsWithTag(t, h, scrip.TagScripBuyHold)
 	preMatch := countMsgsWithTag(t, h, exchange.TagMatch)
 
+	// Run engine to get a match (no buy-hold emitted at buy time).
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	go func() { _ = eng.Start(ctx) }()
@@ -94,22 +100,27 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 		nil,
 	)
 
-	// Wait for the match message (engine processed the buy).
-	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	_ = preMsgs
-	matchMsg := waitForScripMessage(t, h, exchange.TagMatch, nil, 2*time.Second)
-	_ = matchMsg
-
-	// Wait for the buy-hold message to appear.
-	holdMsg := waitForScripMessage(t, h, scrip.TagScripBuyHold,
-		make([]store.MessageRecord, preBuyHold), 2*time.Second)
+	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	// Verify match count increased.
+	// Verify match count increased. No buy-hold yet (hold is at buyer-accept time).
 	afterMatch := countMsgsWithTag(t, h, exchange.TagMatch)
 	if afterMatch <= preMatch {
 		t.Fatal("expected at least one match message")
 	}
+	if countMsgsWithTag(t, h, scrip.TagScripBuyHold) != preBuyHold {
+		t.Error("buy-hold must NOT be emitted at buy time (only at buyer-accept)")
+	}
+
+	// Dispatch buyer-accept — this triggers the scrip hold.
+	_ = sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Buy-hold message must appear after buyer-accept.
+	holdMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(holdMsgs) <= preBuyHold {
+		t.Fatal("expected scrip-buy-hold message to be emitted after buyer-accept")
+	}
+	holdMsg := holdMsgs[len(holdMsgs)-1]
 
 	// Parse the buy-hold payload and verify fields.
 	var p scrip.BuyHoldPayload
@@ -132,7 +143,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 		t.Error("buy-hold reservation_id must be non-empty")
 	}
 	if p.BuyMsg == "" {
-		t.Error("buy-hold buy_msg must be non-empty")
+		t.Error("buy-hold buy_msg (matchMsgID anchor) must be non-empty")
 	}
 	if p.ExpiresAt == "" {
 		t.Error("buy-hold expires_at must be non-empty")
@@ -149,8 +160,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}
-	// Mint gave buyer holdAmount+5000. After buy-hold, balance = 5000.
-	// But the buy-hold message subtracts from balance during replay.
+	// Mint gave buyer holdAmount+5000. After buyer-accept hold, balance = 5000.
 	buyerBalance := freshCS.Balance(h.buyer.PublicKeyHex())
 	if buyerBalance != 5000 {
 		t.Errorf("replayed buyer balance = %d, want 5000 (mint %d - hold %d)",
@@ -208,27 +218,16 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMatch, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Dispatch buyer-accept to trigger the scrip hold and create the reservation.
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get reservation ID from the scrip-buy-hold log message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
-	// Build the antecedent chain: buyer-accept → deliver → complete.
-	// The seller is derived from the chain; seller_key in the payload is not trusted.
-	buyerAcceptP, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": inv[0].EntryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptP,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
-
+	// Build the deliver antecedent for the complete message.
 	deliverP, _ := json.Marshal(map[string]any{
 		"phase":        "deliver",
 		"entry_id":     inv[0].EntryID,
@@ -252,10 +251,9 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	preBurn := countMsgsWithTag(t, h, scrip.TagScripBurn)
 
 	// Dispatch settle(complete) — sender is buyer; seller derived from chain.
+	// Price is derived from the reservation (locked at buyer-accept), not from payload.
 	completePayload, _ := json.Marshal(map[string]any{
-		"reservation_id": resID,
-		"price":          salePrice,
-		"entry_id":       inv[0].EntryID,
+		"entry_id": inv[0].EntryID,
 	})
 	completeMsg := h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -383,9 +381,13 @@ func TestDispute_EmitsConventionMessage(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMatch, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
+	// Dispatch buyer-accept to trigger the scrip hold and create the reservation.
+	sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, inv[0].EntryID)
+
+	// Get reservation ID from the scrip-buy-hold log message.
+	resID := extractReservationIDFromLog(t, h)
 	if resID == "" {
-		t.Fatal("expected non-empty reservation_id")
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
 	}
 
 	// Pre-count dispute-refund messages.

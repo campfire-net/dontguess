@@ -8,8 +8,11 @@ package exchange_test
 // After the fix, handlers use engineCtx(), which is the context passed to Start().
 //
 // The test strategy: a blocking mock SpendingStore blocks GetBudget until
-// its context is cancelled. The test cancels the engine ctx and verifies
-// that the blocked GetBudget call returns context.Canceled (not hanging).
+// its context is cancelled. The test sends a buy message (no scrip at buy time),
+// waits for a match, then posts a buyer-accept message which triggers
+// handleSettleBuyerAcceptScrip → GetBudget (the blocking call). The test then
+// cancels the engine ctx and verifies that the blocked GetBudget returns
+// context.Canceled (not hanging).
 
 import (
 	"context"
@@ -106,8 +109,7 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		},
 	})
 
-	// Seed one inventory entry in state so handleBuy finds candidates and
-	// proceeds to the scrip pre-decrement path (GetBudget).
+	// Seed one inventory entry so handleBuy finds a candidate and emits a match.
 	putMsg := h.sendMessage(h.seller,
 		putPayload("cancellation test entry", fmt.Sprintf("sha256:%064x", 42), "code", 10000, 8192),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
@@ -122,6 +124,12 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("expected inventory entry after AutoAcceptPut")
+	}
+	entryID := inv[0].EntryID
+
 	// Engine context — will be cancelled to trigger shutdown.
 	engineCtx, cancelEngine := context.WithCancel(context.Background())
 	defer cancelEngine()
@@ -135,8 +143,7 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 	// Give engine time to start.
 	time.Sleep(20 * time.Millisecond)
 
-	// Send a buy message. The buyer budget is large enough to pass the threshold
-	// and reach GetBudget in the scrip pre-decrement path, which will block.
+	// Send a buy message. handleBuy no longer calls GetBudget — it just emits a match.
 	buyPayloadBytes, _ := json.Marshal(map[string]any{
 		"task":        "cancellation test task",
 		"budget":      int64(100_000),
@@ -146,13 +153,45 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		[]string{exchange.TagBuy}, nil,
 	)
 
+	// Wait for the match message to appear (engine processed the buy without blocking).
+	var matchMsgID string
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > 0 {
+			matchMsgID = matchMsgs[len(matchMsgs)-1].ID
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if matchMsgID == "" {
+		t.Fatal("timed out waiting for match message — engine did not dispatch the buy")
+	}
+
+	// Post a buyer-accept referencing the match. When the engine's poll loop picks
+	// this up, it calls handleSettleBuyerAcceptScrip → GetBudget, which will block
+	// because bs.unblock is never closed.
+	buyerAcceptPayloadBytes, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entryID,
+		"accepted": true,
+	})
+	h.sendMessage(h.buyer, buyerAcceptPayloadBytes,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsgID},
+	)
+
 	// Wait for GetBudget to be called (the handler is now blocked inside GetBudget).
 	var capturedCtx context.Context
 	select {
 	case capturedCtx = <-bs.getBudgetCtxCh:
 		// GetBudget was called — the handler is now blocked waiting on ctx or unblock.
 	case <-time.After(3 * time.Second):
-		t.Fatal("timed out waiting for GetBudget to be called — engine may not have dispatched the buy")
+		t.Fatal("timed out waiting for GetBudget to be called — engine may not have dispatched the buyer-accept")
 	}
 
 	// The context captured inside GetBudget must NOT already be cancelled.

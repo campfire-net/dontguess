@@ -711,40 +711,35 @@ func TestSmallContentDispute_ScripRefundPath(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
-	if resID == "" {
-		t.Fatal("expected non-empty reservation_id in match payload after buy")
+	// Buyer balance must be UNCHANGED after buy (no pre-decrement in preview-before-purchase model).
+	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore {
+		t.Errorf("buyer balance after buy: got %d, want %d (no pre-decrement at buy time)",
+			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore)
 	}
 
-	// Buyer balance must be pre-decremented by holdAmount.
+	// Build the full deliver chain: dispatch buyer-accept (triggers hold), then deliver.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, entryID)
+
+	// Get reservation ID from the scrip-buy-hold log message emitted by buyer-accept.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
+	}
+
+	// Buyer balance must be decremented by holdAmount after buyer-accept.
 	if cs.Balance(h.buyer.PublicKeyHex()) != buyerBalanceBefore-holdAmount {
-		t.Errorf("buyer balance after buy: got %d, want %d (pre-decremented)",
+		t.Errorf("buyer balance after buyer-accept: got %d, want %d (decremented by holdAmount)",
 			cs.Balance(h.buyer.PublicKeyHex()), buyerBalanceBefore-holdAmount)
 	}
 
 	// Reservation must exist.
 	if _, err := cs.GetReservation(context.Background(), resID); err != nil {
-		t.Fatalf("expected reservation %s to exist after buy: %v", resID, err)
+		t.Fatalf("expected reservation %s to exist after buyer-accept: %v", resID, err)
 	}
 
-	// Build the full deliver chain (buyer-accept + deliver) so the state layer
-	// has the deliver→match→entry mapping needed for the dispute.
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
-
-	buyerAcceptPayload, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": entryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 
@@ -887,25 +882,18 @@ func TestSmallContentDispute_MissingEntry_SilentlyDropped(t *testing.T) {
 	matchMsg := waitForMatchMessage(t, h, preMsgs, 2*time.Second)
 	cancel()
 
-	resID := extractReservationID(t, matchMsg)
-
-	// Build the full deliver chain.
+	// Dispatch buyer-accept to trigger the scrip hold and create the reservation.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 
-	buyerAcceptPayload, _ := json.Marshal(map[string]any{
-		"phase":    "buyer-accept",
-		"entry_id": entryID,
-		"accepted": true,
-	})
-	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
-		[]string{
-			exchange.TagSettle,
-			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
-			exchange.TagVerdictPrefix + "accepted",
-		},
-		[]string{matchMsg.ID},
-	)
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, entryID)
+
+	// Get reservation ID from the scrip-buy-hold log message emitted by buyer-accept.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("expected non-empty reservation_id after buyer-accept")
+	}
+
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
 
