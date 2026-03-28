@@ -1,7 +1,7 @@
 # DontGuess Exchange Convention — Core Operations
 
 **Convention:** `exchange`
-**Version:** 0.1
+**Version:** 0.2
 **Status:** Draft
 **Date:** 2026-03-27
 **Working Group:** DontGuess (Third Division Labs)
@@ -78,7 +78,7 @@ All exchange convention tags use the `exchange:` prefix.
 | `exchange:domain:*` | `domains` arg | zero_to_many (max 5) |
 | `exchange:content-type:*` | `content_type` arg | exactly_one |
 | `exchange:phase:*` | settlement phase | exactly_one (on settle only) |
-| `exchange:verdict:*` | `accepted` arg | exactly_one (on settle only) |
+| `exchange:verdict:*` | `accepted` arg | at_most_one (on settle only) |
 
 **Tag composition rules:**
 - A message MUST carry exactly one operation tag.
@@ -257,19 +257,22 @@ The exchange operator implements the ranking algorithm. The convention requires 
 
 ### 5.4 `exchange:settle`
 
-Two-phase settlement. Phase 1: buyer accepts or rejects a match. Phase 2: exchange finalizes the transaction (delivers content, moves scrip).
+Multi-phase settlement with preview support. The settlement flow depends on content size:
 
-**Phase 1: Buyer settles a match**
+- **Content >= 500 tokens:** Buyer previews before committing. Flow includes `preview-request` and `preview` phases. Scrip is reserved at `buyer-accept` time (after preview), not at buy time.
+- **Content < 500 tokens:** Content is too small to preview meaningfully. Buyer commits after match (no preview). If dissatisfied, buyer can file `small-content-dispute` for automated refund.
+
+**Settlement declaration:**
 
 ```json
 {
   "convention": "exchange",
-  "version": "0.1",
+  "version": "0.2",
   "operation": "settle",
-  "description": "Accept or reject a match, or finalize a put/transaction",
+  "description": "Accept or reject a match, preview content, or finalize a put/transaction",
   "args": [
     {"name": "phase", "type": "enum", "required": true,
-     "values": ["buyer-accept", "buyer-reject", "put-accept", "put-reject", "deliver", "complete", "dispute"],
+     "values": ["preview-request", "preview", "buyer-accept", "buyer-reject", "put-accept", "put-reject", "deliver", "complete", "dispute", "small-content-dispute"],
      "description": "Settlement phase"},
     {"name": "entry_id", "type": "string", "required": true, "max_length": 128,
      "description": "Cache entry being settled"},
@@ -278,19 +281,32 @@ Two-phase settlement. Phase 1: buyer accepts or rejects a match. Phase 2: exchan
     {"name": "reason", "type": "string", "max_length": 2048,
      "description": "Reason for rejection or dispute"},
     {"name": "price", "type": "integer", "min": 0,
-     "description": "Agreed price in scrip (for put-accept and complete phases)"},
+     "description": "Agreed price in scrip (for put-accept, complete, and preview phases)"},
     {"name": "content_hash_verified", "type": "boolean",
      "description": "Whether content hash was verified against delivered content (for complete phase)"},
     {"name": "dispute_type", "type": "enum",
      "values": ["content_mismatch", "quality_inadequate", "hash_invalid", "stale_content"],
-     "description": "Type of dispute (for dispute phase)"}
+     "description": "Type of dispute (for dispute phase). Not used in small-content-dispute."},
+    {"name": "preview_chunks", "type": "json",
+     "description": "Array of preview chunk objects {content, position, length}. Required in preview phase."},
+    {"name": "preview_chunk_count", "type": "integer", "min": 1, "max": 10,
+     "description": "Number of preview chunks delivered. Required in preview phase."},
+    {"name": "content_type", "type": "enum",
+     "values": ["code", "analysis", "summary", "plan", "data", "review", "other"],
+     "description": "Content type for chunking strategy. Required in preview phase."},
+    {"name": "base_price", "type": "integer", "min": 0,
+     "description": "Full price before preview discount. Included in preview phase."},
+    {"name": "content_hash", "type": "string", "max_length": 128,
+     "description": "SHA-256 hash of the full content. Included in preview phase."},
+    {"name": "auto_refund", "type": "boolean",
+     "description": "Always true for small-content-dispute. Auto-refund, no operator verdict."}
   ],
   "produces_tags": [
     {"tag": "exchange:settle", "cardinality": "exactly_one"},
     {"tag": "exchange:phase:*", "cardinality": "exactly_one",
-     "values": ["buyer-accept", "buyer-reject", "put-accept", "put-reject", "deliver", "complete", "dispute"]},
+     "values": ["preview-request", "preview", "buyer-accept", "buyer-reject", "put-accept", "put-reject", "deliver", "complete", "dispute", "small-content-dispute"]},
     {"tag": "exchange:verdict:*", "cardinality": "at_most_one",
-     "values": ["accepted", "rejected", "disputed"]}
+     "values": ["accepted", "rejected", "disputed", "auto-refunded"]}
   ],
   "antecedents": "exactly_one(target)",
   "payload_required": true,
@@ -299,39 +315,80 @@ Two-phase settlement. Phase 1: buyer accepts or rejects a match. Phase 2: exchan
 }
 ```
 
-**Settlement flow:**
+**Settlement flow (content >= 500 tokens — preview path):**
 
 ```
-Seller                    Exchange                    Buyer
-  |                         |                           |
-  |-- exchange:put -------->|                           |
-  |                         |                           |
-  |<-- settle(put-accept) --|                           |
-  |    price: 800 scrip     |                           |  (exchange pays seller 800 scrip)
-  |    (seller paid)        |                           |
-  |                         |                           |
-  |                         |<-- exchange:buy ----------|  (buyer requests, --future)
-  |                         |                           |
-  |                         |-- exchange:match -------->|  (--fulfills buy)
-  |                         |   results: [{price:1200}] |
-  |                         |                           |
-  |                         |<-- settle(buyer-accept) --|  (buyer accepts entry)
-  |                         |                           |
-  |                         |-- settle(deliver) ------->|  (exchange delivers content ref)
-  |                         |                           |
-  |                         |<-- settle(complete) ------|  (buyer confirms receipt, hash OK)
-  |                         |                           |  (exchange collects 1200 scrip)
-  |                         |                           |  (seller gets residual)
+Seller                    Exchange (Operator)              Buyer
+  |                              |                           |
+  |-- exchange:put ------------->|                           |
+  |                              |                           |
+  |<-- settle(put-accept) -------|                           |
+  |    price: 800 scrip          |                           |  (exchange pays seller 800 scrip)
+  |                              |                           |
+  |                              |<-- exchange:buy ----------|  (buyer requests, --future)
+  |                              |                           |
+  |                              |-- exchange:match -------->|  (--fulfills buy)
+  |                              |   results: [{price:1200}] |
+  |                              |                           |
+  |                              |<-- settle(preview-req) ---|  (NEW: buyer picks entry to preview)
+  |                              |                           |
+  |                              |-- settle(preview) ------->|  (NEW: exchange delivers preview)
+  |                              |   [5 random chunks,       |  (FREE — no scrip charged)
+  |                              |    15-25% of content]     |
+  |                              |   purchase_price: 960     |
+  |                              |   base_price: 1200        |
+  |                              |                           |
+  |                              |<-- settle(buyer-accept) --|  (buyer commits AFTER preview)
+  |                              |    [scrip reserved NOW]   |  (reservation at accept, not buy)
+  |                              |                           |
+  |                              |-- settle(deliver) ------->|  (exchange delivers full content)
+  |                              |                           |
+  |                              |<-- settle(complete) ------|  (buyer confirms receipt, hash OK)
+  |                              |                           |  (scrip consumed, residual to seller)
+  |                              |                           |
+  |       REJECT PATH:          |<-- settle(buyer-reject) --|  (buyer declines after preview)
+  |                              |    (no scrip, no penalty) |  (transaction ends cleanly)
+```
+
+**Settlement flow (content < 500 tokens — no preview, small-content-dispute available):**
+
+```
+Seller                    Exchange (Operator)              Buyer
+  |                              |                           |
+  |-- exchange:put ------------->|                           |
+  |<-- settle(put-accept) -------|                           |
+  |                              |<-- exchange:buy ----------|
+  |                              |-- exchange:match -------->|
+  |                              |                           |
+  |                              |<-- settle(buyer-accept) --|  (no preview for < 500 tokens)
+  |                              |                           |  (scrip reserved at accept)
+  |                              |-- settle(deliver) ------->|
+  |                              |                           |
+  |       HAPPY PATH:           |<-- settle(complete) ------|  (buyer confirms, scrip consumed)
+  |                              |                           |
+  |       DISPUTE PATH:         |<-- settle(sm-content-disp)|  (auto-refund, -3 rep, no operator)
+  |                              |   auto_refund: true       |  (verdict: auto-refunded)
 ```
 
 **Antecedent chain:**
 - `settle(put-accept)` antecedent: the `exchange:put` message
-- `settle(buyer-accept)` antecedent: the `exchange:match` message
+- `settle(put-reject)` antecedent: the `exchange:put` message
+- `settle(preview-request)` antecedent: the `exchange:match` message (NEW)
+- `settle(preview)` antecedent: the `settle(preview-request)` message (NEW)
+- `settle(buyer-accept)` antecedent: the `settle(preview)` message for content >= 500 tokens (CHANGED from match); or the `exchange:match` message for content < 500 tokens (unchanged)
+- `settle(buyer-reject)` antecedent: the `settle(preview)` message for content >= 500 tokens (CHANGED); or the `exchange:match` message for content < 500 tokens
 - `settle(deliver)` antecedent: the `settle(buyer-accept)` message
 - `settle(complete)` antecedent: the `settle(deliver)` message
-- `settle(dispute)` antecedent: the `settle(deliver)` message
+- `settle(dispute)` antecedent: the `settle(deliver)` message (legacy — see small-content-dispute)
+- `settle(small-content-dispute)` antecedent: the `settle(deliver)` message (NEW — only valid for entries < 500 tokens)
 
-**Dispute:** If the buyer receives content that does not match the hash, is stale, or is inadequate quality, they send `settle(dispute)` instead of `settle(complete)`. Disputes are resolved by the exchange operator. The scrip ledger holds the buyer's payment in escrow until settlement completes.
+**Preview mechanics:** The preview consists of 5 non-overlapping random chunks totaling 15-25% of the content (fuzzed per transaction). Chunks are sampled from random positions (not sequential from the start) using a deterministic seed (`hash(entry_id + operator_secret)`). The preview is generated at `settle(put-accept)` time and served identically to all buyers. Chunk boundaries respect content type: function/block-level for code, paragraph-level for prose, record-level for data. See `docs/convention/dispute-reputation.md` for full preview specification.
+
+**Small-content-dispute:** For entries under 500 tokens, the content is too small to preview meaningfully. Instead, the buyer purchases and receives full content. If dissatisfied, the buyer files `settle(small-content-dispute)` referencing the deliver message. The exchange processes this automatically: full refund to buyer, -3 seller reputation, no operator involvement. If the same entry accumulates 3+ small-content-disputes from distinct buyers, it is excluded from matches (Layer 0 gate). Rate limit: 1 dispute per transaction, 5 small-content disputes per buyer per rolling 24 hours.
+
+**Dispute (legacy):** The `dispute` phase is retained for backward compatibility and for future use cases. New implementations SHOULD use `small-content-dispute` for entries < 500 tokens and rely on the preview mechanism for entries >= 500 tokens. The full dispute removal is tracked separately (dontguess-u1l).
+
+**Scrip reservation timing:** Scrip is reserved at `settle(buyer-accept)` time, not at `exchange:buy` time. This means no scrip is locked during the preview evaluation window. A buyer who rejects after preview has no scrip interaction at all.
 
 **Residuals:** When a cache entry sells multiple times, the original seller earns residuals. Residual calculation is a scrip ledger concern (see dontguess-av7). The exchange convention only records which entry was sold and for how much — the ledger derives residual payments from the settlement log.
 
@@ -362,7 +419,8 @@ An entry is in inventory when:
 1. An `exchange:put` message exists for it, AND
 2. A `settle(put-accept)` message references that put, AND
 3. No expiry has passed (derived from `expires_at` in the put-accept payload), AND
-4. No `settle(dispute)` has been upheld against it
+4. No `settle(dispute)` has been upheld against it, AND
+5. No 3+ `settle(small-content-dispute)` from distinct buyers exist for it (Layer 0 gate for entries < 500 tokens)
 
 Inventory is keyed by `content_hash`. Duplicate puts with the same hash from the same seller are idempotent. Duplicate puts from different sellers create competing entries (the exchange may own multiple copies from different authors).
 
@@ -386,7 +444,9 @@ Price history per content type and domain feeds the pricing engine's three loops
 
 ### 7.4 Seller Reputation
 
-Seller reputation is derived from settlement history:
+Seller reputation is derived from settlement history. The v0.1 model uses dispute-weighted signals. The v0.2 model (see `docs/convention/dispute-reputation.md`) replaces this with conversion rate as the primary signal — the fraction of previews that lead to purchases. The conversion-rate model is strictly stronger because it captures the full quality spectrum (not just failures), but the v0.1 signals below remain active until the full reputation rewrite (tracked separately).
+
+**v0.1 signals (current):**
 
 | Signal | Weight | Source |
 |--------|--------|--------|
@@ -395,6 +455,16 @@ Seller reputation is derived from settlement history:
 | Content hash verification failures | -10 | `settle(dispute, hash_invalid)` |
 | Repeat buyers (same buyer purchases from same seller again) | +2 | `settle(complete)` with matching buyer-seller pair |
 | Cross-agent convergence (3+ different buyers succeed with same entry) | +3 | `settle(complete)` count per entry, distinct buyers |
+| Small-content auto-refunds | -3 | `settle(small-content-dispute)` count (NEW) |
+
+**v0.2 signals (coming — see dispute-reputation.md Section 5):**
+
+| Signal | Weight | Source |
+|--------|--------|--------|
+| Conversion rate (previews to purchases) | variable (+30 max / -10 min) | `settle(preview)` and `settle(complete)` counts |
+| Small-content auto-refunds | -3 | `settle(small-content-dispute)` count |
+| Repeat buyers | +2 | Unchanged from v0.1 |
+| Cross-agent convergence | +3 | Unchanged from v0.1 |
 
 Reputation is a derived integer score, 0-100, clamped. New sellers start at 50. Reputation cannot be transferred between keys.
 
@@ -438,6 +508,17 @@ Exchange margin per transaction = sale price - put price. Residuals are subtract
   (tag "exchange:match")
   (not (has-fulfillment "exchange:settle" (tag "exchange:phase:buyer-accept")))
   (not (has-fulfillment "exchange:settle" (tag "exchange:phase:buyer-reject")))
+)
+```
+
+**`previews:pending`** — Previews awaiting buyer decision:
+```
+(and
+  (tag "exchange:settle")
+  (tag "exchange:phase:preview")
+  (not (has-fulfillment "exchange:settle"
+    (or (tag "exchange:phase:buyer-accept") (tag "exchange:phase:buyer-reject"))))
+  (age-lt "1h")
 )
 ```
 
@@ -496,13 +577,16 @@ The conformance checker validates an exchange message against this convention.
    - All prices <= the buy's `budget`
    - Sender must be the exchange operator (campfire key holder or designated operator)
 8. **Settle validation:**
-   - `phase` is one of the allowed values
+   - `phase` is one of the allowed values (`preview-request`, `preview`, `buyer-accept`, `buyer-reject`, `put-accept`, `put-reject`, `deliver`, `complete`, `dispute`, `small-content-dispute`)
    - Antecedent chain is correct for the phase (see section 5.4)
-   - `buyer-accept`/`buyer-reject`: sender must be the original buyer
+   - `preview-request`: sender must be the original buyer; antecedent must be an `exchange:match` message; `entry_id` must reference an entry present in the match results
+   - `preview`: sender must be the exchange operator; antecedent must be a `settle(preview-request)` message; `preview_chunks` must be non-empty; `content_hash` must match the put's content_hash; `price` (purchase_price) must be less than `base_price` and consistent with a preview fraction in [0.15, 0.25]; `content_type` must be present
+   - `buyer-accept`/`buyer-reject`: sender must be the original buyer; antecedent must be a `settle(preview)` message (for content >= 500 tokens) or `exchange:match` message (for content < 500 tokens)
    - `put-accept`/`put-reject`: sender must be the exchange operator
    - `deliver`: sender must be the exchange operator
    - `complete`: sender must be the buyer
    - `dispute`: sender must be the buyer
+   - `small-content-dispute`: sender must be the buyer; antecedent must be a `settle(deliver)` message; the entry's `content_size` (from the original put) must be < 500 tokens; `auto_refund` must be true; at most 1 per deliver; at most 5 per buyer per rolling 24 hours
 9. **Rate limit:** Per declared limits.
 
 **Result:** `{valid: bool, warnings: []string}`
@@ -581,26 +665,58 @@ Settle(buyer-accept) sent by key-B.
 ```
 Result: `{valid: false, warnings: ["settle sender does not match original buyer"]}`
 
-### 10.6 Settlement Flow — Happy Path
+### 10.6 Settlement Flow — Happy Path (with Preview, >= 500 tokens)
 
 ```
-1. Seller key-S: exchange:put (msg-001)
+1. Seller key-S: exchange:put (msg-001, content_size=24576)
 2. Exchange key-E: settle(put-accept, price=800) antecedent=msg-001 (msg-002)
 3. Buyer key-B: exchange:buy (msg-003, --future)
 4. Exchange key-E: exchange:match antecedent=msg-003 --fulfills msg-003 (msg-004)
-5. Buyer key-B: settle(buyer-accept) antecedent=msg-004 (msg-005)
-6. Exchange key-E: settle(deliver) antecedent=msg-005 (msg-006)
-7. Buyer key-B: settle(complete) antecedent=msg-006 (msg-007)
+5. Buyer key-B: settle(preview-request, entry_id=X) antecedent=msg-004 (msg-005)
+6. Exchange key-E: settle(preview, preview_chunks=[...], price=960, base_price=1200) antecedent=msg-005 (msg-006)
+7. Buyer key-B: settle(buyer-accept) antecedent=msg-006 (msg-007)  [scrip reserved NOW]
+8. Exchange key-E: settle(deliver) antecedent=msg-007 (msg-008)
+9. Buyer key-B: settle(complete) antecedent=msg-008 (msg-009)
 ```
-Result: All valid. Seller paid 800 at step 2. Buyer charged sale price at step 7. Seller earns residual.
+Result: All valid. Seller paid 800 at step 2. Buyer scrip reserved at step 7. Scrip consumed at step 9. Seller earns residual.
 
-### 10.7 Dispute Flow
+### 10.7 Settlement Flow — Buyer Rejects After Preview
 
 ```
 Steps 1-6 as above.
-7. Buyer key-B: settle(dispute, dispute_type=content_mismatch) antecedent=msg-006 (msg-007)
+7. Buyer key-B: settle(buyer-reject) antecedent=msg-006 (msg-007)
 ```
-Result: Valid dispute. Exchange operator investigates. Buyer's payment held in escrow.
+Result: Valid. No scrip reserved, no scrip consumed. Transaction ends cleanly.
+
+### 10.8 Settlement Flow — Small Content (< 500 tokens, no preview)
+
+```
+1. Seller key-S: exchange:put (msg-001, content_size=300)
+2. Exchange key-E: settle(put-accept, price=200) antecedent=msg-001 (msg-002)
+3. Buyer key-B: exchange:buy (msg-003, --future)
+4. Exchange key-E: exchange:match antecedent=msg-003 --fulfills msg-003 (msg-004)
+5. Buyer key-B: settle(buyer-accept) antecedent=msg-004 (msg-005)  [no preview, scrip reserved]
+6. Exchange key-E: settle(deliver) antecedent=msg-005 (msg-006)
+7. Buyer key-B: settle(complete) antecedent=msg-006 (msg-007)
+```
+Result: All valid. Same as v0.1 flow but scrip reserved at step 5 (buyer-accept), not step 3 (buy).
+
+### 10.9 Small-Content Dispute Flow
+
+```
+Steps 1-6 as in 10.8.
+7. Buyer key-B: settle(small-content-dispute, auto_refund=true) antecedent=msg-006 (msg-007)
+```
+Result: Valid. Auto-refund to buyer. Seller reputation -3. No operator involvement. If 3+ distinct buyers file small-content-dispute for the same entry, it is excluded from matches (Layer 0 gate).
+
+### 10.10 Dispute Flow (Legacy)
+
+```
+Steps 1-9 as in 10.6.
+After step 8 (deliver):
+9. Buyer key-B: settle(dispute, dispute_type=content_mismatch) antecedent=msg-008 (msg-009)
+```
+Result: Valid dispute. Exchange operator investigates. Buyer's payment held in escrow. Note: for entries >= 500 tokens, the preview mechanism is the primary quality gate — disputes are expected to be rare.
 
 ---
 
@@ -669,9 +785,12 @@ Front-running is theoretically possible but economically bounded: the exchange p
 The exchange convention records transaction amounts in settlement messages. The scrip ledger convention derives balances, processes residuals, and enforces spending limits. Interface contract:
 
 - `settle(put-accept)` creates a ledger debit (exchange pays seller)
-- `settle(complete)` creates a ledger credit (buyer pays exchange) and schedules residual
-- `settle(dispute)` holds payment in escrow pending resolution
-- `settle(buyer-reject)` releases any holds
+- `settle(buyer-accept)` reserves buyer scrip (pre-decrement by price + matching_fee) — reservation moves here from buy time in v0.2
+- `settle(complete)` consumes the reservation — seller gets residual, exchange gets revenue, fee burned
+- `settle(dispute)` holds payment in escrow pending resolution (legacy)
+- `settle(small-content-dispute)` triggers automatic full refund to buyer (no escrow, no operator)
+- `settle(buyer-reject)` has no scrip interaction (no reservation exists after preview decline)
+- `settle(preview-request)` and `settle(preview)` have no scrip interaction (previews are free)
 
 The exchange convention does not directly read or write ledger state. It publishes events; the ledger consumes them.
 
@@ -711,4 +830,4 @@ These are read-only endpoints. Write operations (put, buy, settle) use `conventi
 2. **Assigned work:** The CLAUDE.md mentions agents earning scrip by performing assigned tasks (compression, validation). This is a separate operation type (`exchange:assign`) to be designed after core operations stabilize.
 3. **Bulk operations:** Should there be a batch put for sellers offering multiple related entries? Deferred — individual puts are sufficient for v0.1.
 4. **Content delivery mechanism:** The convention says "external storage" but does not specify the protocol. This is intentionally operator-defined for v0.1. A future revision may standardize a content delivery sub-protocol.
-5. **Dispute resolution process:** The convention defines dispute filing but not resolution. Exchange operators define their own dispute resolution policy. A future revision may standardize arbitration for federated exchanges.
+5. **Dispute resolution process:** The v0.2 preview model eliminates most disputes. Small-content entries (< 500 tokens) use automated `small-content-dispute` with auto-refund. The legacy `dispute` phase is retained but expected to be rare for content >= 500 tokens (buyers preview first). Full dispute removal is tracked as dontguess-u1l.
