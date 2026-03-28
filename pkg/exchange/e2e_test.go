@@ -708,6 +708,265 @@ func TestE2E_ScripBalances(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Small-content dispute path:
+// put (token_cost<500) → auto-accept → buy → match → buyer-accept (via match)
+// → deliver → small-content-dispute → auto-refund
+// ----------------------------------------------------------------------------
+
+// TestE2E_SmallContentDisputePath exercises the automated dispute path for
+// small content (token_cost < SmallContentThreshold = 500 tokens).
+//
+// Small content is too small for meaningful preview, so the buyer skips the
+// preview phase and sends buyer-accept directly from the match message.
+// After delivery the buyer can file a small-content-dispute to get an
+// automatic refund, which penalises the seller's reputation by
+// SmallContentReputationPenalty (3) per refund.
+//
+// Flow:
+//
+//  1. Seller puts content with token_cost = 100 (< 500)
+//  2. Operator auto-accepts the put → entry enters inventory
+//  3. Buyer sends a buy request
+//  4. Engine runs and emits a match (buyer-accept antecedent is the match)
+//  5. Buyer sends settle(buyer-accept) with antecedent = match message
+//  6. Operator sends settle(deliver)
+//  7. Buyer sends settle(small-content-dispute)
+//
+// Verified:
+//   - Entry has token_cost < SmallContentThreshold → no preview required
+//   - buyer-accept antecedent is the match message (not a preview)
+//   - small-content-dispute triggers auto-refund: SmallContentDisputeCount++
+//   - Seller's SmallContentRefundCount incremented → reputation drops by 3
+//   - If ScripStore is wired: buyer scrip is refunded
+func TestE2E_SmallContentDisputePath(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+
+	// Wire a scrip store so we can verify the refund path.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// --- Step 1: Seller puts small content (token_cost = 100, < SmallContentThreshold 500) ---
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Tiny Go one-liner helper", "sha256:"+fmt.Sprintf("%064x", 777), "code", 100, 200),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("listing messages: %v", err)
+	}
+	eng.State().Replay(msgs)
+
+	// --- Step 2: Operator auto-accepts the put ---
+	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("step 2: expected 1 inventory entry after put-accept, got %d", len(inv))
+	}
+	entry := inv[0]
+
+	// Verify the entry is genuinely small content.
+	if entry.TokenCost >= exchange.SmallContentThreshold {
+		t.Errorf("step 2: token_cost = %d, want < %d (small content)", entry.TokenCost, exchange.SmallContentThreshold)
+	}
+
+	// Mint enough scrip for the buyer to cover the purchase.
+	salePrice := entry.PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+	const buyerExtra = int64(500)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+buyerExtra)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay after mint: %v", err)
+	}
+	buyerBalanceAfterMint := cs.Balance(h.buyer.PublicKeyHex())
+
+	// --- Step 3: Buyer sends a buy request ---
+	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	h.sendMessage(h.buyer,
+		buyPayload("Tiny Go helper function", holdAmount+buyerExtra),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// --- Step 4: Engine runs and emits a match ---
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMatchMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= len(preMatchMsgs) {
+		t.Fatal("step 4: no match message emitted by engine")
+	}
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+
+	// Match must reference the buy as antecedent.
+	if len(matchMsg.Antecedents) == 0 {
+		t.Fatalf("step 4: match has no antecedents")
+	}
+
+	// Parse entry_id from match payload.
+	var mp struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+			Price   int64  `json:"price"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
+		t.Fatalf("step 4: parsing match payload: %v (results=%d)", err, len(mp.Results))
+	}
+	if mp.Results[0].EntryID != entry.EntryID {
+		t.Errorf("step 4: match result entry_id = %q, want %q", mp.Results[0].EntryID, entry.EntryID)
+	}
+
+	// Sync state.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Step 5: Buyer sends settle(buyer-accept) with antecedent = match message ---
+	// For small content there is no preview phase — the buyer-accept references the
+	// match directly, not a preview message.
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entry.EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID}, // antecedent is the match, not a preview
+	)
+
+	// Dispatch buyer-accept through the engine to trigger scrip hold.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	buyerAcceptRec, err := h.st.GetMessage(buyerAcceptMsg.ID)
+	if err != nil {
+		t.Fatalf("step 5: GetMessage(buyer-accept): %v", err)
+	}
+	if err := eng.DispatchForTest(buyerAcceptRec); err != nil {
+		t.Fatalf("step 5: DispatchForTest(buyer-accept): %v", err)
+	}
+
+	// --- Step 6: Operator sends settle(deliver) ---
+	deliverPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entry.EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 777),
+		"content_size": int64(200),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Step 7: Buyer sends settle(small-content-dispute) ---
+	// Extract the reservation_id from the scrip-buy-hold log so we can include
+	// it in the dispute payload (engine uses it to locate and consume the reservation).
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("step 7: no scrip-buy-hold message found — reservation_id unavailable")
+	}
+
+	reputationBefore := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	disputeCountBefore := eng.State().SmallContentDisputeCount(entry.EntryID)
+
+	disputePayload, _ := json.Marshal(map[string]any{
+		"phase":          "small-content-dispute",
+		"entry_id":       entry.EntryID,
+		"reservation_id": resID,
+		"buyer_key":      h.buyer.PublicKeyHex(),
+		"reason":         "content too small for preview — auto-refund requested",
+	})
+	disputeMsg := h.sendMessage(h.buyer, disputePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrSmallContentDispute,
+		},
+		[]string{deliverMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Dispatch the dispute through the engine to trigger auto-refund logic.
+	disputeRec, err := h.st.GetMessage(disputeMsg.ID)
+	if err != nil {
+		t.Fatalf("step 7: GetMessage(dispute): %v", err)
+	}
+	if err := eng.DispatchForTest(disputeRec); err != nil {
+		t.Fatalf("step 7: DispatchForTest(dispute): %v", err)
+	}
+
+	// Sync state after dispute.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Verify: smallContentDisputes incremented ---
+	disputeCountAfter := eng.State().SmallContentDisputeCount(entry.EntryID)
+	if disputeCountAfter != disputeCountBefore+1 {
+		t.Errorf("step 7: SmallContentDisputeCount = %d, want %d (before=%d + 1)",
+			disputeCountAfter, disputeCountBefore+1, disputeCountBefore)
+	}
+
+	// --- Verify: seller reputation decreased by SmallContentReputationPenalty (3) ---
+	reputationAfter := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	expectedReputation := reputationBefore - exchange.SmallContentReputationPenalty
+	if reputationAfter != expectedReputation {
+		t.Errorf("step 7: seller reputation = %d after dispute, want %d (before=%d - penalty=%d)",
+			reputationAfter, expectedReputation, reputationBefore, exchange.SmallContentReputationPenalty)
+	}
+
+	// --- Verify: seller SmallContentRefundCount incremented ---
+	refundCount := eng.State().SellerSmallContentRefundCount(h.seller.PublicKeyHex())
+	if refundCount != 1 {
+		t.Errorf("step 7: SellerSmallContentRefundCount = %d, want 1", refundCount)
+	}
+
+	// --- Verify: buyer scrip refunded (ScripStore path) ---
+	// The engine's handleSettleSmallContentDispute should have issued a refund
+	// via the scrip store. The buyer's balance should be back to the mint amount
+	// (hold cancelled/refunded).
+	buyerBalanceAfterDispute := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterDispute != buyerBalanceAfterMint {
+		t.Errorf("step 7: buyer balance after dispute = %d, want %d (full refund of hold=%d)",
+			buyerBalanceAfterDispute, buyerBalanceAfterMint, holdAmount)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Assign-pay: operator posts scrip-assign-pay → worker balance credited,
 // operator balance decremented
 // ----------------------------------------------------------------------------
@@ -829,4 +1088,387 @@ func TestE2E_AssignPay(t *testing.T) {
 		t.Errorf("fresh replay operator balance = %d, want %d",
 			freshCS.Balance(operatorKey), operatorMint-assignAmount)
 	}
+}
+
+// ----------------------------------------------------------------------------
+// Preview-before-purchase happy path:
+//
+//	put → put-accept → buy → match → settle(preview-request) →
+//	settle(preview) → settle(buyer-accept) → settle(deliver) →
+//	settle(complete)
+//
+// This test exercises the complete preview flow end-to-end with a real engine,
+// real campfire store, and a CampfireScripStore wired in for scrip verification.
+//
+// Done conditions verified at each step:
+//  1. After buy:             buyer scrip NOT decremented (no pre-hold at buy time)
+//  2. After match:           results include the entry; no reservation_id in payload
+//  3. After preview-request: previewsByEntry populated; previewCountByMatch incremented
+//  4. After preview:         preview payload contains entry_id; previewToMatch populated
+//  5. After buyer-accept:    scrip hold created; match accepted in state
+//  6. After deliver:         delivered state tracked (IsMatchDelivered)
+//  7. After complete:        seller reputation updated; price history record created;
+//     scrip settled (seller residual, operator revenue, fee burned)
+// ----------------------------------------------------------------------------
+
+func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+
+	// Wire a real CampfireScripStore so we can verify scrip movement.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// --- Step 1: Seller puts content large enough for preview (token_cost >= 500) ---
+	// put_price = 7000 → sale_price = 8400, fee = 840, hold = 9240
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Go HTTP handler integration test suite", "sha256:"+fmt.Sprintf("%064x", 9001), "code", 12000, 50000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("step 1: listing messages: %v", err)
+	}
+	eng.State().Replay(msgs)
+
+	if inv := eng.State().Inventory(); len(inv) != 0 {
+		t.Errorf("step 1: expected empty inventory before put-accept, got %d", len(inv))
+	}
+
+	// --- Step 2: Exchange auto-accepts the put ---
+	const putPrice = int64(7000)
+	if err := eng.AutoAcceptPut(putMsg.ID, putPrice, time.Now().Add(168*time.Hour)); err != nil {
+		t.Fatalf("step 2: AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("step 2: expected 1 inventory entry after put-accept, got %d", len(inv))
+	}
+	entry := inv[0]
+	if entry.PutMsgID != putMsg.ID {
+		t.Errorf("step 2: inventory entry PutMsgID = %q, want %q", entry.PutMsgID, putMsg.ID)
+	}
+
+	// Compute expected scrip amounts.
+	salePrice := putPrice * 120 / 100                       // 8400
+	fee := salePrice / exchange.MatchingFeeRate             // 840
+	holdAmount := salePrice + fee                           // 9240
+	expectedResidual := salePrice / exchange.ResidualRate   // 840
+	expectedExchangeRevenue := salePrice - expectedResidual // 7560
+
+	// Mint scrip for the buyer so it can afford the purchase.
+	const buyerExtra = int64(3000)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+buyerExtra)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("step 2: cs.Replay after mint: %v", err)
+	}
+	buyerBalanceAfterMint := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterMint != holdAmount+buyerExtra {
+		t.Errorf("step 2 (mint): buyer balance = %d, want %d", buyerBalanceAfterMint, holdAmount+buyerExtra)
+	}
+
+	// --- Step 3: Buyer sends buy request ---
+	preBuyMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(h.buyer,
+		buyPayload("Write integration tests for a Go HTTP handler with JSON validation", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// --- Step 4: Engine emits match ---
+	matchMsg := waitForMatchMessage(t, h, preBuyMatchMsgs, 2*time.Second)
+	cancel()
+
+	// Step 3 assertion: buyer scrip NOT decremented at buy time.
+	buyerBalanceAfterBuy := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterBuy != buyerBalanceAfterMint {
+		t.Errorf("step 3 (buy): buyer balance = %d after buy, want %d (no pre-decrement at buy time)",
+			buyerBalanceAfterBuy, buyerBalanceAfterMint)
+	}
+
+	// Step 4 assertions: match includes entry; no reservation_id in payload.
+	if len(matchMsg.Antecedents) == 0 {
+		t.Error("step 4: match has no antecedents")
+	}
+	var matchPayload struct {
+		Results []struct {
+			EntryID    string  `json:"entry_id"`
+			Price      int64   `json:"price"`
+			Confidence float64 `json:"confidence"`
+		} `json:"results"`
+		SearchMeta struct {
+			ReservationID string `json:"reservation_id"`
+		} `json:"search_meta"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &matchPayload); err != nil {
+		t.Fatalf("step 4: parsing match payload: %v", err)
+	}
+	if len(matchPayload.Results) == 0 {
+		t.Fatal("step 4: match has no results — entry not returned")
+	}
+	if matchPayload.Results[0].EntryID != entry.EntryID {
+		t.Errorf("step 4: match result entry_id = %q, want %q", matchPayload.Results[0].EntryID, entry.EntryID)
+	}
+	if matchPayload.SearchMeta.ReservationID != "" {
+		t.Error("step 4: match search_meta.reservation_id must be empty — scrip hold not created at buy time")
+	}
+
+	// Sync state to pick up the match.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Step 5: Buyer sends settle(preview-request) with match as antecedent ---
+	preqMsg := h.sendMessage(h.buyer,
+		previewRequestPayload(entry.EntryID),
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchMsg.ID},
+	)
+	preqRec, err := h.st.GetMessage(preqMsg.ID)
+	if err != nil {
+		t.Fatalf("step 5: GetMessage preview-request: %v", err)
+	}
+	eng.State().Apply(preqRec)
+
+	// Step 5 assertions: previewsByEntry, previewCountByMatch, previewRequestToMatch populated.
+	byEntry := eng.State().PreviewsByEntryForTest()
+	if byBuyer, ok := byEntry[entry.EntryID]; !ok {
+		t.Errorf("step 5: previewsByEntry[%s] not set after preview-request", entry.EntryID[:8])
+	} else if got := byBuyer[h.buyer.PublicKeyHex()]; got != matchMsg.ID {
+		t.Errorf("step 5: previewsByEntry[entry][buyer] = %q, want match %q", got, matchMsg.ID)
+	}
+
+	countByMatch := eng.State().PreviewCountByMatchForTest()
+	if got := countByMatch[matchMsg.ID]; got != 1 {
+		t.Errorf("step 5: previewCountByMatch[matchID] = %d, want 1", got)
+	}
+
+	reqToMatch := eng.State().PreviewRequestToMatchForTest()
+	if got := reqToMatch[preqMsg.ID]; got != matchMsg.ID {
+		t.Errorf("step 5: previewRequestToMatch[preqMsgID] = %q, want %q", got, matchMsg.ID)
+	}
+
+	// --- Step 6: Engine emits settle(preview) in response to preview-request ---
+	preSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	preCount := len(preSettleMsgs)
+
+	if err := eng.DispatchForTest(preqRec); err != nil {
+		t.Fatalf("step 6: DispatchForTest preview-request: %v", err)
+	}
+
+	postSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	if len(postSettleMsgs) <= preCount {
+		t.Fatal("step 6: engine did not emit a settle(preview) response")
+	}
+
+	// Find the emitted preview message.
+	var previewMsg *store.MessageRecord
+	for i := range postSettleMsgs {
+		m := &postSettleMsgs[i]
+		for _, tag := range m.Tags {
+			if tag == exchange.TagPhasePrefix+exchange.SettlePhaseStrPreview {
+				previewMsg = m
+				break
+			}
+		}
+		if previewMsg != nil {
+			break
+		}
+	}
+	if previewMsg == nil {
+		t.Fatal("step 6: no settle(preview) message found after dispatch")
+	}
+
+	// Preview antecedent must be the preview-request.
+	if len(previewMsg.Antecedents) == 0 || previewMsg.Antecedents[0] != preqMsg.ID {
+		t.Errorf("step 6: preview antecedent = %v, want [%s]", previewMsg.Antecedents, preqMsg.ID)
+	}
+
+	// Preview payload must include entry_id and chunks field.
+	var previewPayload struct {
+		EntryID string        `json:"entry_id"`
+		Chunks  []interface{} `json:"chunks"`
+	}
+	if err := json.Unmarshal(previewMsg.Payload, &previewPayload); err != nil {
+		t.Fatalf("step 6: parsing preview payload: %v", err)
+	}
+	if previewPayload.EntryID != entry.EntryID {
+		t.Errorf("step 6: preview payload entry_id = %q, want %q", previewPayload.EntryID, entry.EntryID)
+	}
+
+	// Apply preview message to state so previewToMatch is populated.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	previewToMatch := eng.State().PreviewToMatchForTest()
+	if got := previewToMatch[previewMsg.ID]; got != matchMsg.ID {
+		t.Errorf("step 6: previewToMatch[previewMsgID] = %q, want %q", got, matchMsg.ID)
+	}
+
+	// --- Step 7: Buyer sends settle(buyer-accept) with preview as antecedent ---
+	// Scrip hold is created HERE (not at buy time).
+	preBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+
+	buyerAcceptMsg := sendBuyerAcceptViaPreview(t, h, eng, previewMsg.ID, entry.EntryID)
+
+	// Step 7 assertions: scrip hold created and buyer balance decremented.
+	afterBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(afterBuyHoldMsgs) <= len(preBuyHoldMsgs) {
+		t.Error("step 7 (buyer-accept): expected scrip-buy-hold message in campfire log after buyer-accept")
+	}
+
+	buyerBalanceAfterAccept := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterAccept != buyerBalanceAfterMint-holdAmount {
+		t.Errorf("step 7 (buyer-accept): buyer balance = %d, want %d (mint=%d - hold=%d)",
+			buyerBalanceAfterAccept, buyerBalanceAfterMint-holdAmount, buyerBalanceAfterMint, holdAmount)
+	}
+
+	// Reservation must exist.
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("step 7 (buyer-accept): reservation_id must be non-empty in scrip-buy-hold log")
+	}
+	if _, err := cs.GetReservation(context.Background(), resID); err != nil {
+		t.Fatalf("step 7 (buyer-accept): reservation %s must exist: %v", resID[:8], err)
+	}
+
+	// Match must be accepted in state (via preview → match antecedent chain).
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	if !eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Error("step 7 (buyer-accept): match should be accepted in state after buyer-accept via preview path")
+	}
+
+	// --- Step 8: Exchange sends settle(deliver) ---
+	deliverMsg := h.sendMessage(h.operator, deliverPayloadFor(entry.EntryID),
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Step 8 assertion: delivered state tracked.
+	if !eng.State().IsMatchDelivered(matchMsg.ID) {
+		t.Error("step 8 (deliver): IsMatchDelivered should be true after deliver message")
+	}
+
+	// --- Step 9: Buyer sends settle(complete) ---
+	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
+	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
+	preScripSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripSettle}})
+	preBurnMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBurn}})
+
+	completeP, _ := json.Marshal(map[string]any{"entry_id": entry.EntryID})
+	completeMsg := h.sendMessage(h.buyer, completeP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	completeMsgRec, err := h.st.GetMessage(completeMsg.ID)
+	if err != nil {
+		t.Fatalf("step 9: GetMessage complete: %v", err)
+	}
+	if err := eng.DispatchForTest(completeMsgRec); err != nil {
+		t.Fatalf("step 9: DispatchForTest complete: %v", err)
+	}
+
+	// --- Step 10: Verify final state ---
+
+	// Seller reputation must be above default (successful sale increments SuccessCount).
+	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	if rep <= exchange.DefaultReputation {
+		t.Errorf("step 10 (complete): seller reputation = %d, want > %d (successful sale)", rep, exchange.DefaultReputation)
+	}
+
+	// Price history must have one record.
+	history := eng.State().PriceHistory()
+	if len(history) != 1 {
+		t.Errorf("step 10 (complete): price history len = %d, want 1", len(history))
+	} else if history[0].EntryID != entry.EntryID {
+		t.Errorf("step 10 (complete): price history entry_id = %q, want %q", history[0].EntryID, entry.EntryID)
+	}
+
+	// Scrip settled: seller receives residual, operator receives exchange revenue.
+	sellerBalanceAfter := cs.Balance(h.seller.PublicKeyHex())
+	if sellerBalanceAfter != sellerBalanceBefore+expectedResidual {
+		t.Errorf("step 10 (complete): seller balance = %d, want %d (before=%d + residual=%d)",
+			sellerBalanceAfter, sellerBalanceBefore+expectedResidual, sellerBalanceBefore, expectedResidual)
+	}
+
+	operatorBalanceAfter := cs.Balance(h.operator.PublicKeyHex())
+	if operatorBalanceAfter != operatorBalanceBefore+expectedExchangeRevenue {
+		t.Errorf("step 10 (complete): operator balance = %d, want %d (before=%d + revenue=%d)",
+			operatorBalanceAfter, operatorBalanceBefore+expectedExchangeRevenue, operatorBalanceBefore, expectedExchangeRevenue)
+	}
+
+	// Reservation must be deleted after settle.
+	if _, err := cs.GetReservation(context.Background(), resID); err == nil {
+		t.Errorf("step 10 (complete): reservation %s must be deleted after settle(complete)", resID[:8])
+	}
+
+	// Campfire log must have scrip-settle and scrip-burn messages.
+	afterScripSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripSettle}})
+	if len(afterScripSettleMsgs) <= len(preScripSettleMsgs) {
+		t.Error("step 10 (complete): scrip-settle message not found in campfire log")
+	}
+	afterBurnMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBurn}})
+	if len(afterBurnMsgs) <= len(preBurnMsgs) {
+		t.Error("step 10 (complete): scrip-burn message not found in campfire log")
+	}
+}
+
+// sendBuyerAcceptViaPreview sends a settle(buyer-accept) with the preview message
+// as antecedent and dispatches it via DispatchForTest, triggering the scrip hold.
+// This is the preview-before-purchase path (distinct from the legacy match-antecedent
+// path used in sendBuyerAcceptAndDispatch).
+func sendBuyerAcceptViaPreview(t *testing.T, h *testHarness, eng *exchange.Engine, previewMsgID, entryID string) *store.MessageRecord {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entryID,
+		"accepted": true,
+	})
+	msg := h.sendMessage(h.buyer, payload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{previewMsgID},
+	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	rec, err := h.st.GetMessage(msg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage buyer-accept (preview path): %v", err)
+	}
+	if err := eng.DispatchForTest(rec); err != nil {
+		t.Fatalf("DispatchForTest buyer-accept (preview path): %v", err)
+	}
+	return msg
 }
