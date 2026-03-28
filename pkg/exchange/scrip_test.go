@@ -55,6 +55,37 @@ func addScripMintMsg(t *testing.T, h *testHarness, agentKey string, amount int64
 	}
 }
 
+// addScripPutPayMsg emits a scrip-put-pay message for a seller who submitted a put.
+// The antecedent is the put message ID being paid.
+func addScripPutPayMsg(t *testing.T, h *testHarness, putMsgID, seller string, amount, tokenCost int64, discountPct int64, resultHash string) {
+	t.Helper()
+	rawPayload, err := json.Marshal(map[string]any{
+		"seller":       seller,
+		"amount":       amount,
+		"token_cost":   tokenCost,
+		"discount_pct": discountPct,
+		"result_hash":  resultHash,
+		"put_msg":      putMsgID,
+	})
+	if err != nil {
+		t.Fatalf("marshal scrip-put-pay payload: %v", err)
+	}
+	rec := store.MessageRecord{
+		ID:         fmt.Sprintf("put-pay-%s-%d-%d", seller[:8], amount, time.Now().UnixNano()),
+		CampfireID: h.cfID,
+		Sender:     h.operator.PublicKeyHex(),
+		Payload:    rawPayload,
+		Tags:       []string{scrip.TagScripPutPay},
+		Antecedents: []string{putMsgID},
+		Timestamp:  time.Now().UnixNano(),
+		ReceivedAt: time.Now().UnixNano(),
+		Signature:  []byte{0x00}, // non-nil to satisfy schema NOT NULL constraint
+	}
+	if _, err := h.st.AddMessage(rec); err != nil {
+		t.Fatalf("AddMessage (scrip-put-pay): %v", err)
+	}
+}
+
 // newCampfireScripStore creates a CampfireScripStore backed by the harness store.
 // Must be called after all mint messages are written so Replay sees them.
 // Uses the harness operator identity as the operator key.
