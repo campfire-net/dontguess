@@ -532,8 +532,9 @@ func TestE2E_ScripBalances(t *testing.T) {
 	})
 
 	// Seed one inventory entry: put_price = 5600, sale_price = 6720, fee = 672, hold = 7392.
-	putMsgID := seedInventoryEntry(t, h, eng, "Go HTTP handler unit test generator", "code", 8000, 5600)
-	_ = putMsgID
+	const putPrice = int64(5600)
+	const tokenCostSeed = int64(8000)
+	putMsgID := seedInventoryEntry(t, h, eng, "Go HTTP handler unit test generator", "code", tokenCostSeed, putPrice)
 	inv := eng.State().Inventory()
 	if len(inv) != 1 {
 		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
@@ -559,17 +560,21 @@ func TestE2E_ScripBalances(t *testing.T) {
 	}
 
 	// --- Step 2: Put-accept (scrip-put-pay) ---
-	// seedInventoryEntry already called AutoAcceptPut. Verify the scrip-put-pay message
-	// is in the campfire log by checking the store, and that it can be replayed.
-	putPayMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripPutPay}})
-	// Note: if AutoAcceptPut does not emit scrip-put-pay (put-pay is not yet implemented
-	// in the engine at this stage), we verify only that the inventory entry exists.
-	// The scrip-put-pay path is recorded but operator-initiated and outside the engine loop.
-	// The done condition for this step is: inventory is live.
+	// seedInventoryEntry already called AutoAcceptPut. The engine does not automatically
+	// emit scrip-put-pay — that is an operator-initiated side-effect after accepting.
+	// Emit it now, replay, and assert the seller's balance increased by putPrice.
 	if eng.State().GetInventoryEntry(entry.EntryID) == nil {
 		t.Fatal("step 2 (put-accept): inventory entry missing after AutoAcceptPut")
 	}
-	_ = putPayMsgs // informational — may be 0 if put-pay emission is not yet wired
+	const discountPct = int64(30) // (1 - 5600/8000) * 100
+	addScripPutPayMsg(t, h, putMsgID, h.seller.PublicKeyHex(), putPrice, tokenCostSeed, discountPct, entry.ContentHash)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay after put-pay: %v", err)
+	}
+	sellerBalanceAfterPutPay := cs.Balance(h.seller.PublicKeyHex())
+	if sellerBalanceAfterPutPay != putPrice {
+		t.Errorf("step 2 (put-accept): seller balance = %d, want %d (putPrice)", sellerBalanceAfterPutPay, putPrice)
+	}
 
 	// --- Step 3: Buy — buyer balance decremented ---
 	preBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
@@ -738,10 +743,12 @@ func TestE2E_ScripBalances(t *testing.T) {
 			replayedBuyerBalance, buyerExtra, holdAmount+buyerExtra, holdAmount)
 	}
 
-	// Seller: residual from settle.
+	// Seller: put-pay (putPrice) at step 2 + residual from settle at step 5.
 	replayedSellerBalance := freshCS.Balance(h.seller.PublicKeyHex())
-	if replayedSellerBalance != expectedResidual {
-		t.Errorf("step 7 (replay): seller balance = %d, want %d (residual)", replayedSellerBalance, expectedResidual)
+	wantSellerBalance := putPrice + expectedResidual
+	if replayedSellerBalance != wantSellerBalance {
+		t.Errorf("step 7 (replay): seller balance = %d, want %d (putPrice=%d + residual=%d)",
+			replayedSellerBalance, wantSellerBalance, putPrice, expectedResidual)
 	}
 
 	// Fee burned: totalBurned reflects the matching fee from scrip-burn.
