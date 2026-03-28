@@ -18,6 +18,7 @@ package exchange
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/campfire-net/campfire/pkg/provenance"
 )
@@ -33,10 +34,10 @@ const (
 	OperationSettle Operation = "settle"
 
 	// Extended operations not in core convention v0.1, defined here for completeness.
-	OperationAssign          Operation = "assign"
-	OperationMint            Operation = "mint"
-	OperationBurn            Operation = "burn"
-	OperationRatePublish     Operation = "rate-publish"
+	OperationAssign              Operation = "assign"
+	OperationMint                Operation = "mint"
+	OperationBurn                Operation = "burn"
+	OperationRatePublish         Operation = "rate-publish"
 	OperationConventionPromote   Operation = "convention-promote"
 	OperationConventionSupersede Operation = "convention-supersede"
 
@@ -127,13 +128,25 @@ func NewProvenanceChecker(store *provenance.Store) (*ProvenanceChecker, error) {
 //
 // For OperationSettle, phase must be a non-empty SettlePhase. For all other
 // operations, phase is ignored.
+//
+// Check uses the current time for freshness evaluation. For deterministic tests,
+// use CheckAt with a fixed time.
 func (c *ProvenanceChecker) Check(senderKey string, op Operation, phase SettlePhase) error {
+	return c.CheckAt(senderKey, op, phase, time.Now())
+}
+
+// CheckAt is identical to Check but evaluates provenance freshness at the given
+// time t instead of time.Now(). This allows tests to control the clock and
+// produce deterministic results for freshness-sensitive operations (e.g., a
+// key whose attestation is within the freshness window relative to t will be
+// LevelPresent; outside the window it will be LevelContactable).
+func (c *ProvenanceChecker) CheckAt(senderKey string, op Operation, phase SettlePhase, t time.Time) error {
 	required, err := RequiredLevel(op, phase)
 	if err != nil {
 		return err
 	}
 
-	actual := c.store.Level(senderKey)
+	actual := c.store.LevelAt(senderKey, t)
 	if actual < required {
 		return fmt.Errorf("%w: operation=%q phase=%q requires %s, sender %q has %s",
 			ErrInsufficientProvenance, op, phase, required, senderKey, actual)
