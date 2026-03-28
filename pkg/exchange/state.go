@@ -1440,3 +1440,22 @@ func (s *State) AllPriceAdjustments() map[string]PriceAdjustment {
 	}
 	return out
 }
+
+// AllSellerKeys returns the deduplicated set of seller public keys that have
+// at least one live inventory entry. Used by the medium loop for per-seller
+// reputation and residual computation.
+func (s *State) AllSellerKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	seen := make(map[string]struct{}, len(s.sellers))
+	for _, entry := range s.inventory {
+		if !entry.IsExpired() {
+			seen[entry.SellerKey] = struct{}{}
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for k := range seen {
+		out = append(out, k)
+	}
+	return out
+}
