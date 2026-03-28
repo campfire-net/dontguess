@@ -55,6 +55,7 @@ var allowedTagPatterns = []tagPattern{
 	{exact: "dontguess:scrip-put-pay"},
 	// exchange-scrip/rate-publish.json
 	{exact: "dontguess:scrip-rate"},
+	{prefix: "scrip:rate:"},
 	// exchange-scrip/settle.json
 	{exact: "dontguess:scrip-settle"},
 }
