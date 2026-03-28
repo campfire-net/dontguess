@@ -469,18 +469,16 @@ func TestEngineDispatch_PreviewRequest_InvalidAntecedent_NoResponse(t *testing.T
 }
 
 // TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated verifies that the
-// engine passes correct metadata fields (ContentType, BuyerKey, MatchID) to
-// PreviewAssembler when handling a preview-request.
+// engine passes correct metadata fields (ContentType, EntryID) to PreviewAssembler
+// when handling a preview-request.
+//
+// After dontguess-nh4: seed is entry_id only. BuyerKey and MatchID are no longer
+// seeding inputs and have been removed from PreviewRequest.
 //
 // Content delivery is not wired at this stage — the engine uses nil content and
 // PreviewAssembler returns an empty chunk slice. What we can verify is that the
 // emitted preview payload correctly reflects metadata derived from the inventory
-// entry (ContentType) and the match message (MatchID traced from antecedent chain).
-//
-// Known gap: BuyerKey and MatchID are used only for deterministic seeding
-// (deriveSeed) and have no observable effect when Content is nil. Once content
-// delivery is wired, a follow-up test should verify seed-derived chunk positions
-// differ across (BuyerKey, MatchID) pairs.
+// entry (ContentType, EntryID).
 func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
