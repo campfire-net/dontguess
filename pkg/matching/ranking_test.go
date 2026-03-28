@@ -17,47 +17,6 @@ func makeEntry(id, sellerKey, description, contentType string, tokenCost, price 
 		Price:            price,
 		SellerReputation: rep,
 		PutTimestamp:     time.Now().Add(-24 * time.Hour).UnixNano(), // 1 day old
-		HasUpheldDispute: false,
-	}
-}
-
-// TestRank_CorrectGateExcludesDisputed verifies Layer 0: entries with
-// HasUpheldDispute=true are excluded from results entirely.
-func TestRank_CorrectGateExcludesDisputed(t *testing.T) {
-	t.Parallel()
-	e := NewTFIDFEmbedder()
-
-	candidates := []RankInput{
-		makeEntry("good-1", "seller-a", "Go HTTP handler unit tests table-driven", "code", 10000, 1000, 70),
-		{
-			EntryID:          "disputed-1",
-			SellerKey:        "seller-b",
-			Description:      "Go HTTP handler unit tests table-driven",
-			ContentType:      "code",
-			Domains:          []string{"go"},
-			TokenCost:        10000,
-			Price:            800,
-			SellerReputation: 20,
-			PutTimestamp:     time.Now().Add(-1 * time.Hour).UnixNano(),
-			HasUpheldDispute: true, // should be excluded
-		},
-	}
-
-	results := Rank("Go HTTP unit test generator", candidates, e, RankOptions{})
-	for _, r := range results {
-		if r.EntryID == "disputed-1" {
-			t.Errorf("disputed entry appeared in results")
-		}
-	}
-	// good-1 must appear.
-	found := false
-	for _, r := range results {
-		if r.EntryID == "good-1" {
-			found = true
-		}
-	}
-	if !found {
-		t.Errorf("expected good-1 in results, got %d results", len(results))
 	}
 }
 
@@ -146,7 +105,6 @@ func TestRank_EfficiencyFavorsHighTokenSavings(t *testing.T) {
 		Domains:          []string{"go"},
 		SellerReputation: 70,
 		PutTimestamp:     time.Now().Add(-1 * time.Hour).UnixNano(),
-		HasUpheldDispute: false,
 	}
 
 	highEff := base
@@ -166,22 +124,6 @@ func TestRank_EfficiencyFavorsHighTokenSavings(t *testing.T) {
 	}
 	if results[0].EntryID != "high-eff" {
 		t.Errorf("expected high-eff to rank first, got %q", results[0].EntryID)
-	}
-}
-
-// TestRank_AllDisputedReturnsEmpty verifies that when all candidates have
-// upheld disputes, no results are returned.
-func TestRank_AllDisputedReturnsEmpty(t *testing.T) {
-	t.Parallel()
-	e := NewTFIDFEmbedder()
-
-	candidates := []RankInput{
-		{EntryID: "a", SellerKey: "s1", Description: "Go test generator", HasUpheldDispute: true, Price: 100, SellerReputation: 50, PutTimestamp: time.Now().UnixNano()},
-		{EntryID: "b", SellerKey: "s2", Description: "Go test generator", HasUpheldDispute: true, Price: 100, SellerReputation: 50, PutTimestamp: time.Now().UnixNano()},
-	}
-	results := Rank("Go unit tests", candidates, e, RankOptions{})
-	if len(results) != 0 {
-		t.Errorf("expected 0 results when all disputed, got %d", len(results))
 	}
 }
 
@@ -245,92 +187,6 @@ func TestRank_NoveltyBoostForRareSeller(t *testing.T) {
 	if rareResult.CompositeScore <= dominantResults[0].CompositeScore {
 		t.Errorf("rare seller score (%f) should exceed dominant seller score (%f) due to novelty",
 			rareResult.CompositeScore, dominantResults[0].CompositeScore)
-	}
-}
-
-// TestRank_DisputedEntryDoesNotInflateSellerCount verifies that a disputed entry
-// from a dominant seller is excluded from the sellerCount used in Layer 3 novelty
-// scoring. Without the fix, the disputed entry would inflate the dominant seller's
-// count, suppressing the novelty boost for the rare seller.
-//
-// Setup: dominant seller has 3 undisputed entries + 1 disputed entry (total 4 raw).
-// rare seller has 1 undisputed entry.
-//
-// After Layer 0 filter: dominant appears 3 times, rare appears 1 time.
-// maxSellerCount = 3, so rare seller novelty = 1 - (1/3) ≈ 0.667.
-//
-// Before the fix: dominant appeared 4 times, maxSellerCount = 4,
-// rare seller novelty = 1 - (1/4) = 0.75. Dominant's surviving entries got
-// novelty = 1 - (4/4) = 0.0, which was wrong — the disputed entry inflated
-// the count for surviving entries of the same seller.
-func TestRank_DisputedEntryDoesNotInflateSellerCount(t *testing.T) {
-	t.Parallel()
-	e := NewTFIDFEmbedder()
-
-	dominant := "seller-dominant"
-	rare := "seller-rare"
-	desc := "Go HTTP handler unit test generator"
-	ts := time.Now().Add(-1 * time.Hour).UnixNano()
-
-	candidates := []RankInput{
-		// 3 undisputed dominant entries
-		{EntryID: "d1", SellerKey: dominant, Description: desc, ContentType: "code", Domains: []string{"go"}, TokenCost: 10000, Price: 1000, SellerReputation: 70, PutTimestamp: ts},
-		{EntryID: "d2", SellerKey: dominant, Description: desc, ContentType: "code", Domains: []string{"go"}, TokenCost: 10000, Price: 1000, SellerReputation: 70, PutTimestamp: ts},
-		{EntryID: "d3", SellerKey: dominant, Description: desc, ContentType: "code", Domains: []string{"go"}, TokenCost: 10000, Price: 1000, SellerReputation: 70, PutTimestamp: ts},
-		// 1 disputed dominant entry — must not inflate dominant's sellerCount
-		{EntryID: "d4-disputed", SellerKey: dominant, Description: desc, ContentType: "code", Domains: []string{"go"}, TokenCost: 10000, Price: 1000, SellerReputation: 70, PutTimestamp: ts, HasUpheldDispute: true},
-		// 1 undisputed rare entry
-		{EntryID: "r1", SellerKey: rare, Description: desc, ContentType: "code", Domains: []string{"go"}, TokenCost: 10000, Price: 1000, SellerReputation: 70, PutTimestamp: ts},
-	}
-
-	results := Rank("Go HTTP unit test generator", candidates, e, RankOptions{})
-
-	// d4-disputed must not appear.
-	for _, r := range results {
-		if r.EntryID == "d4-disputed" {
-			t.Errorf("disputed entry d4-disputed appeared in results")
-		}
-	}
-
-	// Collect novelty boosts.
-	var dominantBoost, rareBoost float64
-	var foundDominant, foundRare bool
-	for _, r := range results {
-		switch r.EntryID {
-		case "d1", "d2", "d3":
-			dominantBoost = r.NoveltyBoost
-			foundDominant = true
-		case "r1":
-			rareBoost = r.NoveltyBoost
-			foundRare = true
-		}
-	}
-
-	if !foundDominant {
-		t.Fatal("no undisputed dominant entry found in results")
-	}
-	if !foundRare {
-		t.Fatal("rare seller entry r1 not found in results")
-	}
-
-	// With the fix: dominant count=3, rare count=1, maxSellerCount=3.
-	// dominantBoost = 1 - (3/3) = 0.0
-	// rareBoost     = 1 - (1/3) ≈ 0.667
-	// Without the fix: dominant count counted as 4 (disputed entry inflates it),
-	// maxSellerCount=4, dominantBoost = 1 - (4/4) = 0 (same result, but wrong reason),
-	// rareBoost = 1 - (1/4) = 0.75 (different value).
-	//
-	// The critical invariant: dominant's surviving entries must have count=3,
-	// not count=4. We verify by checking dominantBoost == 0 (count == max).
-	if dominantBoost != 0.0 {
-		t.Errorf("dominant seller novelty boost = %f, want 0.0 (all 3 undisputed entries counted, max=3)", dominantBoost)
-	}
-	// Rare seller should have a non-zero boost since it appears less than dominant.
-	if rareBoost <= 0.0 {
-		t.Errorf("rare seller novelty boost = %f, want > 0.0 (1 entry vs dominant's 3)", rareBoost)
-	}
-	if rareBoost >= 1.0 {
-		t.Errorf("rare seller novelty boost = %f, want < 1.0 (not unique — dominated exists)", rareBoost)
 	}
 }
 

@@ -46,12 +46,6 @@ type RankInput struct {
 	SellerReputation int
 	// PutTimestamp is the campfire-observed receipt time of the put (nanoseconds).
 	PutTimestamp int64
-	// DisputeCount is the total number of upheld disputes against this entry's seller.
-	// Used for the Layer 0 correctness gate.
-	DisputeCount int
-	// HasUpheldDispute is true when this specific entry has an upheld dispute.
-	// Layer 0 gates: if true, the entry is excluded from all results.
-	HasUpheldDispute bool
 }
 
 // RankOptions configures the ranking algorithm.
@@ -124,8 +118,6 @@ func (o *RankOptions) weightNovelty() float64 {
 // Rank applies the 4-layer value stack to a set of candidates and returns
 // a sorted slice of RankedResult, highest composite score first.
 //
-// Layer 0: Correctness gate — entries with HasUpheldDispute=true are excluded.
-//
 // Layer 1: Transaction efficiency — tokens_saved / price. Higher ratio = better deal.
 // tokens_saved = TokenCost (original inference cost the buyer avoids).
 //
@@ -152,17 +144,8 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 	now := time.Now().UnixNano()
 	halflifeSec := opts.freshnessHalflife() * 24 * 3600
 
-	// Layer 0: Build the dispute-filtered candidate list.
-	// sellerCount for Layer 3 must be computed AFTER this filter so that
-	// disputed entries do not inflate the seller count and skew novelty scores.
-	filtered := candidates[:0:0] // zero-length slice, same backing type
-	for _, c := range candidates {
-		if !c.HasUpheldDispute {
-			filtered = append(filtered, c)
-		}
-	}
-
-	// Layer 3: count seller appearances over the filtered (non-disputed) set only.
+	// Layer 3: count seller appearances for the novelty boost.
+	filtered := candidates
 	sellerCount := make(map[string]int, len(filtered))
 	for _, c := range filtered {
 		sellerCount[c.SellerKey]++
