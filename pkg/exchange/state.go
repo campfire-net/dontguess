@@ -34,6 +34,19 @@ const (
 	SettlePhaseStrComplete    = "complete"
 	SettlePhaseStrDispute     = "dispute"
 
+	SettlePhaseStrPreviewRequest      = "preview-request"
+	SettlePhaseStrPreview             = "preview"
+	SettlePhaseStrSmallContentDispute = "small-content-dispute"
+
+	// SmallContentThreshold is the token count below which content is too small
+	// for meaningful preview. Entries below this threshold use the small-content
+	// dispute path instead.
+	SmallContentThreshold = 500
+
+	// SmallContentReputationPenalty is the per-refund reputation hit for
+	// small-content disputes.
+	SmallContentReputationPenalty = 3
+
 	// OrderExpiry is how long a buy order lives before it expires without a match.
 	OrderExpiry = time.Hour
 
@@ -301,6 +314,28 @@ type State struct {
 	// when Apply is called multiple times with the same message (e.g., duplicate
 	// delivery). Key: settle(complete) message ID.
 	completedSettlements map[string]struct{}
+
+	// previewsByEntry tracks which buyers have requested previews for which entries.
+	// Key: entryID -> map[buyerKey]matchMsgID. Used to enforce one-preview-per-match
+	// and to trace the preview antecedent chain.
+	previewsByEntry map[string]map[string]string
+
+	// previewCountByMatch tracks how many preview-requests have been made per match.
+	// Key: matchMsgID -> count. Used for rate limiting and anti-reconstruction detection.
+	previewCountByMatch map[string]int
+
+	// previewRequestToMatch maps a preview-request message ID to the match message ID
+	// it references. Used by applySettlePreview to trace the antecedent chain.
+	previewRequestToMatch map[string]string
+
+	// previewToMatch maps a preview message ID to the match message ID.
+	// Used by buyer-accept to validate the antecedent chain (buyer-accept antecedent
+	// is now the preview message for content >= 500 tokens).
+	previewToMatch map[string]string
+
+	// smallContentDisputes tracks entries that received small-content auto-refund disputes.
+	// Key: entryID -> count of disputes. Used by reputation model for -3 per refund.
+	smallContentDisputes map[string]int
 }
 
 // NewState creates an empty exchange state.
@@ -321,9 +356,14 @@ func NewState() *State {
 		deliveredOrders:    make(map[string]struct{}),
 		deliverToMatch:     make(map[string]string),
 		completedEntries:   make(map[string]string),
-		pendingDisputes:      make(map[string]struct{}),
-		upheldDisputes:       make(map[string]struct{}),
-		completedSettlements: make(map[string]struct{}),
+		pendingDisputes:       make(map[string]struct{}),
+		upheldDisputes:        make(map[string]struct{}),
+		completedSettlements:  make(map[string]struct{}),
+		previewsByEntry:       make(map[string]map[string]string),
+		previewCountByMatch:   make(map[string]int),
+		previewRequestToMatch: make(map[string]string),
+		previewToMatch:        make(map[string]string),
+		smallContentDisputes:  make(map[string]int),
 	}
 }
 
@@ -352,6 +392,11 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.pendingDisputes = make(map[string]struct{})
 	s.upheldDisputes = make(map[string]struct{})
 	s.completedSettlements = make(map[string]struct{})
+	s.previewsByEntry = make(map[string]map[string]string)
+	s.previewCountByMatch = make(map[string]int)
+	s.previewRequestToMatch = make(map[string]string)
+	s.previewToMatch = make(map[string]string)
+	s.smallContentDisputes = make(map[string]int)
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
