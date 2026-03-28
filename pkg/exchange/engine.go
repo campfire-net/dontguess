@@ -330,6 +330,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	var payload struct {
 		Task           string   `json:"task"`
 		Budget         int64    `json:"budget"`
+		MaxPrice       int64    `json:"max_price"`
 		MinReputation  int      `json:"min_reputation"`
 		FreshnessHours int      `json:"freshness_hours"`
 		ContentType    string   `json:"content_type"`
@@ -338,6 +339,10 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("parsing buy payload: %w", err)
+	}
+	// Accept max_price as alias for budget — agents naturally use this name.
+	if payload.Budget == 0 && payload.MaxPrice > 0 {
+		payload.Budget = payload.MaxPrice
 	}
 
 	maxResults := payload.MaxResults
