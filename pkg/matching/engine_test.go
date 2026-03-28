@@ -50,25 +50,6 @@ func TestIndex_SearchReturnsTopRelevant(t *testing.T) {
 	}
 }
 
-// TestIndex_DisputedEntryExcluded verifies that Layer 0 works through the Index.
-func TestIndex_DisputedEntryExcluded(t *testing.T) {
-	t.Parallel()
-
-	now := time.Now()
-	entries := []matching.RankInput{
-		{EntryID: "good", SellerKey: "s1", Description: "Go HTTP handler tests", ContentType: "code", Domains: []string{"go"}, TokenCost: 5000, Price: 500, SellerReputation: 70, PutTimestamp: now.Add(-1 * time.Hour).UnixNano(), HasUpheldDispute: false},
-		{EntryID: "disputed", SellerKey: "s2", Description: "Go HTTP handler tests", ContentType: "code", Domains: []string{"go"}, TokenCost: 5000, Price: 500, SellerReputation: 70, PutTimestamp: now.Add(-1 * time.Hour).UnixNano(), HasUpheldDispute: true},
-	}
-	idx := buildIndex(entries)
-
-	results := idx.Search("Go HTTP handler unit tests", 10)
-	for _, r := range results {
-		if r.EntryID == "disputed" {
-			t.Errorf("disputed entry appeared in search results")
-		}
-	}
-}
-
 // TestIndex_AddAndRemove verifies incremental index mutations.
 func TestIndex_AddAndRemove(t *testing.T) {
 	t.Parallel()

@@ -278,10 +278,6 @@ func (e *Engine) dispatch(msg *store.MessageRecord) error {
 	case TagBuy:
 		return e.handleBuy(msg)
 	case TagSettle:
-		phase := settlePhaseFromTags(msg.Tags)
-		if phase == SettlePhaseStrDispute {
-			return e.handleDispute(msg)
-		}
 		return e.handleSettle(msg)
 	}
 	return nil
@@ -929,111 +925,6 @@ func (e *Engine) handleSettlePreviewRequest(msg *store.MessageRecord) error {
 	return nil
 }
 
-// handleDispute processes settle(dispute) messages.
-//
-// If ScripStore is configured, the engine refunds the buyer's pre-decremented
-// scrip using the reservation_id from the dispute payload.
-func (e *Engine) handleDispute(msg *store.MessageRecord) error {
-	if e.opts.ScripStore == nil {
-		return nil
-	}
-
-	var payload struct {
-		ReservationID string `json:"reservation_id"`
-		BuyerKey      string `json:"buyer_key"`
-	}
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		return fmt.Errorf("scrip: parsing dispute payload: %w", err)
-	}
-	if payload.ReservationID == "" || payload.BuyerKey == "" {
-		return nil // not a scrip-bearing dispute
-	}
-
-	ctx := e.engineCtx()
-
-	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
-	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
-	if err != nil {
-		e.opts.log("engine: dispute: reservation %s not found: %v", shortKey(payload.ReservationID), err)
-		return nil
-	}
-
-	// Security check: the buyer_key in the dispute payload must match the agent key
-	// recorded in the reservation at buy time. Reject any dispute that tries to
-	// redirect the refund to a different identity.
-	// If the check fails, restore the reservation before returning — ConsumeReservation
-	// already deleted it, and the legitimate owner must still be able to claim a refund.
-	if res.AgentKey != payload.BuyerKey {
-		// Restore the atomically consumed reservation so the legitimate owner can
-		// still dispute and claim their refund. If restore fails, the reservation
-		// is permanently lost — surface an error that includes both failures so the
-		// caller has full context.
-		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
-			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after key mismatch: %v",
-				shortKey(payload.ReservationID), restoreErr)
-			return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch AND restore failed (reservation lost): %w",
-				shortKey(payload.ReservationID), restoreErr)
-		}
-		return fmt.Errorf("scrip: dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
-			shortKey(payload.ReservationID), shortKey(payload.BuyerKey), shortKey(res.AgentKey))
-	}
-
-	// Sender identity gate: the campfire message sender must be either the buyer
-	// who holds the reservation, or the exchange operator processing the dispute.
-	// Convention §9.5: "dispute: sender must be the buyer."
-	// The operator is permitted because the scrip-bearing dispute is the operator's
-	// action to issue a refund after investigating the buyer's initial filing.
-	// Any other campfire member sending a dispute with a valid reservation_id is
-	// rejected — they cannot trigger a refund on behalf of another buyer.
-	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
-	if msg.Sender != res.AgentKey && msg.Sender != operatorKey {
-		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
-			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after sender mismatch: %v",
-				shortKey(payload.ReservationID), restoreErr)
-			return fmt.Errorf("scrip: dispute reservation %s: sender mismatch AND restore failed (reservation lost): %w",
-				shortKey(payload.ReservationID), restoreErr)
-		}
-		return fmt.Errorf("scrip: dispute reservation %s: sender mismatch (sender=%s, buyer=%s)",
-			shortKey(payload.ReservationID), shortKey(msg.Sender), shortKey(res.AgentKey))
-	}
-
-	// Marshal the convention message BEFORE mutating scrip state.
-	// If marshal fails, restore the reservation (it was consumed above) and return the error.
-	refundPayload, err := e.marshal(scrip.DisputeRefundPayload{
-		Buyer:         res.AgentKey,
-		Amount:        res.Amount,
-		ReservationID: payload.ReservationID,
-		DisputeMsg:    msg.ID,
-	})
-	if err != nil {
-		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
-			e.opts.log("engine: dispute: CRITICAL: failed to restore reservation %s after marshal failure: %v",
-				shortKey(payload.ReservationID), restoreErr)
-			return fmt.Errorf("scrip: dispute reservation %s: marshal failed AND restore failed (reservation lost): %w",
-				shortKey(payload.ReservationID), restoreErr)
-		}
-		return fmt.Errorf("scrip: marshal dispute-refund payload: %w", err)
-	}
-
-	// Refund the full held amount to the buyer.
-	// Use res.AgentKey (the trusted identity recorded at buy time), not payload.BuyerKey
-	// (attacker-controlled). The check above confirmed they match, but we always use the
-	// reservation's authoritative key as the refund target.
-	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, res.Amount, ""); err != nil {
-		return fmt.Errorf("scrip: dispute refund for buyer %s: %w", shortKey(res.AgentKey), err)
-	}
-
-	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
-	if _, emitErr := e.sendOperatorMessage(refundPayload,
-		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
-		e.opts.log("engine: warning: emit scrip-dispute-refund: %v", emitErr)
-	}
-
-	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
-		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
-	return nil
-}
-
 // handleSettleSmallContentDispute processes a settle(small-content-dispute) message.
 //
 // This is a fully automated refund path — no operator verdict required. When
@@ -1149,13 +1040,6 @@ func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
 	var out []*InventoryEntry
 
 	for _, entry := range inventory {
-		// Layer 0 correctness gate: exclude entries with an operator-upheld dispute
-		// (exchange:verdict:accepted). Upheld disputes signal that the cached
-		// inference is incorrect or misrepresented — buyers must not receive them.
-		if e.state.HasUpheldDispute(entry.EntryID) {
-			continue
-		}
-
 		// Provenance revalidation gate: exclude entries flagged for re-validation
 		// due to a seller provenance downgrade (dontguess-lqp). These entries remain
 		// in inventory but are withheld from buyers until the operator clears the flag.
@@ -1435,8 +1319,6 @@ func (e *Engine) inventoryEntryToRankInput(entry *InventoryEntry) matching.RankI
 		Price:            e.computePrice(entry),
 		SellerReputation: e.state.SellerReputation(entry.SellerKey),
 		PutTimestamp:     entry.PutTimestamp,
-		DisputeCount:     e.state.SellerDisputeCount(entry.SellerKey),
-		HasUpheldDispute: e.state.HasUpheldDispute(entry.EntryID),
 	}
 }
 

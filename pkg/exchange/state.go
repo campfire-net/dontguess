@@ -32,7 +32,6 @@ const (
 	SettlePhaseStrBuyerReject = "buyer-reject"
 	SettlePhaseStrDeliver     = "deliver"
 	SettlePhaseStrComplete    = "complete"
-	SettlePhaseStrDispute     = "dispute"
 
 	SettlePhaseStrPreviewRequest      = "preview-request"
 	SettlePhaseStrPreview             = "preview"
@@ -180,10 +179,6 @@ type PriceRecord struct {
 type SellerStats struct {
 	// SuccessCount is the number of completed sales without dispute.
 	SuccessCount int
-	// DisputeCount is the number of upheld disputes against this seller.
-	DisputeCount int
-	// HashInvalidCount is the number of hash_invalid disputes.
-	HashInvalidCount int
 	// SmallContentRefundCount tracks auto-refunds from small-content disputes.
 	// Each refund costs SmallContentReputationPenalty (3) reputation points.
 	SmallContentRefundCount int
@@ -199,9 +194,7 @@ type SellerStats struct {
 // New sellers start at 50 (DefaultReputation).
 func (s *SellerStats) Reputation() int {
 	score := DefaultReputation
-	score += s.SuccessCount                                   // +1 per success
-	score -= s.DisputeCount * 5                               // -5 per upheld dispute
-	score -= s.HashInvalidCount * 5                           // additional -5 per hash_invalid (total -10)
+	score += s.SuccessCount                                                            // +1 per success
 	score -= s.SmallContentRefundCount * SmallContentReputationPenalty // -3 per small-content auto-refund
 
 	// +2 for each buyer who has purchased from this seller more than once
@@ -301,18 +294,6 @@ type State struct {
 	// Key: entryID -> buyerKey.
 	completedEntries map[string]string
 
-	// pendingDisputes tracks entries with filed but not-yet-upheld disputes.
-	// Key: entryID. A dispute message filed by the buyer records the entry here
-	// without penalizing seller reputation. Only an operator upheld verdict
-	// (exchange:verdict:accepted on a settle(dispute) message) triggers the
-	// reputation penalty.
-	pendingDisputes map[string]struct{}
-
-	// upheldDisputes tracks entries where an operator has upheld a dispute
-	// (exchange:verdict:accepted). Key: entryID. Used by the Layer 0
-	// correctness gate to exclude disputed entries from match results.
-	upheldDisputes map[string]struct{}
-
 	// completedSettlements tracks settle(complete) message IDs that have
 	// already been processed. Guards applySettleComplete against double-application
 	// when Apply is called multiple times with the same message (e.g., duplicate
@@ -359,9 +340,7 @@ func NewState() *State {
 		buyerAcceptToMatch: make(map[string]string),
 		deliveredOrders:    make(map[string]struct{}),
 		deliverToMatch:     make(map[string]string),
-		completedEntries:   make(map[string]string),
-		pendingDisputes:       make(map[string]struct{}),
-		upheldDisputes:        make(map[string]struct{}),
+		completedEntries:      make(map[string]string),
 		completedSettlements:  make(map[string]struct{}),
 		previewsByEntry:       make(map[string]map[string]string),
 		previewCountByMatch:   make(map[string]int),
@@ -393,8 +372,6 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.deliveredOrders = make(map[string]struct{})
 	s.deliverToMatch = make(map[string]string)
 	s.completedEntries = make(map[string]string)
-	s.pendingDisputes = make(map[string]struct{})
-	s.upheldDisputes = make(map[string]struct{})
 	s.completedSettlements = make(map[string]struct{})
 	s.previewsByEntry = make(map[string]map[string]string)
 	s.previewCountByMatch = make(map[string]int)
@@ -447,16 +424,6 @@ func settlePhaseFromTags(tags []string) string {
 	for _, t := range tags {
 		if strings.HasPrefix(t, TagPhasePrefix) {
 			return strings.TrimPrefix(t, TagPhasePrefix)
-		}
-	}
-	return ""
-}
-
-// verdictFromTags extracts the exchange:verdict:* value from tags, or "" if absent.
-func verdictFromTags(tags []string) string {
-	for _, t := range tags {
-		if strings.HasPrefix(t, TagVerdictPrefix) {
-			return strings.TrimPrefix(t, TagVerdictPrefix)
 		}
 	}
 	return ""
@@ -596,8 +563,6 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 		s.applySettleDeliver(msg)
 	case SettlePhaseStrComplete:
 		s.applySettleComplete(msg)
-	case SettlePhaseStrDispute:
-		s.applySettleDispute(msg)
 	case SettlePhaseStrPreviewRequest:
 		s.applySettlePreviewRequest(msg)
 	case SettlePhaseStrPreview:
@@ -851,61 +816,6 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 		SalePrice:   payload.Price,
 		Timestamp:   msg.Timestamp,
 	})
-}
-
-// applySettleDispute records a dispute filing. Seller reputation is only penalized
-// when the dispute is upheld by the operator — indicated by an exchange:verdict:accepted
-// tag on the settle(dispute) message. A dispute filed by the buyer alone (no verdict
-// tag, or exchange:verdict:disputed) is tracked in pendingDisputes but does NOT
-// affect seller reputation. This prevents buyers from gaming reputation by filing
-// unlimited unreviewed disputes (convention §7.4).
-//
-// Sender identity gate (dontguess-nte):
-//   - Only the operator may send a settle(dispute) with verdict:accepted.
-//     Convention §9.5 allows the operator to uphold disputes; reputation penalties
-//     require operator authorization. Any non-operator sender with verdict:accepted
-//     is silently rejected — they cannot game seller reputation.
-func (s *State) applySettleDispute(msg *store.MessageRecord) {
-	var payload struct {
-		EntryID     string `json:"entry_id"`
-		DisputeType string `json:"dispute_type"`
-	}
-	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
-		return
-	}
-	entryID := payload.EntryID
-	if entryID == "" {
-		return
-	}
-
-	// Track all filed disputes, regardless of verdict.
-	s.pendingDisputes[entryID] = struct{}{}
-
-	// Only penalize reputation on operator-upheld disputes (exchange:verdict:accepted).
-	verdict := verdictFromTags(msg.Tags)
-	if verdict != "accepted" {
-		return
-	}
-
-	// Sender identity gate: only the operator may uphold a dispute and apply
-	// reputation penalties. Convention §9.5: operator controls verdict:accepted.
-	// This prevents any campfire member from sending a forged settle(dispute)
-	// with verdict:accepted to damage a seller's reputation.
-	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
-		return
-	}
-
-	s.upheldDisputes[entryID] = struct{}{}
-
-	entry, ok := s.inventory[entryID]
-	if !ok {
-		return
-	}
-	stats := s.sellerStats(entry.SellerKey)
-	stats.DisputeCount++
-	if payload.DisputeType == "hash_invalid" {
-		stats.HashInvalidCount++
-	}
 }
 
 // applySettleSmallContentDispute processes a buyer-initiated small-content dispute.
@@ -1166,25 +1076,6 @@ func (s *State) IsMatchAccepted(matchMsgID string) bool {
 	return ok
 }
 
-// HasPendingDispute returns true if a dispute has been filed against the entry
-// (regardless of whether it has been upheld by the operator).
-func (s *State) HasPendingDispute(entryID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.pendingDisputes[entryID]
-	return ok
-}
-
-// HasUpheldDispute returns true if an operator-upheld dispute (verdict:accepted)
-// has been recorded against this entry. Used by the Layer 0 correctness gate
-// to exclude disputed entries from match results.
-func (s *State) HasUpheldDispute(entryID string) bool {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	_, ok := s.upheldDisputes[entryID]
-	return ok
-}
-
 // SetEntryProvenanceLevel records the seller's provenance level for an inventory
 // entry. Call this after a put-accept with the seller's current level. The level
 // is stored as an int (0=anonymous … 3=present) to avoid coupling state.go to
@@ -1231,17 +1122,6 @@ func (s *State) EntryNeedsRevalidation(entryID string) bool {
 		return entry.NeedsRevalidation
 	}
 	return false
-}
-
-// SellerDisputeCount returns the number of upheld disputes against the seller.
-// Returns 0 for unknown sellers.
-func (s *State) SellerDisputeCount(sellerKey string) int {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	if stats, ok := s.sellers[sellerKey]; ok {
-		return stats.DisputeCount
-	}
-	return 0
 }
 
 // SellerSmallContentRefundCount returns the number of small-content auto-refunds
