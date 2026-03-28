@@ -1223,10 +1223,19 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 		sizeFactor = 1.0 + sizeBonus
 	}
 
-	// Step 6: compound all multipliers
-	price := base * demandFactor * ageFactor * repFactor * sizeFactor
+	// Step 6: dynamic price adjustment from the fast pricing loop.
+	// If no active adjustment exists (cold start, no loop yet, expired TTL), the
+	// multiplier returned by GetPriceAdjustment is 1.0 — a no-op.
+	fastAdj := e.state.GetPriceAdjustment(entry.EntryID)
+	fastFactor := fastAdj.Multiplier
+	if fastFactor <= 0 {
+		fastFactor = 1.0
+	}
 
-	// Step 7: clamp and round (nearest-integer, not truncate, for stable results)
+	// Step 7: compound all multipliers
+	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor
+
+	// Step 8: clamp and round (nearest-integer, not truncate, for stable results)
 	rounded := math.Round(price)
 	if rounded < float64(computePriceMinPrice) {
 		return computePriceMinPrice

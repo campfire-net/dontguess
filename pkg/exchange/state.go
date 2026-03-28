@@ -186,7 +186,7 @@ type PriceAdjustment struct {
 	// Must be > 0. Values <= 0 are ignored (treated as 1.0).
 	Multiplier float64
 	// ExpiresAt is when this adjustment becomes stale and is ignored.
-	// Zero ExpiresAt means the adjustment never expires (use with care in tests).
+	// Zero ExpiresAt means the adjustment never expires (useful in tests).
 	ExpiresAt time.Time
 	// VelocityPerHour is the demand velocity (purchases per hour) that drove
 	// this adjustment. Stored for diagnostics and medium-loop input.
@@ -449,8 +449,8 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.entryPreviewCount = make(map[string]int)
 	s.entryConversionCount = make(map[string]int)
 	s.matchToBuyHold = make(map[string]string)
-	// Note: priceAdjustments is NOT reset on Replay â it holds runtime state
-	// from the fast pricing loop, not derived from the campfire log.
+	// Note: priceAdjustments is intentionally NOT reset on Replay.
+	// It is externally written by the fast pricing loop, not derived from the log.
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -490,7 +490,7 @@ func (s *State) applyLocked(msg *store.MessageRecord) {
 
 // applyScripBuyHold indexes a scrip-buy-hold message into matchToBuyHold.
 // Enables O(1) lookup in GetBuyHoldReservation, replacing the O(n) log scan
-// previously done by findExistingBuyerAcceptHold.
+// in findExistingBuyerAcceptHold.
 func (s *State) applyScripBuyHold(msg *store.MessageRecord) {
 	var p scrip.BuyHoldPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
@@ -504,7 +504,7 @@ func (s *State) applyScripBuyHold(msg *store.MessageRecord) {
 
 // GetBuyHoldReservation returns the reservation ID for a prior scrip-buy-hold
 // message matching the given match message ID, or "" if none exists.
-// O(1) â replaces the O(n) log scan in findExistingBuyerAcceptHold.
+// O(1) — replaces the O(n) log scan in findExistingBuyerAcceptHold.
 func (s *State) GetBuyHoldReservation(matchMsgID string) string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
