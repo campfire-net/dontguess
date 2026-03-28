@@ -36,10 +36,12 @@ func (s *stubState) SetPriceAdjustment(entryID string, adj exchange.PriceAdjustm
 	s.adjustments[entryID] = adj
 }
 
-// TestFastLoop_NoSalesNoAdjustment verifies that an entry with zero recent
-// sales and no preview data receives no adjustment (multiplier stays 1.0).
-// The loop skips entries where |multiplier - 1.0| < 0.01.
-func TestFastLoop_NoSalesNoAdjustment(t *testing.T) {
+// TestFastLoop_ColdEntryGetsColdDiscount verifies that an entry with zero recent
+// sales and no preview data receives a sub-1.0 price multiplier (cold discount).
+// A cold entry has volumeSurplus=0; the logistic maps this to a mild discount
+// (~0.75x), which differs from 1.0 by more than the 0.01 skip threshold, so
+// an adjustment IS written.
+func TestFastLoop_ColdEntryGetsColdDiscount(t *testing.T) {
 	t.Parallel()
 	st := newStubState()
 	st.inventory = []*exchange.InventoryEntry{
@@ -427,45 +429,7 @@ func TestState_AllPriceAdjustments_FiltersExpired(t *testing.T) {
 	}
 }
 
-// TestComputePrice_FastLoopAdjustment is an integration test that verifies
-// the exchange engine's computePrice applies the fast-loop adjustment.
-// It uses the exchange.State directly to set adjustments and checks the
-// resulting price via the exported test helper.
-//
-// This is intentionally a black-box test: we set a 1.5x adjustment and verify
-// the price increases by approximately 1.5x vs the base.
-func TestComputePrice_FastLoopAdjustment(t *testing.T) {
-	t.Parallel()
-
-	// Create a state and set a 1.5x fast-loop adjustment.
-	st := exchange.NewState()
-	st.SetPriceAdjustment("entry-adj", exchange.PriceAdjustment{
-		Multiplier: 1.5,
-		ExpiresAt:  time.Now().Add(10 * time.Minute),
-	})
-
-	baseEntry := &exchange.InventoryEntry{
-		EntryID:      "entry-adj",
-		PutPrice:     1000,
-		PutTimestamp: 0, // no age decay
-	}
-	noAdjEntry := &exchange.InventoryEntry{
-		EntryID:      "entry-no-adj",
-		PutPrice:     1000,
-		PutTimestamp: 0,
-	}
-
-	// We need the engine to use our state. The ComputePriceForTest helper is
-	// in the exchange_test package (export_test.go). We verify via State methods.
-	// The multiplier on "entry-adj" = 1.5, so the effective price should be
-	// approximately 1.5x the price of "entry-no-adj" (same base, no adjustment).
-	adjAdj := st.GetPriceAdjustment(baseEntry.EntryID)
-	adjBase := st.GetPriceAdjustment(noAdjEntry.EntryID)
-
-	if adjAdj.Multiplier != 1.5 {
-		t.Errorf("expected 1.5x on adjusted entry, got %.2f", adjAdj.Multiplier)
-	}
-	if adjBase.Multiplier != 1.0 {
-		t.Errorf("expected 1.0x on unadjusted entry, got %.2f", adjBase.Multiplier)
-	}
-}
+// TestComputePrice_FastLoopAdjustment has been moved to
+// pkg/exchange/fast_loop_integration_test.go where newTestHarness is available
+// to create a real engine and verify that computePrice applies the fastFactor
+// multiplier from exchange state.
