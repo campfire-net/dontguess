@@ -568,13 +568,28 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 //   - Burns the matching fee (price * MatchingFeeRate / 100)
 //   - Credits exchange revenue (remainder) to the operator
 //
+// For settle(preview-request) phases, the engine generates a content preview
+// using PreviewAssembler and responds with a settle(preview) message. The
+// preview antecedent is the preview-request message ID.
+//
 // The reservation_id in the settle payload links back to the buy-hold reservation.
 func (e *Engine) handleSettle(msg *store.MessageRecord) error {
+	phase := settlePhaseFromTags(msg.Tags)
+
+	// Handle preview-request: generate and send a preview response.
+	if phase == SettlePhaseStrPreviewRequest {
+		return e.handleSettlePreviewRequest(msg)
+	}
+
+	// Handle small-content-dispute: fully automated refund path, no operator required.
+	if phase == SettlePhaseStrSmallContentDispute {
+		return e.handleSettleSmallContentDispute(msg)
+	}
+
 	if e.opts.ScripStore == nil {
 		return nil
 	}
 
-	phase := settlePhaseFromTags(msg.Tags)
 	if phase != SettlePhaseStrComplete {
 		// Only complete phase triggers scrip movement.
 		// Other phases (buyer-accept, deliver, put-accept) are tracked in state only.
@@ -725,6 +740,119 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 	return nil
 }
 
+// handleSettlePreviewRequest generates a content preview in response to a
+// settle(preview-request) message from a buyer.
+//
+// The engine:
+//  1. Validates the match exists in state (antecedent must be a match message).
+//  2. Looks up the entry from the match.
+//  3. Calls PreviewAssembler.Assemble() with the entry details and nil content
+//     (actual content delivery is a future concern — the preview payload carries
+//     entry metadata and chunk descriptors, not the real content bytes).
+//  4. Sends a settle(preview) response with the antecedent set to the
+//     preview-request message ID.
+//
+// If the antecedent is not a recognized match or the entry is not in inventory,
+// the message is silently ignored (no error returned to the poll loop).
+func (e *Engine) handleSettlePreviewRequest(msg *store.MessageRecord) error {
+	if len(msg.Antecedents) == 0 {
+		e.opts.log("engine: preview-request: no antecedents, ignoring msg=%s", msg.ID)
+		return nil
+	}
+	matchMsgID := msg.Antecedents[0]
+
+	// Validate match exists and sender is the expected buyer.
+	e.state.mu.RLock()
+	expectedBuyer, matchKnown := e.state.matchToBuyer[matchMsgID]
+	matchEntryID := e.state.matchToEntry[matchMsgID]
+	// Also confirm that state applied the preview-request (previewRequestToMatch populated).
+	_, previewTracked := e.state.previewRequestToMatch[msg.ID]
+	e.state.mu.RUnlock()
+
+	if !matchKnown {
+		e.opts.log("engine: preview-request: unknown match %s, ignoring", shortKey(matchMsgID))
+		return nil
+	}
+	if msg.Sender != expectedBuyer {
+		e.opts.log("engine: preview-request: sender %s is not the expected buyer for match %s, ignoring",
+			shortKey(msg.Sender), shortKey(matchMsgID))
+		return nil
+	}
+	if !previewTracked {
+		// State rejected the preview-request (invalid antecedent or wrong sender).
+		// Do not respond.
+		e.opts.log("engine: preview-request: state did not track msg=%s, ignoring", msg.ID)
+		return nil
+	}
+
+	// Look up the entry.
+	entry := e.state.GetInventoryEntry(matchEntryID)
+	if entry == nil {
+		e.opts.log("engine: preview-request: entry %s not in inventory, ignoring", shortKey(matchEntryID))
+		return nil
+	}
+
+	// Generate preview. Content delivery is a future concern; use nil content for now.
+	// PreviewAssembler returns an empty result for nil/zero content, which is correct
+	// for the preview-before-purchase flow at this stage — the preview payload
+	// carries entry metadata so the buyer can decide whether to proceed.
+	pa := &PreviewAssembler{}
+	previewResult, err := pa.Assemble(PreviewRequest{
+		Content:     nil, // stub: real content delivery is a future concern
+		ContentType: entry.ContentType,
+		EntryID:     entry.EntryID,
+		BuyerKey:    msg.Sender,
+		MatchID:     matchMsgID,
+	})
+	if err != nil {
+		return fmt.Errorf("engine: preview-request: assemble preview for entry %s: %w", shortKey(entry.EntryID), err)
+	}
+
+	// Build preview payload.
+	type ChunkPayload struct {
+		Content    string `json:"content"`
+		StartByte  int    `json:"start_byte"`
+		EndByte    int    `json:"end_byte"`
+		ChunkIndex int    `json:"chunk_index"`
+	}
+	chunks := make([]ChunkPayload, len(previewResult.Chunks))
+	for i, c := range previewResult.Chunks {
+		chunks[i] = ChunkPayload{
+			Content:    c.Content,
+			StartByte:  c.StartByte,
+			EndByte:    c.EndByte,
+			ChunkIndex: c.ChunkIndex,
+		}
+	}
+
+	previewPayload, err := e.marshal(map[string]any{
+		"entry_id":       entry.EntryID,
+		"content_type":   entry.ContentType,
+		"total_tokens":   previewResult.TotalTokens,
+		"preview_tokens": previewResult.PreviewTokens,
+		"chunks":         chunks,
+	})
+	if err != nil {
+		return fmt.Errorf("engine: preview-request: marshal preview payload: %w", err)
+	}
+
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrPreview,
+	}
+	// Antecedent of the preview response is the preview-request message.
+	antecedents := []string{msg.ID}
+
+	_, err = e.sendOperatorMessage(previewPayload, tags, antecedents)
+	if err != nil {
+		return fmt.Errorf("engine: preview-request: send preview response: %w", err)
+	}
+
+	e.opts.log("engine: preview-request: sent preview for entry=%s match=%s buyer=%s",
+		shortKey(entry.EntryID), shortKey(matchMsgID), shortKey(msg.Sender))
+	return nil
+}
+
 // handleDispute processes settle(dispute) messages.
 //
 // If ScripStore is configured, the engine refunds the buyer's pre-decremented
@@ -828,6 +956,113 @@ func (e *Engine) handleDispute(msg *store.MessageRecord) error {
 	e.opts.log("engine: dispute refund: reservation=%s buyer=%s amount=%d",
 		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
 	return nil
+}
+
+// handleSettleSmallContentDispute processes a settle(small-content-dispute) message.
+//
+// This is a fully automated refund path — no operator verdict required. When
+// content is below SmallContentThreshold tokens, previews are not meaningful,
+// so buyers receive an immediate auto-refund of their held scrip.
+//
+// If ScripStore is configured, the buyer's reservation is consumed and the
+// full held amount is returned to their balance. State tracking (reputation
+// penalty) is handled by applySettleSmallContentDispute in state.go.
+func (e *Engine) handleSettleSmallContentDispute(msg *store.MessageRecord) error {
+	if e.opts.ScripStore == nil {
+		return nil
+	}
+
+	var payload struct {
+		ReservationID string `json:"reservation_id"`
+		BuyerKey      string `json:"buyer_key"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return fmt.Errorf("scrip: parsing small-content-dispute payload: %w", err)
+	}
+	if payload.ReservationID == "" || payload.BuyerKey == "" {
+		return nil // no scrip involved — state-only tracking already done
+	}
+
+	// Verify the entry is actually small content. Derive entry from antecedent chain.
+	if len(msg.Antecedents) == 0 {
+		return nil
+	}
+	deliverMsgID := msg.Antecedents[0]
+	entry := e.entryForDeliver(deliverMsgID)
+	if entry != nil {
+		isSmall := entry.TokenCost < SmallContentThreshold ||
+			entry.ContentSize < int64(SmallContentThreshold)*4
+		if !isSmall {
+			e.opts.log("engine: small-content-dispute: entry %s is not small content (token_cost=%d, content_size=%d) — rejecting refund",
+				shortKey(entry.EntryID), entry.TokenCost, entry.ContentSize)
+			return nil
+		}
+	}
+
+	ctx := e.engineCtx()
+
+	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
+	res, err := e.opts.ScripStore.ConsumeReservation(ctx, payload.ReservationID)
+	if err != nil {
+		e.opts.log("engine: small-content-dispute: reservation %s not found: %v",
+			shortKey(payload.ReservationID), err)
+		return nil // reservation missing or already settled
+	}
+
+	// Security check: buyer_key in payload must match the agent key in the reservation.
+	if res.AgentKey != payload.BuyerKey {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: small-content-dispute: CRITICAL: failed to restore reservation %s after key mismatch: %v",
+				shortKey(payload.ReservationID), restoreErr)
+			return fmt.Errorf("scrip: small-content-dispute reservation %s: buyer_key mismatch AND restore failed (reservation lost): %w",
+				shortKey(payload.ReservationID), restoreErr)
+		}
+		return fmt.Errorf("scrip: small-content-dispute reservation %s: buyer_key mismatch (payload=%s, reservation=%s)",
+			shortKey(payload.ReservationID), shortKey(payload.BuyerKey), shortKey(res.AgentKey))
+	}
+
+	// Marshal the convention refund message BEFORE mutating scrip state.
+	refundPayload, err := e.marshal(scrip.DisputeRefundPayload{
+		Buyer:         res.AgentKey,
+		Amount:        res.Amount,
+		ReservationID: payload.ReservationID,
+		DisputeMsg:    msg.ID,
+	})
+	if err != nil {
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: small-content-dispute: CRITICAL: failed to restore reservation %s after marshal failure: %v",
+				shortKey(payload.ReservationID), restoreErr)
+			return fmt.Errorf("scrip: small-content-dispute reservation %s: marshal failed AND restore failed (reservation lost): %w",
+				shortKey(payload.ReservationID), restoreErr)
+		}
+		return fmt.Errorf("scrip: marshal small-content-dispute refund payload: %w", err)
+	}
+
+	// Refund the full held amount to the buyer.
+	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, res.Amount, ""); err != nil {
+		return fmt.Errorf("scrip: small-content-dispute refund for buyer %s: %w", shortKey(res.AgentKey), err)
+	}
+
+	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
+	if _, emitErr := e.sendOperatorMessage(refundPayload,
+		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
+		e.opts.log("engine: warning: emit scrip-dispute-refund (small-content): %v", emitErr)
+	}
+
+	e.opts.log("engine: small-content-dispute refund: reservation=%s buyer=%s amount=%d",
+		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
+	return nil
+}
+
+// entryForDeliver derives the inventory entry for a deliver message ID by tracing
+// the antecedent chain: deliver → match (deliverToMatch) → entry (matchToEntry).
+// Returns nil if any link in the chain is missing or the entry is not in inventory.
+func (e *Engine) entryForDeliver(deliverMsgID string) *InventoryEntry {
+	entry, ok := e.state.EntryForDeliver(deliverMsgID)
+	if !ok {
+		return nil
+	}
+	return entry
 }
 
 // findCandidates returns inventory entries that satisfy the buyer's filters.
