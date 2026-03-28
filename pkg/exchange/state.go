@@ -188,14 +188,29 @@ type SellerStats struct {
 	// EntryBuyerMap tracks distinct buyers per entry for cross-agent convergence.
 	// Key: entryID, Value: set of buyer keys.
 	EntryBuyerMap map[string]map[string]struct{}
+	// PreviewCount tracks total previews served for this seller's entries.
+	PreviewCount int
+	// ConversionCount tracks previews that resulted in buyer-accept (purchase).
+	ConversionCount int
 }
 
 // Reputation computes the derived reputation score (0-100) for a seller.
 // New sellers start at 50 (DefaultReputation).
+//
+// Conversion rate bonus: if 10+ previews have been served, reward high conversion.
+// Scale: 0% conversion = -10, 50% = 0, 100% = +10.
 func (s *SellerStats) Reputation() int {
 	score := DefaultReputation
-	score += s.SuccessCount                                                            // +1 per success
-	score -= s.SmallContentRefundCount * SmallContentReputationPenalty // -3 per small-content auto-refund
+
+	// Conversion rate bonus: only applied when there is enough data (10+ previews).
+	if s.PreviewCount >= 10 {
+		rate := float64(s.ConversionCount) / float64(s.PreviewCount)
+		// Scale: 0% = -10, 50% = 0, 100% = +10
+		conversionBonus := int((rate - 0.5) * 20)
+		score += conversionBonus
+	}
+
+	score += s.SuccessCount // +1 per completed sale
 
 	// +2 for each buyer who has purchased from this seller more than once
 	for _, count := range s.RepeatBuyerMap {
@@ -210,6 +225,9 @@ func (s *SellerStats) Reputation() int {
 			score += 3
 		}
 	}
+
+	// Small-content refund penalty.
+	score -= s.SmallContentRefundCount * SmallContentReputationPenalty
 
 	if score < 0 {
 		return 0
@@ -321,6 +339,14 @@ type State struct {
 	// smallContentDisputes tracks entries that received small-content auto-refund disputes.
 	// Key: entryID -> count of disputes. Used by reputation model for -3 per refund.
 	smallContentDisputes map[string]int
+
+	// entryPreviewCount tracks previews per entry. Key: entryID.
+	// Incremented in applySettlePreviewRequest when the preview-request is accepted.
+	entryPreviewCount map[string]int
+
+	// entryConversionCount tracks conversions per entry. Key: entryID.
+	// Incremented in applySettleBuyerAccept when the buyer accepts via the preview path.
+	entryConversionCount map[string]int
 }
 
 // NewState creates an empty exchange state.
@@ -347,6 +373,8 @@ func NewState() *State {
 		previewRequestToMatch: make(map[string]string),
 		previewToMatch:        make(map[string]string),
 		smallContentDisputes:  make(map[string]int),
+		entryPreviewCount:     make(map[string]int),
+		entryConversionCount:  make(map[string]int),
 	}
 }
 
@@ -378,6 +406,8 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 	s.previewRequestToMatch = make(map[string]string)
 	s.previewToMatch = make(map[string]string)
 	s.smallContentDisputes = make(map[string]int)
+	s.entryPreviewCount = make(map[string]int)
+	s.entryConversionCount = make(map[string]int)
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -676,6 +706,16 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 	}
 	// Record buyer-accept → match mapping so deliver can trace the chain.
 	s.buyerAcceptToMatch[msg.ID] = matchMsgID
+
+	// If this accept came via the preview path (antecedent was a preview message),
+	// count it as a conversion for the seller and per-entry conversion tracking.
+	if _, viaPreview := s.previewToMatch[antecedentID]; viaPreview && selectedEntry != "" {
+		s.entryConversionCount[selectedEntry]++
+		if entry, ok := s.inventory[selectedEntry]; ok {
+			stats := s.sellerStats(entry.SellerKey)
+			stats.ConversionCount++
+		}
+	}
 }
 
 // applySettleBuyerReject records that a buyer has rejected a match.
@@ -944,6 +984,13 @@ func (s *State) applySettlePreviewRequest(msg *store.MessageRecord) {
 
 	// Track preview-request → match mapping for the response chain.
 	s.previewRequestToMatch[msg.ID] = matchMsgID
+
+	// Update per-entry and per-seller preview counts for the conversion rate model.
+	s.entryPreviewCount[entryID]++
+	if entry, ok := s.inventory[entryID]; ok {
+		stats := s.sellerStats(entry.SellerKey)
+		stats.PreviewCount++
+	}
 }
 
 // applySettlePreview records an operator's preview response message.
@@ -1050,6 +1097,26 @@ func (s *State) SellerReputation(sellerKey string) int {
 		return stats.Reputation()
 	}
 	return DefaultReputation
+}
+
+// LowConversionEntries returns entry IDs where conversion rate is below maxRate
+// and preview count is at or above minPreviews. Used by Layer 0 gate (dontguess-5iz)
+// to identify entries with poor preview-to-purchase ratios.
+func (s *State) LowConversionEntries(minPreviews int, maxRate float64) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var out []string
+	for entryID, previews := range s.entryPreviewCount {
+		if previews < minPreviews {
+			continue
+		}
+		conversions := s.entryConversionCount[entryID]
+		rate := float64(conversions) / float64(previews)
+		if rate < maxRate {
+			out = append(out, entryID)
+		}
+	}
+	return out
 }
 
 // GetInventoryEntry returns a single inventory entry by ID, or nil if not found.
