@@ -29,6 +29,14 @@ const MatchingFeeRate = 10
 // original seller. 10% = 1/10.
 const ResidualRate = 10
 
+// Layer0MinPreviews is the minimum number of previews before conversion-rate
+// exclusion kicks in. Below this, entries have insufficient data for exclusion.
+const Layer0MinPreviews = 10
+
+// Layer0MaxConversionRate is the conversion rate below which entries are excluded
+// from match results. 5% means fewer than 1 in 20 previewers chose to buy.
+const Layer0MaxConversionRate = 0.05
+
 // EngineOptions configures an exchange engine.
 type EngineOptions struct {
 	// CampfireID is the exchange campfire's public key hex.
@@ -1036,10 +1044,26 @@ func (e *Engine) entryForDeliver(deliverMsgID string) *InventoryEntry {
 func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
 	freshnessHours int, contentType string, domains []string) []*InventoryEntry {
 
+	// Layer 0 correctness gate: exclude entries with poor preview-to-purchase
+	// conversion rate (dontguess-5iz). Only applied once per call and keyed by
+	// entry ID for O(1) lookup in the loop below. Reversible: if an entry's
+	// conversion rate improves above the threshold, it re-appears automatically
+	// on the next call since LowConversionEntries is computed fresh from state.
+	lowConv := e.state.LowConversionEntries(Layer0MinPreviews, Layer0MaxConversionRate)
+	excluded := make(map[string]struct{}, len(lowConv))
+	for _, id := range lowConv {
+		excluded[id] = struct{}{}
+	}
+
 	inventory := e.state.Inventory()
 	var out []*InventoryEntry
 
 	for _, entry := range inventory {
+		// Layer 0: exclude entries with low conversion rate (insufficient buyer demand).
+		if _, ok := excluded[entry.EntryID]; ok {
+			continue
+		}
+
 		// Provenance revalidation gate: exclude entries flagged for re-validation
 		// due to a seller provenance downgrade (dontguess-lqp). These entries remain
 		// in inventory but are withheld from buyers until the operator clears the flag.
