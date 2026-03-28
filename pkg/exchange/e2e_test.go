@@ -243,7 +243,29 @@ func TestE2E_FullHappyPath(t *testing.T) {
 func TestE2E_BuyerReject(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
-	eng := h.newEngine()
+
+	// Wire a real CampfireScripStore so we can assert escrow (non-)interaction.
+	// Convention §scrip: buyer-reject has no scrip interaction — scrip is only locked
+	// at buyer-accept time. A buyer who rejects after seeing the match never touches escrow.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
+
+	// Seed buyer with scrip so any accidental escrow deduction would be visible.
+	const buyerSeedScrip = int64(50_000)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), buyerSeedScrip)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("cs.Replay after mint: %v", err)
+	}
+	buyerBalanceBefore := cs.Balance(h.buyer.PublicKeyHex())
 
 	// Seed inventory.
 	putMsg := h.sendMessage(h.seller,
@@ -295,7 +317,10 @@ func TestE2E_BuyerReject(t *testing.T) {
 		t.Fatalf("parsing match payload: %v", err)
 	}
 
-	// Buyer rejects.
+	// Snapshot scrip-buy-hold count before reject — no new holds should appear.
+	preBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+
+	// Buyer rejects (no buyer-accept was sent — buyer declines after seeing the match).
 	rejectPayload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-reject",
 		"entry_id": mp.Results[0].EntryID,
@@ -313,6 +338,23 @@ func TestE2E_BuyerReject(t *testing.T) {
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(allMsgs)
+
+	// --- Scrip balance assertions: escrow refund path ---
+	// Convention §scrip: buyer-reject has no scrip interaction. Scrip is only locked
+	// at buyer-accept time, which was never sent in this flow. Buyer balance must be
+	// unchanged and no scrip-buy-hold message should have been emitted.
+
+	buyerBalanceAfter := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfter != buyerBalanceBefore {
+		t.Errorf("buyer-reject: buyer scrip balance changed: got %d, want %d (unchanged) — escrow must not be taken before buyer-accept",
+			buyerBalanceAfter, buyerBalanceBefore)
+	}
+
+	afterBuyHoldMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
+	if len(afterBuyHoldMsgs) != len(preBuyHoldMsgs) {
+		t.Errorf("buyer-reject: unexpected scrip-buy-hold message emitted (before=%d, after=%d) — no escrow should be created on reject",
+			len(preBuyHoldMsgs), len(afterBuyHoldMsgs))
+	}
 
 	// No price history: transaction was not completed.
 	history := eng.State().PriceHistory()
