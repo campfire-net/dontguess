@@ -48,6 +48,7 @@ var pa = &PreviewAssembler{}
 
 // ---- Determinism tests ----
 
+// TestPreviewDeterministic verifies identical inputs produce identical outputs.
 func TestPreviewDeterministic(t *testing.T) {
 	content := generateProse(2000)
 	req := PreviewRequest{
@@ -78,6 +79,64 @@ func TestPreviewDeterministic(t *testing.T) {
 			t.Errorf("chunk %d StartByte differs: %d vs %d", i, c.StartByte, r2.Chunks[i].StartByte)
 		}
 	}
+}
+
+// TestPreviewDeterministicSeedDriven verifies that chunk positions are driven by the seed
+// (entryID, buyerKey, matchID), not by random state or content alone.
+// - Same seed + different content → positions are seed-driven (not content-hash-driven).
+// - Same content + different seeds → different chunk positions.
+func TestPreviewDeterministicSeedDriven(t *testing.T) {
+	// Build two different contents of the same size so chunk count is equal.
+	contentA := generateProse(2000)
+	// contentB: same structure but different text.
+	contentB := []byte(strings.ReplaceAll(string(contentA), "word", "text"))
+
+	entryID := "entry-seed-test"
+	buyerKey := "buyer-seed-test"
+	matchID := "match-seed-test"
+
+	// Same seed, different content — positions should differ (content is different).
+	rA, err := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	if err != nil {
+		t.Fatalf("Assemble A: %v", err)
+	}
+	rB, err := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	if err != nil {
+		t.Fatalf("Assemble B: %v", err)
+	}
+	// Both results must be deterministic when called again with the same inputs.
+	rA2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	rB2, _ := pa.Assemble(PreviewRequest{Content: contentB, ContentType: "analysis", EntryID: entryID, BuyerKey: buyerKey, MatchID: matchID})
+	for i := range rA.Chunks {
+		if rA.Chunks[i].StartByte != rA2.Chunks[i].StartByte {
+			t.Errorf("content A not deterministic: chunk %d start %d vs %d", i, rA.Chunks[i].StartByte, rA2.Chunks[i].StartByte)
+		}
+	}
+	for i := range rB.Chunks {
+		if rB.Chunks[i].StartByte != rB2.Chunks[i].StartByte {
+			t.Errorf("content B not deterministic: chunk %d start %d vs %d", i, rB.Chunks[i].StartByte, rB2.Chunks[i].StartByte)
+		}
+	}
+
+	// Same content + different seeds → different chunk positions.
+	rSeed1, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "e1", BuyerKey: "b1", MatchID: "m1"})
+	rSeed2, _ := pa.Assemble(PreviewRequest{Content: contentA, ContentType: "analysis", EntryID: "e2", BuyerKey: "b2", MatchID: "m2"})
+	allSame := true
+	if len(rSeed1.Chunks) == len(rSeed2.Chunks) {
+		for i := range rSeed1.Chunks {
+			if rSeed1.Chunks[i].StartByte != rSeed2.Chunks[i].StartByte {
+				allSame = false
+				break
+			}
+		}
+	} else {
+		allSame = false
+	}
+	if allSame {
+		t.Error("same content + different seeds produced identical chunk positions — seeding is broken")
+	}
+	_ = rA
+	_ = rB
 }
 
 func TestPreviewDifferentSeeds(t *testing.T) {
@@ -136,6 +195,95 @@ func TestPreviewReducedChunksSmallContent(t *testing.T) {
 	}
 	if len(r.Chunks) == 0 {
 		t.Error("expected at least one chunk for 250-token content")
+	}
+}
+
+// ---- Exact boundary edge cases (Finding 3) ----
+
+// makeExactTokenContent builds content with exactly the given number of tokens.
+// estimateTokens = (len+3)/4 = n when len = n*4.
+// Content uses 'word '-repeated text with '\n\n' paragraph separators so boundary
+// detection produces genuine split points for the assembler to snap to.
+func makeExactTokenContent(tokens int) []byte {
+	// Each "word " is 5 bytes = ~1.25 tokens. Use repeated words terminated with '\n\n'
+	// every ~50 tokens so there are plenty of paragraph boundaries.
+	// We build at least `tokens*4` bytes and trim to exactly `tokens*4` bytes.
+	target := tokens * 4
+	var sb strings.Builder
+	wordUnit := "word " // 5 bytes
+	for sb.Len() < target+100 {
+		sb.WriteString(wordUnit)
+		if sb.Len()%200 == 0 { // paragraph break roughly every 200 bytes
+			sb.WriteString("\n\n")
+		}
+	}
+	b := []byte(sb.String())
+	// Trim or pad to exactly target bytes so estimateTokens returns exactly tokens.
+	if len(b) > target {
+		b = b[:target]
+	}
+	for len(b) < target {
+		b = append(b, 'x')
+	}
+	return b
+}
+
+// TestPreviewChunkCountAtBoundaries tests the token-count thresholds at critical values.
+//
+// Logic in Assemble:
+//   - totalTokens < minTokensPerChunk (100)  → single full-content chunk (passthrough)
+//   - totalTokens < minTokensForChunks (500) → chunkCount = totalTokens / 100
+//   - totalTokens >= minTokensForChunks      → chunkCount = 5
+//
+// The minimum-token enforcement and boundary snapping can reduce the final produced
+// chunk count below chunkCount when chunks would overlap (sparse content, small size).
+// This test verifies the correct logic path is taken at each threshold boundary, with
+// bounds that account for the overlap-resolution behaviour of selectChunks.
+//
+//   -  99 tokens → 1 chunk containing all content (full passthrough, not chunked)
+//   - 100 tokens → 1..1 chunks (chunkCount=1, no further reduction possible)
+//   - 499 tokens → 1..4 chunks (chunkCount=4, overlap may reduce to fewer)
+//   - 500 tokens → 1..5 chunks (chunkCount=5, first token count above the threshold)
+//   - 501 tokens → 1..5 chunks (chunkCount=5, firmly above threshold)
+func TestPreviewChunkCountAtBoundaries(t *testing.T) {
+	cases := []struct {
+		tokens       int
+		wantMinChunk int
+		wantMaxChunk int
+		fullContent  bool // if true, the single chunk must equal all content
+		desc         string
+	}{
+		{99, 1, 1, true, "99 tokens: below per-chunk minimum, full-content passthrough"},
+		{100, 1, 1, false, "100 tokens: exactly at per-chunk minimum, chunkCount=100/100=1"},
+		{499, 1, 4, false, "499 tokens: below 5-chunk threshold, chunkCount<=4"},
+		{500, 1, 5, false, "500 tokens: exactly at 5-chunk threshold (500 is not < 500), chunkCount=5"},
+		{501, 1, 5, false, "501 tokens: above threshold, chunkCount=5"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.desc, func(t *testing.T) {
+			content := makeExactTokenContent(tc.tokens)
+			// Verify the helper produces the exact token count we intend.
+			actualTokens := estimateTokens(content)
+			if actualTokens != tc.tokens {
+				t.Fatalf("makeExactTokenContent(%d) produced %d tokens (len=%d) — helper is wrong",
+					tc.tokens, actualTokens, len(content))
+			}
+			req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+			r, err := pa.Assemble(req)
+			if err != nil {
+				t.Fatalf("Assemble: %v", err)
+			}
+			n := len(r.Chunks)
+			if n < tc.wantMinChunk || n > tc.wantMaxChunk {
+				t.Errorf("tokens=%d: got %d chunks, want [%d,%d]", tc.tokens, n, tc.wantMinChunk, tc.wantMaxChunk)
+			}
+			if tc.fullContent && n == 1 {
+				if r.Chunks[0].Content != string(content) {
+					t.Errorf("tokens=%d: expected full-content passthrough but chunk content differs", tc.tokens)
+				}
+			}
+		})
 	}
 }
 
@@ -206,8 +354,13 @@ func TestPreviewSingleLine(t *testing.T) {
 
 // ---- Content-type-aware chunking ----
 
+// TestPreviewCodeBoundaries verifies that code chunks start at recognizable code keywords.
+// Requirements (Finding 2):
+//   - >= 3/5 chunks must start at a code keyword (func/def/class/function)
+//   - Blank-line alignment does NOT count as code boundary alignment
+//   - At least one chunk must start with a recognizable keyword
 func TestPreviewCodeBoundaries(t *testing.T) {
-	// Code with clear function boundaries — chunks should start at func declarations
+	// Generate code with dense func declarations to ensure many boundaries.
 	content := generateCode(1500)
 	req := PreviewRequest{Content: content, ContentType: "code", EntryID: "e", BuyerKey: "b", MatchID: "m"}
 
@@ -222,30 +375,118 @@ func TestPreviewCodeBoundaries(t *testing.T) {
 	s := string(content)
 	codeKeywords := []string{"func ", "def ", "class ", "function "}
 
-	// At least half the chunks should start at a recognizable code boundary or
-	// within a few bytes of one (snap tolerance). Accept chunks that start at
-	// offset 0 or immediately after a newline that precedes a keyword.
 	aligned := 0
 	for _, c := range r.Chunks {
 		start := c.StartByte
-		// Check if start is at position 0 or the character at start begins a code keyword
-		atKeyword := false
 		for _, kw := range codeKeywords {
 			if start+len(kw) <= len(s) && s[start:start+len(kw)] == kw {
-				atKeyword = true
+				aligned++
 				break
 			}
 		}
-		// Also accept start of file (offset 0) or blank-line boundary
-		atBlankLine := start == 0 || (start >= 2 && s[start-2:start] == "\n\n")
-		if atKeyword || atBlankLine {
+	}
+
+	// Require at least 3 out of 5 chunks to start at actual code keywords.
+	threshold := 3
+	if len(r.Chunks) < previewChunkCount {
+		// Proportional threshold for smaller content: ceil(60% of chunks)
+		threshold = (len(r.Chunks)*3 + 4) / 5
+		if threshold < 1 {
+			threshold = 1
+		}
+	}
+	if aligned < threshold {
+		t.Errorf("only %d/%d chunks start at code keyword boundaries (need >= %d); chunks: %+v",
+			aligned, len(r.Chunks), threshold, r.Chunks)
+	}
+
+	// At least one chunk must start with a recognizable keyword.
+	atLeastOne := false
+	for _, c := range r.Chunks {
+		start := c.StartByte
+		for _, kw := range codeKeywords {
+			if start+len(kw) <= len(s) && s[start:start+len(kw)] == kw {
+				atLeastOne = true
+				break
+			}
+		}
+	}
+	if !atLeastOne {
+		t.Errorf("no chunk starts with a recognizable code keyword; chunks: %+v", r.Chunks)
+	}
+}
+
+// TestPreviewPlanParagraphBoundaries verifies 'plan' content snaps to paragraph boundaries.
+func TestPreviewPlanParagraphBoundaries(t *testing.T) {
+	content := generateProse(2000)
+	req := PreviewRequest{Content: content, ContentType: "plan", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+
+	r, err := pa.Assemble(req)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	s := string(content)
+
+	aligned := 0
+	for _, c := range r.Chunks {
+		start := c.StartByte
+		if start == 0 || (start >= 2 && s[start-2:start] == "\n\n") {
 			aligned++
 		}
 	}
-	// Require at least 1 chunk aligned (strict requirement would be all, but snapping
-	// can shift to adjacent blank lines)
 	if aligned == 0 {
-		t.Errorf("no code chunks start at code boundaries; chunks: %+v", r.Chunks)
+		t.Errorf("no 'plan' chunks start at paragraph boundaries; chunks: %+v", r.Chunks)
+	}
+}
+
+// TestPreviewReviewParagraphBoundaries verifies 'review' content snaps to paragraph boundaries.
+func TestPreviewReviewParagraphBoundaries(t *testing.T) {
+	content := generateProse(2000)
+	req := PreviewRequest{Content: content, ContentType: "review", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+
+	r, err := pa.Assemble(req)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	s := string(content)
+
+	aligned := 0
+	for _, c := range r.Chunks {
+		start := c.StartByte
+		if start == 0 || (start >= 2 && s[start-2:start] == "\n\n") {
+			aligned++
+		}
+	}
+	if aligned == 0 {
+		t.Errorf("no 'review' chunks start at paragraph boundaries; chunks: %+v", r.Chunks)
+	}
+}
+
+// TestPreviewOtherNewlineBoundaries verifies 'other' content snaps to newline boundaries.
+func TestPreviewOtherNewlineBoundaries(t *testing.T) {
+	// Generate line-delimited content with many newlines.
+	var sb strings.Builder
+	for i := 0; i < 400; i++ {
+		sb.WriteString(fmt.Sprintf("line %d: some content here for padding purposes\n", i))
+	}
+	content := []byte(sb.String())
+	req := PreviewRequest{Content: content, ContentType: "other", EntryID: "e", BuyerKey: "b", MatchID: "m"}
+
+	r, err := pa.Assemble(req)
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	s := string(content)
+
+	aligned := 0
+	for _, c := range r.Chunks {
+		start := c.StartByte
+		if start == 0 || (start > 0 && s[start-1] == '\n') {
+			aligned++
+		}
+	}
+	if aligned == 0 {
+		t.Errorf("no 'other' chunks start at newline boundaries; chunks: %+v", r.Chunks)
 	}
 }
 
@@ -411,8 +652,50 @@ func TestXorShift64Distribution(t *testing.T) {
 	}
 }
 
-// ---- ChunkIndex ----
+// TestXorShift64ZeroSeedFallback verifies that a zero seed is replaced with the built-in
+// fallback constant, producing a non-zero, non-degenerate sequence (Finding 7).
+func TestXorShift64ZeroSeedFallback(t *testing.T) {
+	rng := newXorShift64(0)
 
+	// The state should have been set to the fallback constant, not zero.
+	if rng.state == 0 {
+		t.Fatal("newXorShift64(0) left state as 0 — xorshift will produce only zeros")
+	}
+
+	// Generate a sequence and verify it is non-degenerate: not all identical, not all zero.
+	const n = 20
+	values := make([]uint64, n)
+	for i := range values {
+		values[i] = rng.next()
+	}
+
+	allZero := true
+	for _, v := range values {
+		if v != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		t.Error("newXorShift64(0) produced all-zero sequence")
+	}
+
+	allSame := true
+	for i := 1; i < n; i++ {
+		if values[i] != values[0] {
+			allSame = false
+			break
+		}
+	}
+	if allSame {
+		t.Errorf("newXorShift64(0) produced constant sequence (value=%d) — degenerate PRNG", values[0])
+	}
+}
+
+// ---- ChunkIndex integrity (Finding 6) ----
+
+// TestPreviewChunkIndexAssigned verifies ChunkIndex values are unique, cover range [0, chunkCount),
+// and are monotonically increasing alongside StartByte.
 func TestPreviewChunkIndexAssigned(t *testing.T) {
 	content := generateProse(2000)
 	req := PreviewRequest{Content: content, ContentType: "analysis", EntryID: "e", BuyerKey: "b", MatchID: "m"}
@@ -421,9 +704,137 @@ func TestPreviewChunkIndexAssigned(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Assemble: %v", err)
 	}
+	if len(r.Chunks) == 0 {
+		t.Fatal("expected at least one chunk")
+	}
+
+	n := len(r.Chunks)
+
+	// ChunkIndex values must be unique.
+	seen := make(map[int]int)
 	for i, c := range r.Chunks {
-		if c.ChunkIndex < 0 {
-			t.Errorf("chunk %d has negative ChunkIndex %d", i, c.ChunkIndex)
+		if prev, dup := seen[c.ChunkIndex]; dup {
+			t.Errorf("duplicate ChunkIndex %d at positions %d and %d", c.ChunkIndex, prev, i)
+		}
+		seen[c.ChunkIndex] = i
+	}
+
+	// ChunkIndex values must cover [0, n).
+	for idx := 0; idx < n; idx++ {
+		if _, ok := seen[idx]; !ok {
+			t.Errorf("ChunkIndex %d missing from result (have %d chunks, expected range [0,%d))", idx, n, n)
+		}
+	}
+
+	// Chunks must be monotonically ordered: chunk[i].ChunkIndex < chunk[i+1].ChunkIndex
+	// and chunk[i].StartByte < chunk[i+1].StartByte.
+	for i := 1; i < n; i++ {
+		if r.Chunks[i].ChunkIndex <= r.Chunks[i-1].ChunkIndex {
+			t.Errorf("ChunkIndex not monotonically increasing: chunk[%d].ChunkIndex=%d <= chunk[%d].ChunkIndex=%d",
+				i, r.Chunks[i].ChunkIndex, i-1, r.Chunks[i-1].ChunkIndex)
+		}
+		if r.Chunks[i].StartByte <= r.Chunks[i-1].StartByte {
+			t.Errorf("StartByte not monotonically increasing: chunk[%d].StartByte=%d <= chunk[%d].StartByte=%d",
+				i, r.Chunks[i].StartByte, i-1, r.Chunks[i-1].StartByte)
+		}
+	}
+}
+
+// ---- Anti-reconstruction exposure bound (Finding 5) ----
+
+// TestPreviewAntiReconstructionExposureBound documents the exposure bound when
+// the same (entryID, buyerKey) are used across many different matchIDs.
+//
+// Design intent: each matchID is a separate transaction — different chunks per match
+// is intentional economic friction. This test does NOT assert that reconstruction is
+// impossible; it documents how much of the content is exposed across N transactions,
+// so the bound is known and visible as a test assertion.
+//
+// The test asserts that no single matchID alone reveals the full content (each
+// transaction is still partial), while acknowledging that N transactions together
+// may cover a larger fraction.
+func TestPreviewAntiReconstructionExposureBound(t *testing.T) {
+	const numMatchIDs = 50
+	content := generateProse(2000)
+	contentLen := len(content)
+
+	exposed := make([]bool, contentLen)
+	exposedPerMatch := make([]int, numMatchIDs)
+
+	for i := 0; i < numMatchIDs; i++ {
+		matchID := fmt.Sprintf("match-%04d", i)
+		req := PreviewRequest{
+			Content:     content,
+			ContentType: "analysis",
+			EntryID:     "entry-reconstruct-test",
+			BuyerKey:    "buyer-reconstruct-test",
+			MatchID:     matchID,
+		}
+		r, err := pa.Assemble(req)
+		if err != nil {
+			t.Fatalf("Assemble matchID=%s: %v", matchID, err)
+		}
+
+		matchExposed := 0
+		for _, c := range r.Chunks {
+			for b := c.StartByte; b < c.EndByte && b < contentLen; b++ {
+				if !exposed[b] {
+					exposed[b] = true
+				}
+				matchExposed++
+			}
+		}
+		exposedPerMatch[i] = matchExposed
+	}
+
+	// Count total unique bytes exposed.
+	totalExposed := 0
+	for _, v := range exposed {
+		if v {
+			totalExposed++
+		}
+	}
+	exposurePct := float64(totalExposed) / float64(contentLen) * 100.0
+
+	// Each individual match must expose less than 30% of content (the 5×4%=20% target,
+	// with some headroom for minimum-token enforcement extension).
+	for i, me := range exposedPerMatch {
+		pct := float64(me) / float64(contentLen) * 100.0
+		if pct > 30.0 {
+			t.Errorf("match %d exposed %.1f%% of content (>30%%), single-match exposure too high", i, pct)
+		}
+	}
+
+	// Document the cumulative bound. We don't assert a hard upper limit on cumulative
+	// exposure (it's expected to grow with N), but we log it so regressions are visible.
+	t.Logf("exposure bound: %d unique bytes (%.1f%%) exposed across %d match transactions (content=%d bytes)",
+		totalExposed, exposurePct, numMatchIDs, contentLen)
+
+	// The cumulative exposure across 50 transactions should not exceed 100% trivially —
+	// if it does within 50 matchIDs the chunking is effectively reconstructing the full content.
+	// With 5 chunks × 4% = 20% per match, even with no overlap, 50 matches × 20% = 1000%
+	// of theoretical coverage, so by ~5 matches we'd expect near-full coverage unless
+	// the chunking varies well. This is an intentional design trade-off, not a bug.
+	// We assert instead that unique byte coverage grows (chunks are actually different):
+	if numMatchIDs > 1 {
+		// Verify at least 2 distinct matchIDs produced different chunks (non-constant chunking).
+		req0 := PreviewRequest{Content: content, ContentType: "analysis",
+			EntryID: "entry-reconstruct-test", BuyerKey: "buyer-reconstruct-test", MatchID: "match-0000"}
+		req1 := PreviewRequest{Content: content, ContentType: "analysis",
+			EntryID: "entry-reconstruct-test", BuyerKey: "buyer-reconstruct-test", MatchID: "match-0001"}
+		r0, _ := pa.Assemble(req0)
+		r1, _ := pa.Assemble(req1)
+		identical := len(r0.Chunks) == len(r1.Chunks)
+		if identical {
+			for i := range r0.Chunks {
+				if r0.Chunks[i].StartByte != r1.Chunks[i].StartByte {
+					identical = false
+					break
+				}
+			}
+		}
+		if identical {
+			t.Error("different matchIDs produced identical chunk positions — matchID is not influencing chunking")
 		}
 	}
 }
