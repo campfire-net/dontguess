@@ -1,0 +1,74 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "federation:reconcile",
+  "description": "Record an inter-operator settlement event. Sent by either operator to acknowledge reconciliation of cross-operator matching fees. References the x402 transaction or bilateral credit instrument. Both operators post a reconcile message to form a bilateral acknowledgment -- the reconciliation is complete when both messages exist and agree on the amount.",
+  "signing": "campfire_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "period_start",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp for the start of the reconciliation period."
+    },
+    {
+      "name": "period_end",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp for the end of the reconciliation period."
+    },
+    {
+      "name": "matches_completed",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Number of cross-operator matches completed in this period."
+    },
+    {
+      "name": "gross_fees_micro_tokens",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "description": "Total cross-operator fees accrued in this period in micro-tokens."
+    },
+    {
+      "name": "net_amount_micro_tokens",
+      "type": "integer",
+      "required": true,
+      "description": "Net amount owed after bilateral netting. Positive means this operator is owed by the partner; negative means this operator owes the partner."
+    },
+    {
+      "name": "settlement_rail",
+      "type": "enum",
+      "required": true,
+      "values": ["x402", "bilateral-credit", "deferred-netting"],
+      "description": "Settlement rail used for this reconciliation."
+    },
+    {
+      "name": "settlement_ref",
+      "type": "string",
+      "required": false,
+      "max_length": 256,
+      "description": "External settlement reference (e.g. x402 transaction ID). Required for x402 rail."
+    },
+    {
+      "name": "partner_reconcile_msg",
+      "type": "message_id",
+      "required": false,
+      "description": "Message ID of the partner's reconcile message for the same period. Present in the second reconcile message (bilateral acknowledgment)."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "federation:reconcile",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 10,
+    "per": "sender",
+    "window": "24h"
+  }
+}
