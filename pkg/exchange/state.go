@@ -184,6 +184,9 @@ type SellerStats struct {
 	DisputeCount int
 	// HashInvalidCount is the number of hash_invalid disputes.
 	HashInvalidCount int
+	// SmallContentRefundCount tracks auto-refunds from small-content disputes.
+	// Each refund costs SmallContentReputationPenalty (3) reputation points.
+	SmallContentRefundCount int
 	// RepeatBuyerMap tracks distinct (seller, buyer) pairs that have completed.
 	// Key: buyerKey, Value: count.
 	RepeatBuyerMap map[string]int
@@ -196,9 +199,10 @@ type SellerStats struct {
 // New sellers start at 50 (DefaultReputation).
 func (s *SellerStats) Reputation() int {
 	score := DefaultReputation
-	score += s.SuccessCount         // +1 per success
-	score -= s.DisputeCount * 5     // -5 per upheld dispute
-	score -= s.HashInvalidCount * 5 // additional -5 per hash_invalid (total -10)
+	score += s.SuccessCount                                   // +1 per success
+	score -= s.DisputeCount * 5                               // -5 per upheld dispute
+	score -= s.HashInvalidCount * 5                           // additional -5 per hash_invalid (total -10)
+	score -= s.SmallContentRefundCount * SmallContentReputationPenalty // -3 per small-content auto-refund
 
 	// +2 for each buyer who has purchased from this seller more than once
 	for _, count := range s.RepeatBuyerMap {
@@ -594,6 +598,12 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 		s.applySettleComplete(msg)
 	case SettlePhaseStrDispute:
 		s.applySettleDispute(msg)
+	case SettlePhaseStrPreviewRequest:
+		s.applySettlePreviewRequest(msg)
+	case SettlePhaseStrPreview:
+		s.applySettlePreview(msg)
+	case SettlePhaseStrSmallContentDispute:
+		s.applySettleSmallContentDispute(msg)
 	}
 }
 
@@ -643,11 +653,27 @@ func (s *State) applySettlePutReject(msg *store.MessageRecord) {
 // applySettleBuyerAccept records that a buyer has accepted a match.
 // Security: only the buyer who placed the original buy order may accept a match.
 // Any other sender is silently rejected (convention §5.3: buyer identity gate).
+//
+// The antecedent may be either:
+//   - A match message ID (legacy/small-content direct accept path), or
+//   - A preview message ID (preview-before-purchase path, for content >= SmallContentThreshold tokens).
+//
+// Both paths resolve to the same match and proceed identically from there.
 func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	matchMsgID := msg.Antecedents[0]
+	antecedentID := msg.Antecedents[0]
+
+	// Resolve the match message ID from the antecedent.
+	// Try preview path first (antecedent is a preview message).
+	var matchMsgID string
+	if previewMatch, ok := s.previewToMatch[antecedentID]; ok {
+		matchMsgID = previewMatch
+	} else {
+		// Legacy path: antecedent is the match message directly.
+		matchMsgID = antecedentID
+	}
 
 	// Enforce buyer identity: the sender must be the buyer who placed the
 	// original buy order that this match fulfills.
@@ -882,6 +908,157 @@ func (s *State) applySettleDispute(msg *store.MessageRecord) {
 	}
 }
 
+// applySettleSmallContentDispute processes a buyer-initiated small-content dispute.
+//
+// This is a fully automated path — no operator verdict required. When content
+// is below SmallContentThreshold tokens, previews are not meaningful, so buyers
+// get an immediate auto-refund with a reputation penalty on the seller.
+//
+// Validation:
+//   - Antecedent must be a deliver message (in deliverToMatch).
+//   - Sender must be the buyer who holds the corresponding match.
+//   - Entry must exist and have token_cost < SmallContentThreshold
+//     OR content_size < SmallContentThreshold*4 bytes (tokens * ~4 bytes/token).
+//
+// On success:
+//   - smallContentDisputes[entryID]++ is incremented.
+//   - Seller's SmallContentRefundCount is incremented (-3 reputation per refund).
+//
+// Silently ignored on any validation failure.
+func (s *State) applySettleSmallContentDispute(msg *store.MessageRecord) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+
+	// Antecedent must be a deliver message.
+	deliverMsgID := msg.Antecedents[0]
+	matchMsgID, ok := s.deliverToMatch[deliverMsgID]
+	if !ok || matchMsgID == "" {
+		return
+	}
+
+	// Sender identity gate: must be the original buyer for this match.
+	expectedBuyer, ok := s.matchToBuyer[matchMsgID]
+	if !ok || msg.Sender != expectedBuyer {
+		return
+	}
+
+	// Parse entry_id from payload (informational; we cross-check against chain).
+	var payload struct {
+		EntryID string `json:"entry_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+
+	// Derive entry_id from the antecedent chain to avoid trusting buyer payload.
+	chainEntryID := s.matchToEntry[matchMsgID]
+	if chainEntryID == "" {
+		return
+	}
+
+	entry, ok := s.inventory[chainEntryID]
+	if !ok {
+		return
+	}
+
+	// Verify content is actually small: token_cost < threshold OR
+	// content_size < threshold * 4 bytes (approximate bytes per token).
+	isSmall := entry.TokenCost < SmallContentThreshold ||
+		entry.ContentSize < int64(SmallContentThreshold)*4
+	if !isSmall {
+		return
+	}
+
+	// Track the auto-refund dispute against this entry.
+	s.smallContentDisputes[chainEntryID]++
+
+	// Apply reputation penalty to the seller.
+	stats := s.sellerStats(entry.SellerKey)
+	stats.SmallContentRefundCount++
+}
+
+// applySettlePreviewRequest records a buyer's request for a content preview.
+//
+// Validation:
+//   - Antecedent must be a match message (in matchToBuyer).
+//   - Sender must be the buyer who placed the original buy order for that match.
+//   - Payload must contain a non-empty entry_id.
+//
+// On success, updates previewsByEntry, previewCountByMatch, and previewRequestToMatch.
+// Silently ignored on any validation failure — the message remains on the log.
+func (s *State) applySettlePreviewRequest(msg *store.MessageRecord) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	matchMsgID := msg.Antecedents[0]
+
+	// Validate that the antecedent is a match message with a known buyer.
+	expectedBuyer, ok := s.matchToBuyer[matchMsgID]
+	if !ok {
+		return
+	}
+	// Validate sender is the original buyer.
+	if msg.Sender != expectedBuyer {
+		return
+	}
+
+	// Parse entry_id from payload.
+	var payload struct {
+		EntryID string `json:"entry_id"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil || payload.EntryID == "" {
+		return
+	}
+	entryID := payload.EntryID
+
+	// Track buyer preview request per entry.
+	buyerKey := msg.Sender
+	if s.previewsByEntry[entryID] == nil {
+		s.previewsByEntry[entryID] = make(map[string]string)
+	}
+
+	// Reject duplicate preview-requests: if this buyer already has a tracked
+	// preview-request for this entry/match, silently ignore the duplicate.
+	// Counting duplicates in previewCountByMatch would inflate the rate-limit
+	// counter and cause the engine to emit a second preview response for the same
+	// buyer/match pair — both wasteful and a content-reconstruction risk.
+	if existing := s.previewsByEntry[entryID][buyerKey]; existing == matchMsgID {
+		return
+	}
+
+	s.previewsByEntry[entryID][buyerKey] = matchMsgID
+
+	// Track preview count per match.
+	s.previewCountByMatch[matchMsgID]++
+
+	// Track preview-request → match mapping for the response chain.
+	s.previewRequestToMatch[msg.ID] = matchMsgID
+}
+
+// applySettlePreview records an operator's preview response message.
+//
+// Validation:
+//   - Sender must be the operator (if OperatorKey is set).
+//   - Antecedent must be a preview-request message (in previewRequestToMatch).
+//
+// On success, updates previewToMatch so buyer-accept can trace the antecedent chain.
+// Silently ignored on any validation failure.
+func (s *State) applySettlePreview(msg *store.MessageRecord) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	previewRequestMsgID := msg.Antecedents[0]
+	matchMsgID, ok := s.previewRequestToMatch[previewRequestMsgID]
+	if !ok {
+		return
+	}
+	s.previewToMatch[msg.ID] = matchMsgID
+}
+
 // sellerStats returns the SellerStats for the given key, creating if absent.
 // Caller must hold s.mu.
 func (s *State) sellerStats(sellerKey string) *SellerStats {
@@ -1067,6 +1244,26 @@ func (s *State) SellerDisputeCount(sellerKey string) int {
 	return 0
 }
 
+// SellerSmallContentRefundCount returns the number of small-content auto-refunds
+// recorded against the seller. Each refund applies a -3 reputation penalty.
+// Returns 0 for unknown sellers.
+func (s *State) SellerSmallContentRefundCount(sellerKey string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if stats, ok := s.sellers[sellerKey]; ok {
+		return stats.SmallContentRefundCount
+	}
+	return 0
+}
+
+// SmallContentDisputeCount returns the number of small-content auto-refund
+// disputes filed against the given entry ID. Returns 0 if none.
+func (s *State) SmallContentDisputeCount(entryID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.smallContentDisputes[entryID]
+}
+
 // IsMatchDelivered returns true if a match (identified by its message ID)
 // has received a settle(deliver) from the exchange operator.
 func (s *State) IsMatchDelivered(matchMsgID string) bool {
@@ -1102,6 +1299,34 @@ func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
 		return "", false
 	}
 	return entry.SellerKey, true
+}
+
+// EntryForDeliver derives the inventory entry from the antecedent chain starting
+// at a deliver message ID. The chain is:
+//
+//	deliver → match (via deliverToMatch)
+//	match   → entry (via matchToEntry)
+//	entry   → InventoryEntry (via inventory)
+//
+// Returns a shallow copy of the entry and true on success.
+// Returns (nil, false) if any link in the chain is missing.
+func (s *State) EntryForDeliver(deliverMsgID string) (*InventoryEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	matchMsgID := s.deliverToMatch[deliverMsgID]
+	if matchMsgID == "" {
+		return nil, false
+	}
+	entryID := s.matchToEntry[matchMsgID]
+	if entryID == "" {
+		return nil, false
+	}
+	entry, ok := s.inventory[entryID]
+	if !ok {
+		return nil, false
+	}
+	cp := *entry
+	return &cp, true
 }
 
 // operatorKeyHex converts a raw Ed25519 public key to its hex representation.
