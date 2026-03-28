@@ -708,6 +708,265 @@ func TestE2E_ScripBalances(t *testing.T) {
 }
 
 // ----------------------------------------------------------------------------
+// Small-content dispute path:
+// put (token_cost<500) → auto-accept → buy → match → buyer-accept (via match)
+// → deliver → small-content-dispute → auto-refund
+// ----------------------------------------------------------------------------
+
+// TestE2E_SmallContentDisputePath exercises the automated dispute path for
+// small content (token_cost < SmallContentThreshold = 500 tokens).
+//
+// Small content is too small for meaningful preview, so the buyer skips the
+// preview phase and sends buyer-accept directly from the match message.
+// After delivery the buyer can file a small-content-dispute to get an
+// automatic refund, which penalises the seller's reputation by
+// SmallContentReputationPenalty (3) per refund.
+//
+// Flow:
+//
+//  1. Seller puts content with token_cost = 100 (< 500)
+//  2. Operator auto-accepts the put → entry enters inventory
+//  3. Buyer sends a buy request
+//  4. Engine runs and emits a match (buyer-accept antecedent is the match)
+//  5. Buyer sends settle(buyer-accept) with antecedent = match message
+//  6. Operator sends settle(deliver)
+//  7. Buyer sends settle(small-content-dispute)
+//
+// Verified:
+//   - Entry has token_cost < SmallContentThreshold → no preview required
+//   - buyer-accept antecedent is the match message (not a preview)
+//   - small-content-dispute triggers auto-refund: SmallContentDisputeCount++
+//   - Seller's SmallContentRefundCount incremented → reputation drops by 3
+//   - If ScripStore is wired: buyer scrip is refunded
+func TestE2E_SmallContentDisputePath(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+
+	// Wire a scrip store so we can verify the refund path.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:       h.cfID,
+		OperatorIdentity: h.operator,
+		Store:            h.st,
+		Transport:        h.transport,
+		ScripStore:       cs,
+		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	// --- Step 1: Seller puts small content (token_cost = 100, < SmallContentThreshold 500) ---
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Tiny Go one-liner helper", "sha256:"+fmt.Sprintf("%064x", 777), "code", 100, 200),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("listing messages: %v", err)
+	}
+	eng.State().Replay(msgs)
+
+	// --- Step 2: Operator auto-accepts the put ---
+	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("step 2: expected 1 inventory entry after put-accept, got %d", len(inv))
+	}
+	entry := inv[0]
+
+	// Verify the entry is genuinely small content.
+	if entry.TokenCost >= exchange.SmallContentThreshold {
+		t.Errorf("step 2: token_cost = %d, want < %d (small content)", entry.TokenCost, exchange.SmallContentThreshold)
+	}
+
+	// Mint enough scrip for the buyer to cover the purchase.
+	salePrice := entry.PutPrice * 120 / 100
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+	const buyerExtra = int64(500)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+buyerExtra)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay after mint: %v", err)
+	}
+	buyerBalanceAfterMint := cs.Balance(h.buyer.PublicKeyHex())
+
+	// --- Step 3: Buyer sends a buy request ---
+	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	h.sendMessage(h.buyer,
+		buyPayload("Tiny Go helper function", holdAmount+buyerExtra),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// --- Step 4: Engine runs and emits a match ---
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > len(preMatchMsgs) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= len(preMatchMsgs) {
+		t.Fatal("step 4: no match message emitted by engine")
+	}
+	matchMsg := matchMsgs[len(matchMsgs)-1]
+
+	// Match must reference the buy as antecedent.
+	if len(matchMsg.Antecedents) == 0 {
+		t.Fatalf("step 4: match has no antecedents")
+	}
+
+	// Parse entry_id from match payload.
+	var mp struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+			Price   int64  `json:"price"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
+		t.Fatalf("step 4: parsing match payload: %v (results=%d)", err, len(mp.Results))
+	}
+	if mp.Results[0].EntryID != entry.EntryID {
+		t.Errorf("step 4: match result entry_id = %q, want %q", mp.Results[0].EntryID, entry.EntryID)
+	}
+
+	// Sync state.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Step 5: Buyer sends settle(buyer-accept) with antecedent = match message ---
+	// For small content there is no preview phase — the buyer-accept references the
+	// match directly, not a preview message.
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    "buyer-accept",
+		"entry_id": entry.EntryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+			exchange.TagVerdictPrefix + "accepted",
+		},
+		[]string{matchMsg.ID}, // antecedent is the match, not a preview
+	)
+
+	// Dispatch buyer-accept through the engine to trigger scrip hold.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+	buyerAcceptRec, err := h.st.GetMessage(buyerAcceptMsg.ID)
+	if err != nil {
+		t.Fatalf("step 5: GetMessage(buyer-accept): %v", err)
+	}
+	if err := eng.DispatchForTest(buyerAcceptRec); err != nil {
+		t.Fatalf("step 5: DispatchForTest(buyer-accept): %v", err)
+	}
+
+	// --- Step 6: Operator sends settle(deliver) ---
+	deliverPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entry.EntryID,
+		"content_ref":  "sha256:" + fmt.Sprintf("%064x", 777),
+		"content_size": int64(200),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Step 7: Buyer sends settle(small-content-dispute) ---
+	// Extract the reservation_id from the scrip-buy-hold log so we can include
+	// it in the dispute payload (engine uses it to locate and consume the reservation).
+	resID := extractReservationIDFromLog(t, h)
+	if resID == "" {
+		t.Fatal("step 7: no scrip-buy-hold message found — reservation_id unavailable")
+	}
+
+	reputationBefore := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	disputeCountBefore := eng.State().SmallContentDisputeCount(entry.EntryID)
+
+	disputePayload, _ := json.Marshal(map[string]any{
+		"phase":          "small-content-dispute",
+		"entry_id":       entry.EntryID,
+		"reservation_id": resID,
+		"buyer_key":      h.buyer.PublicKeyHex(),
+		"reason":         "content too small for preview — auto-refund requested",
+	})
+	disputeMsg := h.sendMessage(h.buyer, disputePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrSmallContentDispute,
+		},
+		[]string{deliverMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// Dispatch the dispute through the engine to trigger auto-refund logic.
+	disputeRec, err := h.st.GetMessage(disputeMsg.ID)
+	if err != nil {
+		t.Fatalf("step 7: GetMessage(dispute): %v", err)
+	}
+	if err := eng.DispatchForTest(disputeRec); err != nil {
+		t.Fatalf("step 7: DispatchForTest(dispute): %v", err)
+	}
+
+	// Sync state after dispute.
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(allMsgs)
+
+	// --- Verify: smallContentDisputes incremented ---
+	disputeCountAfter := eng.State().SmallContentDisputeCount(entry.EntryID)
+	if disputeCountAfter != disputeCountBefore+1 {
+		t.Errorf("step 7: SmallContentDisputeCount = %d, want %d (before=%d + 1)",
+			disputeCountAfter, disputeCountBefore+1, disputeCountBefore)
+	}
+
+	// --- Verify: seller reputation decreased by SmallContentReputationPenalty (3) ---
+	reputationAfter := eng.State().SellerReputation(h.seller.PublicKeyHex())
+	expectedReputation := reputationBefore - exchange.SmallContentReputationPenalty
+	if reputationAfter != expectedReputation {
+		t.Errorf("step 7: seller reputation = %d after dispute, want %d (before=%d - penalty=%d)",
+			reputationAfter, expectedReputation, reputationBefore, exchange.SmallContentReputationPenalty)
+	}
+
+	// --- Verify: seller SmallContentRefundCount incremented ---
+	refundCount := eng.State().SellerSmallContentRefundCount(h.seller.PublicKeyHex())
+	if refundCount != 1 {
+		t.Errorf("step 7: SellerSmallContentRefundCount = %d, want 1", refundCount)
+	}
+
+	// --- Verify: buyer scrip refunded (ScripStore path) ---
+	// The engine's handleSettleSmallContentDispute should have issued a refund
+	// via the scrip store. The buyer's balance should be back to the mint amount
+	// (hold cancelled/refunded).
+	buyerBalanceAfterDispute := cs.Balance(h.buyer.PublicKeyHex())
+	if buyerBalanceAfterDispute != buyerBalanceAfterMint {
+		t.Errorf("step 7: buyer balance after dispute = %d, want %d (full refund of hold=%d)",
+			buyerBalanceAfterDispute, buyerBalanceAfterMint, holdAmount)
+	}
+}
+
+// ----------------------------------------------------------------------------
 // Assign-pay: operator posts scrip-assign-pay → worker balance credited,
 // operator balance decremented
 // ----------------------------------------------------------------------------
