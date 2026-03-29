@@ -80,11 +80,39 @@ The seller chart's `[worksource]` pointed at a bare campfire (9d282c83) that was
 
 **Fix applied:** `eb2f7f5` — Updated `campfire` field to the project campfire ID.
 
+## Finding 7: Worker cf send writes to store but not filesystem transport
+
+**Severity:** High (blocker)
+**Component:** cf join / cf send in jail environment
+**Tracked:** dontguess-86d
+
+Worker's `cf send` writes puts to the jail's local `store.db` but not to the shared filesystem transport at `/tmp/campfire/<campfire-id>/messages/`. The exchange engine reads from the transport, so puts are invisible.
+
+The jail's `CF_HOME` is fresh — only `identity.json` is copied in. When the worker runs `cf join`, it creates a membership record in the local store but doesn't record the filesystem transport path from `CF_TRANSPORT_DIR`. Subsequent `cf send` calls write to the store only.
+
+**Evidence:** Worker store.db has 3 `exchange:put` messages (analysis, code, review). Transport dir has zero new files. `cf read` from operator shows zero new messages.
+
+## Finding 8: Landlock sandbox blocks Claude Code startup
+
+**Severity:** Medium
+**Component:** `internal/sandbox/landlock.go`, `internal/worker/jail_create.go`
+**Tracked:** dontguess-bbf
+
+With `[sandbox] mode = "auto"` (Landlock v1, kernel 5.15/WSL2), Claude Code workers have zero network sockets and hang. With `mode = "none"`, workers get 9 sockets and execute normally. Landlock v1 doesn't restrict network — the hang is caused by a filesystem path being denied that Claude Code needs during startup.
+
 ## Live-Fire Results
 
-**S01 outcome:** Workers spawned, joined the exchange campfire, sent puts via `cf c5c1ee put --`, and the exchange engine auto-accepted them at 70% of token_cost. 16 puts sent, 16 put-accepts received.
+**S01 final outcome:** Worker spawned as `claude --agent exchange-seller`, loaded agent spec, connected to API (9 sockets), executed cf convention commands, sent 3 puts (analysis/2500, code/4000, review/1800) to the exchange campfire. Puts confirmed in jail store.db. Exchange engine did not see them because of Finding 7 (transport sync gap).
 
-**Known ClankerOS issues observed (not dontguess bugs):**
-- All three automata claimed the same item (no skill-based routing in ReadyWorkSource)
-- Worker sender keys (f8888ac2, a9cbcfcb) didn't match the provisioned seller identity (ae58d729) — jail identity provisioning issue
-- Constellation telemetry campfire sends failed (worker identity not admitted to constellation campfires)
+**ClankerOS issues fixed during session:**
+- Skill-based routing added to ReadyWorkSource (commit cc706a2)
+- Claim-before-spawn prevents race on shared work campfire (commit 01a5791)
+- Agent type resolved from chart `agents.default_type`, not work item type (commit 798804f)
+- Token capture defaulted to true with `--verbose` flag (commits 34e206c, 2ebb5b1)
+- CLAUDECODE env stripped from worker env to prevent nesting detection (commit 03abe3a)
+
+**Identity provisioning was NOT broken** — investigation confirmed each automaton's worker got the correct identity. The "wrong sender keys" from early runs were buyer/attacker identities correctly provisioned to their automata, working the wrong item because of the routing bug (now fixed).
+
+**Remaining blockers:**
+1. dontguess-86d: Transport sync — worker puts reach store but not transport (Finding 7)
+2. dontguess-bbf: Landlock sandbox path tuning (Finding 8, workaround: `mode = "none"`)
