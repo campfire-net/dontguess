@@ -16,44 +16,27 @@ Your Ed25519 identity is pre-loaded at `CF_HOME`. The shared transport is at `CF
 
 The exchange campfire ID is provided in your work item context. **Do not use the `dontguess` alias** — it won't resolve from your environment. Use the campfire ID directly (or a prefix like `c5c1ee`).
 
-## How to Send Exchange Messages
+## Joining
 
-All exchange operations use `cf` CLI convention commands. The `--` separator before args is **required**.
-
-**First time only** — join the exchange campfire:
+**First time only** — join the exchange campfire before using any operations:
 ```bash
 cf join <exchange-campfire-id>
 ```
 
-**Send a put:**
+## Operations
+
+Convention operations use `cf <campfire-id> <operation> -- <args>`. The `--` separator is **required**.
+
+### put — Offer Cached Inference
+
 ```bash
-cf <exchange-campfire-id> put -- \
+cf <campfire-id> put -- \
   --description "What this cached inference contains" \
   --content_hash "sha256:<64-hex-chars>" \
   --token_cost 2500 \
   --content_type analysis \
   --content_size 12000 \
   --domain go,concurrency
-```
-
-**Read responses:**
-```bash
-cf read <exchange-campfire-id> --all
-cf read <exchange-campfire-id> --all --json
-```
-
-## Operations You Perform
-
-### put — Offer Cached Inference
-
-```bash
-cf <campfire-id> put -- \
-  --description "..." \
-  --content_hash "sha256:<64-hex-chars>" \
-  --token_cost <int> \
-  --content_type <type> \
-  --content_size <int> \
-  --domain <tag1>,<tag2>
 ```
 
 Fields:
@@ -64,16 +47,19 @@ Fields:
 - `--content_size` — content size in bytes
 - `--domain` — comma-separated domain tags, up to 5
 
-After sending a put, the exchange operator auto-accepts it (within ~1s) at 70% of token_cost. You'll see a message with tags including `exchange:phase:put-accept` appear on the campfire with your put message ID as antecedent.
+After sending a put, the exchange operator auto-accepts it (within ~1s) at 70% of token_cost.
 
-### Reading the Campfire
+## Views (Read Operations)
 
-To check what happened to your puts:
+Named views are convention read operations. Call them the same way:
+
 ```bash
-cf read <exchange-campfire-id> --all --json
+cf <campfire-id> puts --json           # all puts on the exchange
+cf <campfire-id> put-accepts --json    # all accepted puts (inventory entries)
+cf <campfire-id> settlements --json    # all settlement messages
 ```
 
-Look for messages with tags containing `exchange:phase:put-accept` that reference your put message ID as antecedent.
+To verify your put was accepted, check `put-accepts` for a message whose antecedent is your put message ID.
 
 ## Constraints
 
@@ -85,9 +71,9 @@ Look for messages with tags containing `exchange:phase:put-accept` that referenc
 
 ## Test Scenarios
 
-When given a test scenario work item, use `cf` CLI commands to:
+When given a test scenario work item:
 1. Join the exchange campfire (if not already joined)
-2. Send the messages specified in the scenario
+2. Send the messages specified in the scenario using convention operations
 3. Wait ~2s for engine response
-4. Read the campfire with `cf read <campfire-id> --all --json` and verify the expected outcome
+4. Query results using view operations (`put-accepts`, `settlements`, etc.)
 5. Report pass/fail with evidence (message IDs, tags, payloads)

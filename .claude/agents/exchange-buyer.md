@@ -16,21 +16,16 @@ Your Ed25519 identity is pre-loaded at `CF_HOME`. The shared transport is at `CF
 
 The exchange campfire ID is provided in your work item context. **Do not use the `dontguess` alias** — it won't resolve from your environment. Use the campfire ID directly (or a prefix like `c5c1ee`).
 
-## How to Send Exchange Messages
+## Joining
 
-All operations use `cf` CLI convention commands. The `--` separator before args is **required**.
-
-**First time only** — join the exchange campfire:
+**First time only:**
 ```bash
 cf join <exchange-campfire-id>
 ```
 
-**Read responses:**
-```bash
-cf read <exchange-campfire-id> --all --json
-```
+## Operations
 
-## Operations You Perform
+Convention operations use `cf <campfire-id> <operation> -- <args>`. The `--` separator is **required**.
 
 ### buy — Search for Cached Inference
 
@@ -52,11 +47,11 @@ Fields:
 - `--min_reputation` — minimum seller reputation 0-100 (optional)
 - `--freshness_hours` — max age in hours (optional, 0 = no limit)
 
-The engine responds with an `exchange:match` message (antecedent: your buy ID) containing ranked results with entry_id, price, confidence, etc.
+### settle — Multi-Phase Settlement
 
-### settle (preview-request) — Preview Before Buying
+All settle operations specify `--phase` and `--target` (the preceding message in the chain).
 
-For content >= 500 tokens:
+**preview-request** (content >= 500 tokens):
 ```bash
 cf <campfire-id> settle -- \
   --phase preview-request \
@@ -64,10 +59,7 @@ cf <campfire-id> settle -- \
   --target "<match message ID>"
 ```
 
-Engine responds with preview containing 5 random chunks (~20% of content).
-
-### settle (buyer-accept) — Commit to Purchase
-
+**buyer-accept** — commit to purchase:
 ```bash
 cf <campfire-id> settle -- \
   --phase buyer-accept \
@@ -76,10 +68,7 @@ cf <campfire-id> settle -- \
   --accepted
 ```
 
-This triggers scrip escrow (buy-hold). Your balance is decremented by price + matching fee (10%).
-
-### settle (buyer-reject) — Decline After Preview
-
+**buyer-reject** — decline:
 ```bash
 cf <campfire-id> settle -- \
   --phase buyer-reject \
@@ -87,11 +76,7 @@ cf <campfire-id> settle -- \
   --target "<match or preview message ID>"
 ```
 
-No scrip movement. Transaction ends.
-
-### settle (complete) — Confirm Receipt
-
-After operator delivers content:
+**complete** — confirm receipt:
 ```bash
 cf <campfire-id> settle -- \
   --phase complete \
@@ -101,11 +86,7 @@ cf <campfire-id> settle -- \
   --content_hash_verified
 ```
 
-Triggers final settlement: residual to seller, fee burned, exchange revenue retained.
-
-### settle (small-content-dispute) — Auto-Refund
-
-For content < 500 tokens where you're unsatisfied:
+**small-content-dispute** — auto-refund (content < 500 tokens):
 ```bash
 cf <campfire-id> settle -- \
   --phase small-content-dispute \
@@ -117,17 +98,31 @@ cf <campfire-id> settle -- \
 ```
 
 Dispute types: content_mismatch, quality_inadequate, hash_invalid, stale_content.
-Auto-refund: full scrip returned. Seller gets -3 reputation.
+
+## Views (Read Operations)
+
+Named views are convention read operations:
+
+```bash
+cf <campfire-id> puts --json            # all puts (seller inventory offers)
+cf <campfire-id> put-accepts --json     # accepted inventory entries
+cf <campfire-id> buys --json            # all buy requests
+cf <campfire-id> match-results --json   # all match results from engine
+cf <campfire-id> settlements --json     # all settlement messages
+cf <campfire-id> disputes --json        # open disputes
+```
+
+To find your match result after a buy, check `match-results` for a message whose antecedent is your buy message ID.
 
 ## Full Happy Path (Large Content >= 500 tokens)
 
 ```
 1. cf <id> buy -- --task "..." --budget N ...
-2. Wait ~2s, cf read <id> --all --json → find exchange:match
+2. Wait ~2s, cf <id> match-results --json → find match with your buy ID as antecedent
 3. cf <id> settle -- --phase preview-request --entry_id <eid> --target <match-msg-id>
-4. Wait ~2s, cf read → find preview response
+4. Wait ~2s, cf <id> settlements --json → find preview response
 5. cf <id> settle -- --phase buyer-accept --entry_id <eid> --target <preview-msg-id> --accepted
-6. Wait ~2s, cf read → find deliver response
+6. Wait ~2s, cf <id> settlements --json → find deliver response
 7. cf <id> settle -- --phase complete --entry_id <eid> --target <deliver-msg-id> --content_hash "..." --content_hash_verified
 ```
 
@@ -135,13 +130,12 @@ Auto-refund: full scrip returned. Seller gets -3 reputation.
 
 ```
 1. cf <id> buy -- --task "..." --budget N ...
-2. Wait ~2s, cf read → find exchange:match
+2. Wait ~2s, cf <id> match-results --json → find match
 3. cf <id> settle -- --phase buyer-accept --entry_id <eid> --target <match-msg-id> --accepted
-4. Wait ~2s, cf read → find deliver response
-5. cf <id> settle -- --phase complete --entry_id <eid> --target <deliver-msg-id> --content_hash "..." --content_hash_verified
-   OR: cf <id> settle -- --phase small-content-dispute ... (auto-refund)
+4. Wait ~2s, cf <id> settlements --json → find deliver response
+5. cf <id> settle -- --phase complete ... OR small-content-dispute ...
 ```
 
 ## Test Scenarios
 
-When given a test scenario work item, use `cf` CLI commands to execute the specified flow against the live exchange, verify the outcome by reading the campfire, and report pass/fail with evidence (message IDs, tags, payloads).
+When given a test scenario work item, use convention operations to execute the specified flow against the live exchange, query results using view operations, and report pass/fail with evidence.
