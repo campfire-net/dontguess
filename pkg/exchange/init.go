@@ -196,6 +196,15 @@ func Init(opts InitOptions) (*Config, error) {
 		fmt.Fprintf(os.Stderr, "warning: promoting convention declarations: %v\n", err)
 	}
 
+	// Create standard named views for convention read operations.
+	// On a fresh init the store has no synced messages, so all views are created.
+	viewsCreated, err := EnsureViews(exchangeCF.PublicKeyHex(), operatorID, s, transport)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "warning: creating named views: %v\n", err)
+	} else if viewsCreated > 0 {
+		fmt.Fprintf(os.Stderr, "created %d named views\n", viewsCreated)
+	}
+
 	// Register in naming hierarchy.
 	aliases := naming.NewAliasStore(cfHome)
 	alias := opts.alias()
@@ -419,8 +428,13 @@ func declarationDirs(conventionDir string) []string {
 // sendConventionMessage creates, signs, and writes a convention:operation
 // message to the exchange campfire transport.
 func sendConventionMessage(campfireID string, payload []byte, agentID *identity.Identity, transport *fs.Transport) error {
-	tags := []string{convention.ConventionOperationTag}
+	return sendTaggedMessage(campfireID, payload, []string{convention.ConventionOperationTag}, agentID, transport)
+}
 
+// sendTaggedMessage creates, signs, and writes a message with the given tags
+// to the exchange campfire transport. Used by both convention declarations and
+// view creation.
+func sendTaggedMessage(campfireID string, payload []byte, tags []string, agentID *identity.Identity, transport *fs.Transport) error {
 	msg, err := message.NewMessage(agentID.PrivateKey, agentID.PublicKey, payload, tags, nil)
 	if err != nil {
 		return fmt.Errorf("creating message: %w", err)
