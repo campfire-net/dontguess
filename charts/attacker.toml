@@ -10,7 +10,8 @@ key_file = "~/.clankeros/automata/dontguess-attacker/identity.json"
 
 [worksource]
 type = "ready"
-campfire_id = ""
+# dontguess project work campfire (rd init created this)
+campfire = "9b8cf9af9d41feb00f5f5876368de034db91c906a4f3b96f3284fa78e0731392"
 
 [budget]
 max_tokens_per_session = 300000
@@ -21,7 +22,7 @@ gate_policy = "ungated"
 tool_allowlist = ["bash", "read", "write", "glob", "grep"]
 
 [lifecycle]
-max_workers = 1
+max_workers = 2
 time_limit = "15m"
 poll_interval = "5s"
 
@@ -29,8 +30,8 @@ poll_interval = "5s"
 transport_dir = "/tmp/campfire"
 
 [exchange]
-campfire_id = ""
-operator_key = ""
+campfire_id = "c5c1eee98996231b1c292ab87ec193ead370ff88dfb2cfbb8423834da1b4812c"
+operator_key = "8205ae6fe3af5c3b4688e7c53a38c45efe2362d64be250929c56ae7d0d16b398"
 
 [agent]
 spec = ".claude/agents/exchange-attacker.md"
