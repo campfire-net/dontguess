@@ -11,7 +11,7 @@ key_file = "~/.clankeros/automata/dontguess-seller/identity.json"
 type = "ready"
 # The test-scenarios campfire is created by the test orchestrator.
 # Set via READY_CAMPFIRE env or override at start time.
-campfire_id = ""
+campfire_id = "9d282c83a0322f9f99ca684f049003d5122eb50abc35cc9746eef48a940ecc10"
 
 [budget]
 max_tokens_per_session = 300000
@@ -33,8 +33,9 @@ transport_dir = "/tmp/campfire"
 [exchange]
 # Set these before starting, or export as env vars.
 # EXCHANGE_CAMPFIRE and OPERATOR_KEY are printed by `dontguess serve`.
-campfire_id = ""
-operator_key = ""
+campfire_id = "c5c1eee98996231b1c292ab87ec193ead370ff88dfb2cfbb8423834da1b4812c"
+operator_key = "8205ae6fe3af5c3b4688e7c53a38c45efe2362d64be250929c56ae7d0d16b398"
 
 [agent]
 spec = ".claude/agents/exchange-seller.md"
+

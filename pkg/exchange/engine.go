@@ -204,10 +204,12 @@ func (e *Engine) replayAll() error {
 
 	e.state.Replay(msgs)
 
-	// Set cursor to the latest received_at so subsequent polls start from here.
+	// Set cursor to the latest timestamp so subsequent polls start from here.
+	// Uses message timestamp (sender clock) instead of received_at to match
+	// the poll() cursor field — see poll() comment for rationale.
 	for _, m := range msgs {
-		if m.ReceivedAt > e.lastCursor {
-			e.lastCursor = m.ReceivedAt
+		if m.Timestamp > e.lastCursor {
+			e.lastCursor = m.Timestamp
 		}
 	}
 
@@ -239,12 +241,16 @@ func (e *Engine) run(ctx context.Context) error {
 
 // poll fetches new messages since lastCursor, applies them to state, and
 // triggers handlers for actionable operations.
+//
+// Uses message timestamp (sender clock) instead of received_at for the poll
+// cursor. Messages written directly by cf send arrive with received_at=0
+// (the store's INSERT OR IGNORE dedup means the transport sync never
+// overwrites). Timestamp-based cursoring avoids that blind spot.
 func (e *Engine) poll() error {
 	filter := store.MessageFilter{
 		Tags: []string{TagPut, TagBuy, TagSettle},
-		AfterReceivedAt: e.lastCursor,
 	}
-	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0, filter)
+	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, e.lastCursor, filter)
 	if err != nil {
 		return fmt.Errorf("polling messages: %w", err)
 	}
@@ -255,8 +261,8 @@ func (e *Engine) poll() error {
 		if err := e.dispatch(msg); err != nil {
 			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
 		}
-		if msg.ReceivedAt > e.lastCursor {
-			e.lastCursor = msg.ReceivedAt
+		if msg.Timestamp > e.lastCursor {
+			e.lastCursor = msg.Timestamp
 		}
 	}
 	return nil
