@@ -9,9 +9,8 @@ key_file = "~/.clankeros/automata/dontguess-seller/identity.json"
 
 [worksource]
 type = "ready"
-# The test-scenarios campfire is created by the test orchestrator.
-# Set via READY_CAMPFIRE env or override at start time.
-campfire_id = "9d282c83a0322f9f99ca684f049003d5122eb50abc35cc9746eef48a940ecc10"
+# dontguess project work campfire (rd init created this)
+campfire = "9b8cf9af9d41feb00f5f5876368de034db91c906a4f3b96f3284fa78e0731392"
 
 [budget]
 max_tokens_per_session = 300000
