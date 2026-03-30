@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -251,10 +250,9 @@ func TestE2E_BuyerReject(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -526,10 +524,9 @@ func TestE2E_ScripBalances(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -730,7 +727,7 @@ func TestE2E_ScripBalances(t *testing.T) {
 	}
 
 	// --- Step 7: Replay — fresh store reproduces same balances ---
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("step 7 (replay): NewCampfireScripStore: %v", err)
 	}
@@ -799,10 +796,9 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -1052,7 +1048,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	addScripMintMsg(t, h, operatorKey, operatorMint)
 
 	// Construct the CampfireScripStore after mint messages are in the log.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -1131,7 +1127,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	}
 
 	// Fresh replay: verify a new CampfireScripStore derives the same balances.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh replay): %v", err)
 	}
@@ -1174,10 +1170,9 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})

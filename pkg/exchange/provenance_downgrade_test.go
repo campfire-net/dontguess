@@ -14,7 +14,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"
 
@@ -65,10 +64,9 @@ func TestProvenanceDowngrade_EntriesMarkedOnLevelDrop(t *testing.T) {
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        h.cfID,
-		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -158,10 +156,9 @@ func TestProvenanceDowngrade_FlaggedEntryExcludedFromMatchResults(t *testing.T) 
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        h.cfID,
-		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -258,10 +255,9 @@ func TestProvenanceDowngrade_NoFlagWhenLevelUnchanged(t *testing.T) {
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        h.cfID,
-		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)

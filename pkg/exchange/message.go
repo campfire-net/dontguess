@@ -1,7 +1,6 @@
 package exchange
 
 import (
-	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
@@ -25,12 +24,6 @@ func FromStoreRecord(r *store.MessageRecord) *Message {
 // FromStoreRecords converts a slice of store.MessageRecord to []Message.
 func FromStoreRecords(recs []store.MessageRecord) []Message {
 	return proto.FromStoreRecords(recs)
-}
-
-// FromProtocolMessage converts a campfire message.Message to a *Message.
-// Reserved for Wave 1-2. Not called in Wave 0.
-func FromProtocolMessage(id, campfireID string, m *message.Message) *Message {
-	return proto.FromProtocolMessage(id, campfireID, m)
 }
 
 // FromSDKMessage converts a protocol.Message (from the campfire SDK) to a *Message.

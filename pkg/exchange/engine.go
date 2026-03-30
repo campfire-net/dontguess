@@ -11,7 +11,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
@@ -40,10 +39,14 @@ const Layer0MaxConversionRate = 0.05
 type EngineOptions struct {
 	// CampfireID is the exchange campfire's public key hex.
 	CampfireID string
-	// OperatorIdentity is the exchange operator's Ed25519 keypair.
+	// OperatorPublicKey is the hex-encoded Ed25519 public key of the exchange operator.
 	// Used only for populating State.OperatorKey on startup. Send operations
 	// use WriteClient (which carries its own identity).
-	OperatorIdentity *identity.Identity
+	//
+	// Deprecated: prefer OperatorPublicKey. OperatorIdentity was removed in the
+	// cf SDK 0.13 migration (W3b). Set this to writeClient.PublicKeyHex() if
+	// you previously passed the operator identity.
+	OperatorPublicKey string
 	// Store is the campfire message store (SQLite).
 	// Deprecated: use ReadClient and WriteClient. Kept for backward compatibility
 	// with callers that have not yet migrated (e.g. EnsureViews, CampfireScripStore).
@@ -71,6 +74,11 @@ type EngineOptions struct {
 	// ProvenanceChecker validates sender provenance levels before processing operations.
 	// If nil, provenance checks are skipped (useful for tests that don't exercise provenance).
 	ProvenanceChecker *ProvenanceChecker
+	// ReadSkipSync skips the filesystem sync step in Read operations.
+	// Set to true when the ReadClient shares its store with the test harness's
+	// store (h.st), so that messages written directly to h.st are visible
+	// without re-syncing from the transport. Production code leaves this false.
+	ReadSkipSync bool
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -150,8 +158,11 @@ func NewEngine(opts EngineOptions) *Engine {
 		idx = matching.NewIndex(nil, matching.RankOptions{})
 	}
 	st := NewState()
-	if opts.OperatorIdentity != nil {
-		st.OperatorKey = operatorKeyHex(opts.OperatorIdentity.PublicKey)
+	if opts.OperatorPublicKey != "" {
+		st.OperatorKey = opts.OperatorPublicKey
+	} else if opts.WriteClient != nil {
+		// Derive operator key from the write client's identity (convenience path).
+		st.OperatorKey = opts.WriteClient.PublicKeyHex()
 	}
 	return &Engine{
 		opts:               opts,
@@ -228,6 +239,7 @@ func (e *Engine) replayAll() error {
 	result, err := e.opts.ReadClient.Read(protocol.ReadRequest{
 		CampfireID:     e.opts.CampfireID,
 		AfterTimestamp: 0,
+		SkipSync:       e.opts.ReadSkipSync,
 	})
 	if err != nil {
 		return fmt.Errorf("reading messages for replay: %w", err)
@@ -594,7 +606,7 @@ func (e *Engine) handleSettle(msg *Message) error {
 	residual := price / ResidualRate
 	exchangeRevenue := price - residual // fee already came out of the buyer's pre-decrement
 
-	operatorKey := operatorKeyHex(e.opts.OperatorIdentity.PublicKey)
+	operatorKey := e.state.OperatorKey
 
 	// Marshal both convention messages BEFORE mutating scrip state.
 	// If either marshal fails, restore the reservation (it was consumed above) and return
@@ -1282,7 +1294,16 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 	if err != nil {
 		return nil, fmt.Errorf("sending operator message: %w", err)
 	}
-	return FromProtocolMessage(msg.ID, e.opts.CampfireID, msg), nil
+	// Retrieve via the SDK's Get (sendFilesystem already mirrored the message
+	// to the local store). This avoids importing the internal message package.
+	sdkMsg, err := e.opts.WriteClient.Get(msg.ID)
+	if err != nil {
+		return nil, fmt.Errorf("retrieving sent message: %w", err)
+	}
+	if sdkMsg == nil {
+		return nil, fmt.Errorf("sent message not found in store: %s", msg.ID)
+	}
+	return FromSDKMessage(sdkMsg), nil
 }
 
 // AutoAcceptPut sends a settle(put-accept) for a pending put message, accepting

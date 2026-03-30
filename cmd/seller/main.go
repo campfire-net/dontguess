@@ -8,11 +8,8 @@ import (
 	"path/filepath"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/campfire"
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
 
 const (
@@ -38,56 +35,60 @@ type settlePayload struct {
 }
 
 func main() {
-	// Load or generate seller identity.
-	identityPath := os.Getenv("SELLER_IDENTITY")
-	if identityPath == "" {
-		home, _ := os.UserHomeDir()
-		identityPath = filepath.Join(home, ".clankeros", "automata", "dontguess-seller", "identity.json")
+	// Determine seller config directory (identity + store live here).
+	cfHome := os.Getenv("SELLER_CF_HOME")
+	if cfHome == "" {
+		identityPath := os.Getenv("SELLER_IDENTITY")
+		if identityPath != "" {
+			cfHome = filepath.Dir(identityPath)
+		} else {
+			home, _ := os.UserHomeDir()
+			cfHome = filepath.Join(home, ".clankeros", "automata", "dontguess-seller")
+		}
 	}
 
-	var sellerID *identity.Identity
-	if identity.Exists(identityPath) {
-		id, err := identity.Load(identityPath)
-		if err != nil {
-			log.Fatalf("loading seller identity: %v", err)
-		}
-		sellerID = id
-		fmt.Printf("Loaded seller identity: %s\n", sellerID.PublicKeyHex())
-	} else {
-		// Ensure directory exists.
-		if err := os.MkdirAll(filepath.Dir(identityPath), 0o700); err != nil {
-			log.Fatalf("creating identity dir: %v", err)
-		}
-		id, err := identity.Generate()
-		if err != nil {
-			log.Fatalf("generating seller identity: %v", err)
-		}
-		if err := id.Save(identityPath); err != nil {
-			log.Fatalf("saving seller identity: %v", err)
-		}
-		sellerID = id
-		fmt.Printf("Generated new seller identity: %s\n", sellerID.PublicKeyHex())
+	if err := os.MkdirAll(cfHome, 0o700); err != nil {
+		log.Fatalf("creating seller config dir: %v", err)
 	}
 
-	// Set up filesystem transport.
+	// Load or generate seller identity and open store via SDK.
+	client, err := protocol.Init(cfHome)
+	if err != nil {
+		log.Fatalf("protocol.Init: %v", err)
+	}
+	defer client.Close()
+
+	fmt.Printf("Seller identity: %s\n", client.PublicKeyHex())
+
+	// Set up filesystem transport path.
 	transportPath := os.Getenv("EXCHANGE_TRANSPORT")
 	if transportPath == "" {
 		transportPath = "/tmp/campfire"
 	}
-	transport := fs.New(transportPath)
+	// The transport dir is the exchange-specific subdirectory.
+	transportDir := filepath.Join(transportPath, exchangeCampfireID)
 
-	// Open the SQLite store.
-	cfHome := os.Getenv("CF_HOME")
-	if cfHome == "" {
-		home, _ := os.UserHomeDir()
-		cfHome = filepath.Join(home, ".campfire")
+	// Join the exchange campfire (open protocol — no invite needed).
+	// Join is idempotent: if already a member, it returns the existing membership.
+	_, joinErr := client.Join(protocol.JoinRequest{
+		CampfireID: exchangeCampfireID,
+		Transport: protocol.FilesystemTransport{
+			Dir: transportDir,
+		},
+	})
+	if joinErr != nil {
+		// Non-fatal: may already be a member.
+		fmt.Fprintf(os.Stderr, "warning: joining exchange campfire: %v\n", joinErr)
 	}
+
+	// Open a read-only store view for polling responses.
 	storePath := store.StorePath(cfHome)
 	s, err := store.Open(storePath)
 	if err != nil {
 		log.Fatalf("opening store: %v", err)
 	}
 	defer s.Close()
+	_ = s // available for direct store queries if needed
 
 	// Define 3 puts.
 	puts := []putSpec{
@@ -119,31 +120,6 @@ func main() {
 			Tags:        []string{"exchange:put", "exchange:content-type:code", "exchange:domain:go"},
 		},
 	}
-
-	// Register seller as a campfire member so protocol.Client.Send can verify membership.
-	// This is equivalent to a lightweight join — write the member record to the transport
-	// and record membership in the local store.
-	if err := transport.WriteMember(exchangeCampfireID, campfire.MemberRecord{
-		PublicKey: sellerID.PublicKey,
-		JoinedAt:  time.Now().UnixNano(),
-	}); err != nil {
-		// Non-fatal: may already be registered from a previous run.
-		fmt.Fprintf(os.Stderr, "warning: writing seller member record: %v\n", err)
-	}
-	transportDir := transport.CampfireDir(exchangeCampfireID)
-	if err := s.AddMembership(store.Membership{
-		CampfireID:   exchangeCampfireID,
-		TransportDir: transportDir,
-		JoinProtocol: "open",
-		Role:         store.PeerRoleMember,
-		JoinedAt:     store.NowNano(),
-	}); err != nil {
-		// Non-fatal: may already be recorded.
-		fmt.Fprintf(os.Stderr, "warning: recording exchange membership: %v\n", err)
-	}
-
-	// Build protocol client for sending puts and polling responses.
-	client := protocol.New(s, sellerID)
 
 	// Send all 3 puts and collect message IDs.
 	putMsgIDs := make([]string, 0, 3)

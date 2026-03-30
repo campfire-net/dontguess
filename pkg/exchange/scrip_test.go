@@ -20,8 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -92,7 +90,7 @@ func addScripPutPayMsg(t *testing.T, h *testHarness, putMsgID, seller string, am
 // Uses the harness operator identity as the operator key.
 func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripStore {
 	t.Helper()
-	cs, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -124,10 +122,9 @@ func newEngineWithScrip(t *testing.T, scripStore scrip.SpendingStore) (*testHarn
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:       protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:       h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       scripStore,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -249,10 +246,9 @@ func TestBuyerAccept_DecrementsScripAfterPreview(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -346,10 +342,9 @@ func TestBuyerAccept_InsufficientScripReturnsError(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -447,10 +442,9 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -602,10 +596,9 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	cs0 := newCampfireScripStore(t, h)
 	eng0 := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs0,
 		Logger:           func(format string, args ...any) { t.Logf("[eng0] "+format, args...) },
 	})
@@ -690,7 +683,7 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	// --- Simulate restart ---
 	// Fresh CampfireScripStore replays: mint(2*holdAmount+extraScrip) - buy-hold(holdAmount).
 	// => balance = holdAmount+extraScrip.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	cs, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (restart): %v", err)
 	}
@@ -705,10 +698,9 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	// The fix: findExistingBuyerAcceptHold finds the log entry and skips DecrementBudget.
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[eng-restart] "+format, args...) },
 	})
@@ -753,19 +745,15 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// Generate an attacker identity (not part of the exchange, unknown to the engine).
-	attacker, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generate attacker identity: %v", err)
-	}
+	attacker := newTestAgent(t)
 
 	// Seed inventory entry (real seller = h.seller).
 	seedInventoryEntry(t, h, eng, "Go HTTP handler unit test generator", "code", 8000, 5600)

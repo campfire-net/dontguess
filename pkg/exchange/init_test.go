@@ -7,7 +7,6 @@ import (
 	"testing"
 
 	"github.com/campfire-net/campfire/pkg/beacon"
-	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/naming"
 	"github.com/campfire-net/campfire/pkg/protocol"
@@ -337,9 +336,9 @@ func TestInit_MembershipRecorded(t *testing.T) {
 	if m == nil {
 		t.Fatal("no membership record for exchange campfire")
 	}
-	// client.Create sets role to campfire.RoleFull ("full") for the creator.
-	if m.Role != campfire.RoleFull {
-		t.Errorf("role = %q, want %q", m.Role, campfire.RoleFull)
+	// client.Create sets role to "full" for the creator.
+	if m.Role != "full" {
+		t.Errorf("role = %q, want %q", m.Role, "full")
 	}
 }
 
