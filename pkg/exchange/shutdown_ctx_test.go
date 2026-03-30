@@ -119,7 +119,7 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 5000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -250,7 +250,7 @@ func TestEngine_HandlerCtxIsBackground_BeforeStart(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 3000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -273,15 +273,13 @@ func TestEngine_HandlerCtxIsBackground_BeforeStart(t *testing.T) {
 	// DispatchForTest calls the handler synchronously without Start().
 	// engineCtx() should return context.Background() since e.ctx is nil.
 	// The handler must not panic and should complete successfully.
-	if err := eng.DispatchForTest(&store.MessageRecord{
+	if err := eng.DispatchForTest(&exchange.Message{
 		ID:         buyMsg.ID,
 		CampfireID: h.cfID,
 		Sender:     h.buyer.PublicKeyHex(),
 		Payload:    buyPayloadBytes,
 		Tags:       []string{exchange.TagBuy},
 		Timestamp:  time.Now().UnixNano(),
-		ReceivedAt: time.Now().UnixNano(),
-		Signature:  []byte{0x00},
 	}); err != nil {
 		t.Fatalf("DispatchForTest returned unexpected error: %v", err)
 	}

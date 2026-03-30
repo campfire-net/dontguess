@@ -125,10 +125,10 @@ func TestProvenanceDispatch_AnonymousPutRejected(t *testing.T) {
 
 	// Apply state (so engine knows about the put).
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Dispatch the put — anonymous sender should be silently rejected.
-	if err := eng.DispatchForTest(putRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(putRec)); err != nil {
 		t.Errorf("dispatch returned error, want nil (silent reject): %v", err)
 	}
 
@@ -155,11 +155,11 @@ func TestProvenanceDispatch_AnonymousBuyAccepted(t *testing.T) {
 	buyRec := injectBuyMsg(t, h, "key-anon")
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// dispatch should not return an error — anonymous buy is permitted.
 	// (No match is expected since there's no inventory, but the buy is processed.)
-	if err := eng.DispatchForTest(buyRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 		t.Errorf("dispatch returned error for anonymous buy, want nil: %v", err)
 	}
 }
@@ -178,10 +178,10 @@ func TestProvenanceDispatch_ClaimedPutAccepted(t *testing.T) {
 	putRec := injectPutMsg(t, h, "key-claimed")
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// dispatch should not return an error — claimed put is permitted.
-	if err := eng.DispatchForTest(putRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(putRec)); err != nil {
 		t.Errorf("dispatch returned error for claimed put, want nil: %v", err)
 	}
 }
@@ -216,10 +216,10 @@ func TestProvenanceDispatch_UnverifiedInventory_BuyReturnsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages after put: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 2: Dispatch the put — ProvenanceChecker should reject it silently.
-	if err := eng.DispatchForTest(putRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(putRec)); err != nil {
 		t.Errorf("DispatchForTest(put) returned error, want nil (silent reject): %v", err)
 	}
 
@@ -235,10 +235,10 @@ func TestProvenanceDispatch_UnverifiedInventory_BuyReturnsEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages after buy: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 4: Dispatch the buy — no inventory exists, so the match is empty.
-	if err := eng.DispatchForTest(buyRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 		t.Errorf("DispatchForTest(buy) returned error: %v", err)
 	}
 
@@ -284,9 +284,9 @@ func TestProvenanceDispatch_NilChecker_AllOperationsPass(t *testing.T) {
 	// Anonymous put — would normally be rejected, but no checker is configured.
 	putRec := injectPutMsg(t, h, "key-anon")
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
-	if err := eng.DispatchForTest(putRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(putRec)); err != nil {
 		t.Errorf("dispatch returned error with nil checker, want nil: %v", err)
 	}
 }

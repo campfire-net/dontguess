@@ -28,6 +28,7 @@ poll_interval = "5s"
 
 [campfire]
 transport_dir = "/tmp/campfire"
+bridge_campfires = ["c5c1eee98996231b1c292ab87ec193ead370ff88dfb2cfbb8423834da1b4812c"]
 
 # Exchange-specific config (read by agent spec).
 [exchange]
@@ -35,6 +36,9 @@ transport_dir = "/tmp/campfire"
 # EXCHANGE_CAMPFIRE and OPERATOR_KEY are printed by `dontguess serve`.
 campfire_id = "c5c1eee98996231b1c292ab87ec193ead370ff88dfb2cfbb8423834da1b4812c"
 operator_key = "8205ae6fe3af5c3b4688e7c53a38c45efe2362d64be250929c56ae7d0d16b398"
+
+[sandbox]
+mode = "none"
 
 [agents]
 default_type = "exchange-seller"

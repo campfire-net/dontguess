@@ -106,13 +106,13 @@ func TestBuyerAccept_MarshalFailure_NoBudgetDecrement(t *testing.T) {
 		[]string{matchMsg.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
 	if err != nil || rec == nil {
 		t.Fatalf("GetMessage buyer-accept: %v", err)
 	}
 
-	dispatchErr := eng.DispatchForTest(rec)
+	dispatchErr := eng.DispatchForTest(exchange.FromStoreRecord(rec))
 	if dispatchErr == nil {
 		t.Fatal("expected handleSettleBuyerAcceptScrip to return error on marshal failure, got nil")
 	}
@@ -201,7 +201,7 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Record balances before settle dispatch.
 	sellerBalBefore := cs.Balance(h.seller.PublicKeyHex())
@@ -223,14 +223,14 @@ func TestSettle_MarshalFailure_NoBalanceMutation(t *testing.T) {
 		[]string{deliverMsgRec.ID},
 	)
 	allMsgs2, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs2)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs2))
 
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil || rec == nil {
 		t.Fatalf("GetMessage settle(complete): %v", err)
 	}
 
-	dispatchErr := eng.DispatchForTest(rec)
+	dispatchErr := eng.DispatchForTest(exchange.FromStoreRecord(rec))
 	if dispatchErr == nil {
 		t.Fatal("expected handleSettle to return error on marshal failure, got nil")
 	}

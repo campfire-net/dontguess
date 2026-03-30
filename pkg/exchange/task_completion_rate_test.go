@@ -56,14 +56,14 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 2: put-accept.
 	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(24*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 3: buy.
 	buyMsg := h.sendMessage(h.buyer,
@@ -73,7 +73,7 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 	)
 	_ = buyMsg
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 4: engine match (run engine event loop briefly).
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -101,7 +101,7 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 
 	matchMsg := matchMsgs[len(matchMsgs)-1]
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Parse match payload to get entry ID.
 	var mp struct {
@@ -125,7 +125,7 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 		[]string{matchMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// With 1 accepted, 0 completed: rate should be 0.0.
 	rate := eng.State().TaskCompletionRate()
@@ -153,14 +153,14 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 2: put-accept.
 	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(24*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 3: buy.
 	buyMsg := h.sendMessage(h.buyer,
@@ -170,7 +170,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 	)
 	_ = buyMsg
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Step 4: engine match.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -198,7 +198,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 
 	matchMsg := matchMsgs[len(matchMsgs)-1]
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	var mp struct {
 		Results []struct {
@@ -227,7 +227,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 		[]string{matchMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Verify rate is 0.0 before complete.
 	rateBeforeComplete := eng.State().TaskCompletionRate()
@@ -246,7 +246,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 		[]string{buyerAcceptMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Step 7: buyer completes.
 	completePayload, _ := json.Marshal(map[string]any{"price": salePrice})
@@ -256,7 +256,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 		[]string{deliverMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// After complete: rate = 1/1 = 1.0.
 	rateAfterComplete := eng.State().TaskCompletionRate()

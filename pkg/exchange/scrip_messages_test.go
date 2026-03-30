@@ -245,7 +245,7 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 
 	// Replay so antecedent chain is in state.
 	chainMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(chainMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(chainMsgs))
 
 	// Pre-count settle and burn messages.
 	preSettle := countMsgsWithTag(t, h, scrip.TagScripSettle)
@@ -264,12 +264,12 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 		[]string{deliverMsgRec.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("dispatch settle(complete): %v", err)
 	}
 

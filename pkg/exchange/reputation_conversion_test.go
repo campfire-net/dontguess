@@ -49,12 +49,12 @@ func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engin
 		nil,
 	)
 	buyRec, _ := h.st.GetMessage(buyMsg.ID)
-	eng.State().Apply(buyRec)
-	if err := eng.DispatchForTest(buyRec); err != nil {
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 		t.Fatalf("generateBuyerMatchPreview dispatch: %v", err)
 	}
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	postMatches, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 	if len(postMatches) <= len(preCount) {
@@ -68,7 +68,7 @@ func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engin
 		[]string{matchID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	return matchID, preqMsg.ID, buyer
 }
@@ -88,7 +88,7 @@ func emitPreviewAndAccept(t *testing.T, h *testHarness, eng *exchange.Engine, en
 		[]string{previewReqID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	acceptPayload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
@@ -100,7 +100,7 @@ func emitPreviewAndAccept(t *testing.T, h *testHarness, eng *exchange.Engine, en
 		[]string{prevMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 }
 
 // --- Unit tests for SellerStats.Reputation() ---
@@ -119,7 +119,7 @@ func TestReputation_NoPreviewData(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -147,7 +147,7 @@ func TestReputation_HighConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -200,7 +200,7 @@ func TestReputation_LowConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -252,7 +252,7 @@ func TestReputation_NeutralConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -300,7 +300,7 @@ func TestReputation_PreviewCountIncrements(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -323,7 +323,7 @@ func TestReputation_PreviewCountIncrements(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// 1 preview (< 10 threshold) — no conversion bonus applied yet.
 	rep1 := eng.State().SellerReputation(h.seller.PublicKeyHex())
@@ -353,7 +353,7 @@ func TestReputation_ConversionCountIncrements(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -370,7 +370,7 @@ func TestReputation_ConversionCountIncrements(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	prevPayload, _ := json.Marshal(map[string]any{
 		"phase":    "preview",
@@ -382,7 +382,7 @@ func TestReputation_ConversionCountIncrements(t *testing.T) {
 		[]string{preqMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// No conversion yet — buyer hasn't accepted.
 	// With 1 preview (below threshold of 10), reputation should still be DefaultReputation.
@@ -402,7 +402,7 @@ func TestReputation_ConversionCountIncrements(t *testing.T) {
 		[]string{prevMsg.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Still below threshold (1 preview), but ConversionCount should be tracked internally.
 	// The reputation should still equal DefaultReputation (threshold not met).
@@ -425,7 +425,7 @@ func TestReputation_DirectAcceptNoConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -446,7 +446,7 @@ func TestReputation_DirectAcceptNoConversion(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// No preview-request was sent, so no PreviewCount tracked.
 	// Reputation should equal DefaultReputation (no conversion bonus, no SuccessCount yet).
@@ -469,7 +469,7 @@ func TestReputation_LowConversionEntries(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -539,7 +539,7 @@ func TestReputation_ZeroConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -575,7 +575,7 @@ func TestReputation_FullConversion(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -620,7 +620,7 @@ func TestReputation_LowConversionEntries_AtExactBoundary(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -688,7 +688,7 @@ func TestReputation_SmallContentPenaltyPreserved(t *testing.T) {
 		[]string{chain.deliverMsgID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Reputation should be DefaultReputation - SmallContentReputationPenalty.
 	want := exchange.DefaultReputation - exchange.SmallContentReputationPenalty
@@ -712,7 +712,7 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -746,13 +746,13 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 			nil,
 		)
 		buyRec, _ := h.st.GetMessage(buyMsg.ID)
-		eng.State().Apply(buyRec)
-		if err := eng.DispatchForTest(buyRec); err != nil {
+		eng.State().Apply(exchange.FromStoreRecord(buyRec))
+		if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 			t.Fatalf("buyer %d dispatch: %v", i, err)
 		}
 
 		allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 		// Find the newly emitted match (the one added after preMatchCount).
 		matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
@@ -772,7 +772,7 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 			[]string{matchID},
 		)
 		allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 		// Operator delivers.
 		deliverMsg := h.sendMessage(h.operator, deliverPayloadFor(entryID),
@@ -780,7 +780,7 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 			[]string{acceptMsg.ID},
 		)
 		allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 		// Buyer completes.
 		completePayload, _ := json.Marshal(map[string]any{
@@ -792,7 +792,7 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 			[]string{deliverMsg.ID},
 		)
 		allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 
 	// With 3 distinct buyers completing on the same entry:

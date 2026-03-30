@@ -143,7 +143,7 @@ func seedInventoryEntry(t *testing.T, h *testHarness, eng *exchange.Engine, desc
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, putPrice, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -187,7 +187,7 @@ func extractReservationIDFromLog(t *testing.T, h *testHarness) string {
 // sendBuyerAccept sends a settle(buyer-accept) message and dispatches it via
 // DispatchForTest, triggering the scrip hold. Returns the buyer-accept message.
 // The antecedent is matchMsgID (direct match path, no preview).
-func sendBuyerAcceptAndDispatch(t *testing.T, h *testHarness, eng *exchange.Engine, matchMsgID, entryID string) *store.MessageRecord {
+func sendBuyerAcceptAndDispatch(t *testing.T, h *testHarness, eng *exchange.Engine, matchMsgID, entryID string) *exchange.Message {
 	t.Helper()
 	payload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
@@ -204,12 +204,12 @@ func sendBuyerAcceptAndDispatch(t *testing.T, h *testHarness, eng *exchange.Engi
 	)
 	// Replay state so engine sees the buyer-accept before dispatching.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(msg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage buyer-accept: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("DispatchForTest buyer-accept: %v", err)
 	}
 	return msg
@@ -408,12 +408,12 @@ func TestBuyerAccept_InsufficientScripReturnsError(t *testing.T) {
 		[]string{matchMsg.ID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage buyer-accept: %v", err)
 	}
-	dispatchErr := eng.DispatchForTest(rec)
+	dispatchErr := eng.DispatchForTest(exchange.FromStoreRecord(rec))
 	if dispatchErr == nil {
 		t.Error("expected error from buyer-accept with insufficient scrip, got nil")
 	}
@@ -521,7 +521,7 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 
 	// Replay all messages so the antecedent chain is in state.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// complete (antecedent = deliver message).
 	// Note: reservation_id is NOT in the complete payload — it is looked up by the
@@ -540,12 +540,12 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 
 	// Apply complete to state and dispatch.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("dispatch settle(complete): %v", err)
 	}
 
@@ -708,14 +708,14 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 
 	// Replay state so the engine processes the buyer-accept during dispatch.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Dispatch the buyer-accept: the fix should detect the existing buy-hold and skip.
 	rec, err := h.st.GetMessage(buyerAcceptMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage buyer-accept: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		// An error here means the double-charge path failed the second DecrementBudget
 		// (which would happen if balance was already at 0 or negative). Not the test
 		// scenario we want, but still an error to surface.
@@ -816,7 +816,7 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 
 	// Replay so antecedent chain is in state.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Attacker-controlled complete message: seller_key points to attacker.
 	// Note: reservation_id is NOT in the complete payload — engine looks it up internally.
@@ -836,12 +836,12 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 
 	// Replay and dispatch the complete message.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("dispatch settle(complete): %v", err)
 	}
 

@@ -51,7 +51,7 @@ func setupMultiMatchInventory(t *testing.T, h *testHarness, eng *exchange.Engine
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg0.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut entry0: %v", err)
@@ -61,7 +61,7 @@ func setupMultiMatchInventory(t *testing.T, h *testHarness, eng *exchange.Engine
 	}
 
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	inv := eng.State().Inventory()
 	if len(inv) < 2 {
@@ -103,7 +103,7 @@ func TestState_MultiMatch_BuyerSelectsSecondResult(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting buy message: %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// Operator emits a match with two results: entryID0 first, entryID1 second.
 	matchMsg := h.sendMessage(h.operator,
@@ -113,7 +113,7 @@ func TestState_MultiMatch_BuyerSelectsSecondResult(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Buyer accepts result #1 (entryID1, not the default entryID0).
 	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayloadFor(entryID1),
@@ -145,7 +145,7 @@ func TestState_MultiMatch_BuyerSelectsSecondResult(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Seller reputation must have increased (completion recorded).
 	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
@@ -185,7 +185,7 @@ func TestState_MultiMatch_InvalidEntryIDFallsBackToFirst(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting buy message: %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// Operator emits a match with two results.
 	matchMsg := h.sendMessage(h.operator,
@@ -195,7 +195,7 @@ func TestState_MultiMatch_InvalidEntryIDFallsBackToFirst(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Buyer sends buyer-accept with a bogus entry_id not in the match results.
 	bogusID := fmt.Sprintf("%064x", 9999)
@@ -228,7 +228,7 @@ func TestState_MultiMatch_InvalidEntryIDFallsBackToFirst(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Settlement chain should have completed against entryID0 (the fallback).
 	hist := eng.State().PriceHistory()
@@ -256,14 +256,14 @@ func TestState_SingleMatch_BackwardsCompat(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 8400, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	inv := eng.State().Inventory()
 	if len(inv) == 0 {
@@ -282,7 +282,7 @@ func TestState_SingleMatch_BackwardsCompat(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting buy message: %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// Operator emits a single-result match.
 	matchMsg := h.sendMessage(h.operator,
@@ -292,7 +292,7 @@ func TestState_SingleMatch_BackwardsCompat(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Buyer accepts with the correct entry_id.
 	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayloadFor(entryID),
@@ -324,7 +324,7 @@ func TestState_SingleMatch_BackwardsCompat(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Seller reputation must have increased.
 	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())

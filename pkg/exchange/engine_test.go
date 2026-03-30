@@ -99,7 +99,7 @@ func syncTransportToStore(t *testing.T, st store.Store, cfID string, transport *
 }
 
 // sendMessage sends a signed message to the exchange campfire and persists it.
-func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tags []string, antecedents []string) *store.MessageRecord {
+func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tags []string, antecedents []string) *exchange.Message {
 	h.t.Helper()
 	msg, err := message.NewMessage(sender.PrivateKey, sender.PublicKey, payload, tags, antecedents)
 	if err != nil {
@@ -133,7 +133,7 @@ func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tag
 	if _, err := h.st.AddMessage(rec); err != nil {
 		h.t.Fatalf("adding message to store: %v", err)
 	}
-	return &rec
+	return exchange.FromStoreRecord(&rec)
 }
 
 // newEngine returns a new Engine for this harness.
@@ -191,7 +191,7 @@ func TestState_PutAppearsInInventoryAfterAccept(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Inventory should be empty (no put-accept yet).
 	inv := eng.State().Inventory()
@@ -233,7 +233,7 @@ func TestEngine_BuyEmitsMatchResponse(t *testing.T) {
 
 	// Replay to load the put.
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Accept the put.
 	if err := eng.AutoAcceptPut(putMsg.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
@@ -258,7 +258,7 @@ func TestEngine_BuyEmitsMatchResponse(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting buy message from store: %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// Dispatch the buy (triggers match response).
 	// Access via a test hook: manually run handleBuy via poll.
@@ -356,7 +356,7 @@ func TestState_ReplayRebuildsInventory(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	freshState.Replay(msgs)
+	freshState.Replay(exchange.FromStoreRecords(msgs))
 
 	inv := freshState.Inventory()
 	if len(inv) != 1 {
@@ -417,7 +417,7 @@ func TestState_ExpiredEntryExcludedFromFindCandidates(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(expiredPutMsg.ID, 4200, time.Now().Add(-2*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut (expired): %v", err)
 	}
@@ -438,7 +438,7 @@ func TestState_ExpiredEntryExcludedFromFindCandidates(t *testing.T) {
 		nil,
 	)
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(livePutMsg.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut (live): %v", err)
 	}
@@ -520,7 +520,7 @@ func TestState_BuyOrderExpiry(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	orders := eng.State().ActiveOrders()
 	found := false
@@ -563,7 +563,7 @@ func TestState_PutRejectRemovesFromPending(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	inv := eng.State().Inventory()
 	if len(inv) != 0 {
@@ -586,7 +586,7 @@ func TestState_SettleDeliverMarksMatchDelivered(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -646,7 +646,7 @@ func TestState_SettleDeliverMarksMatchDelivered(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Before deliver: match must not be marked delivered.
 	if eng.State().IsMatchDelivered(matchMsg.ID) {
@@ -669,7 +669,7 @@ func TestState_SettleDeliverMarksMatchDelivered(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// After deliver: match must be marked delivered.
 	if !eng.State().IsMatchDelivered(matchMsg.ID) {
@@ -702,7 +702,7 @@ func TestEngine_MatchIndexPopulatedAfterPutAccept(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -734,7 +734,7 @@ func TestEngine_SemanticMatchConfidenceUsedInMatchPayload(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(relatedPut.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut related: %v", err)
 	}
@@ -822,7 +822,7 @@ func TestEngine_IsPartialMatchForwardedToWirePayload(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(closePut.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -912,7 +912,7 @@ func runFullFlowToDeliver(t *testing.T, h *testHarness, eng *exchange.Engine, en
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -985,7 +985,7 @@ func runFullFlowToDeliver(t *testing.T, h *testHarness, eng *exchange.Engine, en
 
 	// Replay so state reflects all messages including deliver.
 	allMsgs2, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs2)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs2))
 
 	return matchMsg, buyerAcceptMsgID, deliverMsgID, entryID
 }
@@ -1017,7 +1017,7 @@ func TestState_SettleComplete_HappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Seller reputation must have increased by 1 (SuccessCount++).
 	newRep := eng.State().SellerReputation(h.seller.PublicKeyHex())
@@ -1062,7 +1062,7 @@ func TestState_SettleComplete_SpoofedEntryIDRejected(t *testing.T) {
 		nil,
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	if err := eng.AutoAcceptPut(putMsgB.ID, 14000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut entryB: %v", err)
 	}
@@ -1087,7 +1087,7 @@ func TestState_SettleComplete_SpoofedEntryIDRejected(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Price history must have exactly one new entry (for entryA, not entryB).
 	newHistory := eng.State().PriceHistory()
@@ -1124,7 +1124,7 @@ func TestState_SettleComplete_BrokenChainRejected(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -1147,7 +1147,7 @@ func TestState_SettleComplete_BrokenChainRejected(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// No reputation change — complete must be silently dropped.
 	newRep := eng.State().SellerReputation(h.seller.PublicKeyHex())

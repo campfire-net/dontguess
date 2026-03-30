@@ -33,7 +33,7 @@ func buildSettleChainForPriceTests(
 	cs *scrip.CampfireScripStore,
 	entryDesc string,
 	putPrice int64,
-) (res scrip.Reservation, deliverMsg *store.MessageRecord, salePrice int64) {
+) (res scrip.Reservation, deliverMsg *exchange.Message, salePrice int64) {
 	t.Helper()
 
 	seedInventoryEntry(t, h, eng, entryDesc, "code", putPrice*2, putPrice)
@@ -100,7 +100,7 @@ func buildSettleChainForPriceTests(
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	return res, deliverMsg, salePrice
 }
@@ -148,14 +148,14 @@ func TestSettle_PriceLockedAtBuyerAcceptTime(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
 	// Complete must succeed using the reservation-locked price, not the inflated payload price.
-	if dispatchErr := eng.DispatchForTest(rec); dispatchErr != nil {
+	if dispatchErr := eng.DispatchForTest(exchange.FromStoreRecord(rec)); dispatchErr != nil {
 		t.Fatalf("expected settle(complete) to succeed using reservation price, got: %v", dispatchErr)
 	}
 
@@ -262,7 +262,7 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 
 	// Replay state (buyer-accept in state, but NOT dispatched through engine).
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
 	operatorBalanceBefore := cs.Balance(h.operator.PublicKeyHex())
@@ -281,14 +281,14 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage: %v", err)
 	}
 	// Must not return an error — missing reservation is a silent skip.
-	if dispatchErr := eng.DispatchForTest(rec); dispatchErr != nil {
+	if dispatchErr := eng.DispatchForTest(exchange.FromStoreRecord(rec)); dispatchErr != nil {
 		t.Errorf("expected silent skip for complete without buyer-accept, got error: %v", dispatchErr)
 	}
 
