@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -33,13 +32,10 @@ import (
 // for the given entryID. Returns (matchID, previewRequestMsgID, buyer).
 //
 // Each buyer has a unique identity so the dedup logic does not collapse them.
-func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engine, entryID string, taskSuffix string) (matchID, previewReqID string, buyer *identity.Identity) {
+func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engine, entryID string, taskSuffix string) (matchID, previewReqID string, buyer *testAgent) {
 	t.Helper()
 
-	buyer, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generateBuyerMatchPreview: generate identity: %v", err)
-	}
+	buyer = newTestAgent(t)
 
 	preCount, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
@@ -75,7 +71,7 @@ func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engin
 
 // emitPreviewAndAccept sends a preview response (operator) and then a buyer-accept
 // (via the preview path) for the given previewReqID. This constitutes a conversion.
-func emitPreviewAndAccept(t *testing.T, h *testHarness, eng *exchange.Engine, entryID, previewReqID string, buyer *identity.Identity) {
+func emitPreviewAndAccept(t *testing.T, h *testHarness, eng *exchange.Engine, entryID, previewReqID string, buyer *testAgent) {
 	t.Helper()
 
 	prevPayload, _ := json.Marshal(map[string]any{
@@ -161,7 +157,7 @@ func TestReputation_HighConversion(t *testing.T) {
 	// 10 distinct buyers each send a preview-request. 8 of them then accept.
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -214,7 +210,7 @@ func TestReputation_LowConversion(t *testing.T) {
 	// 10 distinct buyers, only 2 convert (20%).
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -266,7 +262,7 @@ func TestReputation_NeutralConversion(t *testing.T) {
 	// 10 distinct buyers, 5 convert (50%).
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -483,7 +479,7 @@ func TestReputation_LowConversionEntries(t *testing.T) {
 	// 10 distinct buyers, only 1 converts (10% conversion rate).
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -586,7 +582,7 @@ func TestReputation_FullConversion(t *testing.T) {
 	// 10 distinct buyers, all convert.
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -631,7 +627,7 @@ func TestReputation_LowConversionEntries_AtExactBoundary(t *testing.T) {
 	// 10 distinct buyers, 3 convert = 30% rate.
 	type buyerPreview struct {
 		previewReqID string
-		buyer        *identity.Identity
+		buyer        *testAgent
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
@@ -725,15 +721,9 @@ func TestReputation_CrossAgentConvergencePreserved(t *testing.T) {
 
 	// Drive 3 complete sales through 3 distinct buyers.
 	// Each buyer: buy → (engine emits match) → buyer-accept → deliver → complete.
-	buyer2, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating buyer2: %v", err)
-	}
-	buyer3, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating buyer3: %v", err)
-	}
-	buyers := []*identity.Identity{h.buyer, buyer2, buyer3}
+	buyer2 := newTestAgent(t)
+	buyer3 := newTestAgent(t)
+	buyers := []*testAgent{h.buyer, buyer2, buyer3}
 
 	for i, buyer := range buyers {
 		// Count match messages before dispatch so we can find the new one after.

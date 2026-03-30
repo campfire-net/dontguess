@@ -2,30 +2,52 @@ package exchange_test
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/campfire"
-	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 )
 
+// testAgent represents a test participant (operator, seller, or buyer).
+// It holds only the hex-encoded public key needed for identity assertions.
+// Message sending is done via sendMessage which writes directly to the store,
+// since the engine does not verify signatures.
+type testAgent struct {
+	pubKeyHex string
+}
+
+// PublicKeyHex returns the hex-encoded public key for this test agent.
+func (a *testAgent) PublicKeyHex() string { return a.pubKeyHex }
+
+// newTestAgent generates a fresh ed25519 keypair and returns a testAgent.
+// Uses only the standard library — no internal cf imports required.
+func newTestAgent(t *testing.T) *testAgent {
+	t.Helper()
+	pub, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generating test agent key: %v", err)
+	}
+	return &testAgent{pubKeyHex: hex.EncodeToString(pub)}
+}
+
 // testHarness sets up a minimal exchange for engine tests.
 type testHarness struct {
-	t         *testing.T
-	cfID      string
-	operator  *identity.Identity
-	seller    *identity.Identity
-	buyer     *identity.Identity
-	transport *fs.Transport
-	st        store.Store
+	t              *testing.T
+	cfID           string
+	cfHome         string          // config dir used by exchange.Init
+	operatorClient *protocol.Client // operator's SDK client (shared store with st)
+	operator       *testAgent
+	seller         *testAgent
+	buyer          *testAgent
+	st             store.Store
 }
 
 func newTestHarness(t *testing.T) *testHarness {
@@ -44,94 +66,60 @@ func newTestHarness(t *testing.T) *testHarness {
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	// Keep initClient open so the campfire state stays valid; close on test end.
 	t.Cleanup(func() { initClient.Close() })
 
-	// Re-load the operator identity that Init created.
-	operatorID, err := identity.Load(cfHome + "/identity.json")
-	if err != nil {
-		t.Fatalf("loading operator identity: %v", err)
-	}
-
-	// Open the store.
+	// Open the store (same SQLite file as used by exchange.Init / initClient).
+	// Tests query h.st directly. The engine's Read/WriteClient use initClient
+	// (which wraps the same file) — SQLite guarantees cross-connection visibility
+	// of committed writes, so messages sent by the engine appear in h.st queries.
 	st, err := store.Open(store.StorePath(cfHome))
 	if err != nil {
 		t.Fatalf("opening store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
 
-	// Pull in the convention messages that Init wrote to the transport into the store.
-	transport := fs.New(transportDir)
-	syncTransportToStore(t, st, cfg.ExchangeCampfireID, transport)
-
-	// Generate test identities for seller and buyer.
-	sellerID, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating seller identity: %v", err)
-	}
-	buyerID, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating buyer identity: %v", err)
-	}
-
 	return &testHarness{
-		t:         t,
-		cfID:      cfg.ExchangeCampfireID,
-		operator:  operatorID,
-		seller:    sellerID,
-		buyer:     buyerID,
-		transport: transport,
-		st:        st,
+		t:              t,
+		cfID:           cfg.ExchangeCampfireID,
+		cfHome:         cfHome,
+		operatorClient: initClient,
+		operator:       &testAgent{pubKeyHex: initClient.PublicKeyHex()},
+		seller:         newTestAgent(t),
+		buyer:          newTestAgent(t),
+		st:             st,
 	}
 }
 
-// syncTransportToStore reads messages from the transport and adds them to the store.
-func syncTransportToStore(t *testing.T, st store.Store, cfID string, transport *fs.Transport) {
-	t.Helper()
-	msgs, err := transport.ListMessages(cfID)
-	if err != nil {
-		t.Fatalf("listing transport messages: %v", err)
-	}
-	for i := range msgs {
-		rec := store.MessageRecordFromMessage(cfID, &msgs[i], store.NowNano())
-		if _, err := st.AddMessage(rec); err != nil {
-			// Ignore duplicate key errors (messages already in store).
-			_ = err
-		}
-	}
-}
-
-// sendMessage sends a signed message to the exchange campfire and persists it.
-func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tags []string, antecedents []string) *exchange.Message {
+// sendMessage writes a message directly to the store with the given sender's
+// public key. The exchange engine does not verify signatures, so test messages
+// do not need to be cryptographically signed — they only need to be present in
+// the store with the correct tags and sender key.
+func (h *testHarness) sendMessage(sender *testAgent, payload []byte, tags []string, antecedents []string) *exchange.Message {
 	h.t.Helper()
-	msg, err := message.NewMessage(sender.PrivateKey, sender.PublicKey, payload, tags, antecedents)
-	if err != nil {
-		h.t.Fatalf("creating message: %v", err)
+	// Generate a unique message ID (hex-encoded random 32 bytes, same format as real IDs).
+	idBytes := make([]byte, 32)
+	if _, err := rand.Read(idBytes); err != nil {
+		h.t.Fatalf("generating message ID: %v", err)
 	}
+	id := hex.EncodeToString(idBytes)
 
-	// Add provenance hop.
-	cfState, err := h.transport.ReadState(h.cfID)
-	if err != nil {
-		h.t.Fatalf("reading campfire state: %v", err)
+	if antecedents == nil {
+		antecedents = []string{}
 	}
-	members, err := h.transport.ListMembers(h.cfID)
-	if err != nil {
-		h.t.Fatalf("listing members: %v", err)
+	if tags == nil {
+		tags = []string{}
 	}
-	cf := cfState.ToCampfire(members)
-	if err := msg.AddHop(
-		cfState.PrivateKey, cfState.PublicKey,
-		cf.MembershipHash(), len(members),
-		cfState.JoinProtocol, cfState.ReceptionRequirements,
-		campfire.RoleFull,
-	); err != nil {
-		h.t.Fatalf("adding hop: %v", err)
+	rec := store.MessageRecord{
+		ID:          id,
+		CampfireID:  h.cfID,
+		Sender:      sender.pubKeyHex,
+		Payload:     payload,
+		Tags:        tags,
+		Antecedents: antecedents,
+		Timestamp:   store.NowNano(),
+		Signature:   []byte{}, // non-nil required for NOT NULL BLOB constraint in AddMessage
 	}
-
-	if err := h.transport.WriteMessage(h.cfID, msg); err != nil {
-		h.t.Fatalf("writing message to transport: %v", err)
-	}
-
-	rec := store.MessageRecordFromMessage(h.cfID, msg, store.NowNano())
 	if _, err := h.st.AddMessage(rec); err != nil {
 		h.t.Fatalf("adding message to store: %v", err)
 	}
@@ -139,18 +127,34 @@ func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tag
 }
 
 // newEngine returns a new Engine for this harness.
-// Uses dual-client model: ReadClient subscribes/replays, WriteClient sends responses.
+//
+// ReadClient uses h.st directly (protocol.New with nil identity = read-only).
+// ReadSkipSync: true skips filesystem transport sync so that messages added
+// directly to h.st by sendMessage are visible without re-syncing.
+//
+// WriteClient uses the operator client from exchange.Init, which has the
+// operator's signing identity. Operator messages written by WriteClient are
+// stored in the operatorClient's SQLite connection; they are visible to h.st
+// (a separate connection to the same file) via SQLite cross-connection commit
+// visibility semantics.
 func (h *testHarness) newEngine() *exchange.Engine {
 	return exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
-		Store:            h.st,
-		ReadClient:       protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		CampfireID:   h.cfID,
+		Store:        h.st,
+		ReadClient:   protocol.New(h.st, nil),
+		WriteClient:  h.operatorClient,
+		ReadSkipSync: true,
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
 		},
 	})
+}
+
+// newOperatorClient returns the operator's protocol.Client created by exchange.Init.
+// The same client is reused across calls — it wraps the same identity and
+// SQLite store file as h.st, so writes are cross-connection visible.
+func (h *testHarness) newOperatorClient() *protocol.Client {
+	return h.operatorClient
 }
 
 // putPayload builds a minimal valid exchange:put payload.

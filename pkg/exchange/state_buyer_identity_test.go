@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -133,10 +132,7 @@ func TestState_BuyerAccept_WrongSenderRejected(t *testing.T) {
 	matchMsg, entryID := setupMatchedOrder(t, h, eng)
 
 	// Generate an impostor identity.
-	impostor, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating impostor identity: %v", err)
-	}
+	impostor := newTestAgent(t)
 
 	// Impostor sends buyer-accept with the real match as antecedent.
 	h.sendMessage(impostor, buyerAcceptPayloadFor(entryID),
@@ -256,10 +252,7 @@ func TestState_Complete_WrongSenderRejected(t *testing.T) {
 	repBefore := eng.State().SellerReputation(h.seller.PublicKeyHex())
 
 	// Impostor sends complete using the valid deliver antecedent.
-	impostor, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating impostor identity: %v", err)
-	}
+	impostor := newTestAgent(t)
 	h.sendMessage(impostor, completePayloadFor(entryID, 12000),
 		[]string{
 			exchange.TagSettle,
@@ -387,10 +380,7 @@ func TestState_BuyerReject_WrongSenderIgnored(t *testing.T) {
 	}
 
 	// Impostor attempts to reject.
-	impostor, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating impostor identity: %v", err)
-	}
+	impostor := newTestAgent(t)
 	h.sendMessage(impostor, buyerRejectPayloadFor(entryID),
 		[]string{
 			exchange.TagSettle,

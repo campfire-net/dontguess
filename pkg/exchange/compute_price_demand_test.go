@@ -28,7 +28,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -47,7 +46,7 @@ func completeBuyTransactionForBuyer(
 	t *testing.T,
 	h *testHarness,
 	eng *exchange.Engine,
-	buyer *identity.Identity,
+	buyer *testAgent,
 	entryID string,
 	putPrice int64,
 ) {
@@ -248,10 +247,7 @@ func TestComputePrice_DemandMultiplier_OneBuyer(t *testing.T) {
 		t.Fatalf("baseline price = %d, want %d", baselinePrice, wantBaseline)
 	}
 
-	buyer1, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating buyer1: %v", err)
-	}
+	buyer1 := newTestAgent(t)
 	completeBuyTransactionForBuyer(t, h, eng, buyer1, entryID, 1000)
 
 	// EntryDemandCount must be 1.
@@ -288,10 +284,7 @@ func TestComputePrice_DemandMultiplier_FiveBuyers(t *testing.T) {
 	}
 
 	for i := 0; i < 5; i++ {
-		buyer, err := identity.Generate()
-		if err != nil {
-			t.Fatalf("generating buyer %d: %v", i, err)
-		}
+		buyer := newTestAgent(t)
 		completeBuyTransactionForBuyer(t, h, eng, buyer, entryID, 1000)
 	}
 
@@ -326,10 +319,7 @@ func TestComputePrice_DemandMultiplier_CapAt10Buyers(t *testing.T) {
 
 	// 11 distinct buyers — one over the cap threshold.
 	for i := 0; i < 11; i++ {
-		buyer, err := identity.Generate()
-		if err != nil {
-			t.Fatalf("generating buyer %d: %v", i, err)
-		}
+		buyer := newTestAgent(t)
 		completeBuyTransactionForBuyer(t, h, eng, buyer, entryID, 1000)
 	}
 

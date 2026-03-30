@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -121,10 +120,9 @@ func TestSettle_PriceLockedAtBuyerAcceptTime(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -197,10 +195,9 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
