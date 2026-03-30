@@ -11,6 +11,7 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	"github.com/campfire-net/campfire/pkg/identity"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 	"github.com/spf13/cobra"
@@ -78,8 +79,11 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("initial transport sync: %w", err)
 	}
 
+	// Build write client for operator sends (view creation, match/settle responses).
+	writeClient := protocol.New(st, ident)
+
 	// Ensure standard named views exist (idempotent — skips existing).
-	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, ident, st, transport)
+	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
 	if viewErr != nil {
 		log.Printf("[exchange] warning: ensuring named views: %v", viewErr)
 	} else if viewsCreated > 0 {
@@ -97,7 +101,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 		CampfireID:       cfg.ExchangeCampfireID,
 		OperatorIdentity: ident,
 		Store:            st,
-		Transport:        transport,
+		WriteClient:      writeClient,
 		PollInterval:     servePollInterval,
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {

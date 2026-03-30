@@ -9,10 +9,8 @@ import (
 
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/message"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport"
-	cftransportfs "github.com/campfire-net/campfire/pkg/transport/fs"
 	dgconv "github.com/3dl-dev/dontguess/pkg/convention"
 	"github.com/spf13/cobra"
 )
@@ -235,8 +233,13 @@ func performSupersede(
 		return result, nil
 	}
 
-	// Step 8: Publish via transport.
-	msgID, err := sendSupersede(supersededPayload, registryID, agentID, s, m)
+	// Step 8: Publish via protocol client.
+	// Build a write client from agentID and s; ensure membership is recorded so
+	// client.Send can resolve the transport. If m is not already in s (test
+	// scenario) this is a no-op-safe upsert — AddMembership is idempotent.
+	client := protocol.New(s, agentID)
+	_ = s.AddMembership(*m) // ensure membership in store; errors ignored (may already exist)
+	msgID, err := sendSupersede(supersededPayload, registryID, client)
 	if err != nil {
 		result.Error = fmt.Sprintf("send failed: %s", err)
 		return result, nil
@@ -260,47 +263,16 @@ func injectSupersedes(payload []byte, supersedes string) ([]byte, error) {
 	return json.Marshal(raw)
 }
 
-// sendSupersede writes the superseding declaration to the campfire transport
-// and stores it locally.
-//
-// For filesystem transports with a valid transport directory, the message is
-// written to the filesystem (so other agents syncing via that directory see it)
-// and also stored locally.
-//
-// For GitHub, P2P HTTP, and any transport where the directory doesn't exist on
-// disk (including test scenarios using in-memory stores), the message is stored
-// in the local SQLite store only. This is sufficient for tests and for
-// single-operator deployments where all agents share the same store.
-func sendSupersede(
-	payload []byte,
-	campfireID string,
-	agentID *identity.Identity,
-	s store.Store,
-	m *store.Membership,
-) (string, error) {
-	tags := []string{cfconvention.ConventionOperationTag}
-
-	msg, err := message.NewMessage(agentID.PrivateKey, agentID.PublicKey, payload, tags, nil)
+// sendSupersede publishes the superseding declaration via the protocol client.
+// The client handles transport selection, identity signing, and local store persistence.
+func sendSupersede(payload []byte, campfireID string, client *protocol.Client) (string, error) {
+	msg, err := client.Send(protocol.SendRequest{
+		CampfireID: campfireID,
+		Payload:    payload,
+		Tags:       []string{cfconvention.ConventionOperationTag},
+	})
 	if err != nil {
-		return "", fmt.Errorf("creating message: %w", err)
-	}
-
-	// Attempt filesystem transport only when the transport directory exists.
-	if transport.ResolveType(*m) == transport.TypeFilesystem && m.TransportDir != "" {
-		if info, statErr := os.Stat(m.TransportDir); statErr == nil && info.IsDir() {
-			tr := cftransportfs.New(m.TransportDir)
-			if writeErr := tr.WriteMessage(campfireID, msg); writeErr != nil {
-				return "", fmt.Errorf("writing via filesystem transport: %w", writeErr)
-			}
-			// Also store locally for queries.
-			s.AddMessage(store.MessageRecordFromMessage(campfireID, msg, store.NowNano())) //nolint:errcheck
-			return msg.ID, nil
-		}
-	}
-
-	// Fall back: store locally only (GitHub, P2P HTTP, test stores).
-	if _, err := s.AddMessage(store.MessageRecordFromMessage(campfireID, msg, store.NowNano())); err != nil {
-		return "", fmt.Errorf("storing message: %w", err)
+		return "", fmt.Errorf("sending supersede message: %w", err)
 	}
 	return msg.ID, nil
 }
