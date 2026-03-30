@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 	dgconv "github.com/3dl-dev/dontguess/pkg/convention"
@@ -17,17 +16,17 @@ import (
 
 // supersedeResult is the JSON output for a supersede operation.
 type supersedeResult struct {
-	File         string                `json:"file"`
-	Operation    string                `json:"operation,omitempty"`
-	OldVersion   string                `json:"old_version,omitempty"`
-	NewVersion   string                `json:"new_version,omitempty"`
-	ChangeKind   dgconv.VersionKind    `json:"change_kind,omitempty"`
+	File         string                  `json:"file"`
+	Operation    string                  `json:"operation,omitempty"`
+	OldVersion   string                  `json:"old_version,omitempty"`
+	NewVersion   string                  `json:"new_version,omitempty"`
+	ChangeKind   dgconv.VersionKind      `json:"change_kind,omitempty"`
 	Breaking     []dgconv.BreakingChange `json:"breaking,omitempty"`
-	Additions    []string              `json:"additions,omitempty"`
-	Deprecations []string              `json:"deprecations,omitempty"`
-	MessageID    string                `json:"message_id,omitempty"`
-	SupersedesID string                `json:"supersedes_id,omitempty"`
-	Error        string                `json:"error,omitempty"`
+	Additions    []string                `json:"additions,omitempty"`
+	Deprecations []string                `json:"deprecations,omitempty"`
+	MessageID    string                  `json:"message_id,omitempty"`
+	SupersedesID string                  `json:"supersedes_id,omitempty"`
+	Error        string                  `json:"error,omitempty"`
 }
 
 var conventionSupersedeCmd = &cobra.Command{
@@ -77,15 +76,15 @@ func runConventionSupersede(_ *cobra.Command, args []string) error {
 		return fmt.Errorf("reading %q: %w", newFilePath, err)
 	}
 
-	// Load agent identity and open store.
-	agentID, s, err := requireAgentAndStore()
+	// Initialize protocol client from campfire home.
+	client, err := requireClient()
 	if err != nil {
 		return err
 	}
-	defer s.Close()
+	defer client.Close()
 
 	// Verify membership.
-	m, err := s.GetMembership(supersedeRegistry)
+	m, err := client.GetMembership(supersedeRegistry)
 	if err != nil {
 		return fmt.Errorf("querying membership for registry %s: %w", shortID(supersedeRegistry), err)
 	}
@@ -96,7 +95,7 @@ func runConventionSupersede(_ *cobra.Command, args []string) error {
 	result, err := performSupersede(
 		newFilePath, newPayload,
 		supersedeRegistry, supersedesMessageID,
-		agentID, s, m,
+		client, m,
 		supersedeForce,
 	)
 	if err != nil {
@@ -131,13 +130,14 @@ func runConventionSupersede(_ *cobra.Command, args []string) error {
 }
 
 // performSupersede is the testable core of the supersede operation.
+// It uses client for all campfire I/O: old message lookup, membership check,
+// and publishing the new declaration.
 func performSupersede(
 	newFilePath string,
 	newPayload []byte,
 	registryID string,
 	oldMessageID string,
-	agentID *identity.Identity,
-	s store.Store,
+	client *protocol.Client,
 	m *store.Membership,
 	force bool,
 ) (*supersedeResult, error) {
@@ -150,7 +150,7 @@ func performSupersede(
 	// conventions. m.CreatorPubkey is set when joining and identifies the
 	// operator. Any other campfire member that attempts to supersede is rejected
 	// immediately, before any store or network I/O.
-	if m.CreatorPubkey != "" && agentID.PublicKeyHex() != m.CreatorPubkey {
+	if m.CreatorPubkey != "" && client.PublicKeyHex() != m.CreatorPubkey {
 		result.Error = fmt.Sprintf("operator check failed: only the operator (%s) may supersede conventions", shortID(m.CreatorPubkey))
 		return result, nil
 	}
@@ -166,8 +166,8 @@ func performSupersede(
 	newDecl, _, err := cfconvention.Parse(
 		[]string{cfconvention.ConventionOperationTag},
 		newPayload,
-		agentID.PublicKeyHex(),
-		agentID.PublicKeyHex(),
+		client.PublicKeyHex(),
+		client.PublicKeyHex(),
 	)
 	if err != nil {
 		result.Error = fmt.Sprintf("parse failed: %s", err)
@@ -176,11 +176,11 @@ func performSupersede(
 	result.Operation = newDecl.Operation
 	result.NewVersion = newDecl.Version
 
-	// Step 3: Load the old declaration from the registry store.
-	oldMsg, err := s.GetMessage(oldMessageID)
+	// Step 3: Load the old declaration via client.Get / client.GetByPrefix.
+	oldMsg, err := client.Get(oldMessageID)
 	if err != nil || oldMsg == nil {
 		// Try prefix match for short IDs.
-		oldMsg, err = s.GetMessageByPrefix(oldMessageID)
+		oldMsg, err = client.GetByPrefix(oldMessageID)
 		if err != nil || oldMsg == nil {
 			result.Error = fmt.Sprintf("old declaration message %s not found in registry — have you synced?", shortID(oldMessageID))
 			return result, nil
@@ -234,11 +234,6 @@ func performSupersede(
 	}
 
 	// Step 8: Publish via protocol client.
-	// Build a write client from agentID and s; ensure membership is recorded so
-	// client.Send can resolve the transport. If m is not already in s (test
-	// scenario) this is a no-op-safe upsert — AddMembership is idempotent.
-	client := protocol.New(s, agentID)
-	_ = s.AddMembership(*m) // ensure membership in store; errors ignored (may already exist)
 	msgID, err := sendSupersede(supersededPayload, registryID, client)
 	if err != nil {
 		result.Error = fmt.Sprintf("send failed: %s", err)
@@ -277,19 +272,15 @@ func sendSupersede(payload []byte, campfireID string, client *protocol.Client) (
 	return msg.ID, nil
 }
 
-// requireAgentAndStore loads the agent identity and opens the campfire store.
+// requireClient initializes a protocol.Client from the campfire home directory.
 // Uses CF_HOME env var or ~/.campfire as the campfire home directory.
-func requireAgentAndStore() (*identity.Identity, store.Store, error) {
+func requireClient() (*protocol.Client, error) {
 	home := cfHome()
-	agentID, err := identity.Load(filepath.Join(home, "identity.json"))
+	client, err := protocol.Init(home)
 	if err != nil {
-		return nil, nil, fmt.Errorf("loading identity from %s: %w", home, err)
+		return nil, fmt.Errorf("initializing campfire client from %s: %w", home, err)
 	}
-	s, err := store.Open(store.StorePath(home))
-	if err != nil {
-		return nil, nil, fmt.Errorf("opening store: %w", err)
-	}
-	return agentID, s, nil
+	return client, nil
 }
 
 // cfHome returns the campfire home directory.
@@ -315,6 +306,9 @@ func shortID(id string) string {
 
 // listOperationsForRegistry is a thin wrapper around convention.ListOperations
 // used by tests.
+// TODO(tech-debt): convention.ListOperations takes StoreReader; no Client variant
+// exists yet. This adapter bridges store.Store -> StoreReader until cf adds a
+// Client-native ListOperations. Track in dontguess-831.
 func listOperationsForRegistry(s store.Store, campfireID string) ([]*cfconvention.Declaration, error) {
 	return cfconvention.ListOperations(context.Background(), cliStoreReader{s}, campfireID, "")
 }
