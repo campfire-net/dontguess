@@ -11,14 +11,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/beacon"
-	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/convention"
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/naming"
 	"github.com/campfire-net/campfire/pkg/protocol"
-	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
 
 // Config is the local operator config written after init.
@@ -32,11 +27,13 @@ type Config struct {
 
 // InitOptions controls the Init operation.
 type InitOptions struct {
-	// CFHome is the campfire home directory (default: ~/.campfire).
-	CFHome string
-	// TransportBaseDir is the filesystem transport root (default: /tmp/campfire).
-	TransportBaseDir string
-	// BeaconDir is the beacon directory (default: ~/.campfire/beacons).
+	// ConfigDir is the campfire config directory (default: ~/.campfire).
+	// protocol.Init is called with this directory to load/generate identity and open store.
+	ConfigDir string
+	// Transport selects and configures the filesystem transport for the exchange campfire.
+	// If nil, FilesystemTransport with fs.DefaultBaseDir() is used.
+	Transport protocol.Transport
+	// BeaconDir overrides the beacon publish directory. If empty, the SDK default is used.
 	BeaconDir string
 	// ConventionDir is the path to the directory containing exchange-core/ and
 	// exchange-scrip/ sub-directories with the .json declaration files.
@@ -50,9 +47,9 @@ type InitOptions struct {
 	Force bool
 }
 
-func (o *InitOptions) cfHome() string {
-	if o.CFHome != "" {
-		return o.CFHome
+func (o *InitOptions) configDir() string {
+	if o.ConfigDir != "" {
+		return o.ConfigDir
 	}
 	if env := os.Getenv("CF_HOME"); env != "" {
 		return env
@@ -64,18 +61,11 @@ func (o *InitOptions) cfHome() string {
 	return filepath.Join(home, ".campfire")
 }
 
-func (o *InitOptions) transportBaseDir() string {
-	if o.TransportBaseDir != "" {
-		return o.TransportBaseDir
+func (o *InitOptions) transport() protocol.Transport {
+	if o.Transport != nil {
+		return o.Transport
 	}
-	return fs.DefaultBaseDir()
-}
-
-func (o *InitOptions) beaconDir() string {
-	if o.BeaconDir != "" {
-		return o.BeaconDir
-	}
-	return beacon.DefaultBeaconDir()
+	return protocol.FilesystemTransport{Dir: defaultTransportBaseDir()}
 }
 
 func (o *InitOptions) alias() string {
@@ -92,14 +82,27 @@ func (o *InitOptions) description() string {
 	return "DontGuess exchange — token-work marketplace"
 }
 
-// ConfigPath returns the path to the exchange operator config file.
-func ConfigPath(cfHome string) string {
-	return filepath.Join(cfHome, "dontguess-exchange.json")
+// defaultTransportBaseDir returns the default filesystem transport base directory.
+// Mirrors fs.DefaultBaseDir() without importing the fs package.
+func defaultTransportBaseDir() string {
+	if env := os.Getenv("CF_TRANSPORT_DIR"); env != "" {
+		return env
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "/tmp/campfire"
+	}
+	return filepath.Join(home, ".campfire", "transport")
 }
 
-// LoadConfig reads the exchange config from cfHome.
-func LoadConfig(cfHome string) (*Config, error) {
-	data, err := os.ReadFile(ConfigPath(cfHome))
+// ConfigPath returns the path to the exchange operator config file.
+func ConfigPath(configDir string) string {
+	return filepath.Join(configDir, "dontguess-exchange.json")
+}
+
+// LoadConfig reads the exchange config from configDir.
+func LoadConfig(configDir string) (*Config, error) {
+	data, err := os.ReadFile(ConfigPath(configDir))
 	if err != nil {
 		return nil, fmt.Errorf("reading exchange config: %w", err)
 	}
@@ -110,143 +113,95 @@ func LoadConfig(cfHome string) (*Config, error) {
 	return &cfg, nil
 }
 
-// Init creates an exchange campfire, promotes convention declarations to its
-// registry, registers the exchange in the operator's naming hierarchy, and
-// publishes a discovery beacon.
+// Init creates an exchange campfire via the campfire SDK, promotes convention
+// declarations to its registry, and registers the exchange in the operator's
+// naming hierarchy.
 //
-// Returns the Config written to disk. If a config already exists and
-// opts.Force is false, returns the existing config without re-initializing.
-func Init(opts InitOptions) (*Config, error) {
-	cfHome := opts.cfHome()
-	configPath := ConfigPath(cfHome)
+// Uses protocol.Init(configDir) to obtain a Client (loading/generating identity
+// and opening the store), then client.Create to generate the campfire, initialize
+// the transport, admit the operator as creator, and publish a beacon.
+//
+// Returns the Config written to disk and the open *protocol.Client. The caller
+// is responsible for calling client.Close() when done. If a config already exists
+// and opts.Force is false, returns the existing config without re-initializing
+// (the returned client is still open and must be closed).
+func Init(opts InitOptions) (*Config, *protocol.Client, error) {
+	configDir := opts.configDir()
+	configPath := ConfigPath(configDir)
 
-	// Check for existing config.
+	if err := os.MkdirAll(configDir, 0700); err != nil {
+		return nil, nil, fmt.Errorf("creating config dir: %w", err)
+	}
+
+	// Open or create identity and store via SDK.
+	client, err := protocol.Init(configDir)
+	if err != nil {
+		return nil, nil, fmt.Errorf("protocol.Init: %w", err)
+	}
+
+	// Check for existing config (after opening client so we can return it).
 	if !opts.Force {
 		if data, err := os.ReadFile(configPath); err == nil {
 			var existing Config
 			if jsonErr := json.Unmarshal(data, &existing); jsonErr == nil {
-				return &existing, nil
+				return &existing, client, nil
 			}
 		}
 	}
 
-	// Load or generate operator identity.
-	identityPath := filepath.Join(cfHome, "identity.json")
-	var operatorID *identity.Identity
-	if identity.Exists(identityPath) {
-		id, err := identity.Load(identityPath)
-		if err != nil {
-			return nil, fmt.Errorf("loading operator identity: %w", err)
-		}
-		operatorID = id
-	} else {
-		id, err := identity.Generate()
-		if err != nil {
-			return nil, fmt.Errorf("generating operator identity: %w", err)
-		}
-		if err := id.Save(identityPath); err != nil {
-			return nil, fmt.Errorf("saving operator identity: %w", err)
-		}
-		operatorID = id
-	}
-
 	// Create exchange campfire (invite-only, threshold=1).
-	exchangeCF, err := campfire.New("invite-only", nil, 1)
-	if err != nil {
-		return nil, fmt.Errorf("creating exchange campfire: %w", err)
-	}
-
-	// Set up filesystem transport.
-	transport := fs.New(opts.transportBaseDir())
-	if err := transport.Init(exchangeCF); err != nil {
-		return nil, fmt.Errorf("initializing transport: %w", err)
-	}
-
-	// Write operator as a member.
-	if err := transport.WriteMember(exchangeCF.PublicKeyHex(), campfire.MemberRecord{
-		PublicKey: operatorID.PublicKey,
-		JoinedAt:  time.Now().UnixNano(),
-	}); err != nil {
-		return nil, fmt.Errorf("writing operator member record: %w", err)
-	}
-
-	// Open store and record membership.
-	s, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		return nil, fmt.Errorf("opening store: %w", err)
-	}
-	defer s.Close()
-
-	transportDir := transport.CampfireDir(exchangeCF.PublicKeyHex())
-	if err := s.AddMembership(store.Membership{
-		CampfireID:   exchangeCF.PublicKeyHex(),
-		TransportDir: transportDir,
-		JoinProtocol: exchangeCF.JoinProtocol,
-		Role:         store.PeerRoleCreator,
-		JoinedAt:     store.NowNano(),
-		Threshold:    exchangeCF.Threshold,
+	// Beacon publishing is handled internally by client.Create.
+	createResult, err := client.Create(protocol.CreateRequest{
+		Transport:    opts.transport(),
 		Description:  opts.description(),
-	}); err != nil {
-		return nil, fmt.Errorf("recording exchange membership: %w", err)
+		JoinProtocol: "invite-only",
+		Threshold:    1,
+		BeaconDir:    opts.BeaconDir,
+	})
+	if err != nil {
+		client.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("creating exchange campfire: %w", err)
 	}
 
-	// Build the write client for sending operator messages (convention declarations, views).
-	writeClient := protocol.New(s, operatorID)
+	campfireID := createResult.CampfireID
 
 	// Promote convention declarations.
-	if err := promoteDeclarations(opts.ConventionDir, exchangeCF.PublicKeyHex(), writeClient); err != nil {
+	if err := promoteDeclarations(opts.ConventionDir, campfireID, client); err != nil {
 		// Non-fatal: log but don't fail init — operator can re-promote later.
 		fmt.Fprintf(os.Stderr, "warning: promoting convention declarations: %v\n", err)
 	}
 
 	// Create standard named views for convention read operations.
 	// On a fresh init the store has no synced messages, so all views are created.
-	viewsCreated, err := EnsureViews(exchangeCF.PublicKeyHex(), writeClient, s)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: creating named views: %v\n", err)
+	viewsCreated, viewErr := EnsureViews(campfireID, client)
+	if viewErr != nil {
+		fmt.Fprintf(os.Stderr, "warning: creating named views: %v\n", viewErr)
 	} else if viewsCreated > 0 {
 		fmt.Fprintf(os.Stderr, "created %d named views\n", viewsCreated)
 	}
 
 	// Register in naming hierarchy.
-	aliases := naming.NewAliasStore(cfHome)
+	aliases := naming.NewAliasStore(configDir)
 	alias := opts.alias()
-	if err := aliases.Set(alias, exchangeCF.PublicKeyHex()); err != nil {
+	if err := aliases.Set(alias, campfireID); err != nil {
 		// Non-fatal: alias failure doesn't block exchange use.
 		fmt.Fprintf(os.Stderr, "warning: setting alias %q: %v\n", alias, err)
 	}
 
-	// Publish beacon.
-	b, err := beacon.New(
-		exchangeCF.PublicKey,
-		exchangeCF.PrivateKey,
-		exchangeCF.JoinProtocol,
-		exchangeCF.ReceptionRequirements,
-		beacon.TransportConfig{
-			Protocol: "filesystem",
-			Config:   map[string]string{"dir": transportDir},
-		},
-		opts.description(),
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "warning: creating beacon: %v\n", err)
-	} else if err := beacon.Publish(opts.beaconDir(), b); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: publishing beacon: %v\n", err)
-	}
-
 	// Write config.
 	cfg := &Config{
-		ExchangeCampfireID: exchangeCF.PublicKeyHex(),
-		OperatorKeyHex:     operatorID.PublicKeyHex(),
+		ExchangeCampfireID: campfireID,
+		OperatorKeyHex:     client.PublicKeyHex(),
 		ConventionVersion:  "0.1",
 		Alias:              alias,
 		CreatedAt:          time.Now().UnixNano(),
 	}
 	if err := writeConfig(configPath, cfg); err != nil {
-		return nil, fmt.Errorf("writing exchange config: %w", err)
+		client.Close() //nolint:errcheck
+		return nil, nil, fmt.Errorf("writing exchange config: %w", err)
 	}
 
-	return cfg, nil
+	return cfg, client, nil
 }
 
 // declCandidate holds a parsed declaration file ready for promotion.

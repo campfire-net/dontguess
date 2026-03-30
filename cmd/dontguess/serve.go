@@ -73,7 +73,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	defer writeClient.Close() //nolint:errcheck
 
 	// Open a shared store for components that require store.Store directly
-	// (EnsureViews, CampfireScripStore). Uses the same path as protocol.Init.
+	// (CampfireScripStore). Uses the same path as protocol.Init.
 	dbPath := store.StorePath(cfHome)
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -82,7 +82,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	defer st.Close()
 
 	// Ensure standard named views exist (idempotent — skips existing).
-	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
+	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient)
 	if viewErr != nil {
 		log.Printf("[exchange] warning: ensuring named views: %v", viewErr)
 	} else if viewsCreated > 0 {
