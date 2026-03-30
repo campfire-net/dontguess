@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -122,7 +123,7 @@ func TestSettle_PriceLockedAtBuyerAcceptTime(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
-		Transport:        h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -197,7 +198,7 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
-		Transport:        h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})

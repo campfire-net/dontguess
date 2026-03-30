@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"
 
@@ -36,7 +37,7 @@ func newEngineWithProvenance(t *testing.T, checker *exchange.ProvenanceChecker) 
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		Transport:         h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -275,7 +276,7 @@ func TestProvenanceDispatch_NilChecker_AllOperationsPass(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
-		Transport:        h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},

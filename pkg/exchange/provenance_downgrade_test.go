@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"
 
@@ -66,7 +67,7 @@ func TestProvenanceDowngrade_EntriesMarkedOnLevelDrop(t *testing.T) {
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		Transport:         h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -158,7 +159,7 @@ func TestProvenanceDowngrade_FlaggedEntryExcludedFromMatchResults(t *testing.T) 
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		Transport:         h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -257,7 +258,7 @@ func TestProvenanceDowngrade_NoFlagWhenLevelUnchanged(t *testing.T) {
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
-		Transport:         h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)

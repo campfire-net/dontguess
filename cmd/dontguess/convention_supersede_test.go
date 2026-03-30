@@ -8,9 +8,11 @@ import (
 	"time"
 
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
+	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/store"
+	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
 
 // ---- helpers ----
@@ -109,6 +111,69 @@ func testMembership(campfireID string, creatorPubkey ...string) *store.Membershi
 	return m
 }
 
+// testCampfireResult holds the result of testSetupCampfire.
+type testCampfireResult struct {
+	CampfireID string
+	Membership *store.Membership
+	Store      store.Store
+}
+
+// testSetupCampfire creates a real campfire with filesystem transport, registers
+// agentID as a member, and returns the campfire ID and membership for use in
+// tests that exercise the full sendSupersede path.
+func testSetupCampfire(t *testing.T, agentID *identity.Identity) *testCampfireResult {
+	t.Helper()
+	transportDir := t.TempDir()
+	dbDir := t.TempDir()
+
+	// Create a new campfire.
+	cf, err := campfire.New("invite-only", nil, 1)
+	if err != nil {
+		t.Fatalf("creating campfire: %v", err)
+	}
+	cfID := cf.PublicKeyHex()
+
+	// Initialize transport for the campfire.
+	tr := fs.New(transportDir)
+	if err := tr.Init(cf); err != nil {
+		t.Fatalf("initializing transport: %v", err)
+	}
+
+	// Register agentID as a member in the transport.
+	if err := tr.WriteMember(cfID, campfire.MemberRecord{
+		PublicKey: agentID.PublicKey,
+		JoinedAt:  time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("writing member: %v", err)
+	}
+
+	// Open store and record membership.
+	s, err := store.Open(filepath.Join(dbDir, "store.db"))
+	if err != nil {
+		t.Fatalf("opening store: %v", err)
+	}
+	t.Cleanup(func() { s.Close() })
+
+	transportCampfireDir := tr.CampfireDir(cfID)
+	m := &store.Membership{
+		CampfireID:   cfID,
+		TransportDir: transportCampfireDir,
+		JoinProtocol: cf.JoinProtocol,
+		Role:         store.PeerRoleCreator,
+		JoinedAt:     store.NowNano(),
+		Threshold:    cf.Threshold,
+	}
+	if err := s.AddMembership(*m); err != nil {
+		t.Fatalf("adding membership: %v", err)
+	}
+
+	return &testCampfireResult{
+		CampfireID: cfID,
+		Membership: m,
+		Store:      s,
+	}
+}
+
 // ---- tests ----
 
 // TestSupersede_PromoteThenSupersede exercises the item spec's core scenario:
@@ -117,14 +182,11 @@ func testMembership(campfireID string, creatorPubkey ...string) *store.Membershi
 //   3. Verify agents see the updated schema — v0.1 gone, v0.2 present.
 func TestSupersede_PromoteThenSupersede(t *testing.T) {
 	agentID := testAgent(t)
-	s := testOpenStore(t)
 
-	// Generate a fake campfire ID.
-	cfID, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generating campfire ID: %v", err)
-	}
-	campfireID := cfID.PublicKeyHex()
+	// Use a real campfire with transport so client.Send can deliver messages.
+	harness := testSetupCampfire(t, agentID)
+	s := harness.Store
+	campfireID := harness.CampfireID
 
 	// ── Stage 1: promote put v0.1 ──────────────────────────────────────────
 
@@ -183,7 +245,7 @@ func TestSupersede_PromoteThenSupersede(t *testing.T) {
 	result, err := performSupersede(
 		v2File, putV2Payload,
 		campfireID, v1MsgID,
-		agentID, s, testMembership(campfireID),
+		agentID, s, harness.Membership,
 		false, // no --force
 	)
 	if err != nil {
@@ -284,9 +346,11 @@ func TestSupersede_BreakingChangeBlocked(t *testing.T) {
 // breaking-change validation.
 func TestSupersede_BreakingChangeAllowedWithForce(t *testing.T) {
 	agentID := testAgent(t)
-	s := testOpenStore(t)
-	cfID, _ := identity.Generate()
-	campfireID := cfID.PublicKeyHex()
+
+	// Use a real campfire with transport so client.Send can deliver messages.
+	harness := testSetupCampfire(t, agentID)
+	s := harness.Store
+	campfireID := harness.CampfireID
 
 	v1Args := []map[string]any{
 		{"name": "description", "type": "string", "required": true},
@@ -310,7 +374,7 @@ func TestSupersede_BreakingChangeAllowedWithForce(t *testing.T) {
 	result, err := performSupersede(
 		v2File, v2Payload,
 		campfireID, v1ID,
-		agentID, s, testMembership(campfireID),
+		agentID, s, harness.Membership,
 		true, // --force
 	)
 	if err != nil {
@@ -417,9 +481,22 @@ func TestSupersede_VersionBumpTooSmall(t *testing.T) {
 func TestSupersede_NonOperatorRejected(t *testing.T) {
 	operatorID := testAgent(t)
 	nonOperatorID := testAgent(t)
-	s := testOpenStore(t)
-	cfID, _ := identity.Generate()
-	campfireID := cfID.PublicKeyHex()
+
+	// Use a real campfire with transport (operator is the creator/member).
+	harness := testSetupCampfire(t, operatorID)
+	s := harness.Store
+	campfireID := harness.CampfireID
+
+	// Set CreatorPubkey so the operator check works correctly.
+	m := &store.Membership{
+		CampfireID:    campfireID,
+		TransportDir:  harness.Membership.TransportDir,
+		JoinProtocol:  harness.Membership.JoinProtocol,
+		Role:          harness.Membership.Role,
+		JoinedAt:      harness.Membership.JoinedAt,
+		Threshold:     harness.Membership.Threshold,
+		CreatorPubkey: operatorID.PublicKeyHex(),
+	}
 
 	// Promote v0.1 as the operator.
 	v1Args := []map[string]any{
@@ -441,10 +518,7 @@ func TestSupersede_NonOperatorRejected(t *testing.T) {
 		t.Fatalf("writing v2 file: %v", err)
 	}
 
-	// Membership records the operator's pubkey as CreatorPubkey.
-	m := testMembership(campfireID, operatorID.PublicKeyHex())
-
-	// Non-operator attempts to supersede — must be rejected.
+	// Non-operator attempts to supersede — must be rejected before reaching send.
 	result, err := performSupersede(
 		v2File, v2Payload,
 		campfireID, v1ID,
@@ -462,7 +536,7 @@ func TestSupersede_NonOperatorRejected(t *testing.T) {
 	}
 	t.Logf("non-operator supersede rejected as expected: %s", result.Error)
 
-	// Operator supersedes successfully with the same membership record.
+	// Operator supersedes successfully using the real campfire harness.
 	result, err = performSupersede(
 		v2File, v2Payload,
 		campfireID, v1ID,
