@@ -11,6 +11,7 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	"github.com/campfire-net/campfire/pkg/protocol"
+	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/spf13/cobra"
 )
@@ -96,13 +97,20 @@ func runServe(_ *cobra.Command, _ []string) error {
 
 	logger := log.New(os.Stderr, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
 
+	provenanceStore := provenance.NewStore(provenance.DefaultConfig())
+	provenanceChecker, err := exchange.NewProvenanceChecker(provenanceStore)
+	if err != nil {
+		return fmt.Errorf("creating provenance checker: %w", err)
+	}
+
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:   cfg.ExchangeCampfireID,
-		Store:        st,
-		ReadClient:   readClient,
-		WriteClient:  writeClient,
-		PollInterval: servePollInterval,
-		ScripStore:   cs,
+		CampfireID:        cfg.ExchangeCampfireID,
+		Store:             st,
+		ReadClient:        readClient,
+		WriteClient:       writeClient,
+		PollInterval:      servePollInterval,
+		ScripStore:        cs,
+		ProvenanceChecker: provenanceChecker,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
