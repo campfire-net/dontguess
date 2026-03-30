@@ -11,11 +11,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/message"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 
 	"github.com/3dl-dev/dontguess/pkg/matching"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
@@ -43,11 +41,15 @@ type EngineOptions struct {
 	// CampfireID is the exchange campfire's public key hex.
 	CampfireID string
 	// OperatorIdentity is the exchange operator's Ed25519 keypair.
+	// Used only for populating State.OperatorKey on startup. Send operations
+	// use WriteClient (which carries its own identity).
 	OperatorIdentity *identity.Identity
 	// Store is the campfire message store (SQLite).
 	Store store.Store
-	// Transport is the filesystem transport for writing response messages.
-	Transport *fs.Transport
+	// WriteClient is the protocol client used to send operator-signed messages
+	// (match, settle, burn). It must carry the operator's identity and have
+	// membership in CampfireID recorded in its backing store.
+	WriteClient *protocol.Client
 	// PollInterval controls how often the engine polls for new messages.
 	// Defaults to 500ms.
 	PollInterval time.Duration
@@ -1272,47 +1274,23 @@ func (e *Engine) computeConfidence(entry *InventoryEntry, _ string) float64 {
 	return float64(rep) / 100.0
 }
 
-// sendOperatorMessage creates, signs, and writes an operator-signed message to
-// the exchange campfire transport. Returns a dontguess *Message (converted from
-// the store record) so callers don't depend on store.MessageRecord.
+// sendOperatorMessage sends an operator-signed message to the exchange campfire
+// via the protocol WriteClient. Returns a dontguess *Message so callers don't
+// depend on store.MessageRecord.
 func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) (*Message, error) {
-	op := e.opts.OperatorIdentity
-	msg, err := message.NewMessage(op.PrivateKey, op.PublicKey, payload, tags, antecedents)
+	if e.opts.WriteClient == nil {
+		return nil, fmt.Errorf("engine: WriteClient not configured — cannot send operator message")
+	}
+	msg, err := e.opts.WriteClient.Send(protocol.SendRequest{
+		CampfireID:  e.opts.CampfireID,
+		Payload:     payload,
+		Tags:        tags,
+		Antecedents: antecedents,
+	})
 	if err != nil {
-		return nil, fmt.Errorf("creating operator message: %w", err)
+		return nil, fmt.Errorf("sending operator message: %w", err)
 	}
-
-	// Add provenance hop from the exchange campfire.
-	state, err := e.opts.Transport.ReadState(e.opts.CampfireID)
-	if err != nil {
-		return nil, fmt.Errorf("reading campfire state for hop: %w", err)
-	}
-	members, err := e.opts.Transport.ListMembers(e.opts.CampfireID)
-	if err != nil {
-		return nil, fmt.Errorf("listing members for hop: %w", err)
-	}
-	cf := state.ToCampfire(members)
-	if err := msg.AddHop(
-		state.PrivateKey, state.PublicKey,
-		cf.MembershipHash(), len(members),
-		state.JoinProtocol, state.ReceptionRequirements,
-		campfire.RoleFull,
-	); err != nil {
-		return nil, fmt.Errorf("adding provenance hop: %w", err)
-	}
-
-	if err := e.opts.Transport.WriteMessage(e.opts.CampfireID, msg); err != nil {
-		return nil, fmt.Errorf("writing operator message: %w", err)
-	}
-
-	// Persist to the store so subsequent polls see it.
-	rec := store.MessageRecordFromMessage(e.opts.CampfireID, msg, store.NowNano())
-	if _, err := e.opts.Store.AddMessage(rec); err != nil {
-		// Non-fatal: the message is already in the transport. Log and continue.
-		e.opts.log("engine: warning: adding message to store: %v", err)
-	}
-
-	return FromStoreRecord(&rec), nil
+	return FromProtocolMessage(msg.ID, e.opts.CampfireID, msg), nil
 }
 
 // AutoAcceptPut sends a settle(put-accept) for a pending put message, accepting

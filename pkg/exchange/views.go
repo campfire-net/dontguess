@@ -5,9 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/campfire-net/campfire/pkg/identity"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
 
 // viewDefinition matches the cf CLI's campfire:view message payload schema.
@@ -67,7 +66,7 @@ func StandardViews() []viewDefinition {
 // EnsureViews idempotently creates the standard named views on the exchange
 // campfire. It checks which views already exist (by scanning campfire:view
 // messages in the store) and creates only missing ones.
-func EnsureViews(campfireID string, agentID *identity.Identity, st store.Store, transport *fs.Transport) (created int, err error) {
+func EnsureViews(campfireID string, client *protocol.Client, st store.Store) (created int, err error) {
 	existing, err := existingViewNames(st, campfireID)
 	if err != nil {
 		return 0, fmt.Errorf("listing existing views: %w", err)
@@ -77,7 +76,7 @@ func EnsureViews(campfireID string, agentID *identity.Identity, st store.Store, 
 		if existing[v.Name] {
 			continue
 		}
-		if err := createView(campfireID, v, agentID, transport); err != nil {
+		if err := createView(campfireID, v, client); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: creating view %q: %v\n", v.Name, err)
 			continue
 		}
@@ -109,19 +108,16 @@ func existingViewNames(st store.Store, campfireID string) (map[string]bool, erro
 	return names, nil
 }
 
-// createView sends a campfire:view message to the transport.
-func createView(campfireID string, def viewDefinition, agentID *identity.Identity, transport *fs.Transport) error {
+// createView sends a campfire:view message via client.Send.
+func createView(campfireID string, def viewDefinition, client *protocol.Client) error {
 	payload, err := json.Marshal(def)
 	if err != nil {
 		return fmt.Errorf("encoding view %q: %w", def.Name, err)
 	}
-
-	// sendViewMessage reuses the same message-creation pattern as
-	// sendConventionMessage but with the campfire:view tag.
-	return sendViewMessage(campfireID, payload, agentID, transport)
+	return sendViewMessage(campfireID, payload, client)
 }
 
-// sendViewMessage creates, signs, and writes a campfire:view message.
-func sendViewMessage(campfireID string, payload []byte, agentID *identity.Identity, transport *fs.Transport) error {
-	return sendTaggedMessage(campfireID, payload, []string{"campfire:view"}, agentID, transport)
+// sendViewMessage sends a campfire:view message via client.Send.
+func sendViewMessage(campfireID string, payload []byte, client *protocol.Client) error {
+	return sendTaggedMessage(campfireID, payload, []string{"campfire:view"}, client)
 }

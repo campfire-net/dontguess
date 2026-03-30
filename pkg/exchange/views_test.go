@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/campfire-net/campfire/pkg/identity"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 
@@ -115,7 +116,11 @@ func TestEnsureViews_Idempotent(t *testing.T) {
 	}
 
 	// Second call should create zero views (all already exist).
-	created, err := exchange.EnsureViews(cfg.ExchangeCampfireID, ident, st, transport)
+	// Use protocol.Client backed by the same store and identity.
+	// The membership record was added by Init, so client.Send can resolve it.
+	_ = transport // transport used above for sync; client handles sends via stored membership
+	writeClient := protocol.New(st, ident)
+	created, err := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
 	if err != nil {
 		t.Fatalf("EnsureViews: %v", err)
 	}

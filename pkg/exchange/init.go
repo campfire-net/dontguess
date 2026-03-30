@@ -15,8 +15,8 @@ import (
 	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/naming"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
@@ -190,15 +190,18 @@ func Init(opts InitOptions) (*Config, error) {
 		return nil, fmt.Errorf("recording exchange membership: %w", err)
 	}
 
+	// Build the write client for sending operator messages (convention declarations, views).
+	writeClient := protocol.New(s, operatorID)
+
 	// Promote convention declarations.
-	if err := promoteDeclarations(opts.ConventionDir, exchangeCF.PublicKeyHex(), operatorID, transport); err != nil {
+	if err := promoteDeclarations(opts.ConventionDir, exchangeCF.PublicKeyHex(), writeClient); err != nil {
 		// Non-fatal: log but don't fail init — operator can re-promote later.
 		fmt.Fprintf(os.Stderr, "warning: promoting convention declarations: %v\n", err)
 	}
 
 	// Create standard named views for convention read operations.
 	// On a fresh init the store has no synced messages, so all views are created.
-	viewsCreated, err := EnsureViews(exchangeCF.PublicKeyHex(), operatorID, s, transport)
+	viewsCreated, err := EnsureViews(exchangeCF.PublicKeyHex(), writeClient, s)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "warning: creating named views: %v\n", err)
 	} else if viewsCreated > 0 {
@@ -259,7 +262,7 @@ type declCandidate struct {
 
 // promoteDeclarations reads all .json files from conventionDir (searching
 // exchange-core/ and exchange-scrip/ sub-directories), lints each, and posts
-// them as convention:operation messages to the exchange campfire transport.
+// them as convention:operation messages to the exchange campfire via client.Send.
 // If conventionDir is empty, the embedded declarations are used via the
 // DefaultConventionDir discovery.
 //
@@ -268,7 +271,7 @@ type declCandidate struct {
 // Promoting an older version alongside a newer one would create ambiguous
 // registry state without a supersedes chain, so the older files are silently
 // skipped.
-func promoteDeclarations(conventionDir, campfireID string, agentID *identity.Identity, transport *fs.Transport) error {
+func promoteDeclarations(conventionDir, campfireID string, client *protocol.Client) error {
 	dirs := declarationDirs(conventionDir)
 	if len(dirs) == 0 {
 		return fmt.Errorf("no convention declaration directories found (set ConventionDir)")
@@ -328,7 +331,7 @@ func promoteDeclarations(conventionDir, campfireID string, agentID *identity.Ide
 	// Promote the winning declaration for each operation.
 	var promoted int
 	for _, cand := range winners {
-		if err := sendConventionMessage(campfireID, cand.payload, agentID, transport); err != nil {
+		if err := sendConventionMessage(campfireID, cand.payload, client); err != nil {
 			fmt.Fprintf(os.Stderr, "warning: promoting %s: %v\n", cand.name, err)
 			skipped++
 			continue
@@ -425,45 +428,21 @@ func declarationDirs(conventionDir string) []string {
 	return dirs
 }
 
-// sendConventionMessage creates, signs, and writes a convention:operation
-// message to the exchange campfire transport.
-func sendConventionMessage(campfireID string, payload []byte, agentID *identity.Identity, transport *fs.Transport) error {
-	return sendTaggedMessage(campfireID, payload, []string{convention.ConventionOperationTag}, agentID, transport)
+// sendConventionMessage sends a convention:operation message to the exchange
+// campfire via client.Send.
+func sendConventionMessage(campfireID string, payload []byte, client *protocol.Client) error {
+	return sendTaggedMessage(campfireID, payload, []string{convention.ConventionOperationTag}, client)
 }
 
-// sendTaggedMessage creates, signs, and writes a message with the given tags
-// to the exchange campfire transport. Used by both convention declarations and
-// view creation.
-func sendTaggedMessage(campfireID string, payload []byte, tags []string, agentID *identity.Identity, transport *fs.Transport) error {
-	msg, err := message.NewMessage(agentID.PrivateKey, agentID.PublicKey, payload, tags, nil)
-	if err != nil {
-		return fmt.Errorf("creating message: %w", err)
-	}
-
-	// Read campfire state and members for provenance hop.
-	state, err := transport.ReadState(campfireID)
-	if err != nil {
-		return fmt.Errorf("reading campfire state: %w", err)
-	}
-	members, err := transport.ListMembers(campfireID)
-	if err != nil {
-		return fmt.Errorf("listing members: %w", err)
-	}
-
-	cf := state.ToCampfire(members)
-	if err := msg.AddHop(
-		state.PrivateKey, state.PublicKey,
-		cf.MembershipHash(), len(members),
-		state.JoinProtocol, state.ReceptionRequirements,
-		campfire.RoleFull,
-	); err != nil {
-		return fmt.Errorf("adding provenance hop: %w", err)
-	}
-
-	if err := transport.WriteMessage(campfireID, msg); err != nil {
-		return fmt.Errorf("writing message: %w", err)
-	}
-	return nil
+// sendTaggedMessage sends a message with the given tags to the exchange campfire
+// via client.Send. Used by both convention declarations and view creation.
+func sendTaggedMessage(campfireID string, payload []byte, tags []string, client *protocol.Client) error {
+	_, err := client.Send(protocol.SendRequest{
+		CampfireID: campfireID,
+		Payload:    payload,
+		Tags:       tags,
+	})
+	return err
 }
 
 // writeConfig serializes cfg to configPath (mode 0600).

@@ -10,6 +10,7 @@ import (
 	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/message"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 
@@ -142,7 +143,7 @@ func (h *testHarness) newEngine() *exchange.Engine {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
-		Transport:        h.transport,
+		WriteClient:      protocol.New(h.st, h.operator),
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
 		},
