@@ -19,7 +19,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -63,10 +62,9 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -158,7 +156,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 
 	// Verify CampfireScripStore can materialize the hold: after a full Replay,
 	// a fresh store should show the buyer's balance as reduced by holdAmount.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}
@@ -180,10 +178,9 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
@@ -325,7 +322,7 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	}
 
 	// Verify CampfireScripStore replays correctly: seller gets residual, operator gets revenue.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}

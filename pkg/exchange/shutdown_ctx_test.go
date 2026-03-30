@@ -21,7 +21,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -101,10 +100,9 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       bs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
@@ -236,10 +234,9 @@ func TestEngine_HandlerCtxIsBackground_BeforeStart(t *testing.T) {
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
-		OperatorIdentity: h.operator,
 		Store:            h.st,
-		ReadClient:  protocol.New(h.st, h.operator),
-		WriteClient:      protocol.New(h.st, h.operator),
+		ReadClient:  h.newOperatorClient(),
+		WriteClient:      h.newOperatorClient(),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)

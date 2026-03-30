@@ -6,9 +6,6 @@
 package proto
 
 import (
-	"encoding/hex"
-
-	cfmessage "github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 )
@@ -90,21 +87,3 @@ func FromSDKMessages(ms []protocol.Message) []Message {
 	return msgs
 }
 
-// FromProtocolMessage converts a campfire message.Message to a dontguess
-// Message. Reserved for Wave 1-2 when the engine transitions to protocol-level
-// ingestion. Not called in Wave 0.
-func FromProtocolMessage(id, campfireID string, m *cfmessage.Message) *Message {
-	if m == nil {
-		return nil
-	}
-	return &Message{
-		ID:          id,
-		CampfireID:  campfireID,
-		Sender:      hex.EncodeToString(m.Sender),
-		Payload:     m.Payload,
-		Tags:        m.Tags,
-		Antecedents: m.Antecedents,
-		Timestamp:   m.Timestamp,
-		Instance:    m.Instance,
-	}
-}

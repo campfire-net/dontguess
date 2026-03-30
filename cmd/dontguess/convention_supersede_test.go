@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,12 +10,8 @@ import (
 	"time"
 
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
-	"github.com/campfire-net/campfire/pkg/campfire"
-	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/pkg/message"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 )
 
 // ---- helpers ----
@@ -71,7 +69,10 @@ func testWriteDeclToStore(t *testing.T, client *protocol.Client, campfireID stri
 // testAddDeclToStore writes a convention declaration directly to the store,
 // bypassing the transport. Use for early-exit tests where no campfire transport
 // is set up and send never reaches the wire.
-func testAddDeclToStore(t *testing.T, s store.Store, agentID *identity.Identity, campfireID string, payload []byte, supersedes string) string {
+//
+// The engine and convention code do not verify signatures, so we insert with
+// an empty signature and a random message ID (same format as real messages).
+func testAddDeclToStore(t *testing.T, s store.Store, senderPubKeyHex string, campfireID string, payload []byte, supersedes string) string {
 	t.Helper()
 	var raw map[string]json.RawMessage
 	if err := json.Unmarshal(payload, &raw); err != nil {
@@ -85,23 +86,27 @@ func testAddDeclToStore(t *testing.T, s store.Store, agentID *identity.Identity,
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	msg, err := message.NewMessage(agentID.PrivateKey, agentID.PublicKey, finalPayload, []string{cfconvention.ConventionOperationTag}, nil)
-	if err != nil {
-		t.Fatalf("creating message: %v", err)
+
+	idBytes := make([]byte, 32)
+	if _, err := rand.Read(idBytes); err != nil {
+		t.Fatalf("generating message ID: %v", err)
 	}
+	msgID := hex.EncodeToString(idBytes)
+
 	rec := store.MessageRecord{
-		ID:         msg.ID,
-		CampfireID: campfireID,
-		Sender:     msg.SenderHex(),
-		Payload:    msg.Payload,
-		Tags:       msg.Tags,
-		Timestamp:  msg.Timestamp,
-		Signature:  msg.Signature,
+		ID:          msgID,
+		CampfireID:  campfireID,
+		Sender:      senderPubKeyHex,
+		Payload:     finalPayload,
+		Tags:        []string{cfconvention.ConventionOperationTag},
+		Antecedents: []string{},
+		Timestamp:   store.NowNano(),
+		Signature:   []byte{}, // non-nil required for NOT NULL BLOB constraint
 	}
 	if _, err := s.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage: %v", err)
 	}
-	return msg.ID
+	return msgID
 }
 
 // testOpenStore opens a test store in a temp directory.
@@ -115,19 +120,41 @@ func testOpenStore(t *testing.T) store.Store {
 	return s
 }
 
-// testAgent generates a test identity.
-func testAgent(t *testing.T) *identity.Identity {
-	t.Helper()
-	id, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generate identity: %v", err)
-	}
-	return id
+// testAgentResult holds the result of testAgent.
+type testAgentResult struct {
+	Client *protocol.Client
+	CfHome string // config dir — store is at CfHome/store.db
 }
 
-// testClientFrom creates a *protocol.Client wrapping the given store and identity.
-func testClientFrom(s store.Store, agentID *identity.Identity) *protocol.Client {
-	return protocol.New(s, agentID)
+// testAgent creates a new protocol.Client with its own identity and store in a temp dir.
+// Returns the client and its config directory. The client is closed on test cleanup.
+func testAgent(t *testing.T) *testAgentResult {
+	t.Helper()
+	cfHome := t.TempDir()
+	client, err := protocol.Init(cfHome)
+	if err != nil {
+		t.Fatalf("protocol.Init for test agent: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return &testAgentResult{Client: client, CfHome: cfHome}
+}
+
+// testRandomCampfireID returns a random 32-byte hex string for use as a fake campfire ID
+// in tests that do not need a real campfire transport.
+func testRandomCampfireID(t *testing.T) string {
+	t.Helper()
+	b := make([]byte, 32)
+	if _, err := rand.Read(b); err != nil {
+		t.Fatalf("generating campfire ID: %v", err)
+	}
+	return hex.EncodeToString(b)
+}
+
+// testClientFrom creates a *protocol.Client wrapping the given store.
+// Creates a read-only client (nil identity) — used for early-exit tests that
+// check operator validation before reaching the send path.
+func testClientFrom(s store.Store, _ *testAgentResult) *protocol.Client {
+	return protocol.New(s, nil)
 }
 
 // testMembership returns a minimal Membership for use with performSupersede
@@ -156,62 +183,50 @@ type testCampfireResult struct {
 	Store      store.Store
 }
 
-// testSetupCampfire creates a real campfire with filesystem transport, registers
-// agentID as a member, and returns a testCampfireResult with the campfire ID,
-// membership, protocol.Client (backed by the real store), and the store itself
-// (for listOperationsForRegistry, which still takes StoreReader).
-func testSetupCampfire(t *testing.T, agentID *identity.Identity) *testCampfireResult {
+// testSetupCampfire creates a real campfire with filesystem transport using the
+// protocol SDK. The agent is the campfire creator. Returns a testCampfireResult
+// with the campfire ID, membership, protocol.Client, and the store.
+//
+// The Store field is a second connection to the same SQLite file as the agent's
+// client, so that messages sent via client.Send are visible via Store.ListMessages.
+func testSetupCampfire(t *testing.T, agent *testAgentResult) *testCampfireResult {
 	t.Helper()
 	transportDir := t.TempDir()
-	dbDir := t.TempDir()
+	agentClient := agent.Client
 
-	// Create a new campfire.
-	cf, err := campfire.New("invite-only", nil, 1)
+	// Create a new campfire via the SDK.
+	createResult, err := agentClient.Create(protocol.CreateRequest{
+		Transport: protocol.FilesystemTransport{
+			Dir: transportDir,
+		},
+		Description:  "test campfire",
+		JoinProtocol: "open",
+		Threshold:    1,
+	})
 	if err != nil {
 		t.Fatalf("creating campfire: %v", err)
 	}
-	cfID := cf.PublicKeyHex()
+	cfID := createResult.CampfireID
 
-	// Initialize transport for the campfire.
-	tr := fs.New(transportDir)
-	if err := tr.Init(cf); err != nil {
-		t.Fatalf("initializing transport: %v", err)
+	// Get the membership that was created by Create.
+	mem, err := agentClient.GetMembership(cfID)
+	if err != nil || mem == nil {
+		t.Fatalf("getting membership after create: %v (mem=%v)", err, mem)
 	}
 
-	// Register agentID as a member in the transport.
-	if err := tr.WriteMember(cfID, campfire.MemberRecord{
-		PublicKey: agentID.PublicKey,
-		JoinedAt:  time.Now().UnixNano(),
-	}); err != nil {
-		t.Fatalf("writing member: %v", err)
-	}
-
-	// Open store and record membership.
-	s, err := store.Open(filepath.Join(dbDir, "store.db"))
+	// Open a second connection to the same SQLite file used by agentClient.
+	// SQLite allows multiple readers; messages written by agentClient.Send
+	// are immediately visible to this connection.
+	s, err := store.Open(store.StorePath(agent.CfHome))
 	if err != nil {
-		t.Fatalf("opening store: %v", err)
+		t.Fatalf("opening agent store: %v", err)
 	}
 	t.Cleanup(func() { s.Close() })
 
-	transportCampfireDir := tr.CampfireDir(cfID)
-	m := &store.Membership{
-		CampfireID:   cfID,
-		TransportDir: transportCampfireDir,
-		JoinProtocol: cf.JoinProtocol,
-		Role:         store.PeerRoleCreator,
-		JoinedAt:     store.NowNano(),
-		Threshold:    cf.Threshold,
-	}
-	if err := s.AddMembership(*m); err != nil {
-		t.Fatalf("adding membership: %v", err)
-	}
-
-	client := protocol.New(s, agentID)
-
 	return &testCampfireResult{
 		CampfireID: cfID,
-		Membership: m,
-		Client:     client,
+		Membership: mem,
+		Client:     agentClient,
 		Store:      s,
 	}
 }
@@ -223,10 +238,10 @@ func testSetupCampfire(t *testing.T, agentID *identity.Identity) *testCampfireRe
 //  2. Supersede with put v0.2 (adds optional `priority` arg).
 //  3. Verify agents see the updated schema — v0.1 gone, v0.2 present.
 func TestSupersede_PromoteThenSupersede(t *testing.T) {
-	agentID := testAgent(t)
+	agent := testAgent(t)
 
 	// Use a real campfire with transport so client.Send can deliver messages.
-	harness := testSetupCampfire(t, agentID)
+	harness := testSetupCampfire(t, agent)
 	client := harness.Client
 	campfireID := harness.CampfireID
 
@@ -343,12 +358,12 @@ func TestSupersede_PromoteThenSupersede(t *testing.T) {
 // TestSupersede_BreakingChangeBlocked verifies that breaking changes are blocked
 // without --force.
 func TestSupersede_BreakingChangeBlocked(t *testing.T) {
-	agentID := testAgent(t)
+	agent := testAgent(t)
 	s := testOpenStore(t)
-	client := testClientFrom(s, agentID)
+	client := testClientFrom(s, agent)
+	senderKey := agent.Client.PublicKeyHex()
 
-	cfID, _ := identity.Generate()
-	campfireID := cfID.PublicKeyHex()
+	campfireID := testRandomCampfireID(t)
 
 	// Write v0.1 directly to store — test exits before reaching sendSupersede,
 	// so no transport is needed.
@@ -357,7 +372,7 @@ func TestSupersede_BreakingChangeBlocked(t *testing.T) {
 		{"name": "domain", "type": "string", "description": "domain tag"},
 	}
 	v1Payload := testBuildDecl("dontguess-exchange", "put", "0.1", v1Args)
-	v1ID := testAddDeclToStore(t, s, agentID, campfireID, v1Payload, "")
+	v1ID := testAddDeclToStore(t, s, senderKey, campfireID, v1Payload, "")
 
 	// v2 removes the domain arg — breaking change.
 	v2Args := []map[string]any{
@@ -390,10 +405,10 @@ func TestSupersede_BreakingChangeBlocked(t *testing.T) {
 // TestSupersede_BreakingChangeAllowedWithForce verifies that --force bypasses
 // breaking-change validation.
 func TestSupersede_BreakingChangeAllowedWithForce(t *testing.T) {
-	agentID := testAgent(t)
+	agent := testAgent(t)
 
 	// Use a real campfire with transport so client.Send can deliver messages.
-	harness := testSetupCampfire(t, agentID)
+	harness := testSetupCampfire(t, agent)
 	client := harness.Client
 	campfireID := harness.CampfireID
 
@@ -448,15 +463,15 @@ func TestSupersede_BreakingChangeAllowedWithForce(t *testing.T) {
 
 // TestSupersede_LintFailure verifies that a malformed new declaration is rejected.
 func TestSupersede_LintFailure(t *testing.T) {
-	agentID := testAgent(t)
+	agent := testAgent(t)
 	s := testOpenStore(t)
-	client := testClientFrom(s, agentID)
+	client := testClientFrom(s, agent)
+	senderKey := agent.Client.PublicKeyHex()
 
-	cfID, _ := identity.Generate()
-	campfireID := cfID.PublicKeyHex()
+	campfireID := testRandomCampfireID(t)
 
 	v1Payload := testBuildDecl("dontguess-exchange", "put", "0.1", nil)
-	v1ID := testAddDeclToStore(t, s, agentID, campfireID, v1Payload, "")
+	v1ID := testAddDeclToStore(t, s, senderKey, campfireID, v1Payload, "")
 
 	// Malformed JSON.
 	invalidPayload := []byte(`{not json}`)
@@ -484,18 +499,18 @@ func TestSupersede_LintFailure(t *testing.T) {
 // TestSupersede_VersionBumpTooSmall verifies that adding an optional arg with
 // only a patch bump is rejected.
 func TestSupersede_VersionBumpTooSmall(t *testing.T) {
-	agentID := testAgent(t)
+	agent := testAgent(t)
 	s := testOpenStore(t)
-	client := testClientFrom(s, agentID)
+	client := testClientFrom(s, agent)
+	senderKey := agent.Client.PublicKeyHex()
 
-	cfID, _ := identity.Generate()
-	campfireID := cfID.PublicKeyHex()
+	campfireID := testRandomCampfireID(t)
 
 	v1Args := []map[string]any{
 		{"name": "description", "type": "string", "required": true},
 	}
 	v1Payload := testBuildDecl("dontguess-exchange", "put", "0.1.0", v1Args)
-	v1ID := testAddDeclToStore(t, s, agentID, campfireID, v1Payload, "")
+	v1ID := testAddDeclToStore(t, s, senderKey, campfireID, v1Payload, "")
 
 	// v2 adds optional arg but only bumps patch — wrong.
 	v2Args := []map[string]any{
@@ -528,15 +543,12 @@ func TestSupersede_VersionBumpTooSmall(t *testing.T) {
 // TestSupersede_NonOperatorRejected verifies that a non-operator campfire member
 // cannot supersede a convention. Only the campfire creator (operator) is allowed.
 func TestSupersede_NonOperatorRejected(t *testing.T) {
-	operatorID := testAgent(t)
-	nonOperatorID := testAgent(t)
+	operatorAgent := testAgent(t)
+	_ = testAgent(t) // nonOperatorAgent — not needed; nil-identity client simulates non-operator
 
 	// Use a real campfire with transport (operator is the creator/member).
-	harness := testSetupCampfire(t, operatorID)
+	harness := testSetupCampfire(t, operatorAgent)
 	campfireID := harness.CampfireID
-
-	// Build a non-operator client backed by the same store.
-	nonOperatorClient := protocol.New(harness.Store, nonOperatorID)
 
 	// Set CreatorPubkey so the operator check works correctly.
 	m := &store.Membership{
@@ -546,7 +558,7 @@ func TestSupersede_NonOperatorRejected(t *testing.T) {
 		Role:          harness.Membership.Role,
 		JoinedAt:      harness.Membership.JoinedAt,
 		Threshold:     harness.Membership.Threshold,
-		CreatorPubkey: operatorID.PublicKeyHex(),
+		CreatorPubkey: operatorAgent.Client.PublicKeyHex(),
 	}
 
 	// Promote v0.1 as the operator.
@@ -570,10 +582,12 @@ func TestSupersede_NonOperatorRejected(t *testing.T) {
 	}
 
 	// Non-operator attempts to supersede — must be rejected before reaching send.
+	// Use a client with empty PublicKeyHex (nil identity) which won't match CreatorPubkey.
+	nonOpReadClient := protocol.New(harness.Store, nil)
 	result, err := performSupersede(
 		v2File, v2Payload,
 		campfireID, v1ID,
-		nonOperatorClient, m, // caller is nonOperatorClient, not operator
+		nonOpReadClient, m, // caller has empty pubkey → not operator
 		false,
 	)
 	if err != nil {
@@ -591,7 +605,7 @@ func TestSupersede_NonOperatorRejected(t *testing.T) {
 	result, err = performSupersede(
 		v2File, v2Payload,
 		campfireID, v1ID,
-		harness.Client, m, // caller is operatorID via harness.Client
+		harness.Client, m, // caller is operatorClient via harness.Client
 		false,
 	)
 	if err != nil {
