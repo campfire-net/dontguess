@@ -35,15 +35,16 @@ func newTestHarness(t *testing.T) *testHarness {
 	convDir := conventionDir(t)
 
 	// Create exchange via Init to get a properly bootstrapped campfire.
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        t.TempDir(),
-		ConventionDir:    convDir,
+	cfg, initClient, err := exchange.Init(exchange.InitOptions{
+		ConfigDir:     cfHome,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     t.TempDir(),
+		ConventionDir: convDir,
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)
 	}
+	t.Cleanup(func() { initClient.Close() })
 
 	// Re-load the operator identity that Init created.
 	operatorID, err := identity.Load(cfHome + "/identity.json")

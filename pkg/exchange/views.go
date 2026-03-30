@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"github.com/campfire-net/campfire/pkg/protocol"
-	"github.com/campfire-net/campfire/pkg/store"
 )
 
 // viewDefinition matches the cf CLI's campfire:view message payload schema.
@@ -64,10 +63,10 @@ func StandardViews() []viewDefinition {
 }
 
 // EnsureViews idempotently creates the standard named views on the exchange
-// campfire. It checks which views already exist (by scanning campfire:view
-// messages in the store) and creates only missing ones.
-func EnsureViews(campfireID string, client *protocol.Client, st store.Store) (created int, err error) {
-	existing, err := existingViewNames(st, campfireID)
+// campfire. It checks which views already exist (by reading campfire:view
+// messages via the client) and creates only missing ones.
+func EnsureViews(campfireID string, client *protocol.Client) (created int, err error) {
+	existing, err := existingViewNames(client, campfireID)
 	if err != nil {
 		return 0, fmt.Errorf("listing existing views: %w", err)
 	}
@@ -86,19 +85,19 @@ func EnsureViews(campfireID string, client *protocol.Client, st store.Store) (cr
 }
 
 // existingViewNames returns the set of view names already defined on the
-// campfire by scanning campfire:view tagged messages in the store.
-func existingViewNames(st store.Store, campfireID string) (map[string]bool, error) {
-	storeRecs, err := st.ListMessages(campfireID, 0, store.MessageFilter{Tags: []string{"campfire:view"}})
+// campfire by reading campfire:view tagged messages via the client.
+func existingViewNames(client *protocol.Client, campfireID string) (map[string]bool, error) {
+	result, err := client.Read(protocol.ReadRequest{
+		CampfireID: campfireID,
+		Tags:       []string{"campfire:view"},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// Convert at the cf boundary to dontguess-owned Message type.
-	msgs := FromStoreRecords(storeRecs)
-
 	// Latest definition per name wins (later messages override earlier).
 	names := make(map[string]bool)
-	for _, m := range msgs {
+	for _, m := range result.Messages {
 		var def viewDefinition
 		if err := json.Unmarshal(m.Payload, &def); err != nil {
 			continue

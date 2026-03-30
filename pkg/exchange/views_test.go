@@ -2,20 +2,12 @@ package exchange_test
 
 import (
 	"encoding/json"
-	"path/filepath"
 	"testing"
 
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/protocol"
-	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 )
-
-func loadIdentity(cfHome string) (*identity.Identity, error) {
-	return identity.Load(filepath.Join(cfHome, "identity.json"))
-}
 
 func TestInit_CreatesNamedViews(t *testing.T) {
 	t.Parallel()
@@ -25,35 +17,31 @@ func TestInit_CreatesNamedViews(t *testing.T) {
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     cfHome,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	// Use protocol.Init to read messages via SDK.
+	verifyClient, err := protocol.Init(cfHome)
+	if err != nil {
+		t.Fatalf("protocol.Init for verify: %v", err)
+	}
+	defer verifyClient.Close()
+
+	readResult, err := verifyClient.Read(protocol.ReadRequest{
+		CampfireID: cfg.ExchangeCampfireID,
+		Tags:       []string{"campfire:view"},
 	})
 	if err != nil {
-		t.Fatalf("Init: %v", err)
+		t.Fatalf("Read view messages: %v", err)
 	}
-
-	// Read all messages from transport, filter for campfire:view.
-	transport := fs.New(transportDir)
-	msgs, err := transport.ListMessages(cfg.ExchangeCampfireID)
-	if err != nil {
-		t.Fatalf("ListMessages: %v", err)
-	}
+	msgs := readResult.Messages
 
 	viewNames := make(map[string]bool)
 	for _, msg := range msgs {
-		hasViewTag := false
-		for _, tag := range msg.Tags {
-			if tag == "campfire:view" {
-				hasViewTag = true
-				break
-			}
-		}
-		if !hasViewTag {
-			continue
-		}
 		var def struct {
 			Name      string `json:"name"`
 			Predicate string `json:"predicate"`
@@ -82,45 +70,22 @@ func TestEnsureViews_Idempotent(t *testing.T) {
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     cfHome,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
 
-	// Sync transport into store so EnsureViews can see existing views.
-	st, err := store.Open(store.StorePath(cfHome))
+	// Use protocol.Init to get a client; EnsureViews reads via client.Read.
+	client, err := protocol.Init(cfHome)
 	if err != nil {
-		t.Fatalf("opening store: %v", err)
+		t.Fatalf("protocol.Init: %v", err)
 	}
-	defer st.Close()
+	defer client.Close()
 
-	transport := fs.New(transportDir)
-	msgs, err := transport.ListMessages(cfg.ExchangeCampfireID)
-	if err != nil {
-		t.Fatalf("listing transport messages: %v", err)
-	}
-	for i := range msgs {
-		rec := store.MessageRecordFromMessage(cfg.ExchangeCampfireID, &msgs[i], store.NowNano())
-		st.AddMessage(rec) //nolint:errcheck
-	}
-
-	// Load operator identity for the second EnsureViews call.
-	ident, err := loadIdentity(cfHome)
-	if err != nil {
-		t.Fatalf("loading identity: %v", err)
-	}
-
-	// Second call should create zero views (all already exist).
-	// Use protocol.Client backed by the same store and identity.
-	// The membership record was added by Init, so client.Send can resolve it.
-	_ = transport // transport used above for sync; client handles sends via stored membership
-	writeClient := protocol.New(st, ident)
-	created, err := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
+	// Second call should create zero views (all already exist from Init).
+	created, err := exchange.EnsureViews(cfg.ExchangeCampfireID, client)
 	if err != nil {
 		t.Fatalf("EnsureViews: %v", err)
 	}

@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
@@ -60,11 +61,21 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("load config (did you run 'dontguess init'?): %w", err)
 	}
 
-	ident, err := identity.Load(cfHome + "/identity.json")
+	// Use protocol.Init to load identity and open the store via the SDK.
+	client, err := protocol.Init(cfHome)
+	if err != nil {
+		return fmt.Errorf("protocol.Init: %w", err)
+	}
+	defer client.Close()
+
+	// Load operator identity for engine components that still require *identity.Identity.
+	ident, err := identity.Load(filepath.Join(cfHome, "identity.json"))
 	if err != nil {
 		return fmt.Errorf("loading operator identity: %w", err)
 	}
 
+	// Open a shared store for components that require store.Store directly
+	// (CampfireScripStore, transport sync). Uses the same path as protocol.Init.
 	dbPath := store.StorePath(cfHome)
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -79,11 +90,8 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("initial transport sync: %w", err)
 	}
 
-	// Build write client for operator sends (view creation, match/settle responses).
-	writeClient := protocol.New(st, ident)
-
 	// Ensure standard named views exist (idempotent — skips existing).
-	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
+	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, client)
 	if viewErr != nil {
 		log.Printf("[exchange] warning: ensuring named views: %v", viewErr)
 	} else if viewsCreated > 0 {
@@ -101,7 +109,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 		CampfireID:       cfg.ExchangeCampfireID,
 		OperatorIdentity: ident,
 		Store:            st,
-		WriteClient:      writeClient,
+		WriteClient:      client,
 		PollInterval:     servePollInterval,
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
