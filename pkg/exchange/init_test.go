@@ -7,10 +7,10 @@ import (
 	"testing"
 
 	"github.com/campfire-net/campfire/pkg/beacon"
+	"github.com/campfire-net/campfire/pkg/campfire"
 	"github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/naming"
-	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
+	"github.com/campfire-net/campfire/pkg/protocol"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 )
@@ -38,26 +38,34 @@ func conventionDir(t *testing.T) string {
 	return ""
 }
 
+// initExchange calls exchange.Init with temp dirs, closes the client, and returns the config.
+func initExchange(t *testing.T, opts exchange.InitOptions) *exchange.Config {
+	t.Helper()
+	cfg, client, err := exchange.Init(opts)
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(func() { client.Close() })
+	return cfg
+}
+
 func TestInit_CreatesExchangeCampfire(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
 	opts := exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
-		Alias:            "exchange.dontguess",
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		Alias:         "exchange.dontguess",
 	}
 
-	cfg, err := exchange.Init(opts)
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
+	cfg := initExchange(t, opts)
 
 	// Config must have a non-empty campfire ID (64 hex chars).
 	if len(cfg.ExchangeCampfireID) != 64 {
@@ -74,7 +82,7 @@ func TestInit_CreatesExchangeCampfire(t *testing.T) {
 	}
 
 	// Config file must exist on disk and match returned struct.
-	configPath := exchange.ConfigPath(cfHome)
+	configPath := exchange.ConfigPath(configDir)
 	data, err := os.ReadFile(configPath)
 	if err != nil {
 		t.Fatalf("reading config: %v", err)
@@ -91,23 +99,20 @@ func TestInit_CreatesExchangeCampfire(t *testing.T) {
 func TestInit_TransportDirectoryCreated(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
 
-	transport := fs.New(transportDir)
-	campfireDir := transport.CampfireDir(cfg.ExchangeCampfireID)
+	// client.Create stores transport at {transportDir}/{campfireID}/.
+	campfireDir := filepath.Join(transportDir, cfg.ExchangeCampfireID)
 
 	// campfire.cbor must exist.
 	if _, err := os.Stat(filepath.Join(campfireDir, "campfire.cbor")); os.IsNotExist(err) {
@@ -126,48 +131,40 @@ func TestInit_TransportDirectoryCreated(t *testing.T) {
 func TestInit_ConventionDeclarationsPromoted(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	// Use protocol.Init to open a second client and read messages via SDK.
+	verifyClient, err := protocol.Init(configDir)
+	if err != nil {
+		t.Fatalf("protocol.Init for verify: %v", err)
+	}
+	defer verifyClient.Close()
+
+	result, err := verifyClient.Read(protocol.ReadRequest{
+		CampfireID: cfg.ExchangeCampfireID,
+		Tags:       []string{convention.ConventionOperationTag},
 	})
 	if err != nil {
-		t.Fatalf("Init: %v", err)
+		t.Fatalf("Read convention messages: %v", err)
 	}
 
-	transport := fs.New(transportDir)
-	msgs, err := transport.ListMessages(cfg.ExchangeCampfireID)
-	if err != nil {
-		t.Fatalf("ListMessages: %v", err)
-	}
-
-	// Every message must carry convention:operation tag and parse cleanly.
+	msgs := result.Messages
 	if len(msgs) == 0 {
-		t.Fatal("no convention messages found in transport")
+		t.Fatal("no convention messages found")
 	}
 
 	opNames := make(map[string]bool)
 	for _, msg := range msgs {
-		hasTag := false
-		for _, tag := range msg.Tags {
-			if tag == convention.ConventionOperationTag {
-				hasTag = true
-				break
-			}
-			// Skip non-convention messages (e.g. campfire:view).
-			if tag == "campfire:view" {
-				break
-			}
-		}
-		if !hasTag {
-			continue // non-convention message (view, etc.)
-		}
 		decl, _, err := convention.Parse(msg.Tags, msg.Payload, "", "")
 		if err != nil {
 			t.Errorf("parsing declaration in msg %s: %v", msg.ID, err)
@@ -197,31 +194,36 @@ func TestInit_ConventionDeclarationsPromoted(t *testing.T) {
 func TestInit_PutNotDoublePromoted(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	verifyClient, err := protocol.Init(configDir)
+	if err != nil {
+		t.Fatalf("protocol.Init for verify: %v", err)
+	}
+	defer verifyClient.Close()
+
+	result, err := verifyClient.Read(protocol.ReadRequest{
+		CampfireID: cfg.ExchangeCampfireID,
+		Tags:       []string{convention.ConventionOperationTag},
 	})
 	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
-
-	tr := fs.New(transportDir)
-	msgs, err := tr.ListMessages(cfg.ExchangeCampfireID)
-	if err != nil {
-		t.Fatalf("ListMessages: %v", err)
+		t.Fatalf("Read convention messages: %v", err)
 	}
 
 	// Count how many promoted messages declare operation == "put".
 	var putCount int
 	var putVersion string
-	for _, msg := range msgs {
+	for _, msg := range result.Messages {
 		decl, _, parseErr := convention.Parse(msg.Tags, msg.Payload, "", "")
 		if parseErr != nil {
 			continue
@@ -244,24 +246,21 @@ func TestInit_PutNotDoublePromoted(t *testing.T) {
 func TestInit_NamingAliasRegistered(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 	alias := "home.exchange.dontguess"
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
-		Alias:            alias,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		Alias:         alias,
 	})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
 
-	aliases := naming.NewAliasStore(cfHome)
+	aliases := naming.NewAliasStore(configDir)
 	resolved, err := aliases.Get(alias)
 	if err != nil {
 		t.Fatalf("alias lookup: %v", err)
@@ -274,20 +273,17 @@ func TestInit_NamingAliasRegistered(t *testing.T) {
 func TestInit_BeaconPublished(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
 
 	beacons, err := beacon.Scan(beaconDir)
 	if err != nil {
@@ -315,63 +311,64 @@ func TestInit_BeaconPublished(t *testing.T) {
 func TestInit_MembershipRecorded(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
-	cfg, err := exchange.Init(exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	})
-	if err != nil {
-		t.Fatalf("Init: %v", err)
-	}
 
-	s, err := store.Open(store.StorePath(cfHome))
+	// Use protocol.Init to verify membership via the SDK.
+	verifyClient, err := protocol.Init(configDir)
 	if err != nil {
-		t.Fatalf("opening store: %v", err)
+		t.Fatalf("protocol.Init for verify: %v", err)
 	}
-	defer s.Close()
+	defer verifyClient.Close()
 
-	m, err := s.GetMembership(cfg.ExchangeCampfireID)
+	m, err := verifyClient.GetMembership(cfg.ExchangeCampfireID)
 	if err != nil {
 		t.Fatalf("GetMembership: %v", err)
 	}
 	if m == nil {
 		t.Fatal("no membership record for exchange campfire")
 	}
-	if m.Role != store.PeerRoleCreator {
-		t.Errorf("role = %q, want %q", m.Role, store.PeerRoleCreator)
+	// client.Create sets role to campfire.RoleFull ("full") for the creator.
+	if m.Role != campfire.RoleFull {
+		t.Errorf("role = %q, want %q", m.Role, campfire.RoleFull)
 	}
 }
 
 func TestInit_Idempotent(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
 	opts := exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	}
 
-	cfg1, err := exchange.Init(opts)
+	cfg1, client1, err := exchange.Init(opts)
 	if err != nil {
 		t.Fatalf("first Init: %v", err)
 	}
+	defer client1.Close()
 
-	cfg2, err := exchange.Init(opts)
+	cfg2, client2, err := exchange.Init(opts)
 	if err != nil {
 		t.Fatalf("second Init: %v", err)
 	}
+	defer client2.Close()
 
 	// Second call must return the same campfire ID (idempotent, no re-init).
 	if cfg1.ExchangeCampfireID != cfg2.ExchangeCampfireID {
@@ -410,28 +407,30 @@ func TestRatePublishConvention_ZeroOrOneSelfPrior(t *testing.T) {
 func TestInit_ForceReinitializes(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
+	configDir := t.TempDir()
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
 	convDir := conventionDir(t)
 
 	opts := exchange.InitOptions{
-		CFHome:           cfHome,
-		TransportBaseDir: transportDir,
-		BeaconDir:        beaconDir,
-		ConventionDir:    convDir,
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
 	}
 
-	cfg1, err := exchange.Init(opts)
+	cfg1, client1, err := exchange.Init(opts)
 	if err != nil {
 		t.Fatalf("first Init: %v", err)
 	}
+	client1.Close()
 
 	opts.Force = true
-	cfg2, err := exchange.Init(opts)
+	cfg2, client2, err := exchange.Init(opts)
 	if err != nil {
 		t.Fatalf("force Init: %v", err)
 	}
+	defer client2.Close()
 
 	// Force must create a new campfire (different ID).
 	if cfg1.ExchangeCampfireID == cfg2.ExchangeCampfireID {

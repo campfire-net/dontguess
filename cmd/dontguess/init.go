@@ -46,10 +46,11 @@ func runInit(_ *cobra.Command, _ []string) error {
 		Force:         initForce,
 	}
 
-	cfg, err := exchange.Init(opts)
+	cfg, client, err := exchange.Init(opts)
 	if err != nil {
 		return fmt.Errorf("init failed: %w", err)
 	}
+	defer client.Close()
 
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)
