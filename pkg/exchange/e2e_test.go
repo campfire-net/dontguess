@@ -47,7 +47,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Inventory must be empty before acceptance.
 	if inv := eng.State().Inventory(); len(inv) != 0 {
@@ -84,7 +84,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("getting buy message: %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	orders := eng.State().ActiveOrders()
 	foundOrder := false
@@ -152,7 +152,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	// Order must now be marked matched in state.
 	// Re-sync state from store before checking.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	if !eng.State().IsOrderMatched(buyMsg.ID) {
 		t.Error("step 4: buy order should be marked matched after engine emitted match")
 	}
@@ -173,7 +173,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// acceptedOrders state: matchMsg.ID → entryID (not exported directly, but
 	// we can verify by checking that deliver will work).
@@ -198,7 +198,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Step 7: Buyer completes the transaction ---
 	salePrice := matchPayload.Results[0].Price
@@ -218,7 +218,7 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// After complete, seller reputation must be > default.
 	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
@@ -274,7 +274,7 @@ func TestE2E_BuyerReject(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -337,7 +337,7 @@ func TestE2E_BuyerReject(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Scrip balance assertions: escrow refund path ---
 	// Convention §scrip: buyer-reject has no scrip interaction. Scrip is only locked
@@ -396,7 +396,7 @@ func TestE2E_PutReject(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Operator rejects the put.
 	rejectPayload, _ := json.Marshal(map[string]any{
@@ -414,7 +414,7 @@ func TestE2E_PutReject(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Inventory must be empty: rejected put never enters inventory.
 	if inv := eng.State().Inventory(); len(inv) != 0 {
@@ -443,7 +443,7 @@ func TestE2E_EmptyMatch(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	// Accept at 35000 scrip → ask price = 35000 * 120/100 = 42000.
 	if err := eng.AutoAcceptPut(putMsg.ID, 35000, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -653,7 +653,7 @@ func TestE2E_ScripBalances(t *testing.T) {
 
 	// Replay to pick up deliver before dispatching complete.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Price is derived from the reservation (locked at buyer-accept), not from payload.
 	completePayload, _ := json.Marshal(map[string]any{
@@ -668,12 +668,12 @@ func TestE2E_ScripBalances(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("step 5 (settle): GetMessage: %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("step 5 (settle): DispatchForTest: %v", err)
 	}
 
@@ -814,7 +814,7 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// --- Step 2: Operator auto-accepts the put ---
 	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
@@ -894,7 +894,7 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 
 	// Sync state.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Step 5: Buyer sends settle(buyer-accept) with antecedent = match message ---
 	// For small content there is no preview phase — the buyer-accept references the
@@ -915,12 +915,12 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 
 	// Dispatch buyer-accept through the engine to trigger scrip hold.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	buyerAcceptRec, err := h.st.GetMessage(buyerAcceptMsg.ID)
 	if err != nil {
 		t.Fatalf("step 5: GetMessage(buyer-accept): %v", err)
 	}
-	if err := eng.DispatchForTest(buyerAcceptRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyerAcceptRec)); err != nil {
 		t.Fatalf("step 5: DispatchForTest(buyer-accept): %v", err)
 	}
 
@@ -940,7 +940,7 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Step 7: Buyer sends settle(small-content-dispute) ---
 	// Extract the reservation_id from the scrip-buy-hold log so we can include
@@ -969,20 +969,20 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Dispatch the dispute through the engine to trigger auto-refund logic.
 	disputeRec, err := h.st.GetMessage(disputeMsg.ID)
 	if err != nil {
 		t.Fatalf("step 7: GetMessage(dispute): %v", err)
 	}
-	if err := eng.DispatchForTest(disputeRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(disputeRec)); err != nil {
 		t.Fatalf("step 7: DispatchForTest(dispute): %v", err)
 	}
 
 	// Sync state after dispute.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Verify: smallContentDisputes incremented ---
 	disputeCountAfter := eng.State().SmallContentDisputeCount(entry.EntryID)
@@ -1189,7 +1189,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 1: listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if inv := eng.State().Inventory(); len(inv) != 0 {
 		t.Errorf("step 1: expected empty inventory before put-accept, got %d", len(inv))
@@ -1282,7 +1282,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 
 	// Sync state to pick up the match.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// --- Step 5: Buyer sends settle(preview-request) with match as antecedent ---
 	preqMsg := h.sendMessage(h.buyer,
@@ -1294,7 +1294,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	if err != nil {
 		t.Fatalf("step 5: GetMessage preview-request: %v", err)
 	}
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Step 5 assertions: previewsByEntry, previewCountByMatch, previewRequestToMatch populated.
 	byEntry := eng.State().PreviewsByEntryForTest()
@@ -1318,7 +1318,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	preSettleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	preCount := len(preSettleMsgs)
 
-	if err := eng.DispatchForTest(preqRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
 		t.Fatalf("step 6: DispatchForTest preview-request: %v", err)
 	}
 
@@ -1364,7 +1364,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 
 	// Apply preview message to state so previewToMatch is populated.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	previewToMatch := eng.State().PreviewToMatchForTest()
 	if got := previewToMatch[previewMsg.ID]; got != matchMsg.ID {
@@ -1400,7 +1400,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 
 	// Match must be accepted in state (via preview → match antecedent chain).
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	if !eng.State().IsMatchAccepted(matchMsg.ID) {
 		t.Error("step 7 (buyer-accept): match should be accepted in state after buyer-accept via preview path")
 	}
@@ -1415,7 +1415,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Step 8 assertion: delivered state tracked.
 	if !eng.State().IsMatchDelivered(matchMsg.ID) {
@@ -1438,13 +1438,13 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	completeMsgRec, err := h.st.GetMessage(completeMsg.ID)
 	if err != nil {
 		t.Fatalf("step 9: GetMessage complete: %v", err)
 	}
-	if err := eng.DispatchForTest(completeMsgRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(completeMsgRec)); err != nil {
 		t.Fatalf("step 9: DispatchForTest complete: %v", err)
 	}
 
@@ -1497,7 +1497,7 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 // as antecedent and dispatches it via DispatchForTest, triggering the scrip hold.
 // This is the preview-before-purchase path (distinct from the legacy match-antecedent
 // path used in sendBuyerAcceptAndDispatch).
-func sendBuyerAcceptViaPreview(t *testing.T, h *testHarness, eng *exchange.Engine, previewMsgID, entryID string) *store.MessageRecord {
+func sendBuyerAcceptViaPreview(t *testing.T, h *testHarness, eng *exchange.Engine, previewMsgID, entryID string) *exchange.Message {
 	t.Helper()
 	payload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
@@ -1513,12 +1513,12 @@ func sendBuyerAcceptViaPreview(t *testing.T, h *testHarness, eng *exchange.Engin
 		[]string{previewMsgID},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	rec, err := h.st.GetMessage(msg.ID)
 	if err != nil {
 		t.Fatalf("GetMessage buyer-accept (preview path): %v", err)
 	}
-	if err := eng.DispatchForTest(rec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(rec)); err != nil {
 		t.Fatalf("DispatchForTest buyer-accept (preview path): %v", err)
 	}
 	return msg

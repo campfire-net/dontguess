@@ -67,13 +67,13 @@ func completeBuyTransactionForBuyer(
 	if err != nil {
 		t.Fatalf("completeBuyTransactionForBuyer: GetMessage(buy): %v", err)
 	}
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// DispatchForTest(buy) calls handleBuy synchronously: emits the match message
 	// to the store and applies it to engine state inline (matchToBuyer/matchToEntry
 	// are populated before this call returns).
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	if err := eng.DispatchForTest(buyRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 		t.Fatalf("completeBuyTransactionForBuyer: DispatchForTest(buy): %v", err)
 	}
 
@@ -155,7 +155,7 @@ func completeBuyTransactionForBuyer(
 
 	// Rebuild state from the full message log to reflect this completed transaction.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 }
 
 // demandPriceExpected computes the expected computePrice output for an entry
@@ -213,7 +213,7 @@ func seedDemandEntry(t *testing.T, h *testHarness, eng *exchange.Engine) (entryI
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, putPrice, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("seedDemandEntry: AutoAcceptPut: %v", err)

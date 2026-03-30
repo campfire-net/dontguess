@@ -12,6 +12,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
+	"github.com/3dl-dev/dontguess/pkg/proto"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
 
@@ -70,24 +71,22 @@ func addMsg(t *testing.T, st store.Store, campfireID, sender, op string, payload
 	}
 }
 
-// buildMsg constructs a MessageRecord without inserting it into the store.
+// buildMsg constructs a proto.Message without inserting it into the store.
 // Used to test ApplyMessage (live-mode path) directly.
-func buildMsg(t *testing.T, campfireID, sender, op string, payload any, tags ...string) store.MessageRecord {
+func buildMsg(t *testing.T, campfireID, sender, op string, payload any, tags ...string) proto.Message {
 	t.Helper()
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
 	allTags := append([]string{op}, tags...)
-	return store.MessageRecord{
+	return proto.Message{
 		ID:         randomID(t),
 		CampfireID: campfireID,
 		Sender:     sender,
 		Payload:    rawPayload,
 		Tags:       allTags,
 		Timestamp:  time.Now().UnixNano(),
-		ReceivedAt: time.Now().UnixNano(),
-		Signature:  []byte{0x00},
 	}
 }
 

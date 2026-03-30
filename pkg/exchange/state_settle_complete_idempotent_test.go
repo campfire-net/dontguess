@@ -53,7 +53,7 @@ func TestState_SettleComplete_ReplayIdempotent(t *testing.T) {
 
 	// Replay once — record baseline reputation.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	repAfterFirstReplay := eng.State().SellerReputation(h.seller.PublicKeyHex())
 
 	if repAfterFirstReplay <= exchange.DefaultReputation {
@@ -62,7 +62,7 @@ func TestState_SettleComplete_ReplayIdempotent(t *testing.T) {
 	}
 
 	// Replay again — reputation must not change.
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	repAfterSecondReplay := eng.State().SellerReputation(h.seller.PublicKeyHex())
 
 	if repAfterSecondReplay != repAfterFirstReplay {
@@ -71,7 +71,7 @@ func TestState_SettleComplete_ReplayIdempotent(t *testing.T) {
 	}
 
 	// Replay a third time for extra confidence.
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	repAfterThirdReplay := eng.State().SellerReputation(h.seller.PublicKeyHex())
 
 	if repAfterThirdReplay != repAfterFirstReplay {
@@ -119,7 +119,7 @@ func TestState_SettleComplete_SuccessCountExactlyOne(t *testing.T) {
 
 	// Replay 5 times — SuccessCount must remain 1 throughout.
 	for i := 1; i <= 5; i++ {
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 		// Reputation after 1 success = DefaultReputation + 1 = 51 (no repeat buyer bonus).
 		got := eng.State().SellerReputation(h.seller.PublicKeyHex())
 		want := exchange.DefaultReputation + 1 // +1 per SuccessCount
@@ -168,14 +168,14 @@ func TestState_SettleComplete_PriceHistoryNotDuplicated(t *testing.T) {
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 
 	// First replay — expect exactly 1 price record.
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	priceHistory := eng.State().PriceHistory()
 	if len(priceHistory) != 1 {
 		t.Fatalf("price history after first replay = %d records, want 1", len(priceHistory))
 	}
 
 	// Second replay — still exactly 1 record.
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	priceHistory = eng.State().PriceHistory()
 	if len(priceHistory) != 1 {
 		t.Errorf("price history after second replay = %d records, want 1 (duplicate appended)", len(priceHistory))

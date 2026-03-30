@@ -17,8 +17,6 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/campfire-net/campfire/pkg/store"
-
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
@@ -67,11 +65,11 @@ func BenchmarkGetBuyHoldReservation_Miss(b *testing.B) {
 	}
 }
 
-// makeBuyHoldMessages builds n synthetic scrip-buy-hold MessageRecords.
+// makeBuyHoldMessages builds n synthetic scrip-buy-hold Messages.
 // Each uses a unique matchMsgID "match-msg-{i}" and reservationID "res-{i}".
-func makeBuyHoldMessages(tb testing.TB, n int) []store.MessageRecord {
+func makeBuyHoldMessages(tb testing.TB, n int) []exchange.Message {
 	tb.Helper()
-	msgs := make([]store.MessageRecord, n)
+	msgs := make([]exchange.Message, n)
 	for i := 0; i < n; i++ {
 		matchID := "match-msg-" + itoa(i)
 		resID := "res-" + itoa(i)
@@ -88,7 +86,7 @@ func makeBuyHoldMessages(tb testing.TB, n int) []store.MessageRecord {
 		if err != nil {
 			tb.Fatalf("marshal BuyHoldPayload: %v", err)
 		}
-		msgs[i] = store.MessageRecord{
+		msgs[i] = exchange.Message{
 			ID:      "buy-hold-msg-" + itoa(i),
 			Payload: raw,
 			Tags:    []string{scrip.TagScripBuyHold},
