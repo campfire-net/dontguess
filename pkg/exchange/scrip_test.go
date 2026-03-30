@@ -92,7 +92,7 @@ func addScripPutPayMsg(t *testing.T, h *testHarness, putMsgID, seller string, am
 // Uses the harness operator identity as the operator key.
 func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripStore {
 	t.Helper()
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
+	cs, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -690,7 +690,7 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 	// --- Simulate restart ---
 	// Fresh CampfireScripStore replays: mint(2*holdAmount+extraScrip) - buy-hold(holdAmount).
 	// => balance = holdAmount+extraScrip.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.st, h.operator.PublicKeyHex())
+	cs, err := scrip.NewCampfireScripStore(h.cfID, protocol.New(h.st, h.operator), h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (restart): %v", err)
 	}
