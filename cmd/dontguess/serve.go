@@ -72,8 +72,8 @@ func runServe(_ *cobra.Command, _ []string) error {
 	}
 	defer writeClient.Close() //nolint:errcheck
 
-	// Open a shared store for components that require store.Store directly
-	// (CampfireScripStore). Uses the same path as protocol.Init.
+	// Open a shared store for the exchange engine (Store field in EngineOptions).
+	// Uses the same path as protocol.Init.
 	dbPath := store.StorePath(cfHome)
 	st, err := store.Open(dbPath)
 	if err != nil {
@@ -89,7 +89,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 		log.Printf("[exchange] created %d missing named views", viewsCreated)
 	}
 
-	cs, err := scrip.NewCampfireScripStore(cfg.ExchangeCampfireID, st, cfg.OperatorKeyHex)
+	cs, err := scrip.NewCampfireScripStore(cfg.ExchangeCampfireID, readClient, cfg.OperatorKeyHex)
 	if err != nil {
 		return fmt.Errorf("creating scrip store: %w", err)
 	}

@@ -9,6 +9,7 @@ import (
 	"encoding/hex"
 
 	cfmessage "github.com/campfire-net/campfire/pkg/message"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 )
 
@@ -60,6 +61,31 @@ func FromStoreRecords(recs []store.MessageRecord) []Message {
 	msgs := make([]Message, len(recs))
 	for i := range recs {
 		msgs[i] = *FromStoreRecord(&recs[i])
+	}
+	return msgs
+}
+
+// FromSDKMessage converts a protocol.Message (the SDK-facing type returned by
+// client.Read) to a dontguess Message.
+func FromSDKMessage(m protocol.Message) Message {
+	return Message{
+		ID:          m.ID,
+		CampfireID:  m.CampfireID,
+		Sender:      m.Sender,
+		Payload:     m.Payload,
+		Tags:        m.Tags,
+		Antecedents: m.Antecedents,
+		Timestamp:   m.Timestamp,
+		Instance:    m.Instance,
+	}
+}
+
+// FromSDKMessages converts a slice of protocol.Message to []Message.
+// Convenience helper for Replay via client.Read.
+func FromSDKMessages(ms []protocol.Message) []Message {
+	msgs := make([]Message, len(ms))
+	for i, m := range ms {
+		msgs[i] = FromSDKMessage(m)
 	}
 	return msgs
 }

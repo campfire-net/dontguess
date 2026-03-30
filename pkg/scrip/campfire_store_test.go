@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/proto"
@@ -98,9 +99,11 @@ func randomID(t *testing.T) string {
 // newStore creates a CampfireScripStore seeded with the given campfire messages.
 // Messages are added in order before constructing the store so Replay sees them.
 // Uses agentOperator as the operator key so only messages from that sender are applied.
+// Internally wraps st in a protocol.Client (read-only, no identity needed for Replay).
 func newStore(t *testing.T, st store.Store) *scrip.CampfireScripStore {
 	t.Helper()
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	client := protocol.New(st, nil)
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, client, agentOperator)
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -835,7 +838,7 @@ func TestOperatorGate_ForgedMintRejected(t *testing.T) {
 	})
 
 	// Construct store with operator key set — forged message must be ignored.
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, protocol.New(st, nil), agentOperator)
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -861,7 +864,7 @@ func TestOperatorGate_LegitimateOperatorMintAccepted(t *testing.T) {
 		"rate":        int64(1000),
 	})
 
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, protocol.New(st, nil), agentOperator)
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -892,7 +895,7 @@ func TestOperatorGate_MixedMints(t *testing.T) {
 		"recipient": agentAlice, "amount": int64(8888), "x402_tx_ref": "forged-02", "rate": int64(1000),
 	})
 
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, agentOperator)
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, protocol.New(st, nil), agentOperator)
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -918,7 +921,7 @@ func TestOperatorGate_EmptyKeyDisablesCheck(t *testing.T) {
 		"recipient": agentAlice, "amount": int64(500), "x402_tx_ref": "any-sender", "rate": int64(1000),
 	})
 
-	cs, err := scrip.NewCampfireScripStore(testCampfireID, st, "")
+	cs, err := scrip.NewCampfireScripStore(testCampfireID, protocol.New(st, nil), "")
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}

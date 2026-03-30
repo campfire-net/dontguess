@@ -7,7 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
-	"github.com/campfire-net/campfire/pkg/store"
+	"github.com/campfire-net/campfire/pkg/protocol"
 
 	"github.com/3dl-dev/dontguess/pkg/proto"
 )
@@ -51,7 +51,7 @@ func (e *balanceEntry) etag() string {
 // CampfireScripStore is safe for concurrent use.
 type CampfireScripStore struct {
 	campfireID string
-	st         store.Store
+	client     *protocol.Client
 
 	// OperatorKey is the public key hex of the exchange operator. When non-empty,
 	// scrip operation messages from any other sender are rejected. An empty string
@@ -85,14 +85,14 @@ type CampfireScripStore struct {
 // NewCampfireScripStore creates a CampfireScripStore and replays the campfire
 // log to build initial balance state.
 //
-// campfireID is the exchange campfire's public key hex. st is the campfire store.
-// operatorKey is the public key hex of the exchange operator; only messages from
-// this sender are accepted for scrip operations. Pass an empty string to disable
-// the check (backwards compat for tests).
-func NewCampfireScripStore(campfireID string, st store.Store, operatorKey string) (*CampfireScripStore, error) {
+// campfireID is the exchange campfire's public key hex. client is the campfire
+// protocol client used to read messages. operatorKey is the public key hex of
+// the exchange operator; only messages from this sender are accepted for scrip
+// operations. Pass an empty string to disable the check (backwards compat for tests).
+func NewCampfireScripStore(campfireID string, client *protocol.Client, operatorKey string) (*CampfireScripStore, error) {
 	s := &CampfireScripStore{
 		campfireID:   campfireID,
-		st:           st,
+		client:       client,
 		OperatorKey:  operatorKey,
 		balances:     make(map[string]*balanceEntry),
 		reservations: make(map[string]Reservation),
@@ -107,7 +107,11 @@ func NewCampfireScripStore(campfireID string, st store.Store, operatorKey string
 // It resets all balances and re-derives them from scratch.
 // Called on construction; can be called again to resync.
 func (s *CampfireScripStore) Replay() error {
-	storeRecs, err := s.st.ListMessages(s.campfireID, 0)
+	result, err := s.client.Read(protocol.ReadRequest{
+		CampfireID:     s.campfireID,
+		AfterTimestamp: 0,
+		SkipSync:       true,
+	})
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
 	}
@@ -122,7 +126,7 @@ func (s *CampfireScripStore) Replay() error {
 	s.totalBurned.Store(0)
 
 	// Convert at the cf boundary before replaying into internal state.
-	msgs := proto.FromStoreRecords(storeRecs)
+	msgs := proto.FromSDKMessages(result.Messages)
 	s.replaying = true
 	for i := range msgs {
 		s.applyMessage(&msgs[i])
