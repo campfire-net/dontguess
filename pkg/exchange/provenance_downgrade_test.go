@@ -67,6 +67,7 @@ func TestProvenanceDowngrade_EntriesMarkedOnLevelDrop(t *testing.T) {
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
@@ -159,6 +160,7 @@ func TestProvenanceDowngrade_FlaggedEntryExcludedFromMatchResults(t *testing.T) 
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
@@ -258,6 +260,7 @@ func TestProvenanceDowngrade_NoFlagWhenLevelUnchanged(t *testing.T) {
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
