@@ -661,6 +661,7 @@ func TestSmallContentDispute_ScripRefundPath(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
@@ -833,6 +834,7 @@ func TestSmallContentDispute_MissingEntry_SilentlyDropped(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {

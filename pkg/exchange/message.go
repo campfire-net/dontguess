@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"github.com/campfire-net/campfire/pkg/message"
+	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
 	"github.com/3dl-dev/dontguess/pkg/proto"
@@ -30,4 +31,39 @@ func FromStoreRecords(recs []store.MessageRecord) []Message {
 // Reserved for Wave 1-2. Not called in Wave 0.
 func FromProtocolMessage(id, campfireID string, m *message.Message) *Message {
 	return proto.FromProtocolMessage(id, campfireID, m)
+}
+
+// FromSDKMessage converts a protocol.Message (from the campfire SDK) to a *Message.
+// Used at the Subscribe/Read boundary when ReadClient is configured.
+func FromSDKMessage(m *protocol.Message) *Message {
+	if m == nil {
+		return nil
+	}
+	tags := m.Tags
+	if tags == nil {
+		tags = []string{}
+	}
+	antecedents := m.Antecedents
+	if antecedents == nil {
+		antecedents = []string{}
+	}
+	return &Message{
+		ID:          m.ID,
+		CampfireID:  m.CampfireID,
+		Sender:      m.Sender,
+		Payload:     m.Payload,
+		Tags:        tags,
+		Antecedents: antecedents,
+		Timestamp:   m.Timestamp,
+		Instance:    m.Instance,
+	}
+}
+
+// FromSDKMessages converts a slice of protocol.Message to []Message.
+func FromSDKMessages(msgs []protocol.Message) []Message {
+	result := make([]Message, len(msgs))
+	for i := range msgs {
+		result[i] = *FromSDKMessage(&msgs[i])
+	}
+	return result
 }

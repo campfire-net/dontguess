@@ -126,6 +126,7 @@ func newEngineWithScrip(t *testing.T, scripStore scrip.SpendingStore) (*testHarn
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:       protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       scripStore,
 		Logger: func(format string, args ...any) {
@@ -250,6 +251,7 @@ func TestBuyerAccept_DecrementsScripAfterPreview(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
@@ -346,6 +348,7 @@ func TestBuyerAccept_InsufficientScripReturnsError(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
@@ -446,6 +449,7 @@ func TestSettle_AdjustsScripOnComplete(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {
@@ -600,6 +604,7 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs0,
 		Logger:           func(format string, args ...any) { t.Logf("[eng0] "+format, args...) },
@@ -702,6 +707,7 @@ func TestRestart_NoDoubleHoldOnBuyerAccept(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[eng-restart] "+format, args...) },
@@ -749,6 +755,7 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },

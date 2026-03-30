@@ -138,11 +138,13 @@ func (h *testHarness) sendMessage(sender *identity.Identity, payload []byte, tag
 }
 
 // newEngine returns a new Engine for this harness.
+// Uses dual-client model: ReadClient subscribes/replays, WriteClient sends responses.
 func (h *testHarness) newEngine() *exchange.Engine {
 	return exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:       protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
