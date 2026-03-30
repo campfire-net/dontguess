@@ -13,8 +13,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/campfire-net/campfire/pkg/store"
-
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
 
@@ -420,7 +418,7 @@ func NewState() *State {
 
 // Replay builds state from scratch by processing all messages in log order.
 // It resets the state before processing. Thread-safe.
-func (s *State) Replay(msgs []store.MessageRecord) {
+func (s *State) Replay(msgs []Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -459,14 +457,14 @@ func (s *State) Replay(msgs []store.MessageRecord) {
 
 // Apply processes a single new message, updating state.
 // Thread-safe.
-func (s *State) Apply(msg *store.MessageRecord) {
+func (s *State) Apply(msg *Message) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.applyLocked(msg)
 }
 
 // applyLocked applies a message to state. Caller must hold s.mu.
-func (s *State) applyLocked(msg *store.MessageRecord) {
+func (s *State) applyLocked(msg *Message) {
 	op := exchangeOp(msg.Tags)
 	switch op {
 	case TagPut:
@@ -491,7 +489,7 @@ func (s *State) applyLocked(msg *store.MessageRecord) {
 // applyScripBuyHold indexes a scrip-buy-hold message into matchToBuyHold.
 // Enables O(1) lookup in GetBuyHoldReservation, replacing the O(n) log scan
 // in findExistingBuyerAcceptHold.
-func (s *State) applyScripBuyHold(msg *store.MessageRecord) {
+func (s *State) applyScripBuyHold(msg *Message) {
 	var p scrip.BuyHoldPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return
@@ -534,7 +532,7 @@ func settlePhaseFromTags(tags []string) string {
 }
 
 // applyPut processes an exchange:put message.
-func (s *State) applyPut(msg *store.MessageRecord) {
+func (s *State) applyPut(msg *Message) {
 	var payload struct {
 		Description string   `json:"description"`
 		ContentHash string   `json:"content_hash"`
@@ -575,7 +573,7 @@ func (s *State) applyPut(msg *store.MessageRecord) {
 }
 
 // applyBuy processes an exchange:buy message.
-func (s *State) applyBuy(msg *store.MessageRecord) {
+func (s *State) applyBuy(msg *Message) {
 	var payload struct {
 		Task           string   `json:"task"`
 		Budget         int64    `json:"budget"`
@@ -616,7 +614,7 @@ func (s *State) applyBuy(msg *store.MessageRecord) {
 
 // applyMatch processes an exchange:match message.
 // The match fulfills a buy future. We mark the order matched and record match→buyer.
-func (s *State) applyMatch(msg *store.MessageRecord) {
+func (s *State) applyMatch(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
@@ -652,7 +650,7 @@ func (s *State) applyMatch(msg *store.MessageRecord) {
 }
 
 // applySettle processes an exchange:settle message.
-func (s *State) applySettle(msg *store.MessageRecord) {
+func (s *State) applySettle(msg *Message) {
 	phase := settlePhaseFromTags(msg.Tags)
 	switch phase {
 	case SettlePhaseStrPutAccept:
@@ -677,7 +675,7 @@ func (s *State) applySettle(msg *store.MessageRecord) {
 }
 
 // applySettlePutAccept moves an entry from pending to active inventory.
-func (s *State) applySettlePutAccept(msg *store.MessageRecord) {
+func (s *State) applySettlePutAccept(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
@@ -708,7 +706,7 @@ func (s *State) applySettlePutAccept(msg *store.MessageRecord) {
 }
 
 // applySettlePutReject removes an entry from pending inventory.
-func (s *State) applySettlePutReject(msg *store.MessageRecord) {
+func (s *State) applySettlePutReject(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
@@ -728,7 +726,7 @@ func (s *State) applySettlePutReject(msg *store.MessageRecord) {
 //   - A preview message ID (preview-before-purchase path, for content >= SmallContentThreshold tokens).
 //
 // Both paths resolve to the same match and proceed identically from there.
-func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
+func (s *State) applySettleBuyerAccept(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -798,7 +796,7 @@ func (s *State) applySettleBuyerAccept(msg *store.MessageRecord) {
 // for other buyers. Seller reputation is not affected (buyer chose not to buy).
 // Security: only the buyer who placed the original buy order may reject a match.
 // Convention §5.3: buyer identity gate — same pattern as applySettleBuyerAccept.
-func (s *State) applySettleBuyerReject(msg *store.MessageRecord) {
+func (s *State) applySettleBuyerReject(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -821,7 +819,7 @@ func (s *State) applySettleBuyerReject(msg *store.MessageRecord) {
 // The antecedent is the settle(buyer-accept) message ID.
 // It marks the corresponding match as delivered in deliveredOrders and records
 // the deliver→match mapping for use by applySettleComplete.
-func (s *State) applySettleDeliver(msg *store.MessageRecord) {
+func (s *State) applySettleDeliver(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
@@ -849,7 +847,7 @@ func (s *State) applySettleDeliver(msg *store.MessageRecord) {
 //
 // The price field is still read from the payload (it is operator-signed by the
 // deliver step; the buyer does not control sale price).
-func (s *State) applySettleComplete(msg *store.MessageRecord) {
+func (s *State) applySettleComplete(msg *Message) {
 	// Idempotency guard: if this settle(complete) message has already been
 	// applied, skip it. Protects against double-application when Apply is
 	// called multiple times with the same message (e.g., duplicate delivery).
@@ -949,7 +947,7 @@ func (s *State) applySettleComplete(msg *store.MessageRecord) {
 //   - Seller's SmallContentRefundCount is incremented (-3 reputation per refund).
 //
 // Silently ignored on any validation failure.
-func (s *State) applySettleSmallContentDispute(msg *store.MessageRecord) {
+func (s *State) applySettleSmallContentDispute(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -1011,7 +1009,7 @@ func (s *State) applySettleSmallContentDispute(msg *store.MessageRecord) {
 //
 // On success, updates previewsByEntry, previewCountByMatch, and previewRequestToMatch.
 // Silently ignored on any validation failure — the message remains on the log.
-func (s *State) applySettlePreviewRequest(msg *store.MessageRecord) {
+func (s *State) applySettlePreviewRequest(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
@@ -1075,7 +1073,7 @@ func (s *State) applySettlePreviewRequest(msg *store.MessageRecord) {
 //
 // On success, updates previewToMatch so buyer-accept can trace the antecedent chain.
 // Silently ignored on any validation failure.
-func (s *State) applySettlePreview(msg *store.MessageRecord) {
+func (s *State) applySettlePreview(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}

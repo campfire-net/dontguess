@@ -21,6 +21,7 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 )
 
+
 // MatchingFeeRate is the fraction of the sale price charged as a matching fee.
 // The fee is burned (deflationary). 10% = 1/10.
 const MatchingFeeRate = 10
@@ -188,7 +189,8 @@ func (e *Engine) dispatchPendingOrders() error {
 			e.opts.log("engine: could not fetch order message %s: %v", order.OrderID, err)
 			continue
 		}
-		if err := e.handleBuy(rec); err != nil {
+		// Convert at the cf boundary before passing into internal handler.
+		if err := e.handleBuy(FromStoreRecord(rec)); err != nil {
 			e.opts.log("engine: error handling pending buy %s: %v", order.OrderID, err)
 		}
 	}
@@ -197,17 +199,19 @@ func (e *Engine) dispatchPendingOrders() error {
 
 // replayAll loads all historical messages from the store and rebuilds state.
 func (e *Engine) replayAll() error {
-	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0)
+	storeRecs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0)
 	if err != nil {
 		return fmt.Errorf("listing messages for replay: %w", err)
 	}
 
+	// Convert at the cf boundary before replaying into internal state.
+	msgs := FromStoreRecords(storeRecs)
 	e.state.Replay(msgs)
 
 	// Set cursor to the latest timestamp so subsequent polls start from here.
 	// Uses message timestamp (sender clock) instead of received_at to match
 	// the poll() cursor field — see poll() comment for rationale.
-	for _, m := range msgs {
+	for _, m := range storeRecs {
 		if m.Timestamp > e.lastCursor {
 			e.lastCursor = m.Timestamp
 		}
@@ -256,7 +260,8 @@ func (e *Engine) poll() error {
 	}
 
 	for i := range msgs {
-		msg := &msgs[i]
+		// Convert at the cf boundary before processing internally.
+		msg := FromStoreRecord(&msgs[i])
 		e.state.Apply(msg)
 		if err := e.dispatch(msg); err != nil {
 			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
@@ -269,7 +274,7 @@ func (e *Engine) poll() error {
 }
 
 // dispatch routes a new message to the appropriate handler.
-func (e *Engine) dispatch(msg *store.MessageRecord) error {
+func (e *Engine) dispatch(msg *Message) error {
 	op := exchangeOp(msg.Tags)
 
 	// Provenance gate: check sender's provenance level if checker is configured.
@@ -322,7 +327,7 @@ func tagToProvenanceOp(op string) Operation {
 // If ScripStore is configured, the buyer's scrip balance is pre-decremented
 // by (best_price + fee) before matching. If the buyer has insufficient scrip,
 // the buy is rejected with ErrBudgetExceeded and no match is emitted.
-func (e *Engine) handleBuy(msg *store.MessageRecord) error {
+func (e *Engine) handleBuy(msg *Message) error {
 	// Guard: if this order was already matched (a match message exists in the
 	// campfire log for this buy), return immediately. This prevents
 	// double-dispatch on engine restart when a buy message is re-applied via
@@ -517,7 +522,7 @@ func (e *Engine) handleBuy(msg *store.MessageRecord) error {
 // For settle(preview-request) phases, the engine generates a content preview
 // using PreviewAssembler and responds with a settle(preview) message. The
 // preview antecedent is the preview-request message ID.
-func (e *Engine) handleSettle(msg *store.MessageRecord) error {
+func (e *Engine) handleSettle(msg *Message) error {
 	phase := settlePhaseFromTags(msg.Tags)
 
 	// Handle preview-request: generate and send a preview response.
@@ -689,7 +694,7 @@ func (e *Engine) handleSettle(msg *store.MessageRecord) error {
 //	buyer-accept → preview (optional) → match
 //
 // This mirrors the antecedent resolution in state.applySettleBuyerAccept.
-func (e *Engine) handleSettleBuyerAcceptScrip(msg *store.MessageRecord) error {
+func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 	if len(msg.Antecedents) == 0 {
 		e.opts.log("engine: buyer-accept scrip: no antecedents, ignoring msg=%s", shortKey(msg.ID))
 		return nil
@@ -848,7 +853,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *store.MessageRecord) error {
 //
 // If the antecedent is not a recognized match or the entry is not in inventory,
 // the message is silently ignored (no error returned to the poll loop).
-func (e *Engine) handleSettlePreviewRequest(msg *store.MessageRecord) error {
+func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 	if len(msg.Antecedents) == 0 {
 		e.opts.log("engine: preview-request: no antecedents, ignoring msg=%s", msg.ID)
 		return nil
@@ -955,7 +960,7 @@ func (e *Engine) handleSettlePreviewRequest(msg *store.MessageRecord) error {
 // If ScripStore is configured, the buyer's reservation is consumed and the
 // full held amount is returned to their balance. State tracking (reputation
 // penalty) is handled by applySettleSmallContentDispute in state.go.
-func (e *Engine) handleSettleSmallContentDispute(msg *store.MessageRecord) error {
+func (e *Engine) handleSettleSmallContentDispute(msg *Message) error {
 	if e.opts.ScripStore == nil {
 		return nil
 	}
@@ -1268,8 +1273,9 @@ func (e *Engine) computeConfidence(entry *InventoryEntry, _ string) float64 {
 }
 
 // sendOperatorMessage creates, signs, and writes an operator-signed message to
-// the exchange campfire transport.
-func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) (*store.MessageRecord, error) {
+// the exchange campfire transport. Returns a dontguess *Message (converted from
+// the store record) so callers don't depend on store.MessageRecord.
+func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) (*Message, error) {
 	op := e.opts.OperatorIdentity
 	msg, err := message.NewMessage(op.PrivateKey, op.PublicKey, payload, tags, antecedents)
 	if err != nil {
@@ -1306,7 +1312,7 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 		e.opts.log("engine: warning: adding message to store: %v", err)
 	}
 
-	return &rec, nil
+	return FromStoreRecord(&rec), nil
 }
 
 // AutoAcceptPut sends a settle(put-accept) for a pending put message, accepting

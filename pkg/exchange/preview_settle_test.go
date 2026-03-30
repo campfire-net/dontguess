@@ -36,7 +36,7 @@ func buildMatchedState(t *testing.T, h *testHarness, eng *exchange.Engine) (matc
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(168*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
@@ -53,16 +53,16 @@ func buildMatchedState(t *testing.T, h *testHarness, eng *exchange.Engine) (matc
 		nil,
 	)
 	buyRec, _ := h.st.GetMessage(buyMsg.ID)
-	eng.State().Apply(buyRec)
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
 
 	// Emit a match by dispatching the buy message through the engine.
-	if err := eng.DispatchForTest(buyRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
 		t.Fatalf("DispatchForTest buy: %v", err)
 	}
 
 	// Find the emitted match message.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 	if len(matchMsgs) == 0 {
@@ -97,7 +97,7 @@ func TestPreviewRequest_ValidMatch(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Verify previewsByEntry[entryID][buyerKey] == matchRec.ID
 	buyerKey := h.buyer.PublicKeyHex()
@@ -138,7 +138,7 @@ func TestPreviewRequest_InvalidAntecedent(t *testing.T) {
 		[]string{fakeMatchID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Nothing should be recorded.
 	reqToMatch := eng.State().PreviewRequestToMatchForTest()
@@ -163,7 +163,7 @@ func TestPreviewRequest_WrongBuyer(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	reqToMatch := eng.State().PreviewRequestToMatchForTest()
 	if _, ok := reqToMatch[preqMsg.ID]; ok {
@@ -191,7 +191,7 @@ func TestPreviewResponse_PopulatesPreviewToMatch(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Operator sends preview response (antecedent = preview-request).
 	prevPayload, _ := json.Marshal(map[string]any{
@@ -205,7 +205,7 @@ func TestPreviewResponse_PopulatesPreviewToMatch(t *testing.T) {
 		[]string{preqMsg.ID},
 	)
 	prevRec, _ := h.st.GetMessage(prevMsg.ID)
-	eng.State().Apply(prevRec)
+	eng.State().Apply(exchange.FromStoreRecord(prevRec))
 
 	previewToMatch := eng.State().PreviewToMatchForTest()
 	if got := previewToMatch[prevMsg.ID]; got != matchRec.ID {
@@ -229,7 +229,7 @@ func TestPreviewResponse_NonOperatorIgnored(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Attacker (seller) sends a forged preview response.
 	prevPayload, _ := json.Marshal(map[string]any{
@@ -242,7 +242,7 @@ func TestPreviewResponse_NonOperatorIgnored(t *testing.T) {
 		[]string{preqMsg.ID},
 	)
 	prevRec, _ := h.st.GetMessage(prevMsg.ID)
-	eng.State().Apply(prevRec)
+	eng.State().Apply(exchange.FromStoreRecord(prevRec))
 
 	previewToMatch := eng.State().PreviewToMatchForTest()
 	if _, ok := previewToMatch[prevMsg.ID]; ok {
@@ -267,7 +267,7 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	// Operator sends preview response.
 	prevPayload, _ := json.Marshal(map[string]any{
@@ -281,7 +281,7 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 		[]string{preqMsg.ID},
 	)
 	prevRec, _ := h.st.GetMessage(prevMsg.ID)
-	eng.State().Apply(prevRec)
+	eng.State().Apply(exchange.FromStoreRecord(prevRec))
 
 	// Buyer accepts using the preview message as antecedent.
 	acceptPayload, _ := json.Marshal(map[string]any{
@@ -295,7 +295,7 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 		[]string{prevMsg.ID},
 	)
 	acceptRec, _ := h.st.GetMessage(acceptMsg.ID)
-	eng.State().Apply(acceptRec)
+	eng.State().Apply(exchange.FromStoreRecord(acceptRec))
 
 	// The match should now be accepted (acceptedOrders populated).
 	if !eng.State().IsMatchAccepted(matchRec.ID) {
@@ -312,7 +312,7 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 		[]string{acceptMsg.ID},
 	)
 	deliverRec, _ := h.st.GetMessage(deliverMsg.ID)
-	eng.State().Apply(deliverRec)
+	eng.State().Apply(exchange.FromStoreRecord(deliverRec))
 
 	// Buyer completes. Antecedent is the deliver message.
 	completeMsg := h.sendMessage(h.buyer,
@@ -325,11 +325,11 @@ func TestBuyerAccept_ViaPreviewAntecedent(t *testing.T) {
 		[]string{deliverMsg.ID},
 	)
 	completeRec, _ := h.st.GetMessage(completeMsg.ID)
-	eng.State().Apply(completeRec)
+	eng.State().Apply(exchange.FromStoreRecord(completeRec))
 
 	// Re-sync state from the store to pick up all messages.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// After complete: seller reputation must be above the default.
 	rep := eng.State().SellerReputation(h.seller.PublicKeyHex())
@@ -362,7 +362,7 @@ func TestBuyerAccept_LegacyMatchAntecedent(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	acceptRec, _ := h.st.GetMessage(acceptMsg.ID)
-	eng.State().Apply(acceptRec)
+	eng.State().Apply(exchange.FromStoreRecord(acceptRec))
 
 	if !eng.State().IsMatchAccepted(matchRec.ID) {
 		t.Error("expected match to be accepted after buyer-accept via legacy match antecedent")
@@ -390,9 +390,9 @@ func TestEngineDispatch_PreviewRequest_EmitsPreviewResponse(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
-	if err := eng.DispatchForTest(preqRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
 		t.Fatalf("DispatchForTest preview-request: %v", err)
 	}
 
@@ -452,12 +452,12 @@ func TestEngineDispatch_PreviewRequest_InvalidAntecedent_NoResponse(t *testing.T
 		[]string{fakeMatchID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	preCount := len(preMsgs)
 
-	if err := eng.DispatchForTest(preqRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
 		t.Fatalf("DispatchForTest: %v", err)
 	}
 
@@ -500,9 +500,9 @@ func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) 
 		[]string{matchRec.ID},
 	)
 	preqRec, _ := h.st.GetMessage(preqMsg.ID)
-	eng.State().Apply(preqRec)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
 
-	if err := eng.DispatchForTest(preqRec); err != nil {
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
 		t.Fatalf("DispatchForTest preview-request: %v", err)
 	}
 
@@ -594,7 +594,7 @@ func TestPreviewRequest_DuplicateRejected(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec1, _ := h.st.GetMessage(preqMsg1.ID)
-	eng.State().Apply(preqRec1)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec1))
 
 	// Verify first request is tracked.
 	countByMatch := eng.State().PreviewCountByMatchForTest()
@@ -609,7 +609,7 @@ func TestPreviewRequest_DuplicateRejected(t *testing.T) {
 		[]string{matchRec.ID},
 	)
 	preqRec2, _ := h.st.GetMessage(preqMsg2.ID)
-	eng.State().Apply(preqRec2)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec2))
 
 	// previewCountByMatch must still be 1 — duplicate does not increment.
 	countByMatch = eng.State().PreviewCountByMatchForTest()

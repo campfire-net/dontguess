@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 
 	"github.com/campfire-net/campfire/pkg/store"
+
+	"github.com/3dl-dev/dontguess/pkg/proto"
 )
 
 // scrip operation tag constants. These match the convention spec in
@@ -105,7 +107,7 @@ func NewCampfireScripStore(campfireID string, st store.Store, operatorKey string
 // It resets all balances and re-derives them from scratch.
 // Called on construction; can be called again to resync.
 func (s *CampfireScripStore) Replay() error {
-	msgs, err := s.st.ListMessages(s.campfireID, 0)
+	storeRecs, err := s.st.ListMessages(s.campfireID, 0)
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
 	}
@@ -119,6 +121,8 @@ func (s *CampfireScripStore) Replay() error {
 	s.totalSupply.Store(0)
 	s.totalBurned.Store(0)
 
+	// Convert at the cf boundary before replaying into internal state.
+	msgs := proto.FromStoreRecords(storeRecs)
 	s.replaying = true
 	for i := range msgs {
 		s.applyMessage(&msgs[i])
@@ -134,13 +138,13 @@ func (s *CampfireScripStore) Replay() error {
 // In live mode, subtractFromBalance clamps balances to zero (underflow guard).
 // This prevents a corrupt or unexpected message from producing a negative balance
 // that would permanently block the affected buyer from spending scrip.
-func (s *CampfireScripStore) ApplyMessage(msg *store.MessageRecord) {
+func (s *CampfireScripStore) ApplyMessage(msg *proto.Message) {
 	s.applyMessage(msg)
 }
 
 // applyMessage applies a single campfire message to the in-memory balance state.
 // It is idempotent for messages already in seenMsgIDs.
-func (s *CampfireScripStore) applyMessage(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyMessage(msg *proto.Message) {
 	// Idempotency guard: skip messages we've already processed.
 	if _, loaded := s.seenMsgIDs.LoadOrStore(msg.ID, struct{}{}); loaded {
 		return
@@ -180,7 +184,7 @@ func (s *CampfireScripStore) applyMessage(msg *store.MessageRecord) {
 
 // applyMint processes a scrip:mint message.
 // Payload: { "recipient": "<pubkey>", "amount": <int64>, ... }
-func (s *CampfireScripStore) applyMint(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyMint(msg *proto.Message) {
 	var p struct {
 		Recipient string `json:"recipient"`
 		Amount    int64  `json:"amount"`
@@ -196,7 +200,7 @@ func (s *CampfireScripStore) applyMint(msg *store.MessageRecord) {
 // Payload: { "amount": <int64>, ... }
 // Note: burn destroys scrip that was already removed from a balance (e.g. via buy-hold).
 // It only affects totalBurned, not individual balances.
-func (s *CampfireScripStore) applyBurn(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyBurn(msg *proto.Message) {
 	var p struct {
 		Amount int64 `json:"amount"`
 	}
@@ -210,7 +214,7 @@ func (s *CampfireScripStore) applyBurn(msg *store.MessageRecord) {
 // Payload: { "seller": "<pubkey>", "amount": <int64>, ... }
 // The operator pays the seller; operator balance is decremented, seller balance incremented.
 // For the store's purpose: we track both sides. The operator key is the message sender.
-func (s *CampfireScripStore) applyPutPay(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyPutPay(msg *proto.Message) {
 	var p struct {
 		Seller string `json:"seller"`
 		Amount int64  `json:"amount"`
@@ -228,7 +232,7 @@ func (s *CampfireScripStore) applyPutPay(msg *store.MessageRecord) {
 // applyBuyHold processes a scrip:buy-hold message.
 // Payload: { "buyer": "<pubkey>", "amount": <int64>, ... }
 // Buyer's balance is decremented (escrow hold).
-func (s *CampfireScripStore) applyBuyHold(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyBuyHold(msg *proto.Message) {
 	var p struct {
 		Buyer  string `json:"buyer"`
 		Amount int64  `json:"amount"`
@@ -249,7 +253,7 @@ func (s *CampfireScripStore) applyBuyHold(msg *store.MessageRecord) {
 // message for the matching fee, and applyBurn is the sole source of totalBurned
 // accounting. Counting it here too would double-count after Replay.
 // The operator identity is the message sender.
-func (s *CampfireScripStore) applySettle(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applySettle(msg *proto.Message) {
 	var p struct {
 		Seller          string `json:"seller"`
 		Residual        int64  `json:"residual"`
@@ -272,7 +276,7 @@ func (s *CampfireScripStore) applySettle(msg *store.MessageRecord) {
 // applyAssignPay processes a scrip:assign-pay message.
 // Payload: { "worker": "<pubkey>", "amount": <int64>, ... }
 // Operator pays laborer; operator balance decremented, worker balance incremented.
-func (s *CampfireScripStore) applyAssignPay(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyAssignPay(msg *proto.Message) {
 	var p struct {
 		Worker string `json:"worker"`
 		Amount int64  `json:"amount"`
@@ -289,7 +293,7 @@ func (s *CampfireScripStore) applyAssignPay(msg *store.MessageRecord) {
 // applyDisputeRefund processes a scrip:dispute-refund message.
 // Payload: { "buyer": "<pubkey>", "amount": <int64>, ... }
 // Buyer's balance is restored (escrow released).
-func (s *CampfireScripStore) applyDisputeRefund(msg *store.MessageRecord) {
+func (s *CampfireScripStore) applyDisputeRefund(msg *proto.Message) {
 	var p struct {
 		Buyer  string `json:"buyer"`
 		Amount int64  `json:"amount"`

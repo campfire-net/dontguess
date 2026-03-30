@@ -92,7 +92,7 @@ func TestProvenanceDowngrade_EntriesMarkedOnLevelDrop(t *testing.T) {
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Accept the put. At this point the seller is at level 2 (contactable).
 	// AutoAcceptPut records AcceptedProvenanceLevel=2 on the inventory entry.
@@ -173,7 +173,7 @@ func TestProvenanceDowngrade_FlaggedEntryExcludedFromMatchResults(t *testing.T) 
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putRec.ID, 5000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestProvenanceDowngrade_FlaggedEntryExcludedFromMatchResults(t *testing.T) 
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Apply(&msgs[len(msgs)-1])
+	eng.State().Apply(exchange.FromStoreRecord(&msgs[len(msgs)-1]))
 
 	// Dispatch the buy — the engine emits a match message but with zero results
 	// because the only inventory entry is flagged for re-validation.
@@ -267,7 +267,7 @@ func TestProvenanceDowngrade_NoFlagWhenLevelUnchanged(t *testing.T) {
 	sellerKey := "key-contactable"
 	putRec := injectPutMsg(t, h, sellerKey)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putRec.ID, 5000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}

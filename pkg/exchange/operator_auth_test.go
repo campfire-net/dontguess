@@ -31,7 +31,7 @@ func TestOperatorAuth_ForgePutAcceptIgnored(t *testing.T) {
 
 	// Replay so the put lands in state.
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// Confirm the entry is in pendingPuts.
 	pending := eng.State().PendingPuts()
@@ -57,7 +57,7 @@ func TestOperatorAuth_ForgePutAcceptIgnored(t *testing.T) {
 
 	// Replay all messages including the forged accept.
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Inventory must still be empty — forged accept was rejected.
 	inv := eng.State().Inventory()
@@ -87,7 +87,7 @@ func TestOperatorAuth_ForgePutRejectIgnored(t *testing.T) {
 	)
 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if len(eng.State().PendingPuts()) == 0 {
 		t.Fatal("expected put to be in pendingPuts")
@@ -108,7 +108,7 @@ func TestOperatorAuth_ForgePutRejectIgnored(t *testing.T) {
 	)
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Entry must still be in pendingPuts — forged reject was ignored.
 	pending := eng.State().PendingPuts()
@@ -131,7 +131,7 @@ func TestOperatorAuth_ForgeMatchIgnored(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 5600, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -149,7 +149,7 @@ func TestOperatorAuth_ForgeMatchIgnored(t *testing.T) {
 		nil,
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Confirm order is active (not yet matched).
 	orders := eng.State().ActiveOrders()
@@ -175,7 +175,7 @@ func TestOperatorAuth_ForgeMatchIgnored(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Order must still be active — forged match was rejected.
 	orders = eng.State().ActiveOrders()
@@ -204,7 +204,7 @@ func TestOperatorAuth_ForgeDeliverIgnored(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 8400, time.Now().Add(48*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -216,7 +216,7 @@ func TestOperatorAuth_ForgeDeliverIgnored(t *testing.T) {
 		nil,
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Operator emits a legitimate match.
 	matchPayload, _ := json.Marshal(map[string]any{
@@ -244,7 +244,7 @@ func TestOperatorAuth_ForgeDeliverIgnored(t *testing.T) {
 
 	// Verify match is not yet marked as delivered.
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	if eng.State().IsMatchDelivered(matchMsg.ID) {
 		t.Fatal("match incorrectly marked as delivered before any deliver message")
 	}
@@ -262,7 +262,7 @@ func TestOperatorAuth_ForgeDeliverIgnored(t *testing.T) {
 	)
 
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Match must NOT be marked as delivered — forged deliver was rejected.
 	if eng.State().IsMatchDelivered(matchMsg.ID) {
@@ -284,7 +284,7 @@ func TestOperatorAuth_LegitimateOperatorMessagesAccepted(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 10500, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)

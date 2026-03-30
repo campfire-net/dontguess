@@ -58,7 +58,7 @@ func TestLayer0_LowConversionEntryExcludedFromBuyResults(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -83,7 +83,7 @@ func TestLayer0_LowConversionEntryExcludedFromBuyResults(t *testing.T) {
 			[]string{previewReqID},
 		)
 		allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 
 	// Verify the gate: LowConversionEntries should list this entry.
@@ -164,7 +164,7 @@ func TestLayer0_HighConversionEntryIncluded(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -188,7 +188,7 @@ func TestLayer0_HighConversionEntryIncluded(t *testing.T) {
 			[]string{previewReqID},
 		)
 		allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 	for i := 0; i < 2; i++ {
 		_, previewReqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-high-conv-%d", i))
@@ -266,7 +266,7 @@ func TestLayer0_InsufficientPreviewsNotExcluded(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -290,7 +290,7 @@ func TestLayer0_InsufficientPreviewsNotExcluded(t *testing.T) {
 			[]string{previewReqID},
 		)
 		allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 
 	// Verify: entry should NOT be in LowConversionEntries (only 5 previews < 10).
@@ -380,7 +380,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
@@ -404,7 +404,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 		[]string{previewReqIDA},
 	)
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	// Confirm: 1 preview, not excluded.
 	lowAfterA := eng.State().LowConversionEntries(exchange.Layer0MinPreviews, exchange.Layer0MaxConversionRate)
 	for _, id := range lowAfterA {
@@ -426,7 +426,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 			[]string{previewReqID},
 		)
 		allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-		eng.State().Replay(allMsgs)
+		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 
 	// Verify entry is now excluded (10 previews, 0 conversions = 0% < 5%).
@@ -454,7 +454,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 		[]string{prevMsgA.ID},
 	)
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(allMsgs)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Verify reversal: entry should no longer be in LowConversionEntries.
 	lowAfter := eng.State().LowConversionEntries(exchange.Layer0MinPreviews, exchange.Layer0MaxConversionRate)

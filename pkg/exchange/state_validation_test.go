@@ -61,7 +61,7 @@ func replayIntoEngine(t *testing.T, h *testHarness, eng *exchange.Engine, payloa
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 }
 
 // replayBuyIntoEngine sends a buy message and replays the log.
@@ -75,7 +75,7 @@ func replayBuyIntoEngine(t *testing.T, h *testHarness, eng *exchange.Engine, pay
 	if err != nil {
 		t.Fatalf("listing messages: %v", err)
 	}
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 }
 
 // ---- Put validation tests ----
@@ -116,7 +116,7 @@ func TestValidation_Put_ExactDescriptionLimitAccepted(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Errorf("valid put at description limit rejected: %v", err)
@@ -155,7 +155,7 @@ func TestValidation_Put_ExactDomainsLimitAccepted(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Errorf("valid put at domains limit rejected: %v", err)
@@ -210,7 +210,7 @@ func TestValidation_Put_MaxTokenCostAccepted(t *testing.T) {
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(msgs)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
 		t.Errorf("valid put at max token_cost rejected: %v", err)
