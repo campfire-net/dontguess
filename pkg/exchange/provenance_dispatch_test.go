@@ -37,6 +37,7 @@ func newEngineWithProvenance(t *testing.T, checker *exchange.ProvenanceChecker) 
 		CampfireID:        h.cfID,
 		OperatorIdentity:  h.operator,
 		Store:             h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ProvenanceChecker: checker,
 		Logger: func(format string, args ...any) {
@@ -276,6 +277,7 @@ func TestProvenanceDispatch_NilChecker_AllOperationsPass(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)

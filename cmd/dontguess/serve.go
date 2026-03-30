@@ -10,10 +10,8 @@ import (
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
-	"github.com/campfire-net/campfire/pkg/identity"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	"github.com/campfire-net/campfire/pkg/transport/fs"
 	"github.com/spf13/cobra"
 )
 
@@ -26,15 +24,14 @@ var (
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Run the exchange engine",
-	Long: `Start the DontGuess exchange engine. The engine polls the campfire for
-new messages (put, buy, settle) and processes them.
+	Long: `Start the DontGuess exchange engine. The engine subscribes to the campfire
+for new messages (put, buy, settle) and processes them via the SDK Subscribe API.
 
   dontguess serve                      # default: 500ms poll, auto-accept puts
   dontguess serve --poll-interval 1s   # slower poll
   dontguess serve --no-auto-accept     # manual put approval only
 
-The engine syncs the filesystem transport into the SQLite store on each poll
-cycle, so messages written by "cf send" are picked up automatically.`,
+The SDK's sync-before-query handles filesystem transport sync automatically.`,
 	RunE: runServe,
 }
 
@@ -60,27 +57,29 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("load config (did you run 'dontguess init'?): %w", err)
 	}
 
-	ident, err := identity.Load(cfHome + "/identity.json")
+	// Build two clients via protocol.Init — both share the same identity and store file.
+	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
+	// SDK sync-before-query handles filesystem transport sync automatically.
+	readClient, err := protocol.Init(cfHome)
 	if err != nil {
-		return fmt.Errorf("loading operator identity: %w", err)
+		return fmt.Errorf("protocol.Init (read client): %w", err)
 	}
+	defer readClient.Close() //nolint:errcheck
 
+	writeClient, err := protocol.Init(cfHome)
+	if err != nil {
+		return fmt.Errorf("protocol.Init (write client): %w", err)
+	}
+	defer writeClient.Close() //nolint:errcheck
+
+	// Open a shared store for components that require store.Store directly
+	// (EnsureViews, CampfireScripStore). Uses the same path as protocol.Init.
 	dbPath := store.StorePath(cfHome)
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening store %s: %w", dbPath, err)
 	}
 	defer st.Close()
-
-	transport := fs.New(fs.DefaultBaseDir())
-
-	synced, err := syncTransport(st, cfg.ExchangeCampfireID, transport)
-	if err != nil {
-		return fmt.Errorf("initial transport sync: %w", err)
-	}
-
-	// Build write client for operator sends (view creation, match/settle responses).
-	writeClient := protocol.New(st, ident)
 
 	// Ensure standard named views exist (idempotent — skips existing).
 	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient, st)
@@ -98,12 +97,12 @@ func runServe(_ *cobra.Command, _ []string) error {
 	logger := log.New(os.Stderr, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       cfg.ExchangeCampfireID,
-		OperatorIdentity: ident,
-		Store:            st,
-		WriteClient:      writeClient,
-		PollInterval:     servePollInterval,
-		ScripStore:       cs,
+		CampfireID:   cfg.ExchangeCampfireID,
+		Store:        st,
+		ReadClient:   readClient,
+		WriteClient:  writeClient,
+		PollInterval: servePollInterval,
+		ScripStore:   cs,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
@@ -117,7 +116,6 @@ func runServe(_ *cobra.Command, _ []string) error {
 	logger.Printf("  operator:  %s", cfg.OperatorKeyHex[:16]+"...")
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
-	logger.Printf("  synced:    %d messages from transport", synced)
 	logger.Printf("  store:     %s", dbPath)
 
 	fmt.Printf("\n--- Agent connection info ---\n")
@@ -125,22 +123,6 @@ func runServe(_ *cobra.Command, _ []string) error {
 	fmt.Printf("OPERATOR_KEY=%s\n", cfg.OperatorKeyHex)
 	fmt.Printf("\nAgents join with:\n")
 	fmt.Printf("  cf join %s\n\n", cfg.ExchangeCampfireID[:16])
-
-	// Transport sync goroutine.
-	go func() {
-		ticker := time.NewTicker(servePollInterval)
-		defer ticker.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case <-ticker.C:
-				if _, err := syncTransport(st, cfg.ExchangeCampfireID, transport); err != nil {
-					logger.Printf("transport sync error: %v", err)
-				}
-			}
-		}
-	}()
 
 	// Auto-accept goroutine.
 	if serveAutoAccept {
@@ -164,22 +146,6 @@ func runServe(_ *cobra.Command, _ []string) error {
 
 	logger.Printf("exchange shut down")
 	return nil
-}
-
-func syncTransport(st store.Store, cfID string, transport *fs.Transport) (int, error) {
-	msgs, err := transport.ListMessages(cfID)
-	if err != nil {
-		return 0, fmt.Errorf("listing transport messages: %w", err)
-	}
-	added := 0
-	for i := range msgs {
-		rec := store.MessageRecordFromMessage(cfID, &msgs[i], store.NowNano())
-		if _, err := st.AddMessage(rec); err != nil {
-			continue
-		}
-		added++
-	}
-	return added, nil
 }
 
 func autoAcceptPuts(eng *exchange.Engine, logger *log.Logger) {

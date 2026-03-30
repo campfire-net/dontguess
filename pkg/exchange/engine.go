@@ -45,7 +45,13 @@ type EngineOptions struct {
 	// use WriteClient (which carries its own identity).
 	OperatorIdentity *identity.Identity
 	// Store is the campfire message store (SQLite).
+	// Deprecated: use ReadClient and WriteClient. Kept for backward compatibility
+	// with callers that have not yet migrated (e.g. EnsureViews, CampfireScripStore).
+	// The engine no longer calls Store.ListMessages directly; all reads go via ReadClient.
 	Store store.Store
+	// ReadClient is the protocol client used to subscribe to and replay campfire messages.
+	// If nil, the engine falls back to using Store directly (backward-compat path for tests).
+	ReadClient *protocol.Client
 	// WriteClient is the protocol client used to send operator-signed messages
 	// (match, settle, burn). It must carry the operator's identity and have
 	// membership in CampfireID recorded in its backing store.
@@ -80,6 +86,7 @@ func (o *EngineOptions) log(format string, args ...any) {
 	}
 }
 
+
 // shortKey returns the first 8 characters of key for use in log messages.
 // It never panics on short strings — keys shorter than 8 characters are
 // returned as-is. This prevents the [:8] panic on malformed or truncated keys.
@@ -100,10 +107,9 @@ func shortKey(key string) string {
 // Semantic matching is performed by a matching.Index, which is rebuilt from
 // inventory on startup and updated incrementally as entries are added or removed.
 type Engine struct {
-	opts        EngineOptions
-	state       *State
-	matchIndex  *matching.Index
-	lastCursor  int64 // received_at cursor: last processed message's received_at
+	opts       EngineOptions
+	state      *State
+	matchIndex *matching.Index
 	// ctx is the shutdown context passed to Start. Stored atomically so that
 	// handler goroutines can read it without a data race against the Start write.
 	// Handlers use this so that in-flight scrip operations are cancelled on
@@ -185,94 +191,80 @@ func (e *Engine) Start(ctx context.Context) error {
 func (e *Engine) dispatchPendingOrders() error {
 	orders := e.state.ActiveOrders()
 	for _, order := range orders {
-		// Fetch the original buy message from the store to dispatch.
-		rec, err := e.opts.Store.GetMessage(order.OrderID)
-		if err != nil || rec == nil {
+		msg, err := e.fetchMessage(order.OrderID)
+		if err != nil || msg == nil {
 			e.opts.log("engine: could not fetch order message %s: %v", order.OrderID, err)
 			continue
 		}
-		// Convert at the cf boundary before passing into internal handler.
-		if err := e.handleBuy(FromStoreRecord(rec)); err != nil {
+		// Dispatch the buy (triggers match response).
+		if err := e.handleBuy(msg); err != nil {
 			e.opts.log("engine: error handling pending buy %s: %v", order.OrderID, err)
 		}
 	}
 	return nil
 }
 
-// replayAll loads all historical messages from the store and rebuilds state.
-func (e *Engine) replayAll() error {
-	storeRecs, err := e.opts.Store.ListMessages(e.opts.CampfireID, 0)
-	if err != nil {
-		return fmt.Errorf("listing messages for replay: %w", err)
-	}
-
-	// Convert at the cf boundary before replaying into internal state.
-	msgs := FromStoreRecords(storeRecs)
-	e.state.Replay(msgs)
-
-	// Set cursor to the latest timestamp so subsequent polls start from here.
-	// Uses message timestamp (sender clock) instead of received_at to match
-	// the poll() cursor field — see poll() comment for rationale.
-	for _, m := range storeRecs {
-		if m.Timestamp > e.lastCursor {
-			e.lastCursor = m.Timestamp
+// fetchMessage retrieves a single message by ID. Uses ReadClient.Get when
+// ReadClient is configured (preferred), otherwise falls back to Store.GetMessage.
+func (e *Engine) fetchMessage(id string) (*Message, error) {
+	if e.opts.ReadClient != nil {
+		m, err := e.opts.ReadClient.Get(id)
+		if err != nil {
+			return nil, err
 		}
+		return FromSDKMessage(m), nil
 	}
+	rec, err := e.opts.Store.GetMessage(id)
+	if err != nil || rec == nil {
+		return nil, err
+	}
+	return FromStoreRecord(rec), nil
+}
+
+// replayAll loads all historical messages from the campfire and rebuilds state.
+// Uses ReadClient.Read with AfterTimestamp=0 to fetch all messages. The SDK
+// handles sync-before-query automatically for filesystem transports.
+func (e *Engine) replayAll() error {
+	result, err := e.opts.ReadClient.Read(protocol.ReadRequest{
+		CampfireID:     e.opts.CampfireID,
+		AfterTimestamp: 0,
+	})
+	if err != nil {
+		return fmt.Errorf("reading messages for replay: %w", err)
+	}
+
+	msgs := FromSDKMessages(result.Messages)
+	e.state.Replay(msgs)
 
 	// Rebuild the match index from the current live inventory.
 	e.rebuildMatchIndex()
 
-	e.opts.log("engine: replayed %d messages, cursor=%d, indexed %d entries",
-		len(msgs), e.lastCursor, e.matchIndex.Len())
+	e.opts.log("engine: replayed %d messages, indexed %d entries",
+		len(msgs), e.matchIndex.Len())
 	return nil
 }
 
-// run is the main event loop. It polls for new messages and processes them.
+// run is the main event loop. It subscribes to the campfire via
+// ReadClient.Subscribe and dispatches messages as they arrive on the channel.
 func (e *Engine) run(ctx context.Context) error {
-	ticker := time.NewTicker(e.opts.pollInterval())
-	defer ticker.Stop()
+	sub := e.opts.ReadClient.Subscribe(ctx, protocol.SubscribeRequest{
+		CampfireID:   e.opts.CampfireID,
+		Tags:         []string{TagPut, TagBuy, TagSettle},
+		PollInterval: e.opts.pollInterval(),
+	})
 
-	for {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case <-ticker.C:
-			if err := e.poll(); err != nil {
-				e.opts.log("engine: poll error: %v", err)
-				// Non-fatal: log and continue.
-			}
-		}
-	}
-}
-
-// poll fetches new messages since lastCursor, applies them to state, and
-// triggers handlers for actionable operations.
-//
-// Uses message timestamp (sender clock) instead of received_at for the poll
-// cursor. Messages written directly by cf send arrive with received_at=0
-// (the store's INSERT OR IGNORE dedup means the transport sync never
-// overwrites). Timestamp-based cursoring avoids that blind spot.
-func (e *Engine) poll() error {
-	filter := store.MessageFilter{
-		Tags: []string{TagPut, TagBuy, TagSettle},
-	}
-	msgs, err := e.opts.Store.ListMessages(e.opts.CampfireID, e.lastCursor, filter)
-	if err != nil {
-		return fmt.Errorf("polling messages: %w", err)
-	}
-
-	for i := range msgs {
-		// Convert at the cf boundary before processing internally.
-		msg := FromStoreRecord(&msgs[i])
+	for sdkMsg := range sub.Messages() {
+		msg := FromSDKMessage(&sdkMsg)
 		e.state.Apply(msg)
 		if err := e.dispatch(msg); err != nil {
 			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
 		}
-		if msg.Timestamp > e.lastCursor {
-			e.lastCursor = msg.Timestamp
-		}
 	}
-	return nil
+
+	if err := sub.Err(); err != nil {
+		return fmt.Errorf("engine: subscription error: %w", err)
+	}
+	return ctx.Err()
 }
 
 // dispatch routes a new message to the appropriate handler.

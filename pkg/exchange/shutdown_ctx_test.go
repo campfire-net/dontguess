@@ -103,6 +103,7 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       bs,
 		Logger: func(format string, args ...any) {
@@ -237,6 +238,7 @@ func TestEngine_HandlerCtxIsBackground_BeforeStart(t *testing.T) {
 		CampfireID:       h.cfID,
 		OperatorIdentity: h.operator,
 		Store:            h.st,
+		ReadClient:  protocol.New(h.st, h.operator),
 		WriteClient:      protocol.New(h.st, h.operator),
 		ScripStore:       cs,
 		Logger: func(format string, args ...any) {

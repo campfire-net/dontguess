@@ -142,7 +142,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "warning: recording exchange membership: %v\n", err)
 	}
 
-	// Build protocol client for sending puts.
+	// Build protocol client for sending puts and polling responses.
 	client := protocol.New(s, sellerID)
 
 	// Send all 3 puts and collect message IDs.
@@ -170,29 +170,34 @@ func main() {
 
 	fmt.Println("\nAll 3 puts sent. Waiting for auto-accept responses...")
 
-	// Poll for settle:put-accept responses (up to 15s).
+	// Poll for settle:put-accept responses using client.Read with tag filter (up to 15s).
 	accepted := make(map[string]*settlePayload)
 	deadline := time.Now().Add(15 * time.Second)
 
+	var cursor int64
 	for time.Now().Before(deadline) && len(accepted) < 3 {
-		msgs, err := transport.ListMessages(exchangeCampfireID)
+		result, err := client.Read(protocol.ReadRequest{
+			CampfireID:     exchangeCampfireID,
+			AfterTimestamp: cursor,
+			Tags:           []string{"exchange:settle"},
+		})
 		if err != nil {
 			log.Fatalf("reading messages: %v", err)
 		}
+		if result.MaxTimestamp > cursor {
+			cursor = result.MaxTimestamp
+		}
 
-		for _, msg := range msgs {
+		for _, msg := range result.Messages {
 			// Look for settle messages with put-accept phase.
-			hasSettle := false
 			hasPutAccept := false
 			for _, tag := range msg.Tags {
-				if tag == "exchange:settle" {
-					hasSettle = true
-				}
 				if tag == "exchange:phase:put-accept" {
 					hasPutAccept = true
+					break
 				}
 			}
-			if !hasSettle || !hasPutAccept {
+			if !hasPutAccept {
 				continue
 			}
 
@@ -266,4 +271,3 @@ func sendPut(client *protocol.Client, payload interface{}, tags []string) (strin
 	}
 	return msg.ID, nil
 }
-
