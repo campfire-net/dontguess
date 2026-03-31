@@ -938,6 +938,13 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if residual > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, sellerKey, scrip.BalanceKey, residual, ""); err != nil {
 			e.opts.log("engine: settle: add residual to seller %s: %v", shortKey(sellerKey), err)
+			// Restore reservation so the settle can be retried.
+			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after AddBudget(seller) failure: %v",
+					shortKey(reservationID), restoreErr)
+			}
+			e.emitSettleFailed(msg, reservationID, fmt.Sprintf("add-residual: %v", err))
+			return fmt.Errorf("scrip: settle: AddBudget(seller %s): %w", shortKey(sellerKey), err)
 		}
 	}
 
@@ -945,6 +952,8 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if exchangeRevenue > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, operatorKey, scrip.BalanceKey, exchangeRevenue, ""); err != nil {
 			e.opts.log("engine: settle: add exchange revenue to operator: %v", err)
+			e.emitSettleFailed(msg, reservationID, fmt.Sprintf("add-exchange-revenue: %v", err))
+			return fmt.Errorf("scrip: settle: AddBudget(operator): %w", err)
 		}
 	}
 
@@ -968,6 +977,30 @@ func (e *Engine) handleSettle(msg *Message) error {
 	e.opts.log("engine: settle: reservation=%s seller=%s price=%d residual=%d fee_burned=%d exchange=%d",
 		shortKey(reservationID), shortKey(sellerKey), price, residual, fee, exchangeRevenue)
 	return nil
+}
+
+// emitSettleFailed sends a settle(failed) message to the buyer so they receive
+// an observable signal when the settle(complete) flow cannot complete. The buyer
+// key is taken from msg.Sender (settle(complete) is always sent by the buyer).
+// A best-effort emit: failures are logged but not propagated to the caller.
+func (e *Engine) emitSettleFailed(completeMsg *Message, reservationID, errorCode string) {
+	payload, err := e.marshal(map[string]any{
+		"phase":          SettlePhaseStrFailed,
+		"error_code":     errorCode,
+		"reservation_id": reservationID,
+		"buyer":          completeMsg.Sender,
+	})
+	if err != nil {
+		e.opts.log("engine: settle-failed: marshal: %v", err)
+		return
+	}
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrFailed,
+	}
+	if _, emitErr := e.sendOperatorMessage(payload, tags, []string{completeMsg.ID}); emitErr != nil {
+		e.opts.log("engine: settle-failed: emit: %v", emitErr)
+	}
 }
 
 // handleSettleBuyerAcceptScrip performs the scrip hold when a buyer sends a
@@ -1750,6 +1783,13 @@ const (
 	sizeBonusPerKB   = 0.003  // content size multiplier: +0.3% per KB
 	sizeBonusCap     = 0.30   // content size bonus cap: +30% for sizes >= 100KB
 	scoreRepWeight   = 0.6    // reputation weight in rankResults scoring (recency = 1.0 - scoreRepWeight)
+
+	// Compression tier price multipliers (dontguess-cb5).
+	// Hot entries have high cache hit rate and low staleness — price premium reflects
+	// their higher value to buyers (fewer tokens wasted on stale or unmatched results).
+	tierMultiplierHot  = 1.5 // "hot"  — frequently hit, highly current
+	tierMultiplierWarm = 1.2 // "warm" — moderately active
+	tierMultiplierCold = 1.0 // "cold" or unset — no premium
 )
 
 // computePrice returns the exchange's asking price for an entry.
@@ -1757,11 +1797,12 @@ const (
 // Base price: PutPrice * 1.2 (20% operator margin) when a put-accept exists,
 // otherwise TokenCost * 0.7 (seller's 70% share as a proxy pending acceptance).
 //
-// Five inventory signals adjust the base price:
+// Six inventory signals adjust the base price:
 //   - Demand count: +10% per distinct completed buyer, capped at +100%.
 //   - Age decay: decays from 1.0 to 0.5 linearly over 60 days (PutTimestamp=0 = no decay).
 //   - Reputation: rep=0 -> 0.8x, rep=50 -> 1.0x, rep=100 -> 1.2x.
 //   - Content size: +0.3% per KB, capped at +30% (>=100KB).
+//   - Compression tier: hot=1.5x, warm=1.2x, cold or unset=1.0x (dontguess-cb5).
 //   - Density markup (compressed derivatives only): base * (original_size / compressed_size)
 //     * DensityMarkupFactor (default 1.2). Higher density = higher per-token price.
 //     Total cost is still lower than raw because fewer tokens are delivered.
@@ -1848,10 +1889,23 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 		}
 	}
 
-	// Step 8: compound all multipliers
-	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor * densityFactor
+	// Step 8: compression tier multiplier (dontguess-cb5).
+	// Hot entries command a 1.5x premium; warm entries 1.2x; cold or unset 1.0x.
+	// Tier is set by the seller at put time and reflects expected cache hit rate.
+	var tierFactor float64
+	switch entry.CompressionTier {
+	case "hot":
+		tierFactor = tierMultiplierHot
+	case "warm":
+		tierFactor = tierMultiplierWarm
+	default: // "cold" or "" (unset)
+		tierFactor = tierMultiplierCold
+	}
 
-	// Step 9: clamp and round (nearest-integer, not truncate, for stable results)
+	// Step 9: compound all multipliers
+	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor * densityFactor * tierFactor
+
+	// Step 10: clamp and round (nearest-integer, not truncate, for stable results)
 	rounded := math.Round(price)
 	if rounded < float64(computePriceMinPrice) {
 		return computePriceMinPrice
