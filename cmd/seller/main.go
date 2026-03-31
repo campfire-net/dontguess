@@ -19,12 +19,26 @@ const (
 
 type putSpec struct {
 	Description string
-	ContentHash string
+	Content     string
 	TokenCost   int
 	ContentType string
 	ContentSize int
 	Domains     []string
 	Tags        []string
+}
+
+// buildPutPayload constructs the campfire message payload for a put operation.
+// The content field carries the actual cached inference text; content_hash is
+// not sent — the exchange engine is responsible for hashing.
+func buildPutPayload(p putSpec) map[string]interface{} {
+	return map[string]interface{}{
+		"description":  p.Description,
+		"content":      p.Content,
+		"token_cost":   p.TokenCost,
+		"content_type": p.ContentType,
+		"content_size": p.ContentSize,
+		"domains":      p.Domains,
+	}
 }
 
 type settlePayload struct {
@@ -94,7 +108,7 @@ func main() {
 	puts := []putSpec{
 		{
 			Description: "Cached analysis of Go concurrency patterns for web servers. Covers goroutine pools, channel patterns, context propagation, and graceful shutdown. 2500 tokens of inference.",
-			ContentHash: "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+			Content:     "Go concurrency patterns: goroutine pools, channel fan-out/fan-in, context propagation with cancellation, graceful shutdown via WaitGroup. Each pattern includes production-ready example code.",
 			TokenCost:   2500,
 			ContentType: "analysis",
 			ContentSize: 12000,
@@ -103,7 +117,7 @@ func main() {
 		},
 		{
 			Description: "Performance benchmark results for PostgreSQL vs SQLite for time-series data at 10K-100K rows. Includes query latency, write throughput, and memory usage comparisons. 4000 tokens of inference.",
-			ContentHash: "sha256:b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3",
+			Content:     "PostgreSQL vs SQLite benchmark (10K-100K rows time-series): PG write throughput 45K rows/s vs SQLite 12K rows/s. PG query p99 8ms vs SQLite 2ms at 10K, PG wins at 100K with 15ms vs 120ms. Memory: PG 45MB base, SQLite 2MB.",
 			TokenCost:   4000,
 			ContentType: "data",
 			ContentSize: 8500,
@@ -112,7 +126,7 @@ func main() {
 		},
 		{
 			Description: "Rate limiter implementation in Go using token bucket algorithm. Production-ready with burst support, per-key limits, and Redis backend option. 1500 tokens of inference.",
-			ContentHash: "sha256:c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4",
+			Content:     "Token bucket rate limiter in Go: per-key limits with burst support, Redis backend for distributed use. Interface: Allow(key string) bool, AllowN(key string, n int) bool. Includes middleware adapter for net/http.",
 			TokenCost:   1500,
 			ContentType: "code",
 			ContentSize: 6000,
@@ -126,14 +140,7 @@ func main() {
 	expectedPrices := make([]int64, 0, 3)
 
 	for i, p := range puts {
-		payload := map[string]interface{}{
-			"description":  p.Description,
-			"content_hash": p.ContentHash,
-			"token_cost":   p.TokenCost,
-			"content_type": p.ContentType,
-			"content_size": p.ContentSize,
-			"domains":      p.Domains,
-		}
+		payload := buildPutPayload(p)
 		msgID, err := sendPut(client, payload, p.Tags)
 		if err != nil {
 			log.Fatalf("sending put %d: %v", i+1, err)
