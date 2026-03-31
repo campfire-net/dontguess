@@ -116,7 +116,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	for _, m := range members {
 		provenanceStore.SetSelfClaimed(m.MemberPubkey)
 	}
-	provenanceChecker, err := exchange.NewProvenanceChecker(provenanceStore)
+	provenanceChecker, err := exchange.NewProvenanceChecker(provenanceStore, cfg.ProvenanceLevels)
 	if err != nil {
 		return fmt.Errorf("creating provenance checker: %w", err)
 	}
