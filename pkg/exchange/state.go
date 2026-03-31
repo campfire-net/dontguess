@@ -127,6 +127,12 @@ type InventoryEntry struct {
 	// Operators can clear the flag by calling SetEntryProvenanceLevel with the current
 	// (lower) level once satisfied the content is still acceptable.
 	NeedsRevalidation bool
+
+	// CompressedFrom is the EntryID of the original inventory entry that this
+	// entry was derived from via a compression assign task. Non-empty only for
+	// derivative entries created by handleAssignAccept when task_type == "compress".
+	// The derivative entry is independently priced and matchable.
+	CompressedFrom string
 }
 
 // IsExpired returns true if the entry has passed its expiry time.
@@ -1173,6 +1179,20 @@ func (s *State) applySettlePreview(msg *Message) {
 		return
 	}
 	s.previewToMatch[msg.ID] = matchMsgID
+}
+
+// applyDerivativePut adds a derivative inventory entry (e.g. from a compress
+// assign-accept) directly to the live inventory without going through the
+// put → put-accept flow. The caller is responsible for constructing the entry
+// with all required fields set; in particular CompressedFrom must be non-empty
+// for compression derivatives.
+//
+// The entry is keyed by entry.EntryID. Duplicate IDs are silently overwritten
+// (same semantics as a re-applied put-accept).
+//
+// This method does not acquire the state mutex — callers must hold s.mu.Lock().
+func (s *State) applyDerivativePut(entry *InventoryEntry) {
+	s.inventory[entry.EntryID] = entry
 }
 
 // applyAssign processes an exchange:assign message.

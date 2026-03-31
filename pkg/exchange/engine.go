@@ -1131,6 +1131,15 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 		e.opts.log("engine: assign-accept: no assign record for complete_id=%s", shortKey(completeMsgID))
 		return nil
 	}
+
+	// For compression tasks: create a derivative inventory entry from the result.
+	if rec.TaskType == "compress" && rec.EntryID != "" {
+		if err := e.createCompressionDerivative(rec, msg.ID); err != nil {
+			e.opts.log("engine: assign-accept: create compression derivative: %v", err)
+			// Non-fatal — log and continue to pay bounty.
+		}
+	}
+
 	if rec.Reward <= 0 {
 		e.opts.log("engine: assign-accept: zero reward, skipping scrip payment assign_id=%s", shortKey(rec.AssignID))
 		return nil
@@ -1167,6 +1176,78 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 
 	e.opts.log("engine: assign-accept: bounty paid assign_id=%s worker=%s amount=%d",
 		shortKey(rec.AssignID), shortKey(rec.ClaimantKey), rec.Reward)
+	return nil
+}
+
+// createCompressionDerivative creates a new derivative inventory entry when a
+// compression assign task is accepted. The derivative's content_hash and
+// content_size come from the assign-complete result payload; the description,
+// content_type, domains, token_cost, and seller_key are inherited from the
+// original entry. The derivative is added directly to live inventory via
+// applyDerivativePut and indexed in the match index so buyers can find it.
+//
+// Result payload fields (from the worker's assign-complete message):
+//
+//	content_hash  string  sha256: prefixed hash of compressed content
+//	content_size  int64   byte size of compressed content
+func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID string) error {
+	// Look up the original entry.
+	orig := e.state.GetInventoryEntry(rec.EntryID)
+	if orig == nil {
+		return fmt.Errorf("original entry %s not found in inventory", shortKey(rec.EntryID))
+	}
+
+	// Parse the result payload to extract content_hash and content_size.
+	var result struct {
+		ContentHash string `json:"content_hash"`
+		ContentSize int64  `json:"content_size"`
+	}
+	if err := json.Unmarshal(rec.Result, &result); err != nil {
+		return fmt.Errorf("parse assign-complete result: %w", err)
+	}
+	if result.ContentHash == "" {
+		return fmt.Errorf("assign-complete result missing content_hash")
+	}
+
+	// Generate a unique EntryID for the derivative. Use a random ID with the
+	// accept message ID as entropy source so replays produce the same ID.
+	idBytes := make([]byte, 32)
+	if _, err := rand.Read(idBytes); err != nil {
+		return fmt.Errorf("generate derivative entry ID: %w", err)
+	}
+	derivativeID := hex.EncodeToString(idBytes)
+
+	// Build domains copy so the derivative doesn't share the original's slice.
+	domainsCopy := make([]string, len(orig.Domains))
+	copy(domainsCopy, orig.Domains)
+
+	derivative := &InventoryEntry{
+		EntryID:        derivativeID,
+		PutMsgID:       acceptMsgID, // antecedent is the accept message
+		SellerKey:      orig.SellerKey,
+		Description:    orig.Description,
+		ContentHash:    result.ContentHash,
+		ContentType:    orig.ContentType,
+		Domains:        domainsCopy,
+		TokenCost:      orig.TokenCost,
+		ContentSize:    result.ContentSize,
+		PutPrice:       orig.PutPrice,
+		PutTimestamp:   orig.PutTimestamp,
+		CompressedFrom: orig.EntryID,
+		// AcceptedProvenanceLevel and NeedsRevalidation inherit zero values;
+		// provenance checking is done at put-accept time for primary entries.
+	}
+
+	// Insert into state inventory (holds state mutex internally).
+	e.state.mu.Lock()
+	e.state.applyDerivativePut(derivative)
+	e.state.mu.Unlock()
+
+	// Add to match index so buyers can find the derivative.
+	e.matchIndex.Add(e.inventoryEntryToRankInput(derivative))
+
+	e.opts.log("engine: assign-accept: created compression derivative entry_id=%s from=%s",
+		shortKey(derivativeID), shortKey(orig.EntryID))
 	return nil
 }
 
