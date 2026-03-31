@@ -28,6 +28,18 @@ const MatchingFeeRate = 10
 // original seller. 10% = 1/10.
 const ResidualRate = 10
 
+// HotCompressionBountyPct is the percentage of token_cost paid as bounty for
+// hot compression (immediately after put). 50% = 1/2.
+const HotCompressionBountyPct = 50
+
+// WarmCompressionBountyPct is the percentage of token_cost paid as bounty for
+// warm compression (buyer-initiated, content in cache). 30% = 3/10.
+const WarmCompressionBountyPct = 30
+
+// ReservationExpiryDuration is the time window during which a buyer-accept
+// reservation is valid. After expiry, the scrip hold is released.
+const ReservationExpiryDuration = 5 * time.Minute
+
 // Layer0MinPreviews is the minimum number of previews before conversion-rate
 // exclusion kicks in. Below this, entries have insufficient data for exclusion.
 const Layer0MinPreviews = 10
@@ -1064,7 +1076,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 
 	// Marshal the buy-hold convention message BEFORE mutating scrip state.
 	reservationID := newReservationID()
-	expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	expiresAt := time.Now().Add(ReservationExpiryDuration).UTC().Format(time.RFC3339)
 	holdPayload, err := e.marshal(scrip.BuyHoldPayload{
 		Buyer:         buyerKey,
 		Amount:        holdAmount,
@@ -1873,7 +1885,7 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 // This is sent immediately after a put is accepted (hot path). Failure is
 // non-fatal to the caller — the error is logged and the accept proceeds.
 func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
-	bounty := entry.TokenCost / 2
+	bounty := entry.TokenCost * HotCompressionBountyPct / 100
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). Run /compress with the entry content to produce a Nyquist-sampled summary. Bounty: %d scrip.",
 		entry.EntryID, entry.ContentHash, bounty,
@@ -1910,7 +1922,7 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 // matched entry. Failure is non-fatal to the caller — the error is logged and
 // the match proceeds.
 func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey string) error {
-	bounty := entry.TokenCost * 30 / 100
+	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). You just received this content — run /compress to produce a Nyquist-sampled summary. Bounty: %d scrip.",
 		entry.EntryID, entry.ContentHash, bounty,
