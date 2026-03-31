@@ -421,3 +421,262 @@ func TestBuyMiss_OfferExpiry(t *testing.T) {
 		}
 	}
 }
+
+// TestBuyMiss_WrongSenderIgnored verifies that only the buyer who received the
+// buy-miss offer may fulfill it by submitting a put. A different agent
+// submitting a put with a matching description must NOT trigger auto-accept.
+// When the original buyer then puts the same description, auto-accept fires.
+func TestBuyMiss_WrongSenderIgnored(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	task := "Build a distributed key-value store in Go with Raft consensus"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	eng := h.newEngine()
+
+	// Replay the initial exchange bootstrap messages.
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// Inject a standing offer associating the task with h.buyer as the buyer.
+	offer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "fake-buy-msg-id",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	eng.State().SetBuyMissOffer(offer)
+
+	// Step 2: An impostor (h.seller) submits a put with the same task description.
+	// Use Apply (not Replay) to add the put to state so the injected offer is preserved.
+	impostorPut := h.sendMessage(h.seller,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", 1234), "code", 40000, 80000),
+		[]string{exchange.TagPut},
+		nil,
+	)
+	impostorRec, _ := h.st.GetMessage(impostorPut.ID)
+	if impostorRec == nil {
+		t.Fatal("impostor put not found in store")
+	}
+	impostorMsg := exchange.FromStoreRecord(impostorRec)
+	eng.State().Apply(impostorMsg)
+
+	// Dispatch the impostor put — should be silently ignored (wrong sender).
+	if err := eng.DispatchForTest(impostorMsg); err != nil {
+		t.Fatalf("DispatchForTest(impostor put): %v", err)
+	}
+
+	// No settle should have been emitted.
+	settleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	for _, sm := range settleMsgs {
+		if hasTag(sm.Tags, "exchange:phase:put-accept") {
+			t.Errorf("unexpected put-accept for impostor put: msg %s", sm.ID)
+		}
+	}
+
+	// Standing offer must still be present (not consumed).
+	if eng.State().GetBuyMissOffer(taskHash) == nil {
+		t.Error("standing offer was consumed by impostor — should still be live")
+	}
+
+	// Step 3: The actual buyer now puts the same description — auto-accept must fire.
+	// Use Apply to add only this new message without re-running Replay (which would
+	// wipe the standing offer since it was injected directly, not via campfire messages).
+	preSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+
+	buyerPut := h.sendMessage(h.buyer,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", 5678), "code", 40000, 80000),
+		[]string{exchange.TagPut},
+		nil,
+	)
+	buyerRec, _ := h.st.GetMessage(buyerPut.ID)
+	if buyerRec == nil {
+		t.Fatal("buyer put not found in store")
+	}
+	buyerMsg := exchange.FromStoreRecord(buyerRec)
+	eng.State().Apply(buyerMsg)
+
+	if err := eng.DispatchForTest(buyerMsg); err != nil {
+		t.Fatalf("DispatchForTest(buyer put): %v", err)
+	}
+
+	// A put-accept settle must have been emitted.
+	postSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	var foundAccept bool
+	for _, sm := range postSettle {
+		// Only consider messages that appeared after the impostor phase.
+		alreadySeen := false
+		for _, pre := range preSettle {
+			if pre.ID == sm.ID {
+				alreadySeen = true
+				break
+			}
+		}
+		if !alreadySeen && hasTag(sm.Tags, "exchange:phase:put-accept") {
+			foundAccept = true
+			break
+		}
+	}
+	if !foundAccept {
+		t.Error("buyer put did not trigger auto-accept — expected put-accept settle message")
+	}
+
+	// Standing offer must now be consumed.
+	if eng.State().GetBuyMissOffer(taskHash) != nil {
+		t.Error("standing offer still present after buyer fulfillment — should be consumed")
+	}
+}
+
+// TestBuyMiss_TokenCostCapped verifies that a seller cannot inflate the scrip
+// payout by supplying a token_cost above MaxTokenCost. The price paid must be
+// capped at MaxTokenCost * BuyMissOfferRate / 100.
+func TestBuyMiss_TokenCostCapped(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	const maxTokenCost int64 = 1_000_000
+
+	task := "Generate a high-fidelity physics simulation in Rust"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:   h.cfID,
+		Store:        h.st,
+		ReadClient:   h.newOperatorClient(),
+		WriteClient:  h.newOperatorClient(),
+		MaxTokenCost: maxTokenCost,
+		ReadSkipSync: true,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
+
+	// Replay existing state then inject the standing offer. Use Apply (not Replay)
+	// for subsequent messages to preserve the injected offer in state.
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// Inject a standing offer for the buyer.
+	offer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "fake-buy-msg-id",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	eng.State().SetBuyMissOffer(offer)
+
+	preSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+
+	// Buyer puts with an inflated token_cost (100× above cap).
+	inflatedCost := maxTokenCost * 100
+	putMsg := h.sendMessage(h.buyer,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", inflatedCost), "code", inflatedCost, inflatedCost*2),
+		[]string{exchange.TagPut},
+		nil,
+	)
+
+	// Apply just this new message so pendingPuts is populated without wiping the offer.
+	putRec, _ := h.st.GetMessage(putMsg.ID)
+	if putRec == nil {
+		t.Fatal("put not in store")
+	}
+	putMsgObj := exchange.FromStoreRecord(putRec)
+	eng.State().Apply(putMsgObj)
+
+	if err := eng.DispatchForTest(putMsgObj); err != nil {
+		t.Fatalf("DispatchForTest: %v", err)
+	}
+
+	// Find the put-accept message.
+	postSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	var putAcceptMsg *store.MessageRecord
+	for i := range postSettle {
+		alreadySeen := false
+		for _, pre := range preSettle {
+			if pre.ID == postSettle[i].ID {
+				alreadySeen = true
+				break
+			}
+		}
+		if !alreadySeen && hasTag(postSettle[i].Tags, "exchange:phase:put-accept") {
+			putAcceptMsg = &postSettle[i]
+			break
+		}
+	}
+	if putAcceptMsg == nil {
+		t.Fatal("no put-accept emitted for buy-miss fulfillment")
+	}
+
+	// Parse the price — must be capped at maxTokenCost * BuyMissOfferRate / 100.
+	var acceptPayload struct {
+		Price int64 `json:"price"`
+	}
+	if err := json.Unmarshal(putAcceptMsg.Payload, &acceptPayload); err != nil {
+		t.Fatalf("parsing put-accept payload: %v", err)
+	}
+	expectedPrice := maxTokenCost * int64(exchange.BuyMissOfferRate) / 100
+	if acceptPayload.Price != expectedPrice {
+		t.Errorf("price = %d, want %d (capped at maxTokenCost * %d%%); inflated cost was %d",
+			acceptPayload.Price, expectedPrice, exchange.BuyMissOfferRate, inflatedCost)
+	}
+}
+
+// TestBuyMiss_InvalidHashRejected verifies that a put with a content_hash that
+// does not start with "sha256:" is rejected in the buy-miss auto-accept path
+// (engine returns an error; no put-accept is emitted).
+func TestBuyMiss_InvalidHashRejected(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	task := "Translate a 500-page technical document from French to English"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	eng := h.newEngine()
+
+	// Replay existing state.
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// Inject a standing offer for the buyer.
+	offer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "fake-buy-msg-id",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	eng.State().SetBuyMissOffer(offer)
+
+	// Buyer puts with an invalid content_hash (no sha256: prefix).
+	// Use Apply (not Replay) to add the put to state without wiping the injected offer.
+	invalidHash := "md5:d41d8cd98f00b204e9800998ecf8427e"
+	putMsg := h.sendMessage(h.buyer,
+		putPayload(task, invalidHash, "code", 20000, 40000),
+		[]string{exchange.TagPut},
+		nil,
+	)
+
+	putRec, _ := h.st.GetMessage(putMsg.ID)
+	if putRec == nil {
+		t.Fatal("put not in store")
+	}
+	putMsgObj := exchange.FromStoreRecord(putRec)
+	eng.State().Apply(putMsgObj)
+
+	// Dispatch should return an error for the invalid hash.
+	err := eng.DispatchForTest(putMsgObj)
+	if err == nil {
+		t.Error("expected error for invalid content_hash, got nil")
+	}
+
+	// No put-accept must have been emitted.
+	settleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	for _, sm := range settleMsgs {
+		if hasTag(sm.Tags, "exchange:phase:put-accept") {
+			t.Errorf("unexpected put-accept emitted for invalid content_hash: msg %s", sm.ID)
+		}
+	}
+}
