@@ -1404,9 +1404,8 @@ func (s *State) applyAssignAccept(msg *Message) {
 //   - Antecedent must reference a known assign in AssignCompleted state via
 //     pendingAssignResults.
 //
-// On success, the assign transitions to AssignRejected and is removed from
-// pendingAssignResults. The task returns to AssignOpen so another agent may
-// claim it.
+// On success, the assign is removed from pendingAssignResults and transitions
+// back to AssignOpen so a different agent may claim the task.
 func (s *State) applyAssignReject(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
@@ -1419,7 +1418,6 @@ func (s *State) applyAssignReject(msg *Message) {
 	if !ok || rec.Status != AssignCompleted {
 		return
 	}
-	rec.Status = AssignRejected
 	delete(s.pendingAssignResults, completeMsgID)
 	// Reset to open so a different agent may claim the task.
 	rec.ClaimantKey = ""

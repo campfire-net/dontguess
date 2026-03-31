@@ -393,5 +393,69 @@ func TestClaimAssignPaymentIdempotent(t *testing.T) {
 	}
 }
 
+// TestApplyAssignReject_StatusObservable verifies that after an operator rejects
+// an assign result, the assign record transitions to AssignOpen (re-opened for
+// reclaim) and AssignRejected is never set as the final status. The dead write
+// bug was: rec.Status = AssignRejected was written then immediately overwritten
+// by rec.Status = AssignOpen — making AssignRejected unobservable.
+//
+// This test guards both:
+//  1. The record is in AssignOpen after reject (re-open path works).
+//  2. The record is never left in AssignRejected (no orphaned intermediate state).
+func TestApplyAssignReject_StatusObservable(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-obs", operatorKey, "entry-obs", "validation", 40, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-obs", agentKey, "assign-obs")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-obs", agentKey, "claim-obs", nil)))
+
+	// Verify record is in AssignCompleted before reject.
+	rec := s.assignByID["assign-obs"]
+	if rec == nil {
+		t.Fatal("assign-obs not found in assignByID")
+	}
+	if rec.Status != AssignCompleted {
+		t.Fatalf("pre-reject: expected AssignCompleted, got %v", rec.Status)
+	}
+
+	// Apply the reject.
+	rejectMsg := makeAssignRejectMsg("reject-obs", operatorKey, "complete-obs")
+	s.Apply(&rejectMsg)
+
+	// Post-reject: the record must be AssignOpen (re-opened), never AssignRejected.
+	if rec.Status == AssignRejected {
+		t.Fatalf("post-reject: record is in AssignRejected — this is a dead write bug; status should be AssignOpen")
+	}
+	if rec.Status != AssignOpen {
+		t.Fatalf("post-reject: expected AssignOpen (re-opened for reclaim), got %v", rec.Status)
+	}
+
+	// Confirm claimant and complete fields are cleared.
+	if rec.ClaimantKey != "" {
+		t.Fatalf("post-reject: ClaimantKey not cleared, got %q", rec.ClaimantKey)
+	}
+	if rec.ClaimMsgID != "" {
+		t.Fatalf("post-reject: ClaimMsgID not cleared, got %q", rec.ClaimMsgID)
+	}
+	if rec.CompleteMsgID != "" {
+		t.Fatalf("post-reject: CompleteMsgID not cleared, got %q", rec.CompleteMsgID)
+	}
+
+	// Confirm the record no longer appears in pendingAssignResults.
+	if _, inPending := s.pendingAssignResults["complete-obs"]; inPending {
+		t.Fatal("post-reject: record still in pendingAssignResults after reject")
+	}
+
+	// Confirm the record appears in ActiveAssigns (it's re-opened, so it's active).
+	actives := s.ActiveAssigns("entry-obs")
+	if len(actives) != 1 {
+		t.Fatalf("post-reject: expected 1 active assign (re-opened), got %d", len(actives))
+	}
+	if actives[0].Status != AssignOpen {
+		t.Fatalf("post-reject: ActiveAssigns[0].Status = %v, want AssignOpen", actives[0].Status)
+	}
+}
+
 // ptr is a helper that takes a value and returns a pointer to it.
 func ptr(m Message) *Message { return &m }
