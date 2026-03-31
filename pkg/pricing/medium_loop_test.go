@@ -1013,3 +1013,59 @@ func TestMediumLoop_CompressionAssign_SkippedWhenBelowThreshold(t *testing.T) {
 		t.Errorf("expected 0 PostAssign calls when below threshold, got %d", postCalls)
 	}
 }
+
+// TestMediumLoop_ZeroBountySkip verifies that entries with TokenCost < 2 are
+// skipped by postCompressionAssigns because their bounty (TokenCost/2) would
+// be 0 — a worthless assign. Entries with TokenCost >= 2 proceed normally.
+func TestMediumLoop_ZeroBountySkip(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name        string
+		tokenCost   int64
+		wantAssigns int
+		wantPosts   int
+	}{
+		{name: "zero_cost_skipped", tokenCost: 0, wantAssigns: 0, wantPosts: 0},
+		{name: "one_cost_skipped", tokenCost: 1, wantAssigns: 0, wantPosts: 0},
+		{name: "two_cost_proceeds", tokenCost: 2, wantAssigns: 1, wantPosts: 1},
+		{name: "large_cost_proceeds", tokenCost: 10000, wantAssigns: 1, wantPosts: 1},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			st := newMediumStubState()
+			st.inventory = []*exchange.InventoryEntry{
+				{EntryID: "entry-bounty", SellerKey: "seller-1", TokenCost: tc.tokenCost},
+			}
+			// Meet purchase threshold so only the TokenCost guard can cause a skip.
+			st.purchaseCount["entry-bounty"] = 3
+			st.compressedVersions["entry-bounty"] = false
+
+			var postCalls int
+			loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+				State: st,
+				Now:   func() time.Time { return now },
+				PostAssign: func(spec pricing.AssignSpec) error {
+					postCalls++
+					return nil
+				},
+			})
+
+			result := loop.Tick(context.Background())
+
+			if result.CompressionAssigns != tc.wantAssigns {
+				t.Errorf("tokenCost=%d: expected CompressionAssigns=%d, got %d",
+					tc.tokenCost, tc.wantAssigns, result.CompressionAssigns)
+			}
+			if postCalls != tc.wantPosts {
+				t.Errorf("tokenCost=%d: expected %d PostAssign calls, got %d",
+					tc.tokenCost, tc.wantPosts, postCalls)
+			}
+		})
+	}
+}
