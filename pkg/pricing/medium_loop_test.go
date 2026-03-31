@@ -2,6 +2,7 @@ package pricing_test
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -847,6 +848,133 @@ func TestMediumLoop_CompressionAssign_SkippedWhenDerivativeExists(t *testing.T) 
 	}
 	if postCalls != 0 {
 		t.Errorf("expected 0 PostAssign calls when derivative exists, got %d", postCalls)
+	}
+}
+
+// TestMediumLoop_PurchaseCountBoundary is a table-driven test covering the
+// exact boundary around the default CompressionPurchaseThreshold (3):
+//   - purchaseCount=0: no panic, no assign
+//   - purchaseCount=2: below threshold, no assign
+//   - purchaseCount=3: at threshold, assign is posted
+func TestMediumLoop_PurchaseCountBoundary(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name          string
+		purchaseCount int
+		wantAssigns   int
+	}{
+		{name: "count=0", purchaseCount: 0, wantAssigns: 0},
+		{name: "count=2_below_threshold", purchaseCount: 2, wantAssigns: 0},
+		{name: "count=3_at_threshold", purchaseCount: 3, wantAssigns: 1},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := newMediumStubState()
+			st.inventory = []*exchange.InventoryEntry{
+				{EntryID: "entry-boundary", SellerKey: "seller-1", TokenCost: 6000},
+			}
+			st.purchaseCount["entry-boundary"] = tc.purchaseCount
+
+			var postCalls int
+			loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+				State: st,
+				Now:   func() time.Time { return now },
+				PostAssign: func(spec pricing.AssignSpec) error {
+					postCalls++
+					return nil
+				},
+			})
+
+			result := loop.Tick(context.Background())
+
+			if result.CompressionAssigns != tc.wantAssigns {
+				t.Errorf("purchaseCount=%d: expected CompressionAssigns=%d, got %d",
+					tc.purchaseCount, tc.wantAssigns, result.CompressionAssigns)
+			}
+			if postCalls != tc.wantAssigns {
+				t.Errorf("purchaseCount=%d: expected %d PostAssign calls, got %d",
+					tc.purchaseCount, tc.wantAssigns, postCalls)
+			}
+		})
+	}
+}
+
+// TestMediumLoop_ZeroPurchases verifies that an inventory entry with zero
+// purchases runs without panic and emits no compression assign.
+func TestMediumLoop_ZeroPurchases(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-zero", SellerKey: "seller-1", TokenCost: 4000},
+	}
+	// purchaseCount not set → defaults to 0 in the stub map.
+
+	var postCalls int
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			postCalls++
+			return nil
+		},
+	})
+
+	// Must not panic.
+	result := loop.Tick(context.Background())
+
+	if result.CompressionAssigns != 0 {
+		t.Errorf("expected 0 compression assigns for zero-purchase entry, got %d", result.CompressionAssigns)
+	}
+	if postCalls != 0 {
+		t.Errorf("expected 0 PostAssign calls for zero-purchase entry, got %d", postCalls)
+	}
+}
+
+// TestMediumLoop_PostAssignError verifies that when PostAssign returns an error
+// for one entry, the loop continues processing remaining entries, and
+// CompressionAssigns is not incremented for the failed entry.
+func TestMediumLoop_PostAssignError(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	// Two high-demand entries: first will fail, second will succeed.
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-fail", SellerKey: "seller-1", TokenCost: 8000},
+		{EntryID: "entry-ok", SellerKey: "seller-2", TokenCost: 6000},
+	}
+	st.purchaseCount["entry-fail"] = 5
+	st.purchaseCount["entry-ok"] = 4
+
+	errPostFail := errors.New("simulated assign failure")
+
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			if spec.EntryID == "entry-fail" {
+				return errPostFail
+			}
+			return nil
+		},
+	})
+
+	result := loop.Tick(context.Background())
+
+	// Only the successful entry should be counted.
+	if result.CompressionAssigns != 1 {
+		t.Errorf("expected CompressionAssigns=1 (only entry-ok succeeded), got %d", result.CompressionAssigns)
 	}
 }
 
