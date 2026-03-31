@@ -253,3 +253,116 @@ func TestComputePrice_AllSignals_FreshEntryBaseline(t *testing.T) {
 		t.Errorf("computePrice(baseline) = %d, want 1200", price)
 	}
 }
+
+// --- Compression tier multiplier tests (dontguess-cb5) ---
+
+// TestComputePrice_Tier_HotPremium verifies that a "hot" entry commands a 1.5x
+// tier multiplier on top of the base price.
+// PutPrice=1000 -> base=1200 (1.2x margin). Tier=hot -> 1.2 * 1.5 = 1800.
+func TestComputePrice_Tier_HotPremium(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		PutPrice:        1000,
+		CompressionTier: "hot",
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1800 {
+		t.Errorf("computePrice(PutPrice=1000, tier=hot) = %d, want 1800 (1.2x margin * 1.5x tier)", price)
+	}
+}
+
+// TestComputePrice_Tier_WarmPremium verifies that a "warm" entry commands a 1.2x
+// tier multiplier on top of the base price.
+// PutPrice=1000 -> base=1200. Tier=warm -> 1200 * 1.2 = 1440.
+func TestComputePrice_Tier_WarmPremium(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		PutPrice:        1000,
+		CompressionTier: "warm",
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1440 {
+		t.Errorf("computePrice(PutPrice=1000, tier=warm) = %d, want 1440 (1.2x margin * 1.2x tier)", price)
+	}
+}
+
+// TestComputePrice_Tier_ColdNoChange verifies that a "cold" entry has no tier
+// premium (1.0x multiplier — same as unset tier).
+// PutPrice=1000 -> base=1200. Tier=cold -> 1200 * 1.0 = 1200.
+func TestComputePrice_Tier_ColdNoChange(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		PutPrice:        1000,
+		CompressionTier: "cold",
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1200 {
+		t.Errorf("computePrice(PutPrice=1000, tier=cold) = %d, want 1200 (no tier premium)", price)
+	}
+}
+
+// TestComputePrice_Tier_UnsetNoChange verifies that an unset tier ("") has no
+// premium — same price as a "cold" entry.
+// PutPrice=1000 -> base=1200. Tier="" -> 1200 * 1.0 = 1200.
+func TestComputePrice_Tier_UnsetNoChange(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	entry := &exchange.InventoryEntry{
+		PutPrice:        1000,
+		CompressionTier: "",
+	}
+	price := eng.ComputePriceForTest(entry)
+	if price != 1200 {
+		t.Errorf("computePrice(PutPrice=1000, tier=\"\") = %d, want 1200 (unset tier = no premium)", price)
+	}
+}
+
+// TestComputePrice_Tier_SameTokenCostDifferentTiersProduceDifferentPrices is the
+// canonical done-condition test: same TokenCost at different tiers must produce
+// different prices, and hot > warm > cold == unset.
+// TokenCost=1000 -> base=700 (0.7x seller share). hot=1050, warm=840, cold=700.
+func TestComputePrice_Tier_SameTokenCostDifferentTiersProduceDifferentPrices(t *testing.T) {
+	t.Parallel()
+	eng := newMinimalEngine(t)
+
+	hot := &exchange.InventoryEntry{TokenCost: 1000, CompressionTier: "hot"}
+	warm := &exchange.InventoryEntry{TokenCost: 1000, CompressionTier: "warm"}
+	cold := &exchange.InventoryEntry{TokenCost: 1000, CompressionTier: "cold"}
+	unset := &exchange.InventoryEntry{TokenCost: 1000, CompressionTier: ""}
+
+	hotPrice := eng.ComputePriceForTest(hot)
+	warmPrice := eng.ComputePriceForTest(warm)
+	coldPrice := eng.ComputePriceForTest(cold)
+	unsetPrice := eng.ComputePriceForTest(unset)
+
+	if hotPrice <= warmPrice {
+		t.Errorf("hot price %d should be > warm price %d", hotPrice, warmPrice)
+	}
+	if warmPrice <= coldPrice {
+		t.Errorf("warm price %d should be > cold price %d", warmPrice, coldPrice)
+	}
+	if coldPrice != unsetPrice {
+		t.Errorf("cold price %d should equal unset price %d (both 1.0x)", coldPrice, unsetPrice)
+	}
+
+	// Exact values: TokenCost=1000, PutPrice=0 -> base=700 (0.7x). rep=50 -> repFactor=1.0.
+	// hot:  700 * 1.5 = 1050
+	// warm: 700 * 1.2 = 840
+	// cold: 700 * 1.0 = 700
+	if hotPrice != 1050 {
+		t.Errorf("hot price = %d, want 1050 (700 * 1.5)", hotPrice)
+	}
+	if warmPrice != 840 {
+		t.Errorf("warm price = %d, want 840 (700 * 1.2)", warmPrice)
+	}
+	if coldPrice != 700 {
+		t.Errorf("cold price = %d, want 700 (700 * 1.0)", coldPrice)
+	}
+}
