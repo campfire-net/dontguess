@@ -305,3 +305,266 @@ func TestWarmCompression_SkippedWhenDerivativeExists(t *testing.T) {
 		}
 	}
 }
+
+// TestWarmCompression_DerivativeEntrySkipped verifies that when the top-matched
+// entry is itself a compression derivative (entry.CompressedFrom != ""), the
+// engine does NOT emit a warm compression assign.
+func TestWarmCompression_DerivativeEntrySkipped(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	const tokenCost int64 = 18000
+	origHash := "sha256:" + fmt.Sprintf("%064x", 101)
+	derivHash := "sha256:" + fmt.Sprintf("%064x", 102)
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Rust async patterns", origHash, "code", tokenCost, 28000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:rust"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("ListMessages after put: %v", err)
+	}
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 9000, time.Now().Add(168*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	origEntryID := inv[0].EntryID
+
+	assignPayload, _ := json.Marshal(map[string]any{
+		"entry_id":         origEntryID,
+		"task_type":        "compress",
+		"reward":           tokenCost / 2,
+		"exclusive_sender": h.seller.PublicKeyHex(),
+	})
+	assignMsg := h.sendMessage(h.operator, assignPayload, []string{exchange.TagAssign}, nil)
+	assignExchangeMsg := exchange.FromStoreRecord(mustGetStoreRecord(t, h, assignMsg.ID))
+	eng.State().Apply(assignExchangeMsg)
+	if err := eng.DispatchForTest(assignExchangeMsg); err != nil {
+		t.Fatalf("DispatchForTest(assign): %v", err)
+	}
+
+	claimMsg := h.sendMessage(h.seller, []byte(`{}`), []string{exchange.TagAssignClaim}, []string{assignMsg.ID})
+	claimExchangeMsg := exchange.FromStoreRecord(mustGetStoreRecord(t, h, claimMsg.ID))
+	eng.State().Apply(claimExchangeMsg)
+	if err := eng.DispatchForTest(claimExchangeMsg); err != nil {
+		t.Fatalf("DispatchForTest(claim): %v", err)
+	}
+
+	completePayload, _ := json.Marshal(map[string]any{
+		"content_hash": derivHash,
+		"content_size": int64(7000),
+	})
+	completeMsg := h.sendMessage(h.seller, completePayload, []string{exchange.TagAssignComplete}, []string{claimMsg.ID})
+	completeExchangeMsg := exchange.FromStoreRecord(mustGetStoreRecord(t, h, completeMsg.ID))
+	eng.State().Apply(completeExchangeMsg)
+	if err := eng.DispatchForTest(completeExchangeMsg); err != nil {
+		t.Fatalf("DispatchForTest(complete): %v", err)
+	}
+
+	acceptMsg := h.sendMessage(h.operator, []byte(`{}`), []string{exchange.TagAssignAccept}, []string{completeMsg.ID})
+	acceptExchangeMsg := exchange.FromStoreRecord(mustGetStoreRecord(t, h, acceptMsg.ID))
+	eng.State().Apply(acceptExchangeMsg)
+	if err := eng.DispatchForTest(acceptExchangeMsg); err != nil {
+		t.Fatalf("DispatchForTest(accept): %v", err)
+	}
+
+	inv = eng.State().Inventory()
+	var derivEntryID string
+	for _, e := range inv {
+		if e.CompressedFrom == origEntryID {
+			derivEntryID = e.EntryID
+			break
+		}
+	}
+	if derivEntryID == "" {
+		t.Fatal("expected compression derivative in inventory, found none")
+	}
+
+	assignsBefore, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages before buy: %v", err)
+	}
+	beforeIDs := make(map[string]bool, len(assignsBefore))
+	for _, m := range assignsBefore {
+		beforeIDs[m.ID] = true
+	}
+
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("Rust async patterns", 15000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+	buyExchangeMsg := exchange.FromStoreRecord(mustGetStoreRecord(t, h, buyMsg.ID))
+	eng.State().Apply(buyExchangeMsg)
+
+	if err := eng.DispatchForTest(buyExchangeMsg); err != nil {
+		t.Fatalf("DispatchForTest(buy): %v", err)
+	}
+
+	matchMsgs, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagMatch},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages(TagMatch): %v", err)
+	}
+	if len(matchMsgs) == 0 {
+		t.Fatal("expected a match message, found none")
+	}
+
+	assignsAfter, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages after buy: %v", err)
+	}
+
+	for i := range assignsAfter {
+		msg := &assignsAfter[i]
+		if beforeIDs[msg.ID] {
+			continue
+		}
+		var p struct {
+			TaskType        string `json:"task_type"`
+			ExclusiveSender string `json:"exclusive_sender"`
+		}
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			continue
+		}
+		if p.TaskType == "compress" && p.ExclusiveSender == h.buyer.PublicKeyHex() {
+			t.Errorf("unexpected warm compression assign for buyer when matched entry is derivative (assign_id=%s)", msg.ID[:16])
+		}
+	}
+}
+
+// TestWarmCompression_ActiveAssignSkipped verifies that when a warm compression
+// assign for the buyer already exists (active, non-terminal) for the matched
+// entry, the engine does NOT emit a second warm compression assign on a
+// subsequent buy from the same buyer.
+func TestWarmCompression_ActiveAssignSkipped(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	const tokenCost int64 = 20000
+	contentHash := "sha256:" + fmt.Sprintf("%064x", 103)
+
+	// Step 1: put and accept the entry.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Python asyncio patterns", contentHash, "code", tokenCost, 30000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:python"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("ListMessages after put: %v", err)
+	}
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	if err := eng.AutoAcceptPut(putMsg.ID, 10000, time.Now().Add(168*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	origEntryID := inv[0].EntryID
+
+	// Step 2: first buy — should trigger a warm assign to the buyer.
+	buyMsg1 := h.sendMessage(h.buyer,
+		buyPayload("Python asyncio patterns", 15000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+	buyExchangeMsg1 := exchange.FromStoreRecord(mustGetStoreRecord(t, h, buyMsg1.ID))
+	eng.State().Apply(buyExchangeMsg1)
+
+	if err := eng.DispatchForTest(buyExchangeMsg1); err != nil {
+		t.Fatalf("DispatchForTest(first buy): %v", err)
+	}
+
+	// Verify the first warm assign was sent.
+	assignsAfterFirstBuy, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages after first buy: %v", err)
+	}
+	var warmAssignCount int
+	for _, msg := range assignsAfterFirstBuy {
+		var p struct {
+			TaskType        string `json:"task_type"`
+			EntryID         string `json:"entry_id"`
+			ExclusiveSender string `json:"exclusive_sender"`
+		}
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			continue
+		}
+		if p.TaskType == "compress" && p.EntryID == origEntryID && p.ExclusiveSender == h.buyer.PublicKeyHex() {
+			warmAssignCount++
+		}
+	}
+	if warmAssignCount != 1 {
+		t.Fatalf("expected 1 warm assign after first buy, got %d", warmAssignCount)
+	}
+
+	// Record assigns before second buy.
+	beforeIDs := make(map[string]bool, len(assignsAfterFirstBuy))
+	for _, m := range assignsAfterFirstBuy {
+		beforeIDs[m.ID] = true
+	}
+
+	// Step 3: second buy from same buyer — warm assign already exists (active),
+	// so no second warm assign must be emitted.
+	buyMsg2 := h.sendMessage(h.buyer,
+		buyPayload("Python asyncio patterns", 15000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+	buyExchangeMsg2 := exchange.FromStoreRecord(mustGetStoreRecord(t, h, buyMsg2.ID))
+	eng.State().Apply(buyExchangeMsg2)
+
+	if err := eng.DispatchForTest(buyExchangeMsg2); err != nil {
+		t.Fatalf("DispatchForTest(second buy): %v", err)
+	}
+
+	assignsAfterSecondBuy, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages after second buy: %v", err)
+	}
+
+	for i := range assignsAfterSecondBuy {
+		msg := &assignsAfterSecondBuy[i]
+		if beforeIDs[msg.ID] {
+			continue
+		}
+		var p struct {
+			TaskType        string `json:"task_type"`
+			EntryID         string `json:"entry_id"`
+			ExclusiveSender string `json:"exclusive_sender"`
+		}
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			continue
+		}
+		if p.TaskType == "compress" && p.EntryID == origEntryID && p.ExclusiveSender == h.buyer.PublicKeyHex() {
+			t.Errorf("unexpected second warm compression assign for buyer (active assign already exists) (assign_id=%s)", msg.ID[:16])
+		}
+	}
+}
