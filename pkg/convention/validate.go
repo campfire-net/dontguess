@@ -52,6 +52,8 @@ var allowedTagPatterns = []tagPattern{
 	{prefix: "exchange:assign-verdict:", allowedSuffixes: assignVerdictSuffixes},
 	// exchange-core/assign-reject.json
 	{exact: "exchange:assign-reject"},
+	// exchange-core/assign-expire.json
+	{exact: "exchange:assign-expire"},
 	// exchange-scrip/assign-pay.json
 	{exact: "dontguess:scrip-assign-pay"},
 	{prefix: "scrip:task:", allowedSuffixes: taskSuffixes},
