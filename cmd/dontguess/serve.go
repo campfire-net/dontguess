@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/3dl-dev/dontguess/pkg/matching"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
@@ -122,11 +123,25 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating provenance checker: %w", err)
 	}
 
+	// Use dense embeddings if the embed script is available.
+	var embedder matching.Embedder
+	embedScript := os.Getenv("DONTGUESS_EMBED_SCRIPT")
+	if embedScript == "" {
+		embedScript = "/home/baron/projects/dontguess/cmd/embed/main.py"
+	}
+	if _, err := os.Stat(embedScript); err == nil {
+		embedder = matching.NewDenseEmbedder(embedScript)
+		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
+	} else {
+		logger.Printf("  embedder:  tf-idf (set DONTGUESS_EMBED_SCRIPT for dense)")
+	}
+
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        cfg.ExchangeCampfireID,
 		Store:             st,
 		ReadClient:        readClient,
 		WriteClient:       writeClient,
+		Embedder:          embedder,
 		PollInterval:      servePollInterval,
 		ScripStore:        cs,
 		ProvenanceChecker: provenanceChecker,
