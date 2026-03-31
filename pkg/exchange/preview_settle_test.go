@@ -15,6 +15,7 @@ package exchange_test
 import (
 	"encoding/json"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -469,16 +470,14 @@ func TestEngineDispatch_PreviewRequest_InvalidAntecedent_NoResponse(t *testing.T
 }
 
 // TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated verifies that the
-// engine passes correct metadata fields (ContentType, EntryID) to PreviewAssembler
-// when handling a preview-request.
+// engine passes correct metadata fields (Content, ContentType, EntryID) to
+// PreviewAssembler when handling a preview-request.
 //
 // After dontguess-nh4: seed is entry_id only. BuyerKey and MatchID are no longer
 // seeding inputs and have been removed from PreviewRequest.
 //
-// Content delivery is not wired at this stage — the engine uses nil content and
-// PreviewAssembler returns an empty chunk slice. What we can verify is that the
-// emitted preview payload correctly reflects metadata derived from the inventory
-// entry (ContentType, EntryID).
+// After dontguess-c9c7: entry.Content is wired through to the assembler, so the
+// emitted preview payload carries real chunks and non-zero token counts.
 func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
@@ -556,14 +555,14 @@ func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) 
 		t.Errorf("preview antecedent = %v, want [%s] (preview-request)", previewMsg.Antecedents, preqMsg.ID)
 	}
 
-	// With nil content, the assembler produces zero chunks. Verify the payload
-	// reflects this rather than garbage data, confirming the assembler was called
-	// and its result was faithfully serialized.
-	if payload.TotalTokens != 0 {
-		t.Errorf("preview payload total_tokens = %d with nil content, want 0", payload.TotalTokens)
+	// With real content wired (dontguess-c9c7), the assembler produces non-zero
+	// tokens and at least one chunk. Verify the payload faithfully reflects the
+	// assembler output.
+	if payload.TotalTokens == 0 {
+		t.Errorf("preview payload total_tokens = 0; expected non-zero with real entry.Content")
 	}
-	if len(payload.Chunks) != 0 {
-		t.Errorf("preview payload chunks len = %d with nil content, want 0", len(payload.Chunks))
+	if len(payload.Chunks) == 0 {
+		t.Errorf("preview payload chunks len = 0; expected chunks with real entry.Content")
 	}
 }
 
@@ -638,5 +637,106 @@ func TestPreviewRequest_DuplicateRejected(t *testing.T) {
 	byEntry := eng.State().PreviewsByEntryForTest()
 	if got := byEntry[entryID][buyerKey]; got != matchRec.ID {
 		t.Errorf("previewsByEntry[entry][buyer] = %q after duplicate, want %q", got, matchRec.ID)
+	}
+}
+
+// TestPreviewRequest_RealContent verifies the full flow: put(content=X) → buy → match
+// → preview-request → preview response contains chunks with real content substrings.
+//
+// This is the regression test for dontguess-c9c7: handleSettlePreviewRequest was
+// passing Content: nil to PreviewAssembler, producing empty chunks. The fix wires
+// entry.Content through so preview chunks reflect actual cached inference content.
+func TestPreviewRequest_RealContent(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// buildMatchedState creates an inventory entry whose content starts with
+	// "cached inference result: Preview test inference " — a known prefix we can
+	// assert against in the preview chunks.
+	matchRec, entryID := buildMatchedState(t, h, eng)
+
+	// Retrieve the inventory entry to confirm content is non-empty (dontguess-743 prerequisite).
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("expected inventory entry after put-accept")
+	}
+	if len(inv[0].Content) == 0 {
+		t.Fatal("inventory entry has no content; test prerequisite violated (dontguess-743 must be in place)")
+	}
+
+	// Buyer sends preview-request.
+	preqMsg := h.sendMessage(h.buyer,
+		previewRequestPayload(entryID),
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchRec.ID},
+	)
+	preqRec, _ := h.st.GetMessage(preqMsg.ID)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
+
+	// Dispatch through engine — calls handleSettlePreviewRequest and emits settle(preview).
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
+		t.Fatalf("DispatchForTest preview-request: %v", err)
+	}
+
+	// Find the emitted preview message.
+	postMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	var previewMsg *store.MessageRecord
+	for i := range postMsgs {
+		m := &postMsgs[i]
+		for _, tag := range m.Tags {
+			if tag == exchange.TagPhasePrefix+exchange.SettlePhaseStrPreview {
+				previewMsg = m
+				break
+			}
+		}
+		if previewMsg != nil {
+			break
+		}
+	}
+	if previewMsg == nil {
+		t.Fatal("no settle(preview) message found after dispatch")
+	}
+
+	// Parse the preview payload.
+	var payload struct {
+		EntryID string `json:"entry_id"`
+		Chunks  []struct {
+			Content string `json:"content"`
+		} `json:"chunks"`
+	}
+	if err := json.Unmarshal(previewMsg.Payload, &payload); err != nil {
+		t.Fatalf("parsing preview payload: %v", err)
+	}
+
+	// Chunks must be non-empty — nil content produces zero chunks.
+	if len(payload.Chunks) == 0 {
+		t.Fatal("preview has 0 chunks; expected real content chunks when entry.Content is wired through")
+	}
+
+	// At least one chunk must have non-empty content string.
+	anyNonEmpty := false
+	for _, c := range payload.Chunks {
+		if len(c.Content) > 0 {
+			anyNonEmpty = true
+			break
+		}
+	}
+	if !anyNonEmpty {
+		t.Error("all preview chunk content strings are empty; entry.Content was not passed to PreviewAssembler")
+	}
+
+	// At least one chunk must contain a substring of the original content.
+	// putPayload embeds "cached inference result: <desc>" as a known prefix.
+	const wantSubstr = "cached inference result: Preview test inference"
+	found := false
+	for _, c := range payload.Chunks {
+		if strings.Contains(c.Content, wantSubstr) {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Errorf("no preview chunk contains expected content substring %q; chunks returned but content may not be from the real entry", wantSubstr)
 	}
 }
