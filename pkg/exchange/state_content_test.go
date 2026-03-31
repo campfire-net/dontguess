@@ -91,6 +91,48 @@ func TestApplyPut_HashComputedFromContent(t *testing.T) {
 	}
 }
 
+// TestApplyPut_PreDecodeSizeLimit verifies that a put whose base64-encoded
+// content string exceeds MaxContentBytes*4/3+4 is rejected before base64
+// decoding occurs, preventing unnecessary heap allocation.
+func TestApplyPut_PreDecodeSizeLimit(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Construct a base64 string longer than the pre-decode threshold using
+	// valid base64 characters ('A' is valid). We use valid characters so the
+	// pre-decode guard (not the decode-error handler) is what rejects it.
+	threshold := exchange.MaxContentBytes*4/3 + 4
+	buf := make([]byte, threshold+1)
+	for i := range buf {
+		buf[i] = 'A'
+	}
+	oversizedB64 := string(buf)
+
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("pre-decode rejection", 10000, oversizedB64))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 0 {
+		t.Errorf("expected empty pendingPuts for oversized base64 string (pre-decode), got %d entries", len(pending))
+	}
+}
+
+// TestApplyPut_MalformedBase64 verifies that a put with a non-base64 content
+// string is silently dropped without panicking.
+func TestApplyPut_MalformedBase64(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Pass a string that is not valid base64 but short enough to pass the pre-decode check.
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("malformed content", 5000, "not-valid-base64!!!"))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 0 {
+		t.Errorf("expected empty pendingPuts for malformed base64, got %d entries", len(pending))
+	}
+}
+
 // TestApplyPut_ContentSizeLimit verifies that a put with content exceeding
 // MaxContentBytes is silently dropped.
 func TestApplyPut_ContentSizeLimit(t *testing.T) {

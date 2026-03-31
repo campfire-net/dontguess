@@ -713,6 +713,10 @@ func (s *State) applyPut(msg *Message) {
 	if payload.Content == "" {
 		return
 	}
+	// Pre-decode size guard: base64 expands ~4/3x, reject early to avoid heap allocation
+	if len(payload.Content) > MaxContentBytes*4/3+4 {
+		return
+	}
 	// Decode content from base64. Drop silently on decode failure.
 	contentBytes, err := base64.StdEncoding.DecodeString(payload.Content)
 	if err != nil {
