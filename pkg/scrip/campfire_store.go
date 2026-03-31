@@ -74,7 +74,7 @@ type CampfireScripStore struct {
 	// replaying is true while Replay() is executing. subtractFromBalance uses
 	// this flag to decide whether to permit negative balances (replay trusts the
 	// log) or clamp to zero (live mode prevents permanent buyer lockout).
-	replaying bool
+	replaying atomic.Bool
 
 	// totalSupply tracks total scrip ever minted.
 	totalSupply atomic.Int64
@@ -108,9 +108,10 @@ func NewCampfireScripStore(campfireID string, client *protocol.Client, operatorK
 // Called on construction; can be called again to resync.
 func (s *CampfireScripStore) Replay() error {
 	result, err := s.client.Read(protocol.ReadRequest{
-		CampfireID:     s.campfireID,
-		AfterTimestamp: 0,
-		SkipSync:       true,
+		CampfireID:       s.campfireID,
+		AfterTimestamp:   0,
+		SkipSync:         true,
+		IncludeCompacted: true,
 	})
 	if err != nil {
 		return fmt.Errorf("listing messages: %w", err)
@@ -127,11 +128,11 @@ func (s *CampfireScripStore) Replay() error {
 
 	// Convert at the cf boundary before replaying into internal state.
 	msgs := proto.FromSDKMessages(result.Messages)
-	s.replaying = true
+	s.replaying.Store(true)
 	for i := range msgs {
 		s.applyMessage(&msgs[i])
 	}
-	s.replaying = false
+	s.replaying.Store(false)
 	return nil
 }
 
@@ -505,7 +506,7 @@ func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) 
 
 	e.mu.Lock()
 	newVal := e.value - amount
-	if !s.replaying && newVal < 0 {
+	if !s.replaying.Load() && newVal < 0 {
 		newVal = 0
 	}
 	e.value = newVal
