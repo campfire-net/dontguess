@@ -657,18 +657,24 @@ func (e *Engine) handlePut(msg *Message) error {
 	}
 
 	taskHash := TaskDescriptionHash(pending.Description)
-	// ClaimBuyMissOffer atomically checks and removes the offer in one lock
-	// acquisition, preventing a TOCTOU race where two concurrent puts with the
-	// same task hash could both observe the offer and both get auto-accepted.
-	offer := e.state.ClaimBuyMissOffer(taskHash)
-	if offer == nil {
+
+	// Only the buyer who received the miss offer may fulfill it.
+	// Peek first (read-only) to avoid consuming the offer if sender doesn't match.
+	peeked := e.state.GetBuyMissOffer(taskHash)
+	if peeked == nil {
 		// No standing offer — leave pending for normal operator review.
 		return nil
 	}
+	if msg.Sender != peeked.BuyerKey {
+		return nil // reject: only the original buyer can fulfill their own miss offer
+	}
 
-	// Only the buyer who received the miss offer may fulfill it.
-	if msg.Sender != offer.BuyerKey {
-		return nil // reject: different agent attempted to collect scrip
+	// Sender matches — now atomically claim (get+delete) to prevent TOCTOU
+	// double-accept by two concurrent puts from the same buyer.
+	offer := e.state.ClaimBuyMissOffer(taskHash)
+	if offer == nil {
+		// Lost the race — another concurrent put from the same buyer already claimed it.
+		return nil
 	}
 
 	// Cap token_cost to prevent inflated scrip payouts from untrusted seller input.
