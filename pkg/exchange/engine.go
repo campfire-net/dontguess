@@ -676,6 +676,13 @@ func (e *Engine) handlePut(msg *Message) error {
 		// Lost the race — another concurrent put from the same buyer already claimed it.
 		return nil
 	}
+	// TOCTOU guard: the offer may have been replaced by a new buyer's standing offer
+	// between the peek check above and this atomic claim. Re-validate sender against
+	// the claimed offer (not the peeked one) to prevent consuming the wrong buyer's offer.
+	if offer.BuyerKey != msg.Sender {
+		e.state.SetBuyMissOffer(offer) // restore the rightful buyer's offer
+		return nil
+	}
 
 	// Cap token_cost to prevent inflated scrip payouts from untrusted seller input.
 	tokenCost := pending.TokenCost
@@ -728,7 +735,7 @@ func (e *Engine) handlePut(msg *Message) error {
 
 	// Pay the seller scrip immediately (same as scrip-put-pay in normal put-accept flow).
 	if e.opts.ScripStore != nil {
-		ctx := context.Background()
+		ctx := e.engineCtx()
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, pending.SellerKey, scrip.BalanceKey, offeredPrice, ""); err != nil {
 			e.opts.log("engine: buy-miss put-accept: AddBudget for seller %s: %v", shortKey(pending.SellerKey), err)
 		}
@@ -1869,10 +1876,10 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 	bounty := entry.TokenCost / 2
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). Run /compress with the entry content to produce a Nyquist-sampled summary. Bounty: %d scrip.",
-		entry.PutMsgID, entry.ContentHash, bounty,
+		entry.EntryID, entry.ContentHash, bounty,
 	)
 	payload, err := json.Marshal(map[string]any{
-		"entry_id":         entry.PutMsgID,
+		"entry_id":         entry.EntryID,
 		"task_type":        "compress",
 		"reward":           bounty,
 		"exclusive_sender": entry.SellerKey,
@@ -1906,10 +1913,10 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 	bounty := entry.TokenCost * 30 / 100
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). You just received this content — run /compress to produce a Nyquist-sampled summary. Bounty: %d scrip.",
-		entry.PutMsgID, entry.ContentHash, bounty,
+		entry.EntryID, entry.ContentHash, bounty,
 	)
 	payload, err := json.Marshal(map[string]any{
-		"entry_id":         entry.PutMsgID,
+		"entry_id":         entry.EntryID,
 		"task_type":        "compress",
 		"reward":           bounty,
 		"exclusive_sender": buyerKey,
