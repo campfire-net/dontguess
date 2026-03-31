@@ -305,28 +305,51 @@ func (e *Engine) replayAll() error {
 
 // run is the main event loop. It subscribes to the campfire via
 // ReadClient.Subscribe and dispatches messages as they arrive on the channel.
+// An expiry sweep runs on each received message (lazy path) and on a periodic
+// ticker (backstop path) to catch expired claims when no messages arrive.
 func (e *Engine) run(ctx context.Context) error {
 	sub := e.opts.ReadClient.Subscribe(ctx, protocol.SubscribeRequest{
 		CampfireID: e.opts.CampfireID,
 		Tags: []string{
 			TagPut, TagBuy, TagSettle,
 			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
+			TagAssignExpire,
 		},
 		PollInterval: e.opts.pollInterval(),
 	})
 
-	for sdkMsg := range sub.Messages() {
-		msg := FromSDKMessage(&sdkMsg)
-		e.state.Apply(msg)
-		if err := e.dispatch(msg); err != nil {
-			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
+	// Expiry sweep ticker: backstop for catching expired claims when no messages
+	// arrive. Uses the same poll interval as the subscribe loop.
+	expirySweepTicker := time.NewTicker(e.opts.pollInterval())
+	defer expirySweepTicker.Stop()
+
+	// msgCh is used to multiplex the subscribe channel with the sweep ticker
+	// inside a select loop. We process messages via goroutine → select.
+	msgCh := sub.Messages()
+	for {
+		select {
+		case sdkMsg, ok := <-msgCh:
+			if !ok {
+				// Channel closed — subscription ended.
+				if err := sub.Err(); err != nil {
+					return fmt.Errorf("engine: subscription error: %w", err)
+				}
+				return ctx.Err()
+			}
+			msg := FromSDKMessage(&sdkMsg)
+			e.state.Apply(msg)
+			if err := e.dispatch(msg); err != nil {
+				e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
+			}
+			// Lazy expiry sweep on every received message.
+			e.sweepExpiredClaims()
+		case <-expirySweepTicker.C:
+			// Periodic backstop sweep.
+			e.sweepExpiredClaims()
+		case <-ctx.Done():
+			return ctx.Err()
 		}
 	}
-
-	if err := sub.Err(); err != nil {
-		return fmt.Errorf("engine: subscription error: %w", err)
-	}
-	return ctx.Err()
 }
 
 // dispatch routes a new message to the appropriate handler.
@@ -366,6 +389,8 @@ func (e *Engine) dispatch(msg *Message) error {
 		return e.handleAssignAccept(msg)
 	case TagAssignReject:
 		return e.handleAssignReject(msg)
+	case TagAssignExpire:
+		return e.handleAssignExpire(msg)
 	}
 	return nil
 }
@@ -1636,6 +1661,53 @@ func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID stri
 func (e *Engine) handleAssignReject(msg *Message) error {
 	e.opts.log("engine: assign-reject received reject_id=%s", shortKey(msg.ID))
 	return nil
+}
+
+// handleAssignExpire processes an exchange:assign-expire message.
+//
+// State.Apply has already validated the sender and transitioned the record
+// back to AssignOpen. The engine logs the expiry for diagnostics.
+func (e *Engine) handleAssignExpire(msg *Message) error {
+	e.opts.log("engine: assign-expire processed expire_id=%s", shortKey(msg.ID))
+	return nil
+}
+
+// sweepExpiredClaims detects AssignClaimed records whose ClaimExpiresAt has
+// passed and emits an exchange:assign-expire operator message for each one.
+// State.Apply processes the emitted message and transitions the record back to
+// AssignOpen. This is the backstop expiry path — the lazy path in ActiveAssigns
+// handles the common case where another agent queries for open tasks.
+//
+// sweepExpiredClaims is called on every received message (lazy) and on the
+// periodic expiry sweep ticker (backstop). It is a no-op if WriteClient is
+// not configured (e.g. read-only engine instances in tests).
+func (e *Engine) sweepExpiredClaims() {
+	if e.opts.WriteClient == nil {
+		return
+	}
+	e.state.mu.RLock()
+	expired := e.state.ExpireStaleClaims()
+	e.state.mu.RUnlock()
+
+	for _, claimMsgID := range expired {
+		payload, err := json.Marshal(map[string]string{
+			"claim_id":    claimMsgID,
+			"detected_at": time.Now().UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			e.opts.log("engine: sweep: marshal assign-expire payload: %v", err)
+			continue
+		}
+		expireMsg, err := e.sendOperatorMessage(payload, []string{TagAssignExpire}, []string{claimMsgID})
+		if err != nil {
+			e.opts.log("engine: sweep: emit assign-expire for claim=%s: %v", shortKey(claimMsgID), err)
+			continue
+		}
+		// Apply the emitted expire message directly to state so we don't wait for
+		// the next subscribe loop iteration to pick it up.
+		e.state.Apply(expireMsg)
+		e.opts.log("engine: sweep: claim expired, task reopened claim=%s", shortKey(claimMsgID))
+	}
 }
 
 // entryForDeliver derives the inventory entry for a deliver message ID by tracing

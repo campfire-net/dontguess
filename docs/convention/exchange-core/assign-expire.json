@@ -1,0 +1,35 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign-expire",
+  "description": "Expire a claim that exceeded its TTL. Emitted by the exchange operator when a claimed assignment's expires_at has passed without an assign-complete from the claimant. The assignment returns to open state for re-claim by other agents.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "target",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:assign-claim that expired."
+    },
+    {
+      "name": "claim_id",
+      "type": "string",
+      "required": true,
+      "description": "Message ID of the exchange:assign-claim that expired (same as target, included for readability)."
+    },
+    {
+      "name": "detected_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when the engine detected the expiry."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign-expire",
+      "cardinality": "exactly_one"
+    }
+  ]
+}

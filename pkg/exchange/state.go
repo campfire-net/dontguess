@@ -33,6 +33,7 @@ const (
 	TagAssignComplete = "exchange:assign-complete"
 	TagAssignAccept   = "exchange:assign-accept"
 	TagAssignReject   = "exchange:assign-reject"
+	TagAssignExpire   = "exchange:assign-expire"
 
 	// TagBuyMiss is the tag applied to a buy-miss standing offer message.
 	// Sent by the engine as a reply to a buy with no matching inventory.
@@ -267,6 +268,12 @@ const BuyMissOfferTTL = 24 * time.Hour
 // a buy-miss auto-accept (70% — same as standard auto-accept discount).
 const BuyMissOfferRate = 70 // percent
 
+// DefaultClaimTimeoutMinutes is the default TTL for an assign claim.
+// The claimant must submit assign-complete within this window or the claim
+// is expired and the task returns to AssignOpen for reclaim.
+// Configurable per-assign via claim_timeout_minutes in the assign payload.
+const DefaultClaimTimeoutMinutes = 15
+
 // AssignStatus is the lifecycle state of a single assign task.
 type AssignStatus int
 
@@ -306,6 +313,11 @@ type AssignRecord struct {
 	ClaimantKey string
 	// ClaimMsgID is the message ID of the exchange:assign-claim message.
 	ClaimMsgID string
+	// ClaimExpiresAt is the deadline by which the claimant must submit
+	// assign-complete. Computed at claim time as min(claim.expires_at,
+	// assign_receive_time + claim_timeout_minutes). Zero value means no expiry
+	// is tracked (e.g. for legacy records without expiry data).
+	ClaimExpiresAt time.Time
 	// CompleteMsgID is the message ID of the exchange:assign-complete message.
 	CompleteMsgID string
 	// Result is the agent-supplied result payload (from assign-complete).
@@ -314,6 +326,13 @@ type AssignRecord struct {
 	// ExclusiveSender restricts who may claim this task. If non-empty, only the
 	// agent with this public key may claim. Used for seller-only or buyer-only tasks.
 	ExclusiveSender string
+	// ClaimTimeoutMinutes is the maximum minutes a claimant has to complete the
+	// task. Sourced from the assign payload's claim_timeout_minutes field.
+	// Defaults to DefaultClaimTimeoutMinutes (15) if not set.
+	ClaimTimeoutMinutes int
+	// AssignReceivedAt is the engine-observed receive time of the assign message,
+	// used as the reference point for computing ClaimExpiresAt. Stored as UTC.
+	AssignReceivedAt time.Time
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -633,6 +652,8 @@ func (s *State) applyLocked(msg *Message) {
 		s.applyAssignAccept(msg)
 	case TagAssignReject:
 		s.applyAssignReject(msg)
+	case TagAssignExpire:
+		s.applyAssignExpire(msg)
 	default:
 		// Handle scrip convention messages that are not exchange operations.
 		for _, tag := range msg.Tags {
@@ -673,7 +694,8 @@ func exchangeOp(tags []string) string {
 	for _, t := range tags {
 		switch t {
 		case TagPut, TagBuy, TagMatch, TagSettle,
-			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject:
+			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
+			TagAssignExpire:
 			return t
 		}
 	}
@@ -1326,21 +1348,34 @@ func (s *State) applyAssign(msg *Message) {
 		return
 	}
 	var payload struct {
-		EntryID         string `json:"entry_id"`
-		TaskType        string `json:"task_type"`
-		Reward          int64  `json:"reward"`
-		ExclusiveSender string `json:"exclusive_sender"`
+		EntryID              string `json:"entry_id"`
+		TaskType             string `json:"task_type"`
+		Reward               int64  `json:"reward"`
+		ExclusiveSender      string `json:"exclusive_sender"`
+		ClaimTimeoutMinutes  int    `json:"claim_timeout_minutes"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
+	timeoutMinutes := payload.ClaimTimeoutMinutes
+	if timeoutMinutes <= 0 || timeoutMinutes > 30 {
+		timeoutMinutes = DefaultClaimTimeoutMinutes
+	}
+	// Use the message's sender-reported timestamp as receive time; fall back to
+	// current wall clock if the timestamp is absent (tests, synthetic messages).
+	receivedAt := time.Now().UTC()
+	if msg.Timestamp > 0 {
+		receivedAt = time.Unix(0, msg.Timestamp).UTC()
+	}
 	rec := &AssignRecord{
-		AssignID:        msg.ID,
-		EntryID:         payload.EntryID,
-		TaskType:        payload.TaskType,
-		Reward:          payload.Reward,
-		Status:          AssignOpen,
-		ExclusiveSender: payload.ExclusiveSender,
+		AssignID:            msg.ID,
+		EntryID:             payload.EntryID,
+		TaskType:            payload.TaskType,
+		Reward:              payload.Reward,
+		Status:              AssignOpen,
+		ExclusiveSender:     payload.ExclusiveSender,
+		ClaimTimeoutMinutes: timeoutMinutes,
+		AssignReceivedAt:    receivedAt,
 	}
 	s.assignsByEntry[payload.EntryID] = append(s.assignsByEntry[payload.EntryID], rec)
 	s.assignByID[msg.ID] = rec
@@ -1374,9 +1409,28 @@ func (s *State) applyAssignClaim(msg *Message) {
 	if existing, held := s.claimedAssigns[msg.Sender]; held && existing != "" {
 		return
 	}
+	// Compute claim expiry: ceiling is assign_receive_time + claim_timeout_minutes.
+	// If the claimant supplies expires_at, honour it only if within the ceiling.
+	ceiling := rec.AssignReceivedAt.Add(time.Duration(rec.ClaimTimeoutMinutes) * time.Minute)
+	expiresAt := ceiling // default: ceiling
+	var claimPayload struct {
+		ExpiresAt string `json:"expires_at"`
+	}
+	if len(msg.Payload) > 0 {
+		_ = json.Unmarshal(msg.Payload, &claimPayload) // best-effort; ignore parse errors
+	}
+	if claimPayload.ExpiresAt != "" {
+		if parsed, err := time.Parse(time.RFC3339, claimPayload.ExpiresAt); err == nil {
+			parsed = parsed.UTC()
+			if parsed.Before(ceiling) {
+				expiresAt = parsed
+			}
+		}
+	}
 	rec.Status = AssignClaimed
 	rec.ClaimantKey = msg.Sender
 	rec.ClaimMsgID = msg.ID
+	rec.ClaimExpiresAt = expiresAt
 	s.claimedAssigns[msg.Sender] = assignID
 }
 
@@ -1409,6 +1463,12 @@ func (s *State) applyAssignComplete(msg *Message) {
 	}
 	// Sender must be the claimant.
 	if msg.Sender != rec.ClaimantKey {
+		return
+	}
+	// Defensive expiry check: if the claim has expired (the engine should have
+	// already emitted assign-expire and transitioned back to AssignOpen, but
+	// message ordering is not guaranteed), drop the completion.
+	if !rec.ClaimExpiresAt.IsZero() && time.Now().UTC().After(rec.ClaimExpiresAt) {
 		return
 	}
 	rec.Status = AssignCompleted
@@ -1481,6 +1541,62 @@ func (s *State) applyAssignReject(msg *Message) {
 	rec.Status = AssignOpen
 }
 
+// applyAssignExpire processes an exchange:assign-expire message.
+//
+// Only the operator may emit assign-expire messages.
+// Antecedent: the assign-claim message ID that expired.
+//
+// Validation:
+//   - Sender must be the operator (if OperatorKey set).
+//   - Antecedent must reference a known assign-claim for an assign in AssignClaimed state.
+//   - Idempotent: replaying the same expire message is a no-op (record already open).
+//
+// On success, the claimant fields are cleared, the claimedAssigns binding is
+// removed, and the record transitions back to AssignOpen.
+func (s *State) applyAssignExpire(msg *Message) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	claimMsgID := msg.Antecedents[0]
+	// Find the assign record whose claim matches.
+	var rec *AssignRecord
+	for _, r := range s.assignByID {
+		if r.ClaimMsgID == claimMsgID {
+			rec = r
+			break
+		}
+	}
+	if rec == nil || rec.Status != AssignClaimed {
+		return // idempotent: already expired/open or unknown
+	}
+	// Free the agent's claim slot.
+	delete(s.claimedAssigns, rec.ClaimantKey)
+	// Reset to open so a different agent may claim the task.
+	rec.ClaimantKey = ""
+	rec.ClaimMsgID = ""
+	rec.ClaimExpiresAt = time.Time{}
+	rec.Status = AssignOpen
+}
+
+// ExpireStaleClaims checks all AssignClaimed records and returns the claim
+// message IDs of those whose ClaimExpiresAt has passed (as of now). It does
+// NOT mutate state — the caller (engine) is responsible for emitting
+// exchange:assign-expire messages and then calling applyAssignExpire via Apply.
+// Caller must hold s.mu (at least read lock, but callers use write lock when mutating).
+func (s *State) ExpireStaleClaims() []string {
+	now := time.Now().UTC()
+	var expired []string
+	for _, rec := range s.assignByID {
+		if rec.Status == AssignClaimed && !rec.ClaimExpiresAt.IsZero() && now.After(rec.ClaimExpiresAt) {
+			expired = append(expired, rec.ClaimMsgID)
+		}
+	}
+	return expired
+}
+
 // ClaimAssignPayment atomically checks that the assign record for the given
 // completeMsgID is in AssignAccepted state and transitions it to AssignPaid,
 // returning the record. Returns nil if the record is not found or is not in
@@ -1510,10 +1626,17 @@ func (s *State) ClaimAssignPayment(completeMsgID string) *AssignRecord {
 // ActiveAssigns returns a snapshot of all AssignRecord entries associated with
 // the given entryID that are not yet in a terminal state (Accepted or Rejected).
 // Pass "" to query assigns with no associated entry.
+//
+// Expired claims (AssignClaimed with ClaimExpiresAt in the past) are returned
+// with their effective status as AssignOpen — the claim slot is logically free
+// even if the engine has not yet emitted the assign-expire message. This ensures
+// callers always see claimable tasks without waiting for the next poll cycle.
+//
 // Returns a copy of each record — callers must not mutate.
 func (s *State) ActiveAssigns(entryID string) []*AssignRecord {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	now := time.Now().UTC()
 	recs := s.assignsByEntry[entryID]
 	out := make([]*AssignRecord, 0, len(recs))
 	for _, r := range recs {
@@ -1521,6 +1644,14 @@ func (s *State) ActiveAssigns(entryID string) []*AssignRecord {
 			continue
 		}
 		cp := *r
+		// Lazy expiry: if the claim TTL has elapsed, present effective status as
+		// AssignOpen so callers see the task as claimable. State mutation happens
+		// when the engine emits and applies exchange:assign-expire.
+		if cp.Status == AssignClaimed && !cp.ClaimExpiresAt.IsZero() && now.After(cp.ClaimExpiresAt) {
+			cp.Status = AssignOpen
+			cp.ClaimantKey = ""
+			cp.ClaimMsgID = ""
+		}
 		out = append(out, &cp)
 	}
 	return out

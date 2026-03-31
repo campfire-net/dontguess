@@ -97,3 +97,24 @@ func (s *State) InjectInventoryEntryForTest(entry *InventoryEntry) {
 	defer s.mu.Unlock()
 	s.inventory[entry.EntryID] = entry
 }
+
+// AssignByIDForTest exposes the assignByID map for white-box testing of claim
+// expiry state (ClaimExpiresAt, ClaimantKey, Status).
+func (s *State) AssignByIDForTest() map[string]*AssignRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]*AssignRecord, len(s.assignByID))
+	for k, v := range s.assignByID {
+		cp := *v
+		out[k] = &cp
+	}
+	return out
+}
+
+// SweepExpiredClaimsForTest exposes ExpireStaleClaims for unit tests that need
+// to inspect which claims are eligible for expiry without triggering engine I/O.
+func (s *State) SweepExpiredClaimsForTest() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ExpireStaleClaims()
+}
