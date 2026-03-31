@@ -1176,13 +1176,10 @@ func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 		return nil
 	}
 
-	// Generate preview. Content delivery is a future concern; use nil content for now.
-	// PreviewAssembler returns an empty result for nil/zero content, which is correct
-	// for the preview-before-purchase flow at this stage — the preview payload
-	// carries entry metadata so the buyer can decide whether to proceed.
+	// Generate preview using real entry content.
 	pa := &PreviewAssembler{}
 	previewResult, err := pa.Assemble(PreviewRequest{
-		Content:     nil, // stub: real content delivery is a future concern
+		Content:     entry.Content,
 		ContentType: entry.ContentType,
 		EntryID:     entry.EntryID,
 		// Seed is entry_id only — all buyers see the same deterministic preview.
