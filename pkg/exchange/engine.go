@@ -750,11 +750,21 @@ func (e *Engine) handlePut(msg *Message) error {
 	}
 
 	// Incrementally add the new entry to the match index.
+	var acceptedEntry *InventoryEntry
 	inv := e.state.Inventory()
 	for _, entry := range inv {
 		if entry.PutMsgID == msg.ID {
 			e.matchIndex.Add(e.inventoryEntryToRankInput(entry))
+			acceptedEntry = entry
 			break
+		}
+	}
+
+	// Hot compression offer: same as AutoAcceptPut — immediately assign a compress
+	// task to the seller at 50% of token_cost. Failure is non-fatal.
+	if acceptedEntry != nil && acceptedEntry.SellerKey != "" {
+		if err := e.sendCompressionAssign(acceptedEntry); err != nil {
+			e.opts.log("engine: buy-miss: compression assign failed entry=%s err=%v", msg.ID[:8], err)
 		}
 	}
 
