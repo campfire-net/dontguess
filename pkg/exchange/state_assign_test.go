@@ -279,5 +279,119 @@ func TestAssignReplayIdempotent(t *testing.T) {
 	}
 }
 
+// TestAssignCompleteWrongSender: complete message from an agent that did NOT
+// claim the task is silently dropped — the assign stays in AssignClaimed.
+func TestAssignCompleteWrongSender(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-ws", operatorKey, "entry-ws", "freshness", 50, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-ws", agentKey, "assign-ws")))
+
+	// agentKey2 did NOT claim — its complete should be dropped.
+	s.Apply(ptr(makeAssignCompleteMsg("complete-ws-bad", agentKey2, "claim-ws", nil)))
+
+	rec := s.assignByID["assign-ws"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected assign still Claimed after wrong-sender complete, got %v", rec.Status)
+	}
+	if _, pending := s.pendingAssignResults["complete-ws-bad"]; pending {
+		t.Fatal("wrong-sender complete must not be indexed in pendingAssignResults")
+	}
+}
+
+// TestAssignAcceptNonOperator: accept message from a non-operator sender is
+// silently dropped — the assign stays in AssignCompleted.
+func TestAssignAcceptNonOperator(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-ano", operatorKey, "entry-ano", "freshness", 50, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-ano", agentKey, "assign-ano")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-ano", agentKey, "claim-ano", nil)))
+
+	// Non-operator tries to accept.
+	badAccept := makeAssignAcceptMsg("accept-ano-bad", agentKey, "complete-ano")
+	s.Apply(&badAccept)
+
+	rec := s.assignByID["assign-ano"]
+	if rec.Status != AssignCompleted {
+		t.Fatalf("expected assign still Completed after non-operator accept, got %v", rec.Status)
+	}
+	if _, pending := s.pendingAssignResults["complete-ano"]; !pending {
+		t.Fatal("completed assign must remain in pendingAssignResults after rejected accept")
+	}
+}
+
+// TestAssignRejectNonOperator: reject message from a non-operator sender is
+// silently dropped — the assign stays in AssignCompleted.
+func TestAssignRejectNonOperator(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-rno", operatorKey, "entry-rno", "validation", 30, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-rno", agentKey, "assign-rno")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-rno", agentKey, "claim-rno", nil)))
+
+	// Non-operator tries to reject.
+	badReject := makeAssignRejectMsg("reject-rno-bad", agentKey2, "complete-rno")
+	s.Apply(&badReject)
+
+	rec := s.assignByID["assign-rno"]
+	if rec.Status != AssignCompleted {
+		t.Fatalf("expected assign still Completed after non-operator reject, got %v", rec.Status)
+	}
+}
+
+// TestAssignClaimAlreadyClaimed: a second agent cannot steal a task that is
+// already in AssignClaimed state. The original claimant is unchanged.
+func TestAssignClaimAlreadyClaimed(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-ac", operatorKey, "entry-ac", "freshness", 100, "")))
+	// agentKey claims first.
+	s.Apply(ptr(makeAssignClaimMsg("claim-ac-1", agentKey, "assign-ac")))
+
+	// agentKey2 tries to claim the same already-claimed task.
+	s.Apply(ptr(makeAssignClaimMsg("claim-ac-2", agentKey2, "assign-ac")))
+
+	rec := s.assignByID["assign-ac"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed, got %v", rec.Status)
+	}
+	if rec.ClaimantKey != agentKey {
+		t.Fatalf("original claimant must be retained: expected %s, got %s", agentKey, rec.ClaimantKey)
+	}
+}
+
+// TestClaimAssignPaymentIdempotent: ClaimAssignPayment transitions
+// AssignAccepted → AssignPaid exactly once. A second call on the same
+// completeMsgID returns nil (already paid — no double payment).
+func TestClaimAssignPaymentIdempotent(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-pay", operatorKey, "entry-pay", "freshness", 75, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-pay", agentKey, "assign-pay")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-pay", agentKey, "claim-pay", nil)))
+	s.Apply(ptr(makeAssignAcceptMsg("accept-pay", operatorKey, "complete-pay")))
+
+	// First call should succeed and return the record.
+	rec1 := s.ClaimAssignPayment("complete-pay")
+	if rec1 == nil {
+		t.Fatal("first ClaimAssignPayment should return the record")
+	}
+	if rec1.Status != AssignPaid {
+		t.Fatalf("expected AssignPaid after first ClaimAssignPayment, got %v", rec1.Status)
+	}
+
+	// Second call must return nil — prevents double-payment on replay.
+	rec2 := s.ClaimAssignPayment("complete-pay")
+	if rec2 != nil {
+		t.Fatal("second ClaimAssignPayment must return nil — bounty already paid")
+	}
+}
+
 // ptr is a helper that takes a value and returns a pointer to it.
 func ptr(m Message) *Message { return &m }
