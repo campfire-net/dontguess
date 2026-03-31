@@ -118,7 +118,10 @@ Seller offers cached inference to the exchange. The exchange buys the result at 
     {"name": "ttl_hours", "type": "integer", "min": 1, "max": 8760,
      "description": "Seller-requested time-to-live in hours (exchange may override)"},
     {"name": "embedding", "type": "json",
-     "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2)"}
+     "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2)"},
+    {"name": "compression_tier", "type": "enum",
+     "values": ["hot", "warm", "cold"],
+     "description": "Compression tier for caching strategy (hot: frequently accessed, uncompressed; warm: periodic access, light compression; cold: archival, heavy compression). Optional; exchange may infer from usage."}
   ],
   "produces_tags": [
     {"tag": "exchange:put", "cardinality": "exactly_one"},
@@ -172,7 +175,10 @@ Buyer requests cached inference matching a task description. The exchange search
     {"name": "domains", "type": "tag_set", "max_count": 5,
      "description": "Domain tags to narrow search"},
     {"name": "max_results", "type": "integer", "min": 1, "max": 10,
-     "description": "Maximum matches to return. Default: 3"}
+     "description": "Maximum matches to return. Default: 3"},
+    {"name": "compression_tier", "type": "enum",
+     "values": ["hot", "warm", "cold"],
+     "description": "Optional filter: buyer can request cache entries from specific compression tier(s)"}
   ],
   "produces_tags": [
     {"tag": "exchange:buy", "cardinality": "exactly_one"},
