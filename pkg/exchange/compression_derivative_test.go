@@ -253,3 +253,124 @@ func mustGetStoreRecord(t *testing.T, h *testHarness, id string) *store.MessageR
 	}
 	return rec
 }
+
+// TestCompressionDerivative_ReplayIdempotent verifies that replaying the full
+// compression lifecycle (put → assign → claim → complete → accept) a second
+// time — simulating an engine restart — does not produce duplicate inventory
+// entries. After one full lifecycle and one replay, inventory must contain
+// exactly 2 entries: 1 raw + 1 derivative.
+func TestCompressionDerivative_ReplayIdempotent(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// ── Step 1: put raw entry ────────────────────────────────────────────────
+	rawHash := "sha256:" + fmt.Sprintf("%064x", 55)
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Explain Rust ownership model", rawHash, "analysis", 15000, 36000),
+		[]string{exchange.TagPut, "exchange:content-type:analysis", "exchange:domain:rust"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("ListMessages after put: %v", err)
+	}
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.AutoAcceptPut(putMsg.ID, 10000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry after put-accept, got %d", len(inv))
+	}
+	origEntryID := inv[0].EntryID
+
+	// ── Step 2: operator posts compress assign ───────────────────────────────
+	assignPayload, _ := json.Marshal(map[string]any{
+		"entry_id":  origEntryID,
+		"task_type": "compress",
+		"reward":    80,
+	})
+	assignMsg := h.sendMessage(h.operator, assignPayload, []string{exchange.TagAssign}, nil)
+
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, assignMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest assign: %v", err)
+	}
+
+	// ── Step 3: agent claims ─────────────────────────────────────────────────
+	worker := newTestAgent(t)
+	claimMsg := h.sendMessage(worker, []byte(`{}`), []string{exchange.TagAssignClaim}, []string{assignMsg.ID})
+
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, claimMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest claim: %v", err)
+	}
+
+	// ── Step 4: agent completes ──────────────────────────────────────────────
+	compressedHash := "sha256:" + fmt.Sprintf("%064x", 56)
+	completeResult, _ := json.Marshal(map[string]any{
+		"content_hash": compressedHash,
+		"content_size": int64(9000),
+	})
+	completeMsg := h.sendMessage(worker, completeResult, []string{exchange.TagAssignComplete}, []string{claimMsg.ID})
+
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, completeMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest complete: %v", err)
+	}
+
+	// ── Step 5: operator accepts ─────────────────────────────────────────────
+	acceptMsg := h.sendMessage(h.operator, []byte(`{}`), []string{exchange.TagAssignAccept}, []string{completeMsg.ID})
+
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, acceptMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest accept: %v", err)
+	}
+
+	// Verify: exactly 2 entries after the first pass.
+	inv = eng.State().Inventory()
+	if len(inv) != 2 {
+		t.Fatalf("after lifecycle: expected 2 inventory entries (1 raw + 1 derivative), got %d", len(inv))
+	}
+
+	// ── Step 6: simulate engine restart by replaying all messages again ───────
+	// Re-dispatch the accept message as if the engine restarted and is
+	// re-processing its message log. The derivative ID must be stable, and
+	// applyDerivativePut must be idempotent — no new entry should be created.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, acceptMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest accept (replay): %v", err)
+	}
+
+	// Verify: still exactly 2 entries — replay must not duplicate the derivative.
+	inv = eng.State().Inventory()
+	if len(inv) != 2 {
+		t.Fatalf("after replay: expected 2 inventory entries (1 raw + 1 derivative), got %d (duplicate derivative created)", len(inv))
+	}
+
+	// Confirm the derivative is still correct.
+	var derivative *exchange.InventoryEntry
+	for _, e := range inv {
+		if e.CompressedFrom != "" {
+			derivative = e
+			break
+		}
+	}
+	if derivative == nil {
+		t.Fatal("no derivative entry found after replay")
+	}
+	if derivative.CompressedFrom != origEntryID {
+		t.Errorf("derivative.CompressedFrom = %q, want %q", derivative.CompressedFrom, origEntryID)
+	}
+	if derivative.ContentHash != compressedHash {
+		t.Errorf("derivative.ContentHash = %q, want %q", derivative.ContentHash, compressedHash)
+	}
+}

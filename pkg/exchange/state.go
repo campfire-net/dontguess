@@ -1234,11 +1234,16 @@ func (s *State) applySettlePreview(msg *Message) {
 // with all required fields set; in particular CompressedFrom must be non-empty
 // for compression derivatives.
 //
-// The entry is keyed by entry.EntryID. Duplicate IDs are silently overwritten
-// (same semantics as a re-applied put-accept).
+// The entry is keyed by entry.EntryID. If an entry with the same ID already
+// exists, the insertion is skipped (idempotent). This ensures that replaying
+// the same assign-accept message on engine restart does not produce duplicate
+// inventory entries.
 //
 // This method does not acquire the state mutex — callers must hold s.mu.Lock().
 func (s *State) applyDerivativePut(entry *InventoryEntry) {
+	if _, exists := s.inventory[entry.EntryID]; exists {
+		return
+	}
 	s.inventory[entry.EntryID] = entry
 }
 
