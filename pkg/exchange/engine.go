@@ -83,6 +83,13 @@ type EngineOptions struct {
 	// store (h.st), so that messages written directly to h.st are visible
 	// without re-syncing from the transport. Production code leaves this false.
 	ReadSkipSync bool
+
+	// DensityMarkupFactor is the per-token price premium applied to compressed
+	// derivative entries. A value of 1.2 means the per-token price is 20% higher
+	// than the raw base, compensating for higher information density. The total
+	// price is still lower than raw because fewer tokens are delivered.
+	// If zero or negative, defaults to 1.2.
+	DensityMarkupFactor float64
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -90,6 +97,15 @@ func (o *EngineOptions) pollInterval() time.Duration {
 		return o.PollInterval
 	}
 	return 500 * time.Millisecond
+}
+
+// densityMarkupFactor returns the configured density markup factor for
+// compressed derivatives, defaulting to 1.2 if unset.
+func (o *EngineOptions) densityMarkupFactor() float64 {
+	if o.DensityMarkupFactor > 0 {
+		return o.DensityMarkupFactor
+	}
+	return 1.2
 }
 
 func (o *EngineOptions) log(format string, args ...any) {
@@ -1555,11 +1571,15 @@ const computePriceMinPrice int64 = 1
 // Base price: PutPrice * 1.2 (20% operator margin) when a put-accept exists,
 // otherwise TokenCost * 0.7 (seller's 70% share as a proxy pending acceptance).
 //
-// Four inventory signals adjust the base price:
+// Five inventory signals adjust the base price:
 //   - Demand count: +10% per distinct completed buyer, capped at +100%.
 //   - Age decay: decays from 1.0 to 0.5 linearly over 60 days (PutTimestamp=0 = no decay).
 //   - Reputation: rep=0 -> 0.8x, rep=50 -> 1.0x, rep=100 -> 1.2x.
 //   - Content size: +0.3% per KB, capped at +30% (>=100KB).
+//   - Density markup (compressed derivatives only): base * (original_size / compressed_size)
+//     * DensityMarkupFactor (default 1.2). Higher density = higher per-token price.
+//     Total cost is still lower than raw because fewer tokens are delivered.
+//     Falls back to base pricing when the original entry is not found.
 //
 // Invariants:
 //   - Returns at least computePriceMinPrice (never 0 or negative).
@@ -1628,10 +1648,24 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 		fastFactor = 1.0
 	}
 
-	// Step 7: compound all multipliers
-	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor
+	// Step 7: density markup for compressed derivatives.
+	// Formula: base * (original_size / compressed_size) * density_markup_factor.
+	// The per-token price is higher (higher information density), but total cost
+	// is lower because fewer tokens are delivered. Falls back to 1.0 (no markup)
+	// when the entry is not a derivative or the original entry is not found.
+	densityFactor := 1.0
+	if entry.CompressedFrom != "" && entry.ContentSize > 0 {
+		orig := e.state.GetInventoryEntry(entry.CompressedFrom)
+		if orig != nil && orig.ContentSize > 0 {
+			ratio := float64(orig.ContentSize) / float64(entry.ContentSize)
+			densityFactor = ratio * e.opts.densityMarkupFactor()
+		}
+	}
 
-	// Step 8: clamp and round (nearest-integer, not truncate, for stable results)
+	// Step 8: compound all multipliers
+	price := base * demandFactor * ageFactor * repFactor * sizeFactor * fastFactor * densityFactor
+
+	// Step 9: clamp and round (nearest-integer, not truncate, for stable results)
 	rounded := math.Round(price)
 	if rounded < float64(computePriceMinPrice) {
 		return computePriceMinPrice
