@@ -1510,6 +1510,51 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 			break
 		}
 	}
+
+	// Hot compression offer: immediately assign a compress task to the original
+	// seller at 50% of token_cost. Failure is non-fatal — the entry is already
+	// accepted; the compression offer is best-effort.
+	if pendingEntry != nil && pendingEntry.SellerKey != "" {
+		if err := e.sendCompressionAssign(pendingEntry); err != nil {
+			e.opts.log("engine: compression assign failed entry=%s err=%v", putMsgID, err)
+		}
+	}
+	return nil
+}
+
+// sendCompressionAssign sends an exchange:assign message for a compress task
+// directed exclusively at the original seller of the given entry. The bounty
+// is 50% of the entry's token_cost. The description includes the entry ID,
+// content hash, and instructions to run /compress.
+//
+// This is sent immediately after a put is accepted (hot path). Failure is
+// non-fatal to the caller — the error is logged and the accept proceeds.
+func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
+	bounty := entry.TokenCost / 2
+	description := fmt.Sprintf(
+		"Compress cached inference entry %s (content_hash=%s). Run /compress with the entry content to produce a Nyquist-sampled summary. Bounty: %d scrip.",
+		entry.PutMsgID, entry.ContentHash, bounty,
+	)
+	payload, err := json.Marshal(map[string]any{
+		"entry_id":         entry.PutMsgID,
+		"task_type":        "compress",
+		"reward":           bounty,
+		"exclusive_sender": entry.SellerKey,
+		"description":      description,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding compression assign payload: %w", err)
+	}
+	tags := []string{TagAssign}
+	msg, err := e.sendOperatorMessage(payload, tags, nil)
+	if err != nil {
+		return fmt.Errorf("sending compression assign: %w", err)
+	}
+	if msg != nil {
+		e.state.Apply(msg)
+	}
+	e.opts.log("engine: compression assign sent assign_id=%s entry=%s seller=%s bounty=%d",
+		shortKey(msg.ID), shortKey(entry.PutMsgID), shortKey(entry.SellerKey), bounty)
 	return nil
 }
 
