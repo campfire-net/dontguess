@@ -3,6 +3,7 @@ package exchange
 import (
 	"encoding/json"
 	"testing"
+	"time"
 )
 
 // makeAssignMsg constructs a minimal exchange:assign message for tests.
@@ -454,6 +455,328 @@ func TestApplyAssignReject_StatusObservable(t *testing.T) {
 	}
 	if actives[0].Status != AssignOpen {
 		t.Fatalf("post-reject: ActiveAssigns[0].Status = %v, want AssignOpen", actives[0].Status)
+	}
+}
+
+// makeAssignExpireMsg constructs an exchange:assign-expire message for tests.
+// antecedent is the claim message ID that expired.
+func makeAssignExpireMsg(id, sender, claimMsgID string) Message {
+	payload := map[string]any{
+		"claim_id":    claimMsgID,
+		"detected_at": "2026-01-01T00:00:00Z",
+	}
+	b, _ := json.Marshal(payload)
+	return Message{
+		ID:          id,
+		Sender:      sender,
+		Tags:        []string{TagAssignExpire},
+		Antecedents: []string{claimMsgID},
+		Payload:     b,
+	}
+}
+
+// TestAssignClaimHasExpiresAt verifies that after an assign-claim, the
+// AssignRecord has a non-zero ClaimExpiresAt that is in the future.
+func TestAssignClaimHasExpiresAt(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	before := time.Now()
+	s.Apply(ptr(makeAssignMsg("assign-exp1", operatorKey, "entry-exp1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-exp1", agentKey, "assign-exp1")))
+	after := time.Now()
+
+	rec := s.assignByID["assign-exp1"]
+	if rec == nil {
+		t.Fatal("assign record not found")
+	}
+	if rec.ClaimExpiresAt.IsZero() {
+		t.Fatal("ClaimExpiresAt is zero after claim — expiry timestamp not recorded")
+	}
+	// Must be in the future relative to now (15 minutes from assign receive time).
+	if !rec.ClaimExpiresAt.After(after) {
+		t.Errorf("ClaimExpiresAt %v is not after now %v", rec.ClaimExpiresAt, after)
+	}
+	// Must be within the default timeout window (15 minutes from before).
+	ceiling := before.Add(time.Duration(DefaultClaimTimeoutMinutes) * time.Minute)
+	if rec.ClaimExpiresAt.After(ceiling.Add(time.Second)) {
+		t.Errorf("ClaimExpiresAt %v exceeds ceiling %v", rec.ClaimExpiresAt, ceiling)
+	}
+}
+
+// TestAssignExpireReopensTask verifies that applying an assign-expire message
+// transitions the record from AssignClaimed back to AssignOpen, clears claimant
+// fields, and frees the agent's claim slot.
+func TestAssignExpireReopensTask(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-xe1", operatorKey, "entry-xe1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-xe1", agentKey, "assign-xe1")))
+
+	// Verify claimed state.
+	rec := s.assignByID["assign-xe1"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("pre-expire: expected AssignClaimed, got %v", rec.Status)
+	}
+
+	// Apply expire.
+	s.Apply(ptr(makeAssignExpireMsg("expire-xe1", operatorKey, "claim-xe1")))
+
+	// Record must be back to AssignOpen.
+	if rec.Status != AssignOpen {
+		t.Fatalf("post-expire: expected AssignOpen, got %v", rec.Status)
+	}
+	if rec.ClaimantKey != "" {
+		t.Errorf("post-expire: ClaimantKey not cleared, got %q", rec.ClaimantKey)
+	}
+	if rec.ClaimMsgID != "" {
+		t.Errorf("post-expire: ClaimMsgID not cleared, got %q", rec.ClaimMsgID)
+	}
+	if !rec.ClaimExpiresAt.IsZero() {
+		t.Errorf("post-expire: ClaimExpiresAt not cleared, got %v", rec.ClaimExpiresAt)
+	}
+
+	// claimedAssigns binding must be freed.
+	if _, held := s.claimedAssigns[agentKey]; held {
+		t.Error("post-expire: claimedAssigns still holds agentKey binding")
+	}
+
+	// ActiveAssigns must return the task as AssignOpen (claimable).
+	actives := s.ActiveAssigns("entry-xe1")
+	if len(actives) != 1 {
+		t.Fatalf("post-expire: expected 1 active assign, got %d", len(actives))
+	}
+	if actives[0].Status != AssignOpen {
+		t.Fatalf("post-expire: ActiveAssigns status = %v, want AssignOpen", actives[0].Status)
+	}
+}
+
+// TestAssignExpireNonOperatorDropped verifies that a non-operator assign-expire
+// message is silently dropped — the assign stays in AssignClaimed.
+func TestAssignExpireNonOperatorDropped(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-xe2", operatorKey, "entry-xe2", "freshness", 50, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-xe2", agentKey, "assign-xe2")))
+
+	// Non-operator tries to expire the claim.
+	s.Apply(ptr(makeAssignExpireMsg("expire-xe2-bad", agentKey2, "claim-xe2")))
+
+	rec := s.assignByID["assign-xe2"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed after non-operator expire, got %v", rec.Status)
+	}
+	if rec.ClaimantKey != agentKey {
+		t.Errorf("claimant changed after non-operator expire: got %q", rec.ClaimantKey)
+	}
+}
+
+// TestAssignExpireIdempotent verifies that replaying the same expire message is
+// a no-op — the record stays in AssignOpen after the first expire.
+func TestAssignExpireIdempotent(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-xe3", operatorKey, "entry-xe3", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-xe3", agentKey, "assign-xe3")))
+	s.Apply(ptr(makeAssignExpireMsg("expire-xe3", operatorKey, "claim-xe3")))
+
+	// First expire — should be AssignOpen now.
+	rec := s.assignByID["assign-xe3"]
+	if rec.Status != AssignOpen {
+		t.Fatalf("after first expire: expected AssignOpen, got %v", rec.Status)
+	}
+
+	// Replay same expire — no-op.
+	s.Apply(ptr(makeAssignExpireMsg("expire-xe3", operatorKey, "claim-xe3")))
+	if rec.Status != AssignOpen {
+		t.Fatalf("after replay expire: expected AssignOpen, got %v", rec.Status)
+	}
+}
+
+// TestAssignExpireAllowsReclaim verifies that after a claim expires, another
+// agent can claim the task.
+func TestAssignExpireAllowsReclaim(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-xe4", operatorKey, "entry-xe4", "validation", 75, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-xe4", agentKey, "assign-xe4")))
+	s.Apply(ptr(makeAssignExpireMsg("expire-xe4", operatorKey, "claim-xe4")))
+
+	// A different agent should now be able to claim.
+	s.Apply(ptr(makeAssignClaimMsg("claim-xe4-2", agentKey2, "assign-xe4")))
+
+	rec := s.assignByID["assign-xe4"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed after reclaim, got %v", rec.Status)
+	}
+	if rec.ClaimantKey != agentKey2 {
+		t.Fatalf("expected claimant %s after reclaim, got %s", agentKey2, rec.ClaimantKey)
+	}
+}
+
+// TestAssignActiveAssignsLazyExpiry verifies that ActiveAssigns returns
+// an expired claim as AssignOpen (effective status) without requiring an
+// explicit assign-expire message.
+func TestAssignActiveAssignsLazyExpiry(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	// Post and claim an assign.
+	s.Apply(ptr(makeAssignMsg("assign-lazy1", operatorKey, "entry-lazy1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-lazy1", agentKey, "assign-lazy1")))
+
+	// Artificially set the claim expiry to the past.
+	rec := s.assignByID["assign-lazy1"]
+	rec.ClaimExpiresAt = time.Now().Add(-1 * time.Minute)
+
+	// ActiveAssigns should return the task with effective status AssignOpen.
+	actives := s.ActiveAssigns("entry-lazy1")
+	if len(actives) != 1 {
+		t.Fatalf("expected 1 active assign, got %d", len(actives))
+	}
+	if actives[0].Status != AssignOpen {
+		t.Fatalf("lazy expiry: expected AssignOpen, got %v", actives[0].Status)
+	}
+	if actives[0].ClaimantKey != "" {
+		t.Errorf("lazy expiry: expected empty ClaimantKey, got %q", actives[0].ClaimantKey)
+	}
+
+	// Internal record must still be AssignClaimed (lazy — no mutation yet).
+	if rec.Status != AssignClaimed {
+		t.Fatalf("internal record must remain AssignClaimed until expire msg applied, got %v", rec.Status)
+	}
+}
+
+// TestAssignExpireSweepDetectsExpired verifies that ExpireStaleClaims returns
+// the claim message IDs of records whose TTL has elapsed.
+func TestAssignExpireSweepDetectsExpired(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-sw1", operatorKey, "entry-sw1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-sw1", agentKey, "assign-sw1")))
+
+	// Claim not yet expired.
+	expired := s.ExpireStaleClaims()
+	if len(expired) != 0 {
+		t.Fatalf("expected 0 expired before TTL, got %d", len(expired))
+	}
+
+	// Artificially expire the claim.
+	rec := s.assignByID["assign-sw1"]
+	rec.ClaimExpiresAt = time.Now().Add(-1 * time.Second)
+
+	expired = s.ExpireStaleClaims()
+	if len(expired) != 1 {
+		t.Fatalf("expected 1 expired after TTL, got %d", len(expired))
+	}
+	if expired[0] != "claim-sw1" {
+		t.Errorf("expected claim-sw1 in expired list, got %q", expired[0])
+	}
+}
+
+// TestAssignExpireReplay verifies the done condition: simulate claim + timeout
+// + replay of assign-expire, assert assign is re-opened. This mirrors what
+// happens when the engine replays the campfire log on restart.
+func TestAssignExpireReplay(t *testing.T) {
+	msgs := []Message{
+		makeAssignMsg("assign-rpl1", operatorKey, "entry-rpl1", "freshness", 100, ""),
+		makeAssignClaimMsg("claim-rpl1", agentKey, "assign-rpl1"),
+		makeAssignExpireMsg("expire-rpl1", operatorKey, "claim-rpl1"),
+	}
+
+	s := NewState()
+	s.OperatorKey = operatorKey
+	s.Replay(msgs)
+
+	// After replay, the assign must be AssignOpen (re-opened by the expire message).
+	actives := s.ActiveAssigns("entry-rpl1")
+	if len(actives) != 1 {
+		t.Fatalf("expected 1 active assign after replay, got %d", len(actives))
+	}
+	if actives[0].Status != AssignOpen {
+		t.Fatalf("after replay: expected AssignOpen, got %v", actives[0].Status)
+	}
+	if actives[0].ClaimantKey != "" {
+		t.Errorf("after replay: expected empty ClaimantKey, got %q", actives[0].ClaimantKey)
+	}
+
+	// A new agent should be able to claim the reopened task.
+	claimMsg := makeAssignClaimMsg("claim-rpl1-2", agentKey2, "assign-rpl1")
+	s.Apply(&claimMsg)
+
+	actives = s.ActiveAssigns("entry-rpl1")
+	if actives[0].Status != AssignClaimed {
+		t.Fatalf("after reclaim: expected AssignClaimed, got %v", actives[0].Status)
+	}
+	if actives[0].ClaimantKey != agentKey2 {
+		t.Fatalf("after reclaim: expected claimant %s, got %s", agentKey2, actives[0].ClaimantKey)
+	}
+}
+
+// TestAssignExpireCompleteAfterExpiry verifies that a late assign-complete
+// (submitted after the claim TTL) is dropped by the state machine.
+func TestAssignExpireCompleteAfterExpiry(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-late1", operatorKey, "entry-late1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-late1", agentKey, "assign-late1")))
+
+	// Set expiry to the past.
+	rec := s.assignByID["assign-late1"]
+	rec.ClaimExpiresAt = time.Now().Add(-1 * time.Second)
+
+	// Submit complete after expiry — must be dropped.
+	s.Apply(ptr(makeAssignCompleteMsg("complete-late1", agentKey, "claim-late1", nil)))
+
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed (complete dropped), got %v", rec.Status)
+	}
+	if _, pending := s.pendingAssignResults["complete-late1"]; pending {
+		t.Fatal("late complete must not be indexed in pendingAssignResults")
+	}
+}
+
+// TestAssignClaimCustomTimeout verifies that a claim with a custom (shorter)
+// expires_at honours the claimant-supplied value when within the ceiling.
+func TestAssignClaimCustomTimeout(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-ct1", operatorKey, "entry-ct1", "freshness", 100, "")))
+
+	// Claim with a 5-minute custom expires_at.
+	shortExpiry := time.Now().Add(5 * time.Minute).UTC()
+	claimPayload, _ := json.Marshal(map[string]string{
+		"expires_at": shortExpiry.Format(time.RFC3339),
+	})
+	claimMsg := Message{
+		ID:          "claim-ct1",
+		Sender:      agentKey,
+		Tags:        []string{TagAssignClaim},
+		Antecedents: []string{"assign-ct1"},
+		Payload:     claimPayload,
+	}
+	s.Apply(&claimMsg)
+
+	rec := s.assignByID["assign-ct1"]
+	if rec.ClaimExpiresAt.IsZero() {
+		t.Fatal("ClaimExpiresAt is zero")
+	}
+	// Should be at most 6 minutes from now (5 min + 1 min buffer for rounding).
+	maxExpiry := time.Now().Add(6 * time.Minute)
+	if rec.ClaimExpiresAt.After(maxExpiry) {
+		t.Errorf("ClaimExpiresAt %v exceeds expected ceiling %v", rec.ClaimExpiresAt, maxExpiry)
+	}
+	// Should not have been pushed to the full 15-minute default.
+	minDefault := time.Now().Add(14 * time.Minute)
+	if rec.ClaimExpiresAt.After(minDefault) {
+		t.Errorf("ClaimExpiresAt %v was rounded up to the default timeout — custom value ignored", rec.ClaimExpiresAt)
 	}
 }
 
