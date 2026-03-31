@@ -3,6 +3,7 @@ package exchange
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -90,6 +91,12 @@ type EngineOptions struct {
 	// price is still lower than raw because fewer tokens are delivered.
 	// If zero or negative, defaults to 1.2.
 	DensityMarkupFactor float64
+
+	// MaxTokenCost is the ceiling applied to seller-supplied token_cost in the
+	// buy-miss auto-accept path. Prevents a malicious seller from inflating the
+	// scrip payout by submitting an artificially large token_cost. Defaults to
+	// 1_000_000 if zero.
+	MaxTokenCost int64
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -106,6 +113,13 @@ func (o *EngineOptions) densityMarkupFactor() float64 {
 		return o.DensityMarkupFactor
 	}
 	return 1.2
+}
+
+func (o *EngineOptions) maxTokenCost() int64 {
+	if o.MaxTokenCost > 0 {
+		return o.MaxTokenCost
+	}
+	return 1_000_000
 }
 
 func (o *EngineOptions) log(format string, args ...any) {
@@ -637,6 +651,11 @@ func (e *Engine) handlePut(msg *Message) error {
 		return nil
 	}
 
+	// Reject puts with invalid content_hash format (must start with "sha256:").
+	if !strings.HasPrefix(pending.ContentHash, "sha256:") {
+		return fmt.Errorf("buy-miss put rejected: content_hash %q does not start with sha256:", pending.ContentHash)
+	}
+
 	taskHash := TaskDescriptionHash(pending.Description)
 	offer := e.state.GetBuyMissOffer(taskHash)
 	if offer == nil {
@@ -644,8 +663,20 @@ func (e *Engine) handlePut(msg *Message) error {
 		return nil
 	}
 
+	// Only the buyer who received the miss offer may fulfill it.
+	if msg.Sender != offer.BuyerKey {
+		return nil // reject: different agent attempted to collect scrip
+	}
+
+	// Cap token_cost to prevent inflated scrip payouts from untrusted seller input.
+	tokenCost := pending.TokenCost
+	maxTokenCost := e.opts.maxTokenCost()
+	if tokenCost > maxTokenCost {
+		tokenCost = maxTokenCost
+	}
+
 	// Standing offer found and not expired. Compute the offered price.
-	offeredPrice := pending.TokenCost * BuyMissOfferRate / 100
+	offeredPrice := tokenCost * BuyMissOfferRate / 100
 	if offeredPrice <= 0 {
 		offeredPrice = 1
 	}
@@ -1403,13 +1434,11 @@ func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID stri
 		return fmt.Errorf("assign-complete result missing content_hash")
 	}
 
-	// Generate a unique EntryID for the derivative. Use a random ID with the
-	// accept message ID as entropy source so replays produce the same ID.
-	idBytes := make([]byte, 32)
-	if _, err := rand.Read(idBytes); err != nil {
-		return fmt.Errorf("generate derivative entry ID: %w", err)
-	}
-	derivativeID := hex.EncodeToString(idBytes)
+	// Derive a stable EntryID from the accept message ID so that replaying
+	// the same accept message always produces the same derivative ID.
+	// This prevents duplicate inventory entries on engine restart + replay.
+	h := sha256.Sum256([]byte(acceptMsgID + ":derivative"))
+	derivativeID := hex.EncodeToString(h[:])
 
 	// Build domains copy so the derivative doesn't share the original's slice.
 	domainsCopy := make([]string, len(orig.Domains))
