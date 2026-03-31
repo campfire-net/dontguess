@@ -805,6 +805,218 @@ func TestBuyMiss_ConcurrentBuyDedup(t *testing.T) {
 	}
 }
 
+// TestBuyMiss_ExpiryRace verifies that an offer with ExpiresAt set just barely
+// in the future transitions cleanly from "live" to "expired". Before expiry,
+// ClaimBuyMissOffer must return the offer. After expiry, it must return nil.
+//
+// This exercises the boundary of IsExpired() — specifically that an offer at
+// ExpiresAt = now-1ns is expired and ExpiresAt = now+TTL is not, and that
+// ClaimBuyMissOffer does not return a stale offer during the transition.
+func TestBuyMiss_ExpiryRace(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	task := "Build a CRDT-based collaborative editor in TypeScript"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	// --- Part 1: offer that is NOT yet expired should be claimable.
+	liveOffer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-live-001",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	if !eng.State().SetBuyMissOffer(liveOffer) {
+		t.Fatal("SetBuyMissOffer (live) returned false — should insert into empty map")
+	}
+	// Claim it — must succeed immediately (not expired).
+	claimed := eng.State().ClaimBuyMissOffer(taskHash)
+	if claimed == nil {
+		t.Fatal("ClaimBuyMissOffer returned nil for a non-expired offer")
+	}
+	if claimed.BuyMsgID != liveOffer.BuyMsgID {
+		t.Errorf("claimed offer BuyMsgID = %q, want %q", claimed.BuyMsgID, liveOffer.BuyMsgID)
+	}
+	// Offer must be gone after claim.
+	if got := eng.State().GetBuyMissOffer(taskHash); got != nil {
+		t.Error("offer still present in state after ClaimBuyMissOffer — should be deleted")
+	}
+
+	// --- Part 2: offer that expired one nanosecond ago must NOT be claimable.
+	expiredOffer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-expired-001",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(-time.Nanosecond), // just expired
+	}
+	// SetBuyMissOffer overwrites because the slot is now empty (we just claimed).
+	if !eng.State().SetBuyMissOffer(expiredOffer) {
+		t.Fatal("SetBuyMissOffer (expired) returned false — slot should be empty after claim")
+	}
+	// ClaimBuyMissOffer must return nil for an expired offer.
+	claimed2 := eng.State().ClaimBuyMissOffer(taskHash)
+	if claimed2 != nil {
+		t.Errorf("ClaimBuyMissOffer returned non-nil for a just-expired offer: %+v", claimed2)
+	}
+	// GetBuyMissOffer must also return nil.
+	if got := eng.State().GetBuyMissOffer(taskHash); got != nil {
+		t.Errorf("GetBuyMissOffer returned non-nil for a just-expired offer: %+v", got)
+	}
+}
+
+// TestBuyMiss_SetOverwritesExpiredOffer verifies that SetBuyMissOffer allows a
+// new offer to overwrite an expired one for the same task hash. The dedup guard
+// in SetBuyMissOffer only protects non-expired offers; once an offer has expired
+// a new one must be accepted.
+//
+// This prevents a scenario where a task's standing offer expires but the state
+// map still holds the stale entry, blocking future offers for the same task.
+func TestBuyMiss_SetOverwritesExpiredOffer(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	task := "Generate a multi-threaded file parser in C++ with SIMD acceleration"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	// Insert an offer that has already expired.
+	expiredOffer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-stale-001",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // already expired
+	}
+	// First set always succeeds (map is empty).
+	if !eng.State().SetBuyMissOffer(expiredOffer) {
+		t.Fatal("SetBuyMissOffer (initial insert) returned false — map was empty")
+	}
+
+	// Expired offer must NOT be visible via Get.
+	if got := eng.State().GetBuyMissOffer(taskHash); got != nil {
+		t.Fatalf("GetBuyMissOffer returned non-nil for expired offer: %+v", got)
+	}
+
+	// Now a fresh buyer sends a new buy for the same task.
+	// SetBuyMissOffer must return true (overwrites expired entry).
+	buyer2 := newTestAgent(t)
+	freshOffer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-fresh-001",
+		BuyerKey:  buyer2.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	if !eng.State().SetBuyMissOffer(freshOffer) {
+		t.Fatal("SetBuyMissOffer (fresh offer over expired) returned false — should overwrite expired entry")
+	}
+
+	// Fresh offer must be visible via Get.
+	got := eng.State().GetBuyMissOffer(taskHash)
+	if got == nil {
+		t.Fatal("GetBuyMissOffer returned nil for fresh offer that replaced expired one")
+	}
+	if got.BuyMsgID != freshOffer.BuyMsgID {
+		t.Errorf("active offer BuyMsgID = %q, want %q", got.BuyMsgID, freshOffer.BuyMsgID)
+	}
+	if got.BuyerKey != buyer2.PublicKeyHex() {
+		t.Errorf("active offer BuyerKey = %q, want buyer2 %q", got.BuyerKey, buyer2.PublicKeyHex())
+	}
+}
+
+// TestBuyMiss_MultipleOffersDifferentTasks verifies that buy-miss offers for
+// distinct task descriptions are tracked independently. Each task hash gets its
+// own slot — claiming one does not affect the other.
+//
+// This tests that the task-hash key space is correctly scoped and a bug in
+// key derivation (e.g. collision or shared map key) does not cause cross-task
+// offer interference.
+func TestBuyMiss_MultipleOffersDifferentTasks(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	taskA := "Write a ZK-proof circuit for a hash commitment in Circom"
+	taskB := "Build a Wasm runtime in Rust with memory-safe sandbox isolation"
+	hashA := exchange.TaskDescriptionHash(taskA)
+	hashB := exchange.TaskDescriptionHash(taskB)
+
+	if hashA == hashB {
+		t.Fatal("task hashes collide — test setup invalid")
+	}
+
+	offerA := &exchange.BuyMissOffer{
+		TaskHash:  hashA,
+		BuyMsgID:  "buy-task-a",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      taskA,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	offerB := &exchange.BuyMissOffer{
+		TaskHash:  hashB,
+		BuyMsgID:  "buy-task-b",
+		BuyerKey:  h.seller.PublicKeyHex(),
+		Task:      taskB,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+
+	if !eng.State().SetBuyMissOffer(offerA) {
+		t.Fatal("SetBuyMissOffer(offerA) returned false")
+	}
+	if !eng.State().SetBuyMissOffer(offerB) {
+		t.Fatal("SetBuyMissOffer(offerB) returned false")
+	}
+
+	// Both offers must be independently retrievable.
+	gotA := eng.State().GetBuyMissOffer(hashA)
+	if gotA == nil {
+		t.Fatal("GetBuyMissOffer(hashA) returned nil")
+	}
+	if gotA.BuyMsgID != offerA.BuyMsgID {
+		t.Errorf("offer A BuyMsgID = %q, want %q", gotA.BuyMsgID, offerA.BuyMsgID)
+	}
+
+	gotB := eng.State().GetBuyMissOffer(hashB)
+	if gotB == nil {
+		t.Fatal("GetBuyMissOffer(hashB) returned nil")
+	}
+	if gotB.BuyMsgID != offerB.BuyMsgID {
+		t.Errorf("offer B BuyMsgID = %q, want %q", gotB.BuyMsgID, offerB.BuyMsgID)
+	}
+
+	// Claiming offer A must not affect offer B.
+	claimedA := eng.State().ClaimBuyMissOffer(hashA)
+	if claimedA == nil {
+		t.Fatal("ClaimBuyMissOffer(hashA) returned nil")
+	}
+	if claimedA.BuyMsgID != offerA.BuyMsgID {
+		t.Errorf("claimed A BuyMsgID = %q, want %q", claimedA.BuyMsgID, offerA.BuyMsgID)
+	}
+
+	// Offer A is gone; offer B survives.
+	if eng.State().GetBuyMissOffer(hashA) != nil {
+		t.Error("offer A still present after ClaimBuyMissOffer — should be deleted")
+	}
+	if eng.State().GetBuyMissOffer(hashB) == nil {
+		t.Error("offer B was deleted when offer A was claimed — should be independent")
+	}
+
+	// Claim offer B — must succeed independently.
+	claimedB := eng.State().ClaimBuyMissOffer(hashB)
+	if claimedB == nil {
+		t.Fatal("ClaimBuyMissOffer(hashB) returned nil after claiming A")
+	}
+	if claimedB.BuyMsgID != offerB.BuyMsgID {
+		t.Errorf("claimed B BuyMsgID = %q, want %q", claimedB.BuyMsgID, offerB.BuyMsgID)
+	}
+}
+
 // TestBuyMiss_AutoAcceptEmitsCompressionAssign verifies that when a buy-miss
 // standing offer is fulfilled (seller puts a matching result), the engine also
 // emits a hot compression assign to the seller — consistent with AutoAcceptPut.
