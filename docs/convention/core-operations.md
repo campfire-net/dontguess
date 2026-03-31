@@ -178,7 +178,7 @@ Buyer requests cached inference matching a task description. The exchange search
      "description": "Maximum matches to return. Default: 3"},
     {"name": "compression_tier", "type": "enum",
      "values": ["hot", "warm", "cold"],
-     "description": "Optional filter: buyer can request cache entries from specific compression tier(s)"}
+     "description": "Optional filter: buyer can request cache entries from specific compression tier"}
   ],
   "produces_tags": [
     {"tag": "exchange:buy", "cardinality": "exactly_one"},
@@ -195,6 +195,17 @@ Buyer requests cached inference matching a task description. The exchange search
 **Buy as future:** A buy message is always sent with `--future`. The buyer can `cf await` the match response. The exchange fulfills the future with an `exchange:match` message. If no matches are found, the exchange fulfills with an empty match (zero results).
 
 **Budget enforcement:** The buyer's budget is a maximum. The exchange MUST NOT present matches priced above the buyer's budget. Budget is denominated in scrip (token-cost units). The buyer's balance is verified by the scrip ledger before the buy is accepted.
+
+**Compression tier pricing multipliers:** When a buyer requests a specific compression tier, the exchange applies a tier multiplier to the base price:
+
+| Tier | Multiplier |
+|------|------------|
+| hot | 1.5× |
+| warm | 1.2× |
+| cold | 1.0× |
+| unset (no tier preference) | 1.0× |
+
+The pricing engine applies these multipliers to all matched entries, reflecting the cost difference of retrieving and decompressing from each tier. A buyer requesting `hot` tier expects faster, more readily available inference and pays a premium. A buyer with no tier preference (unset) sees cold-tier baseline pricing.
 
 ### 5.3 `exchange:match`
 
