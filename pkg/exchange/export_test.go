@@ -79,3 +79,13 @@ func (s *State) DeleteInventoryEntryForTest(entryID string) {
 	defer s.mu.Unlock()
 	delete(s.inventory, entryID)
 }
+
+// InjectInventoryEntryForTest inserts an entry directly into the inventory map,
+// bypassing the normal put → put-accept flow. Used in unit tests that need to
+// set up derivative (CompressedFrom) relationships without running the full
+// assign-accept pipeline.
+func (s *State) InjectInventoryEntryForTest(entry *InventoryEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.inventory[entry.EntryID] = entry
+}

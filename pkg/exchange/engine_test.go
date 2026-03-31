@@ -138,7 +138,13 @@ func (h *testHarness) sendMessage(sender *testAgent, payload []byte, tags []stri
 // (a separate connection to the same file) via SQLite cross-connection commit
 // visibility semantics.
 func (h *testHarness) newEngine() *exchange.Engine {
-	return exchange.NewEngine(exchange.EngineOptions{
+	return h.newEngineWithOpts(nil)
+}
+
+// newEngineWithOpts creates an engine with the standard harness options plus any
+// caller-supplied overrides applied after the defaults.
+func (h *testHarness) newEngineWithOpts(override func(*exchange.EngineOptions)) *exchange.Engine {
+	opts := exchange.EngineOptions{
 		CampfireID:   h.cfID,
 		Store:        h.st,
 		ReadClient:   protocol.New(h.st, nil),
@@ -147,7 +153,11 @@ func (h *testHarness) newEngine() *exchange.Engine {
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
 		},
-	})
+	}
+	if override != nil {
+		override(&opts)
+	}
+	return exchange.NewEngine(opts)
 }
 
 // newOperatorClient returns the operator's protocol.Client created by exchange.Init.
