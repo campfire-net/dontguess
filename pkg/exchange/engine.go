@@ -573,7 +573,7 @@ func (e *Engine) handleBuy(msg *Message) error {
 	// compressor. Bounty is 30% of the entry's token_cost. Failure is
 	// non-fatal; log and proceed.
 	topEntry := semanticMatches[0].entry
-	if !e.state.HasCompressedVersion(topEntry.EntryID) {
+	if !e.state.HasCompressedVersion(topEntry.EntryID) && !e.hasActiveBuyerCompressAssign(topEntry.EntryID, msg.Sender) {
 		if err := e.sendWarmCompressionAssign(topEntry, msg.Sender); err != nil {
 			e.opts.log("engine: warm compression assign failed entry=%s err=%v", topEntry.PutMsgID, err)
 		}
@@ -1936,6 +1936,19 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 	e.opts.log("engine: warm compression assign sent assign_id=%s entry=%s buyer=%s bounty=%d",
 		shortKey(msg.ID), shortKey(entry.PutMsgID), shortKey(buyerKey), bounty)
 	return nil
+}
+
+
+// hasActiveBuyerCompressAssign returns true if there is already an active
+// (non-terminal) compression assign for the given entry targeting the buyer.
+// Used to prevent duplicate warm compression assigns for the same buyer.
+func (e *Engine) hasActiveBuyerCompressAssign(entryID, buyerKey string) bool {
+	for _, a := range e.state.ActiveAssigns(entryID) {
+		if a.TaskType == "compress" && a.ExclusiveSender == buyerKey {
+			return true
+		}
+	}
+	return false
 }
 
 // rebuildMatchIndex rebuilds the semantic match index from the current live inventory.

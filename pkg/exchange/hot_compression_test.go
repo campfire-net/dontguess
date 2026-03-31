@@ -177,3 +177,103 @@ func TestAutoAcceptPut_CompressionAssignOddTokenCost(t *testing.T) {
 
 	_ = eng // suppress unused warning
 }
+
+// TestAutoAcceptPut_ZeroTokenCost verifies that a put with token_cost=0 is
+// dropped by state validation (token_cost <= 0 is invalid) and that
+// AutoAcceptPut returns an error without panicking. No compression assign
+// must be emitted.
+func TestAutoAcceptPut_ZeroTokenCost(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	contentHash := "sha256:" + fmt.Sprintf("%064x", 55)
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("zero-cost entry", contentHash, "analysis", 0, 1024),
+		[]string{exchange.TagPut, "exchange:content-type:analysis"},
+		nil,
+	)
+
+	// AutoAcceptPut must return an error — the put was dropped by validation.
+	// It must not panic.
+	if err := eng.AutoAcceptPut(putMsg.ID, 0, time.Now().Add(48*time.Hour)); err == nil {
+		t.Fatal("expected AutoAcceptPut to return error for zero token_cost put, got nil")
+	}
+
+	// No compression assign must have been emitted.
+	allMsgs, listErr := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if listErr != nil {
+		t.Fatalf("ListMessages(TagAssign): %v", listErr)
+	}
+	for _, msg := range allMsgs {
+		var p struct {
+			TaskType string `json:"task_type"`
+			EntryID  string `json:"entry_id"`
+		}
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			continue
+		}
+		if p.TaskType == "compress" && p.EntryID == putMsg.ID {
+			t.Errorf("unexpected compression assign for zero token_cost put (assign_id=%s)", msg.ID[:16])
+		}
+	}
+}
+
+// TestAutoAcceptPut_DuplicateIdempotent verifies that calling AutoAcceptPut
+// twice on the same putMsgID does not create a second compression assign. The
+// second call must return an error (put is no longer pending) and the total
+// number of compression assigns for the entry must remain exactly 1.
+func TestAutoAcceptPut_DuplicateIdempotent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	contentHash := "sha256:" + fmt.Sprintf("%064x", 66)
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("duplicate accept entry", contentHash, "code", 12000, 8192),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+
+	// First accept must succeed.
+	if err := eng.AutoAcceptPut(putMsg.ID, 6000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("first AutoAcceptPut: %v", err)
+	}
+
+	// Second accept must return an error (put is no longer pending).
+	if err := eng.AutoAcceptPut(putMsg.ID, 6000, time.Now().Add(72*time.Hour)); err == nil {
+		t.Fatal("second AutoAcceptPut should return error (put no longer pending), got nil")
+	}
+
+	// Exactly one compression assign must exist for this entry.
+	allMsgs, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+		Tags: []string{exchange.TagAssign},
+	})
+	if err != nil {
+		t.Fatalf("ListMessages(TagAssign): %v", err)
+	}
+
+	var count int
+	for _, msg := range allMsgs {
+		var p struct {
+			TaskType string `json:"task_type"`
+			EntryID  string `json:"entry_id"`
+		}
+		if err := json.Unmarshal(msg.Payload, &p); err != nil {
+			continue
+		}
+		if p.TaskType == "compress" && p.EntryID == putMsg.ID {
+			count++
+		}
+	}
+
+	if count != 1 {
+		t.Errorf("compression assign count = %d, want 1 after duplicate AutoAcceptPut", count)
+	}
+}
