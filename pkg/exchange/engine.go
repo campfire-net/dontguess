@@ -28,6 +28,18 @@ const MatchingFeeRate = 10
 // original seller. 10% = 1/10.
 const ResidualRate = 10
 
+// HotCompressionBountyPct is the percentage of token_cost paid as bounty for
+// hot compression (immediately after put). 50% = 1/2.
+const HotCompressionBountyPct = 50
+
+// WarmCompressionBountyPct is the percentage of token_cost paid as bounty for
+// warm compression (buyer-initiated, content in cache). 30% = 3/10.
+const WarmCompressionBountyPct = 30
+
+// ReservationExpiryDuration is the time window during which a buyer-accept
+// reservation is valid. After expiry, the scrip hold is released.
+const ReservationExpiryDuration = 5 * time.Minute
+
 // Layer0MinPreviews is the minimum number of previews before conversion-rate
 // exclusion kicks in. Below this, entries have insufficient data for exclusion.
 const Layer0MinPreviews = 10
@@ -1064,7 +1076,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 
 	// Marshal the buy-hold convention message BEFORE mutating scrip state.
 	reservationID := newReservationID()
-	expiresAt := time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339)
+	expiresAt := time.Now().Add(ReservationExpiryDuration).UTC().Format(time.RFC3339)
 	holdPayload, err := e.marshal(scrip.BuyHoldPayload{
 		Buyer:         buyerKey,
 		Amount:        holdAmount,
@@ -1601,7 +1613,7 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 		if recency < 0 {
 			recency = 0
 		}
-		scored_[i] = scored{entry: entry, score: rep/100.0*0.6 + recency*0.4}
+		scored_[i] = scored{entry: entry, score: rep/100.0*scoreRepWeight + recency*(1.0-scoreRepWeight)}
 	}
 
 	// Sort descending by score.
@@ -1628,6 +1640,16 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 // A floor of 1 prevents zero-price entries from bypassing budget filters and
 // from receiving l1Efficiency=1.0 (free-item dominance) in the ranker.
 const computePriceMinPrice int64 = 1
+
+// Magic float64 constants used in computePrice and rankResults
+const (
+	ageDecayFloor    = 0.5    // floor of age decay in computePrice (decays from 1.0 to this over 60 days)
+	repFactorBase    = 0.8    // base reputation multiplier (rep=0 -> 0.8x)
+	repFactorRange   = 0.4    // reputation multiplier range (rep=100 -> 1.2x = base + range)
+	sizeBonusPerKB   = 0.003  // content size multiplier: +0.3% per KB
+	sizeBonusCap     = 0.30   // content size bonus cap: +30% for sizes >= 100KB
+	scoreRepWeight   = 0.6    // reputation weight in rankResults scoring (recency = 1.0 - scoreRepWeight)
+)
 
 // computePrice returns the exchange's asking price for an entry.
 //
@@ -1684,20 +1706,20 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 		if decay > 1.0 {
 			decay = 1.0
 		}
-		ageFactor = 1.0 - 0.5*decay
+		ageFactor = 1.0 - ageDecayFloor*decay
 	}
 
 	// Step 4: reputation multiplier (rep=0->0.8x, rep=50->1.0x, rep=100->1.2x)
 	rep := e.state.SellerReputation(entry.SellerKey)
-	repFactor := 0.8 + float64(rep)/100.0*0.4
+	repFactor := repFactorBase + float64(rep)/100.0*repFactorRange
 
 	// Step 5: content size multiplier (+0.3% per KB, capped at +30%)
 	sizeFactor := 1.0
 	if entry.ContentSize > 0 {
 		sizeKB := float64(entry.ContentSize) / 1024.0
-		sizeBonus := sizeKB * 0.003
-		if sizeBonus > 0.30 {
-			sizeBonus = 0.30
+		sizeBonus := sizeKB * sizeBonusPerKB
+		if sizeBonus > sizeBonusCap {
+			sizeBonus = sizeBonusCap
 		}
 		sizeFactor = 1.0 + sizeBonus
 	}
@@ -1873,7 +1895,7 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 // This is sent immediately after a put is accepted (hot path). Failure is
 // non-fatal to the caller — the error is logged and the accept proceeds.
 func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
-	bounty := entry.TokenCost / 2
+	bounty := entry.TokenCost * HotCompressionBountyPct / 100
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). Run /compress with the entry content to produce a Nyquist-sampled summary. Bounty: %d scrip.",
 		entry.EntryID, entry.ContentHash, bounty,
@@ -1910,7 +1932,7 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 // matched entry. Failure is non-fatal to the caller — the error is logged and
 // the match proceeds.
 func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey string) error {
-	bounty := entry.TokenCost * 30 / 100
+	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
 	description := fmt.Sprintf(
 		"Compress cached inference entry %s (content_hash=%s). You just received this content — run /compress to produce a Nyquist-sampled summary. Bounty: %d scrip.",
 		entry.EntryID, entry.ContentHash, bounty,
