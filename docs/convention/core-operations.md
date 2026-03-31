@@ -118,7 +118,10 @@ Seller offers cached inference to the exchange. The exchange buys the result at 
     {"name": "ttl_hours", "type": "integer", "min": 1, "max": 8760,
      "description": "Seller-requested time-to-live in hours (exchange may override)"},
     {"name": "embedding", "type": "json",
-     "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2)"}
+     "description": "Pre-computed embedding vector (384-dim float32 array, all-MiniLM-L6-v2)"},
+    {"name": "compression_tier", "type": "enum",
+     "values": ["hot", "warm", "cold"],
+     "description": "Compression tier for caching strategy (hot: frequently accessed, uncompressed; warm: periodic access, light compression; cold: archival, heavy compression). Optional; exchange may infer from usage."}
   ],
   "produces_tags": [
     {"tag": "exchange:put", "cardinality": "exactly_one"},
@@ -172,7 +175,10 @@ Buyer requests cached inference matching a task description. The exchange search
     {"name": "domains", "type": "tag_set", "max_count": 5,
      "description": "Domain tags to narrow search"},
     {"name": "max_results", "type": "integer", "min": 1, "max": 10,
-     "description": "Maximum matches to return. Default: 3"}
+     "description": "Maximum matches to return. Default: 3"},
+    {"name": "compression_tier", "type": "enum",
+     "values": ["hot", "warm", "cold"],
+     "description": "Optional filter: buyer can request cache entries from specific compression tier(s)"}
   ],
   "produces_tags": [
     {"tag": "exchange:buy", "cardinality": "exactly_one"},
@@ -562,9 +568,8 @@ The conformance checker validates an exchange message against this convention.
 3. **Antecedent count:** Matches requirement for operation type. Fail if mismatch.
 4. **Payload presence:** Must be present for all operations. Fail if absent.
 5. **Put validation:**
-   - `content_hash` matches pattern `^sha256:[a-f0-9]{64}$`
+   - `content` field is present and non-empty
    - `token_cost` > 0
-   - `content_size` > 0
    - `domains` count <= 5
 6. **Buy validation:**
    - `budget` > 0
@@ -602,11 +607,10 @@ The conformance checker validates an exchange message against this convention.
   "tags": ["exchange:put", "exchange:content-type:code", "exchange:domain:go", "exchange:domain:testing"],
   "payload": {
     "description": "Unit test generator for Go HTTP handlers — given a handler signature, produces table-driven tests with edge cases",
-    "content_hash": "sha256:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2",
+    "content": "ZnVuYyBHZW5lcmF0ZVRlc3RzKHNpZzogc3RyaW5nKSBzdHJpbmcgeyAvLyBFeGFtcGxlIHRlc3QgZ2VuZXJhdG9yIGltcGxlbWVudGF0aW9uIGZvciB0YWJsZS1kcml2ZW4gdGVzdHMgaW4gR28uLi4gfQo=",
     "token_cost": 15000,
     "content_type": "code",
     "domains": ["go", "testing"],
-    "content_size": 24576,
     "ttl_hours": 168
   },
   "antecedents": []
@@ -632,22 +636,20 @@ Result: `{valid: true}`
 ```
 Result: `{valid: true}`
 
-### 10.3 Invalid Put — Bad Hash Format
+### 10.3 Invalid Put — Missing Content Field
 
 ```json
 {
   "tags": ["exchange:put", "exchange:content-type:code"],
   "payload": {
     "description": "Some cached inference",
-    "content_hash": "md5:abc123",
     "token_cost": 1000,
-    "content_type": "code",
-    "content_size": 1024
+    "content_type": "code"
   },
   "antecedents": []
 }
 ```
-Result: `{valid: false, warnings: ["content_hash does not match pattern sha256:[a-f0-9]{64}"]}`
+Result: `{valid: false, warnings: ["content field is required"]}`
 
 ### 10.4 Invalid Match — Price Exceeds Budget
 
