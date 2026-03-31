@@ -1268,6 +1268,10 @@ func (s *State) applyAssign(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		return
 	}
+	// Idempotency guard: skip re-application on replay.
+	if _, exists := s.assignByID[msg.ID]; exists {
+		return
+	}
 	var payload struct {
 		EntryID         string `json:"entry_id"`
 		TaskType        string `json:"task_type"`
