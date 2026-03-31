@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 )
@@ -23,13 +24,15 @@ func TestSellerPut_ContentField(t *testing.T) {
 
 	payload := buildPutPayload(spec)
 
-	// Must have 'content' field with the exact value passed in.
+	wantContent := base64.StdEncoding.EncodeToString([]byte("test result"))
+
+	// Must have 'content' field with the base64-encoded value.
 	content, ok := payload["content"]
 	if !ok {
 		t.Fatal("payload missing 'content' field")
 	}
-	if content != "test result" {
-		t.Errorf("payload content = %q, want %q", content, "test result")
+	if content != wantContent {
+		t.Errorf("payload content = %q, want base64 %q", content, wantContent)
 	}
 
 	// Must NOT have 'content_hash' field.
@@ -50,8 +53,8 @@ func TestSellerPut_ContentField(t *testing.T) {
 	if _, hasHash := decoded["content_hash"]; hasHash {
 		t.Error("JSON-encoded payload must not contain 'content_hash' field")
 	}
-	if decoded["content"] != "test result" {
-		t.Errorf("JSON-decoded content = %v, want %q", decoded["content"], "test result")
+	if decoded["content"] != wantContent {
+		t.Errorf("JSON-decoded content = %v, want base64 %q", decoded["content"], wantContent)
 	}
 }
 

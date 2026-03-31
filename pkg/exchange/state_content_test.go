@@ -91,6 +91,48 @@ func TestApplyPut_HashComputedFromContent(t *testing.T) {
 	}
 }
 
+// TestApplyPut_PreDecodeSizeLimit verifies that a put whose base64-encoded
+// content string exceeds MaxContentBytes*4/3+4 is rejected before base64
+// decoding occurs, preventing unnecessary heap allocation.
+func TestApplyPut_PreDecodeSizeLimit(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Construct a base64 string longer than the pre-decode threshold using
+	// valid base64 characters ('A' is valid). We use valid characters so the
+	// pre-decode guard (not the decode-error handler) is what rejects it.
+	threshold := exchange.MaxContentBytes*4/3 + 4
+	buf := make([]byte, threshold+1)
+	for i := range buf {
+		buf[i] = 'A'
+	}
+	oversizedB64 := string(buf)
+
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("pre-decode rejection", 10000, oversizedB64))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 0 {
+		t.Errorf("expected empty pendingPuts for oversized base64 string (pre-decode), got %d entries", len(pending))
+	}
+}
+
+// TestApplyPut_MalformedBase64 verifies that a put with a non-base64 content
+// string is silently dropped without panicking.
+func TestApplyPut_MalformedBase64(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Pass a string that is not valid base64 but short enough to pass the pre-decode check.
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("malformed content", 5000, "not-valid-base64!!!"))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 0 {
+		t.Errorf("expected empty pendingPuts for malformed base64, got %d entries", len(pending))
+	}
+}
+
 // TestApplyPut_ContentSizeLimit verifies that a put with content exceeding
 // MaxContentBytes is silently dropped.
 func TestApplyPut_ContentSizeLimit(t *testing.T) {
@@ -107,5 +149,99 @@ func TestApplyPut_ContentSizeLimit(t *testing.T) {
 	pending := eng.State().PendingPuts()
 	if len(pending) != 0 {
 		t.Errorf("expected empty pendingPuts for put with oversized content, got %d entries", len(pending))
+	}
+}
+
+// TestApplyPut_ZeroByteContent verifies that a put with zero-byte content
+// (base64("") == "") is silently dropped and does not appear in pendingPuts.
+// Zero-byte content encodes to the empty string, which triggers the
+// content-required guard in applyPut.
+func TestApplyPut_ZeroByteContent(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// base64 of empty byte slice is "", which applyPut treats as absent content.
+	contentB64 := base64.StdEncoding.EncodeToString([]byte{})
+
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("zero-byte content", 10000, contentB64))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 0 {
+		t.Errorf("expected empty pendingPuts for put with zero-byte content, got %d entries", len(pending))
+	}
+}
+
+// TestApplyPut_ExactBoundaryAccepted verifies that a put with content of
+// exactly MaxContentBytes is accepted and appears in pendingPuts.
+// This is the upper boundary: MaxContentBytes+1 is rejected (see TestApplyPut_ContentSizeLimit),
+// MaxContentBytes exactly must be accepted.
+func TestApplyPut_ExactBoundaryAccepted(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Exactly at the limit — must be accepted.
+	exactContent := make([]byte, exchange.MaxContentBytes)
+	for i := range exactContent {
+		exactContent[i] = byte('a' + i%26)
+	}
+	contentB64 := base64.StdEncoding.EncodeToString(exactContent)
+
+	replayIntoEngine(t, h, eng, buildPutPayloadWithContent("exact boundary content", 10000, contentB64))
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 1 {
+		t.Errorf("expected 1 entry in pendingPuts for exact-boundary content, got %d", len(pending))
+	}
+}
+
+// TestApplyPut_IdempotentByMsgID verifies that replaying the same put message
+// ID twice results in only one entry in pendingPuts.
+// Campfire deduplicates by message ID at the log level; the state machine
+// mirrors this by keying pendingPuts on msg.ID — a second applyPut with the
+// same ID overwrites the same map slot, producing exactly one entry.
+func TestApplyPut_IdempotentByMsgID(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	content := []byte("cached inference result: idempotency check")
+	contentB64 := base64.StdEncoding.EncodeToString(content)
+	payload := buildPutPayloadWithContent("idempotency check", 5000, contentB64)
+
+	// Send the message once to get a real msg.ID in the store.
+	h.sendMessage(h.seller, payload,
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+
+	// Fetch the messages from the store — contains exactly one put message.
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("listing messages: %v", err)
+	}
+
+	// Build a duplicate slice: same message appended twice.
+	// This simulates a campfire log where the same message ID appears twice
+	// (e.g., due to a replay bug or network re-delivery).
+	exchangeMsgs := exchange.FromStoreRecords(msgs)
+	// Find the put message and duplicate it.
+	var duplicated []exchange.Message
+	for _, m := range exchangeMsgs {
+		duplicated = append(duplicated, m)
+		for _, tag := range m.Tags {
+			if tag == exchange.TagPut {
+				duplicated = append(duplicated, m) // same ID, second time
+				break
+			}
+		}
+	}
+
+	eng.State().Replay(duplicated)
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 1 {
+		t.Errorf("expected 1 entry in pendingPuts after replaying same msg ID twice, got %d", len(pending))
 	}
 }
