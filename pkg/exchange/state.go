@@ -1824,6 +1824,27 @@ func (s *State) AllSellerKeys() []string {
 	return out
 }
 
+// HasCompressedVersion returns true if there is at least one live inventory
+// entry whose CompressedFrom field equals entryID. Used by the medium loop to
+// determine whether a compression assign should be posted for a high-demand entry.
+func (s *State) HasCompressedVersion(entryID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, e := range s.inventory {
+		if e.CompressedFrom == entryID && !e.IsExpired() {
+			return true
+		}
+	}
+	return false
+}
+
+// PurchaseCount returns the number of distinct completed buyers for an entry.
+// Semantically identical to EntryDemandCount — exposed under a name that is
+// natural in the medium-loop compression-assign context.
+func (s *State) PurchaseCount(entryID string) int {
+	return s.EntryDemandCount(entryID)
+}
+
 // TaskDescriptionHash returns the SHA-256 hex of a task description string.
 // Used as the key for buy-miss standing offers.
 func TaskDescriptionHash(task string) string {

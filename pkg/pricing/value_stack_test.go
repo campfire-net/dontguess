@@ -95,6 +95,13 @@ func (s *valueStackStubState) AllSellerKeys() []string {
 	defer s.mu.Unlock()
 	return s.sellers
 }
+func (s *valueStackStubState) HasCompressedVersion(_ string) bool { return false }
+func (s *valueStackStubState) PurchaseCount(entryID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.demandCounts[entryID]
+}
+func (s *valueStackStubState) ActiveAssigns(_ string) []*exchange.AssignRecord { return nil }
 
 // ---- value stack interface ----
 func (s *valueStackStubState) TaskCompletionRate() float64 {
