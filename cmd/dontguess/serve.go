@@ -97,7 +97,25 @@ func runServe(_ *cobra.Command, _ []string) error {
 
 	logger := log.New(os.Stderr, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
 
-	provenanceStore := provenance.NewStore(provenance.DefaultConfig())
+	provCfg := provenance.DefaultConfig()
+	provCfg.AllowSelfAttestation = true
+	provenanceStore := provenance.NewStore(provCfg)
+	// Self-claim the operator and all existing campfire members so they can
+	// participate immediately. Anonymous provenance blocks all operations.
+	operatorKey := writeClient.PublicKeyHex()
+	provenanceStore.SetSelfClaimed(operatorKey)
+	// Self-attest the operator to reach "present" level — required for
+	// match, settle(put-accept/reject/deliver), mint, burn, rate-publish.
+	_ = provenanceStore.AddAttestation(&provenance.Attestation{
+		TargetKey:   operatorKey,
+		VerifierKey: operatorKey,
+		VerifiedAt:  time.Now(),
+		CoSigned:    true,
+	})
+	members, _ := writeClient.Members(cfg.ExchangeCampfireID)
+	for _, m := range members {
+		provenanceStore.SetSelfClaimed(m.MemberPubkey)
+	}
 	provenanceChecker, err := exchange.NewProvenanceChecker(provenanceStore)
 	if err != nil {
 		return fmt.Errorf("creating provenance checker: %w", err)
