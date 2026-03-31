@@ -17,19 +17,25 @@ import (
 
 // mediumStubState implements MediumStateReadWriter for medium loop tests.
 type mediumStubState struct {
-	mu          sync.Mutex
-	inventory   []*exchange.InventoryEntry
-	history     []exchange.PriceRecord
-	adjustments map[string]exchange.PriceAdjustment
-	reputation  map[string]int
-	demandCount map[string]int
+	mu                 sync.Mutex
+	inventory          []*exchange.InventoryEntry
+	history            []exchange.PriceRecord
+	adjustments        map[string]exchange.PriceAdjustment
+	reputation         map[string]int
+	demandCount        map[string]int
+	purchaseCount      map[string]int
+	compressedVersions map[string]bool // entryID → has a compressed derivative
+	activeAssigns      map[string][]*exchange.AssignRecord
 }
 
 func newMediumStubState() *mediumStubState {
 	return &mediumStubState{
-		adjustments: make(map[string]exchange.PriceAdjustment),
-		reputation:  make(map[string]int),
-		demandCount: make(map[string]int),
+		adjustments:        make(map[string]exchange.PriceAdjustment),
+		reputation:         make(map[string]int),
+		demandCount:        make(map[string]int),
+		purchaseCount:      make(map[string]int),
+		compressedVersions: make(map[string]bool),
+		activeAssigns:      make(map[string][]*exchange.AssignRecord),
 	}
 }
 
@@ -83,6 +89,27 @@ func (s *mediumStubState) AllSellerKeys() []string {
 	for k := range seen {
 		out = append(out, k)
 	}
+	return out
+}
+
+func (s *mediumStubState) HasCompressedVersion(entryID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.compressedVersions[entryID]
+}
+
+func (s *mediumStubState) PurchaseCount(entryID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.purchaseCount[entryID]
+}
+
+func (s *mediumStubState) ActiveAssigns(entryID string) []*exchange.AssignRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	recs := s.activeAssigns[entryID]
+	out := make([]*exchange.AssignRecord, len(recs))
+	copy(out, recs)
 	return out
 }
 
@@ -730,5 +757,131 @@ func TestMediumLoop_EmptyState_IsNoop(t *testing.T) {
 	}
 	if len(ss.payments) != 0 {
 		t.Errorf("expected no scrip payments, got %d", len(ss.payments))
+	}
+}
+
+// =============================================================================
+// Compression assign tests
+// =============================================================================
+
+// TestMediumLoop_CompressionAssign_PostedWhenHighDemandNoDerivative verifies
+// that the medium loop posts an open compression assign when an entry has
+// 3+ purchases, no compressed derivative, and no active assign.
+func TestMediumLoop_CompressionAssign_PostedWhenHighDemandNoDerivative(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	const tokenCost int64 = 10000
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-hot", SellerKey: "seller-1", TokenCost: tokenCost},
+	}
+	// 3 distinct buyers have purchased this entry.
+	st.purchaseCount["entry-hot"] = 3
+	// No compressed derivative.
+	st.compressedVersions["entry-hot"] = false
+	// No active assigns.
+
+	var postedSpecs []pricing.AssignSpec
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			postedSpecs = append(postedSpecs, spec)
+			return nil
+		},
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.CompressionAssigns != 1 {
+		t.Errorf("expected 1 compression assign posted, got %d", result.CompressionAssigns)
+	}
+	if len(postedSpecs) != 1 {
+		t.Fatalf("expected 1 PostAssign call, got %d", len(postedSpecs))
+	}
+	spec := postedSpecs[0]
+	if spec.EntryID != "entry-hot" {
+		t.Errorf("expected assign for entry-hot, got %s", spec.EntryID)
+	}
+	if spec.TaskType != "compress" {
+		t.Errorf("expected task_type=compress, got %s", spec.TaskType)
+	}
+	wantReward := tokenCost / 2
+	if spec.Reward != wantReward {
+		t.Errorf("expected reward=%d (token_cost/2), got %d", wantReward, spec.Reward)
+	}
+}
+
+// TestMediumLoop_CompressionAssign_SkippedWhenDerivativeExists verifies that
+// no compression assign is posted when a compressed derivative already exists.
+func TestMediumLoop_CompressionAssign_SkippedWhenDerivativeExists(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-compressed", SellerKey: "seller-1", TokenCost: 8000},
+	}
+	// 3+ purchases — high demand.
+	st.purchaseCount["entry-compressed"] = 5
+	// Compressed derivative already exists — no assign should be posted.
+	st.compressedVersions["entry-compressed"] = true
+
+	var postCalls int
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			postCalls++
+			return nil
+		},
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.CompressionAssigns != 0 {
+		t.Errorf("expected 0 compression assigns when derivative exists, got %d", result.CompressionAssigns)
+	}
+	if postCalls != 0 {
+		t.Errorf("expected 0 PostAssign calls when derivative exists, got %d", postCalls)
+	}
+}
+
+// TestMediumLoop_CompressionAssign_SkippedWhenBelowThreshold verifies that
+// no compression assign is posted when the entry has fewer than 3 purchases.
+func TestMediumLoop_CompressionAssign_SkippedWhenBelowThreshold(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-cold", SellerKey: "seller-1", TokenCost: 6000},
+	}
+	// Only 2 purchases — below the default threshold of 3.
+	st.purchaseCount["entry-cold"] = 2
+	// No compressed derivative.
+	st.compressedVersions["entry-cold"] = false
+
+	var postCalls int
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			postCalls++
+			return nil
+		},
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.CompressionAssigns != 0 {
+		t.Errorf("expected 0 compression assigns when below threshold, got %d", result.CompressionAssigns)
+	}
+	if postCalls != 0 {
+		t.Errorf("expected 0 PostAssign calls when below threshold, got %d", postCalls)
 	}
 }
