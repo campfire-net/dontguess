@@ -552,6 +552,19 @@ func (e *Engine) handleBuy(msg *Message) error {
 	if matchRec != nil {
 		e.state.Apply(matchRec)
 	}
+
+	// Warm compression offer: if the top-matched entry has no compressed
+	// derivative, offer the buyer an exclusive compression assign. The buyer
+	// just consumed the raw content and has it in cache — they are the ideal
+	// compressor. Bounty is 30% of the entry's token_cost. Failure is
+	// non-fatal; log and proceed.
+	topEntry := semanticMatches[0].entry
+	if !e.state.HasCompressedVersion(topEntry.EntryID) {
+		if err := e.sendWarmCompressionAssign(topEntry, msg.Sender); err != nil {
+			e.opts.log("engine: warm compression assign failed entry=%s err=%v", topEntry.PutMsgID, err)
+		}
+	}
+
 	return nil
 }
 
@@ -1835,6 +1848,43 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 	}
 	e.opts.log("engine: compression assign sent assign_id=%s entry=%s seller=%s bounty=%d",
 		shortKey(msg.ID), shortKey(entry.PutMsgID), shortKey(entry.SellerKey), bounty)
+	return nil
+}
+
+// sendWarmCompressionAssign sends an exchange:assign message for a compress task
+// directed exclusively at the buyer of the matched entry. The bounty is 30% of
+// the entry's token_cost (floor integer division). The buyer just consumed the
+// raw content and has it in cache, making them the ideal compressor.
+//
+// Called after a successful match when no compressed derivative exists for the
+// matched entry. Failure is non-fatal to the caller — the error is logged and
+// the match proceeds.
+func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey string) error {
+	bounty := entry.TokenCost * 30 / 100
+	description := fmt.Sprintf(
+		"Compress cached inference entry %s (content_hash=%s). You just received this content — run /compress to produce a Nyquist-sampled summary. Bounty: %d scrip.",
+		entry.PutMsgID, entry.ContentHash, bounty,
+	)
+	payload, err := json.Marshal(map[string]any{
+		"entry_id":         entry.PutMsgID,
+		"task_type":        "compress",
+		"reward":           bounty,
+		"exclusive_sender": buyerKey,
+		"description":      description,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding warm compression assign payload: %w", err)
+	}
+	tags := []string{TagAssign}
+	msg, err := e.sendOperatorMessage(payload, tags, nil)
+	if err != nil {
+		return fmt.Errorf("sending warm compression assign: %w", err)
+	}
+	if msg != nil {
+		e.state.Apply(msg)
+	}
+	e.opts.log("engine: warm compression assign sent assign_id=%s entry=%s buyer=%s bounty=%d",
+		shortKey(msg.ID), shortKey(entry.PutMsgID), shortKey(buyerKey), bounty)
 	return nil
 }
 
