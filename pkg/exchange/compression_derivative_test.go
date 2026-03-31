@@ -171,6 +171,86 @@ func TestCompressionDerivative_FullLifecycle(t *testing.T) {
 	}
 }
 
+// TestCompressionDerivative_InvalidContentHashDropped verifies that a
+// compress-assign-accept whose complete payload contains a content_hash
+// without the required "sha256:" prefix does NOT create a derivative entry.
+// The accept is still processed (bounty paid) but the invalid hash is rejected.
+func TestCompressionDerivative_InvalidContentHashDropped(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Put and accept a raw entry.
+	rawHash := "sha256:" + fmt.Sprintf("%064x", 42)
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Rust ownership explained", rawHash, "analysis", 15000, 30000),
+		[]string{exchange.TagPut, "exchange:content-type:analysis", "exchange:domain:rust"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.AutoAcceptPut(putMsg.ID, 10000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	origEntryID := inv[0].EntryID
+
+	// Post compression assign.
+	assignPayload, _ := json.Marshal(map[string]any{
+		"entry_id":  origEntryID,
+		"task_type": "compress",
+		"reward":    500,
+	})
+	assignMsg := h.sendMessage(h.operator, assignPayload, []string{exchange.TagAssign}, nil)
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, assignMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest assign: %v", err)
+	}
+
+	worker := newTestAgent(t)
+	claimMsg := h.sendMessage(worker, []byte(`{}`), []string{exchange.TagAssignClaim}, []string{assignMsg.ID})
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, claimMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest claim: %v", err)
+	}
+
+	// Complete with an invalid content_hash (md5 prefix, not sha256:).
+	invalidHash := "md5:cafebabe"
+	completeResult, _ := json.Marshal(map[string]any{
+		"content_hash": invalidHash,
+		"content_size": int64(8000),
+	})
+	completeMsg := h.sendMessage(worker, completeResult, []string{exchange.TagAssignComplete}, []string{claimMsg.ID})
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, completeMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest complete: %v", err)
+	}
+
+	// Operator accepts (non-fatal — derivative creation fails, bounty still paid).
+	acceptMsg := h.sendMessage(h.operator, []byte(`{}`), []string{exchange.TagAssignAccept}, []string{completeMsg.ID})
+	msgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(mustGetStoreRecord(t, h, acceptMsg.ID))); err != nil {
+		t.Fatalf("DispatchForTest accept: %v", err)
+	}
+
+	// Inventory must still have exactly one entry — no derivative with the invalid hash.
+	inv = eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("invalid content_hash should not create derivative: expected 1 inventory entry, got %d", len(inv))
+	}
+	if inv[0].CompressedFrom != "" {
+		t.Errorf("unexpected CompressedFrom on original entry after invalid-hash accept: %q", inv[0].CompressedFrom)
+	}
+}
+
 // TestCompressionDerivative_NonCompressTaskNoDerivative verifies that a
 // non-compress task type (e.g. "freshness") does NOT create a derivative entry.
 func TestCompressionDerivative_NonCompressTaskNoDerivative(t *testing.T) {

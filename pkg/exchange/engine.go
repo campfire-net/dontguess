@@ -1434,6 +1434,9 @@ func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID stri
 	if result.ContentHash == "" {
 		return fmt.Errorf("assign-complete result missing content_hash")
 	}
+	if !strings.HasPrefix(result.ContentHash, "sha256:") {
+		return fmt.Errorf("assign-complete result content_hash %q does not start with sha256:", result.ContentHash)
+	}
 
 	// Derive a stable EntryID from the accept message ID so that replaying
 	// the same accept message always produces the same derivative ID.
