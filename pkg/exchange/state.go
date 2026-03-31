@@ -26,6 +26,13 @@ const (
 	TagPhasePrefix   = "exchange:phase:"
 	TagVerdictPrefix = "exchange:verdict:"
 
+	// Assign lifecycle operation tags.
+	TagAssign         = "exchange:assign"
+	TagAssignClaim    = "exchange:assign-claim"
+	TagAssignComplete = "exchange:assign-complete"
+	TagAssignAccept   = "exchange:assign-accept"
+	TagAssignReject   = "exchange:assign-reject"
+
 	SettlePhaseStrPutAccept   = "put-accept"
 	SettlePhaseStrPutReject   = "put-reject"
 	SettlePhaseStrBuyerAccept = "buyer-accept"
@@ -197,6 +204,51 @@ type PriceAdjustment struct {
 // IsExpired returns true if the adjustment's ExpiresAt is non-zero and past.
 func (a *PriceAdjustment) IsExpired() bool {
 	return !a.ExpiresAt.IsZero() && time.Now().After(a.ExpiresAt)
+}
+
+// AssignStatus is the lifecycle state of a single assign task.
+type AssignStatus int
+
+const (
+	// AssignOpen is the initial state: the task is available to claim.
+	AssignOpen AssignStatus = iota
+	// AssignClaimed means an agent has claimed the task and is working it.
+	AssignClaimed
+	// AssignCompleted means the agent has submitted a result pending operator review.
+	AssignCompleted
+	// AssignAccepted means the operator accepted the result and the task is done.
+	AssignAccepted
+	// AssignRejected means the operator rejected the result.
+	AssignRejected
+)
+
+// AssignRecord tracks the lifecycle of a single assign task.
+type AssignRecord struct {
+	// AssignID is the message ID of the originating exchange:assign message.
+	AssignID string
+	// EntryID is the inventory entry this task is associated with (e.g. freshness
+	// check, validation, context compression). May be empty for generic tasks.
+	EntryID string
+	// TaskType is a human-readable task category (e.g. "freshness", "validation",
+	// "compression").
+	TaskType string
+	// Reward is the scrip amount paid to the claimant on accept.
+	Reward int64
+	// Status is the current lifecycle state.
+	Status AssignStatus
+	// ClaimantKey is the hex-encoded public key of the agent that claimed the task.
+	// Empty until claimed.
+	ClaimantKey string
+	// ClaimMsgID is the message ID of the exchange:assign-claim message.
+	ClaimMsgID string
+	// CompleteMsgID is the message ID of the exchange:assign-complete message.
+	CompleteMsgID string
+	// Result is the agent-supplied result payload (from assign-complete).
+	// Stored as raw JSON for the operator to inspect before accepting.
+	Result []byte
+	// ExclusiveSender restricts who may claim this task. If non-empty, only the
+	// agent with this public key may claim. Used for seller-only or buyer-only tasks.
+	ExclusiveSender string
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -383,6 +435,22 @@ type State struct {
 	// O(1) alternative to scanning the full log in findExistingBuyerAcceptHold.
 	// Key: matchMsgID (BuyMsg field from BuyHoldPayload). Value: reservationID.
 	matchToBuyHold map[string]string
+
+	// assignsByEntry maps entry IDs to all assign records for that entry.
+	// Key: entryID. Assigns with no entry use "" as key.
+	assignsByEntry map[string][]*AssignRecord
+
+	// assignByID maps assign message IDs to their records for O(1) lookup.
+	assignByID map[string]*AssignRecord
+
+	// claimedAssigns maps agent public keys to the assign IDs they currently hold.
+	// An agent may only hold one active claim at a time.
+	// Key: agentKey -> assignID.
+	claimedAssigns map[string]string
+
+	// pendingAssignResults maps complete message IDs to the assign record waiting
+	// for operator accept/reject. Key: completeMsgID -> *AssignRecord.
+	pendingAssignResults map[string]*AssignRecord
 }
 
 // NewState creates an empty exchange state.
@@ -411,8 +479,12 @@ func NewState() *State {
 		smallContentDisputes:  make(map[string]int),
 		entryPreviewCount:     make(map[string]int),
 		entryConversionCount:  make(map[string]int),
-		priceAdjustments:      make(map[string]PriceAdjustment),
-		matchToBuyHold:        make(map[string]string),
+		priceAdjustments:     make(map[string]PriceAdjustment),
+		matchToBuyHold:       make(map[string]string),
+		assignsByEntry:       make(map[string][]*AssignRecord),
+		assignByID:           make(map[string]*AssignRecord),
+		claimedAssigns:       make(map[string]string),
+		pendingAssignResults: make(map[string]*AssignRecord),
 	}
 }
 
@@ -447,6 +519,10 @@ func (s *State) Replay(msgs []Message) {
 	s.entryPreviewCount = make(map[string]int)
 	s.entryConversionCount = make(map[string]int)
 	s.matchToBuyHold = make(map[string]string)
+	s.assignsByEntry = make(map[string][]*AssignRecord)
+	s.assignByID = make(map[string]*AssignRecord)
+	s.claimedAssigns = make(map[string]string)
+	s.pendingAssignResults = make(map[string]*AssignRecord)
 	// Note: priceAdjustments is intentionally NOT reset on Replay.
 	// It is externally written by the fast pricing loop, not derived from the log.
 
@@ -475,6 +551,16 @@ func (s *State) applyLocked(msg *Message) {
 		s.applyMatch(msg)
 	case TagSettle:
 		s.applySettle(msg)
+	case TagAssign:
+		s.applyAssign(msg)
+	case TagAssignClaim:
+		s.applyAssignClaim(msg)
+	case TagAssignComplete:
+		s.applyAssignComplete(msg)
+	case TagAssignAccept:
+		s.applyAssignAccept(msg)
+	case TagAssignReject:
+		s.applyAssignReject(msg)
 	default:
 		// Handle scrip convention messages that are not exchange operations.
 		for _, tag := range msg.Tags {
@@ -514,7 +600,8 @@ func (s *State) GetBuyHoldReservation(matchMsgID string) string {
 func exchangeOp(tags []string) string {
 	for _, t := range tags {
 		switch t {
-		case TagPut, TagBuy, TagMatch, TagSettle:
+		case TagPut, TagBuy, TagMatch, TagSettle,
+			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject:
 			return t
 		}
 	}
@@ -1086,6 +1173,200 @@ func (s *State) applySettlePreview(msg *Message) {
 		return
 	}
 	s.previewToMatch[msg.ID] = matchMsgID
+}
+
+// applyAssign processes an exchange:assign message.
+//
+// Only the operator may post assign tasks. Non-operator senders are rejected
+// when OperatorKey is set.
+//
+// Payload fields:
+//   - entry_id: optional inventory entry this task concerns
+//   - task_type: category ("freshness", "validation", "compression", ...)
+//   - reward: scrip to pay the claimant on accept
+//   - exclusive_sender: if set, only this key may claim the task
+//
+// On success, a new AssignRecord is created in AssignOpen state and indexed
+// in assignsByEntry and assignByID.
+func (s *State) applyAssign(msg *Message) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
+	var payload struct {
+		EntryID         string `json:"entry_id"`
+		TaskType        string `json:"task_type"`
+		Reward          int64  `json:"reward"`
+		ExclusiveSender string `json:"exclusive_sender"`
+	}
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		return
+	}
+	rec := &AssignRecord{
+		AssignID:        msg.ID,
+		EntryID:         payload.EntryID,
+		TaskType:        payload.TaskType,
+		Reward:          payload.Reward,
+		Status:          AssignOpen,
+		ExclusiveSender: payload.ExclusiveSender,
+	}
+	s.assignsByEntry[payload.EntryID] = append(s.assignsByEntry[payload.EntryID], rec)
+	s.assignByID[msg.ID] = rec
+}
+
+// applyAssignClaim processes an exchange:assign-claim message.
+//
+// Antecedent: the assign message ID.
+//
+// Validation:
+//   - Antecedent must reference a known assign in AssignOpen state.
+//   - If ExclusiveSender is set on the assign, the sender must match.
+//   - An agent may hold only one active claim at a time.
+//
+// On success, the assign transitions to AssignClaimed and claimedAssigns
+// records the agentKey → assignID binding.
+func (s *State) applyAssignClaim(msg *Message) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	assignID := msg.Antecedents[0]
+	rec, ok := s.assignByID[assignID]
+	if !ok || rec.Status != AssignOpen {
+		return
+	}
+	// Exclusive sender constraint: if set, only the designated key may claim.
+	if rec.ExclusiveSender != "" && msg.Sender != rec.ExclusiveSender {
+		return
+	}
+	// Agent may hold only one active claim at a time.
+	if existing, held := s.claimedAssigns[msg.Sender]; held && existing != "" {
+		return
+	}
+	rec.Status = AssignClaimed
+	rec.ClaimantKey = msg.Sender
+	rec.ClaimMsgID = msg.ID
+	s.claimedAssigns[msg.Sender] = assignID
+}
+
+// applyAssignComplete processes an exchange:assign-complete message.
+//
+// Antecedent: the assign-claim message ID.
+//
+// Validation:
+//   - Antecedent must reference a known assign-claim for an assign in AssignClaimed state.
+//   - Sender must be the agent who claimed the task.
+//
+// On success, the assign transitions to AssignCompleted, the result is stored,
+// the claimedAssigns binding is released, and the record is indexed in
+// pendingAssignResults for the operator to accept or reject.
+func (s *State) applyAssignComplete(msg *Message) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	claimMsgID := msg.Antecedents[0]
+	// Find the assign record via the claim message ID.
+	var rec *AssignRecord
+	for _, r := range s.assignByID {
+		if r.ClaimMsgID == claimMsgID {
+			rec = r
+			break
+		}
+	}
+	if rec == nil || rec.Status != AssignClaimed {
+		return
+	}
+	// Sender must be the claimant.
+	if msg.Sender != rec.ClaimantKey {
+		return
+	}
+	rec.Status = AssignCompleted
+	rec.CompleteMsgID = msg.ID
+	rec.Result = msg.Payload
+	// Release the agent's active claim slot.
+	delete(s.claimedAssigns, msg.Sender)
+	// Index for operator review.
+	s.pendingAssignResults[msg.ID] = rec
+}
+
+// applyAssignAccept processes an exchange:assign-accept message.
+//
+// Only the operator may accept results.
+// Antecedent: the assign-complete message ID.
+//
+// Validation:
+//   - Sender must be the operator (if OperatorKey set).
+//   - Antecedent must reference a known assign in AssignCompleted state via
+//     pendingAssignResults.
+//
+// On success, the assign transitions to AssignAccepted and is removed from
+// pendingAssignResults.
+func (s *State) applyAssignAccept(msg *Message) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	completeMsgID := msg.Antecedents[0]
+	rec, ok := s.pendingAssignResults[completeMsgID]
+	if !ok || rec.Status != AssignCompleted {
+		return
+	}
+	rec.Status = AssignAccepted
+	delete(s.pendingAssignResults, completeMsgID)
+}
+
+// applyAssignReject processes an exchange:assign-reject message.
+//
+// Only the operator may reject results.
+// Antecedent: the assign-complete message ID.
+//
+// Validation:
+//   - Sender must be the operator (if OperatorKey set).
+//   - Antecedent must reference a known assign in AssignCompleted state via
+//     pendingAssignResults.
+//
+// On success, the assign transitions to AssignRejected and is removed from
+// pendingAssignResults. The task returns to AssignOpen so another agent may
+// claim it.
+func (s *State) applyAssignReject(msg *Message) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	completeMsgID := msg.Antecedents[0]
+	rec, ok := s.pendingAssignResults[completeMsgID]
+	if !ok || rec.Status != AssignCompleted {
+		return
+	}
+	rec.Status = AssignRejected
+	delete(s.pendingAssignResults, completeMsgID)
+	// Reset to open so a different agent may claim the task.
+	rec.ClaimantKey = ""
+	rec.ClaimMsgID = ""
+	rec.CompleteMsgID = ""
+	rec.Result = nil
+	rec.Status = AssignOpen
+}
+
+// ActiveAssigns returns a snapshot of all AssignRecord entries associated with
+// the given entryID that are not yet in a terminal state (Accepted or Rejected).
+// Pass "" to query assigns with no associated entry.
+// Returns a copy of each record — callers must not mutate.
+func (s *State) ActiveAssigns(entryID string) []*AssignRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	recs := s.assignsByEntry[entryID]
+	out := make([]*AssignRecord, 0, len(recs))
+	for _, r := range recs {
+		if r.Status == AssignAccepted || r.Status == AssignRejected {
+			continue
+		}
+		cp := *r
+		out = append(out, &cp)
+	}
+	return out
 }
 
 // sellerStats returns the SellerStats for the given key, creating if absent.
