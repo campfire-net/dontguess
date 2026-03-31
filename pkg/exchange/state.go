@@ -6,6 +6,7 @@
 package exchange
 
 import (
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -32,6 +33,10 @@ const (
 	TagAssignComplete = "exchange:assign-complete"
 	TagAssignAccept   = "exchange:assign-accept"
 	TagAssignReject   = "exchange:assign-reject"
+
+	// TagBuyMiss is the tag applied to a buy-miss standing offer message.
+	// Sent by the engine as a reply to a buy with no matching inventory.
+	TagBuyMiss = "exchange:buy-miss"
 
 	SettlePhaseStrPutAccept   = "put-accept"
 	SettlePhaseStrPutReject   = "put-reject"
@@ -205,6 +210,41 @@ type PriceAdjustment struct {
 func (a *PriceAdjustment) IsExpired() bool {
 	return !a.ExpiresAt.IsZero() && time.Now().After(a.ExpiresAt)
 }
+
+// BuyMissOffer is a standing offer the exchange makes to a buyer when no
+// inventory match is found. If the buyer computes the result themselves and
+// puts it within ExpiresAt, the exchange auto-accepts at OfferedPrice.
+//
+// One offer per TaskHash (SHA-256 of the task description, hex-encoded) — no duplicates.
+// Offers expire after BuyMissOfferTTL (24h).
+type BuyMissOffer struct {
+	// TaskHash is the SHA-256 hex of the canonical task description.
+	TaskHash string
+	// BuyMsgID is the campfire message ID of the originating exchange:buy.
+	BuyMsgID string
+	// BuyerKey is the hex-encoded Ed25519 public key of the buyer.
+	BuyerKey string
+	// Task is the original task description (for logging/diagnostics).
+	Task string
+	// OfferedPrice is the scrip the exchange will pay on auto-accept
+	// (token_cost_from_put * 0.7 — computed at fulfillment time).
+	// When zero, the engine uses the standard 70% of token_cost.
+	OfferedPrice int64
+	// ExpiresAt is when this standing offer expires.
+	ExpiresAt time.Time
+}
+
+// IsExpired returns true if the offer has passed its expiry.
+func (o *BuyMissOffer) IsExpired() bool {
+	return time.Now().After(o.ExpiresAt)
+}
+
+// BuyMissOfferTTL is how long a buy-miss standing offer remains valid.
+const BuyMissOfferTTL = 24 * time.Hour
+
+// BuyMissOfferRate is the fraction of token_cost the exchange pays on
+// a buy-miss auto-accept (70% — same as standard auto-accept discount).
+const BuyMissOfferRate = 70 // percent
 
 // AssignStatus is the lifecycle state of a single assign task.
 type AssignStatus int
@@ -451,6 +491,11 @@ type State struct {
 	// pendingAssignResults maps complete message IDs to the assign record waiting
 	// for operator accept/reject. Key: completeMsgID -> *AssignRecord.
 	pendingAssignResults map[string]*AssignRecord
+
+	// buyMissOffers tracks standing buy-miss offers keyed by task description hash.
+	// One offer per task hash — no duplicates. Offers expire after BuyMissOfferTTL.
+	// Key: SHA-256 hex of canonical task description.
+	buyMissOffers map[string]*BuyMissOffer
 }
 
 // NewState creates an empty exchange state.
@@ -485,6 +530,7 @@ func NewState() *State {
 		assignByID:           make(map[string]*AssignRecord),
 		claimedAssigns:       make(map[string]string),
 		pendingAssignResults: make(map[string]*AssignRecord),
+		buyMissOffers:        make(map[string]*BuyMissOffer),
 	}
 }
 
@@ -523,6 +569,7 @@ func (s *State) Replay(msgs []Message) {
 	s.assignByID = make(map[string]*AssignRecord)
 	s.claimedAssigns = make(map[string]string)
 	s.pendingAssignResults = make(map[string]*AssignRecord)
+	s.buyMissOffers = make(map[string]*BuyMissOffer)
 	// Note: priceAdjustments is intentionally NOT reset on Replay.
 	// It is externally written by the fast pricing loop, not derived from the log.
 
@@ -1755,6 +1802,49 @@ func (s *State) AllSellerKeys() []string {
 		out = append(out, k)
 	}
 	return out
+}
+
+// TaskDescriptionHash returns the SHA-256 hex of a task description string.
+// Used as the key for buy-miss standing offers.
+func TaskDescriptionHash(task string) string {
+	h := sha256.Sum256([]byte(task))
+	return hex.EncodeToString(h[:])
+}
+
+// SetBuyMissOffer records a standing buy-miss offer for the given task hash.
+// If a non-expired offer already exists for this hash, it is NOT overwritten
+// (one offer per task hash — no duplicates).
+// Thread-safe.
+func (s *State) SetBuyMissOffer(offer *BuyMissOffer) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.buyMissOffers[offer.TaskHash]; ok && !existing.IsExpired() {
+		return false // duplicate — non-expired offer already exists
+	}
+	s.buyMissOffers[offer.TaskHash] = offer
+	return true
+}
+
+// GetBuyMissOffer returns the standing buy-miss offer for the given task hash,
+// or nil if none exists or it has expired.
+// Thread-safe.
+func (s *State) GetBuyMissOffer(taskHash string) *BuyMissOffer {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	offer, ok := s.buyMissOffers[taskHash]
+	if !ok || offer.IsExpired() {
+		return nil
+	}
+	return offer
+}
+
+// DeleteBuyMissOffer removes the standing offer for the given task hash.
+// Called when a put fulfills the offer (auto-accept path).
+// Thread-safe.
+func (s *State) DeleteBuyMissOffer(taskHash string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.buyMissOffers, taskHash)
 }
 
 // stripTagPrefix removes a convention tag prefix from a value if present.
