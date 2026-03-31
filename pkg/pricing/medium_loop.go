@@ -43,6 +43,11 @@ import (
 // DefaultMediumLoopInterval is the cadence at which the medium loop runs.
 const DefaultMediumLoopInterval = 1 * time.Hour
 
+// DefaultCompressionPurchaseThreshold is the minimum number of distinct
+// completed buyers an entry must have before the medium loop considers posting
+// an open compression assign. Entries below this threshold are ignored.
+const DefaultCompressionPurchaseThreshold = 3
+
 // DefaultMediumLoopWindow is the lookback window for residual settlement and
 // reputation computation. Covers the last 2 hours to overlap with the previous
 // tick and catch any gaps from the fast loop.
@@ -95,6 +100,12 @@ type MediumStateReader interface {
 	EntryDemandCount(entryID string) int
 	// AllSellerKeys returns all seller public keys that have inventory entries.
 	AllSellerKeys() []string
+	// HasCompressedVersion returns true if a compressed derivative exists for entryID.
+	HasCompressedVersion(entryID string) bool
+	// PurchaseCount returns the number of distinct completed buyers for an entry.
+	PurchaseCount(entryID string) int
+	// ActiveAssigns returns all non-terminal assign records for the given entryID.
+	ActiveAssigns(entryID string) []*exchange.AssignRecord
 }
 
 // MediumStateWriter is the write interface the medium loop needs from exchange state.
@@ -136,6 +147,21 @@ type MediumLoopResult struct {
 	// ReputationUpdates is the number of entries that received a
 	// reputation-floor adjustment.
 	ReputationUpdates int
+	// CompressionAssigns is the number of open compression assign tasks posted
+	// this tick for high-demand uncompressed entries.
+	CompressionAssigns int
+}
+
+// AssignSpec describes an open compression assign to be posted by the medium loop.
+// It is passed to MediumLoopOptions.PostAssign for the caller to dispatch.
+type AssignSpec struct {
+	// EntryID is the inventory entry requiring compression.
+	EntryID string
+	// Reward is the scrip bounty for completing the task (break-even rate:
+	// token_cost / 2, matching the hot-compression bounty).
+	Reward int64
+	// TaskType is always "compress" for medium-loop compression assigns.
+	TaskType string
 }
 
 // MediumLoopOptions configures a MediumLoop.
@@ -154,6 +180,15 @@ type MediumLoopOptions struct {
 	Logger func(format string, args ...any)
 	// Now overrides time.Now for testing determinism.
 	Now func() time.Time
+	// PostAssign is called for each open compression assign the medium loop wants
+	// to post. If nil, compression assign posting is skipped. The caller is
+	// responsible for dispatching the assign to the campfire (engine.PostAssign
+	// or equivalent). Errors from PostAssign are logged and do not abort the tick.
+	PostAssign func(spec AssignSpec) error
+	// CompressionPurchaseThreshold is the minimum purchase count an entry must
+	// have before a compression assign is posted. Defaults to
+	// DefaultCompressionPurchaseThreshold (3).
+	CompressionPurchaseThreshold int
 }
 
 func (o *MediumLoopOptions) interval() time.Duration {
@@ -181,6 +216,13 @@ func (o *MediumLoopOptions) log(format string, args ...any) {
 	if o.Logger != nil {
 		o.Logger(format, args...)
 	}
+}
+
+func (o *MediumLoopOptions) compressionPurchaseThreshold() int {
+	if o.CompressionPurchaseThreshold > 0 {
+		return o.CompressionPurchaseThreshold
+	}
+	return DefaultCompressionPurchaseThreshold
 }
 
 // MediumLoop runs the Layer 2 correction loop. It dampens fast-loop outlier
@@ -227,6 +269,8 @@ func (l *MediumLoop) Run(ctx context.Context) error {
 //  1. Cluster correction — dampens fast loop outlier adjustments
 //  2. Residual settlements — pays accumulated residuals to sellers
 //  3. Reputation updates — applies floor adjustments for low-rep sellers
+//  4. Compression assigns — posts open compression tasks for high-demand
+//     uncompressed entries (requires PostAssign to be configured)
 //
 // Tick is exported so it can be called directly in tests without running the
 // full Run loop.
@@ -262,15 +306,19 @@ func (l *MediumLoop) Tick(ctx context.Context) MediumLoopResult {
 	// 3. Reputation updates.
 	repUpdates := l.applyReputationFloor(now, inventory)
 
+	// 4. Compression assigns.
+	compressionAssigns := l.postCompressionAssigns(inventory)
+
 	result := MediumLoopResult{
 		ClusterCorrections: corrections,
 		ResidualsPaid:      residualsPaid,
 		TotalResidualScrip: totalScrip,
 		ReputationUpdates:  repUpdates,
+		CompressionAssigns: compressionAssigns,
 	}
 
-	l.opts.log("medium loop tick: window=%s, history_records=%d, corrections=%d, residuals=%d (scrip=%d), rep_updates=%d",
-		window, len(recentHistory), corrections, residualsPaid, totalScrip, repUpdates)
+	l.opts.log("medium loop tick: window=%s, history_records=%d, corrections=%d, residuals=%d (scrip=%d), rep_updates=%d, compression_assigns=%d",
+		window, len(recentHistory), corrections, residualsPaid, totalScrip, repUpdates, compressionAssigns)
 
 	return result
 }
@@ -533,6 +581,63 @@ func (l *MediumLoop) applyReputationFloor(
 	}
 
 	return updates
+}
+
+// postCompressionAssigns scans inventory for high-demand entries that lack a
+// compressed derivative and have no active compression assign. For each
+// qualifying entry it calls PostAssign (if configured) with an open
+// (non-exclusive) compression task at break-even reward (token_cost / 2).
+//
+// Qualifying conditions (all must hold):
+//  1. PurchaseCount(entryID) >= CompressionPurchaseThreshold
+//  2. !HasCompressedVersion(entryID)
+//  3. len(ActiveAssigns(entryID)) == 0
+//
+// Returns the number of assigns posted.
+func (l *MediumLoop) postCompressionAssigns(inventory []*exchange.InventoryEntry) int {
+	if l.opts.PostAssign == nil {
+		return 0
+	}
+
+	threshold := l.opts.compressionPurchaseThreshold()
+	posted := 0
+
+	for _, entry := range inventory {
+		// Skip compressed derivatives — they are not candidates for further compression.
+		if entry.CompressedFrom != "" {
+			continue
+		}
+
+		// Check purchase threshold.
+		if l.opts.State.PurchaseCount(entry.EntryID) < threshold {
+			continue
+		}
+
+		// Skip if a compressed derivative already exists.
+		if l.opts.State.HasCompressedVersion(entry.EntryID) {
+			continue
+		}
+
+		// Skip if there is already an active compression assign.
+		if len(l.opts.State.ActiveAssigns(entry.EntryID)) > 0 {
+			continue
+		}
+
+		// Post an open (non-exclusive) compression assign at break-even reward.
+		reward := entry.TokenCost / 2
+		spec := AssignSpec{
+			EntryID:  entry.EntryID,
+			Reward:   reward,
+			TaskType: "compress",
+		}
+		if err := l.opts.PostAssign(spec); err != nil {
+			l.opts.log("medium loop: PostAssign failed for entry %s: %v", entry.EntryID, err)
+			continue
+		}
+		posted++
+	}
+
+	return posted
 }
 
 // int64str converts an int64 to a decimal string without importing strconv
