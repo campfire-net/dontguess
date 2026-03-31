@@ -585,7 +585,7 @@ func (e *Engine) handleBuy(msg *Message) error {
 	// compressor. Bounty is 30% of the entry's token_cost. Failure is
 	// non-fatal; log and proceed.
 	topEntry := semanticMatches[0].entry
-	if !e.state.HasCompressedVersion(topEntry.EntryID) && !e.hasActiveBuyerCompressAssign(topEntry.EntryID, msg.Sender) {
+	if topEntry.CompressedFrom == "" && !e.state.HasCompressedVersion(topEntry.EntryID) && !e.hasActiveBuyerCompressAssign(topEntry.EntryID, msg.Sender) {
 		if err := e.sendWarmCompressionAssign(topEntry, msg.Sender); err != nil {
 			e.opts.log("engine: warm compression assign failed entry=%s err=%v", topEntry.PutMsgID, err)
 		}

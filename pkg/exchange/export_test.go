@@ -1,5 +1,13 @@
 package exchange
 
+import "github.com/3dl-dev/dontguess/pkg/matching"
+
+// SetMatchIndexForTest replaces the engine's semantic match index.
+// Used in tests that need to control which entries win the semantic match.
+func (e *Engine) SetMatchIndexForTest(idx *matching.Index) {
+	e.matchIndex = idx
+}
+
 // DispatchForTest exposes the engine's dispatch method for use in tests.
 // It allows tests to trigger specific handler paths (settle, dispute) without
 // running the full engine event loop.
