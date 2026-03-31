@@ -18,11 +18,12 @@ import (
 
 // Config is the local operator config written after init.
 type Config struct {
-	ExchangeCampfireID string `json:"exchange_campfire_id"`
-	OperatorKeyHex     string `json:"operator_key"`
-	ConventionVersion  string `json:"convention_version"`
-	Alias              string `json:"alias"`
-	CreatedAt          int64  `json:"created_at"`
+	ExchangeCampfireID string           `json:"exchange_campfire_id"`
+	OperatorKeyHex     string           `json:"operator_key"`
+	ConventionVersion  string           `json:"convention_version"`
+	Alias              string           `json:"alias"`
+	CreatedAt          int64            `json:"created_at"`
+	ProvenanceLevels   ProvenanceLevels `json:"provenance_levels,omitempty"`
 }
 
 // InitOptions controls the Init operation.
