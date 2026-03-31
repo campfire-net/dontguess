@@ -184,6 +184,8 @@ type ActiveOrder struct {
 	Domains []string
 	// MaxResults is the maximum number of matches to return (default 3).
 	MaxResults int
+	// CompressionTier is the optional compression tier filter (e.g. "lossless", "lossy", "raw").
+	CompressionTier string
 	// CreatedAt is when the buy message was received (nanoseconds).
 	CreatedAt int64
 }
@@ -794,13 +796,14 @@ func (s *State) applyPut(msg *Message) {
 // applyBuy processes an exchange:buy message.
 func (s *State) applyBuy(msg *Message) {
 	var payload struct {
-		Task           string   `json:"task"`
-		Budget         int64    `json:"budget"`
-		MinReputation  int      `json:"min_reputation"`
-		FreshnessHours int      `json:"freshness_hours"`
-		ContentType    string   `json:"content_type"`
-		Domains        []string `json:"domains"`
-		MaxResults     int      `json:"max_results"`
+		Task            string   `json:"task"`
+		Budget          int64    `json:"budget"`
+		MinReputation   int      `json:"min_reputation"`
+		FreshnessHours  int      `json:"freshness_hours"`
+		ContentType     string   `json:"content_type"`
+		Domains         []string `json:"domains"`
+		MaxResults      int      `json:"max_results"`
+		CompressionTier string   `json:"compression_tier"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
@@ -817,16 +820,17 @@ func (s *State) applyBuy(msg *Message) {
 		return
 	}
 	order := &ActiveOrder{
-		OrderID:        msg.ID,
-		BuyerKey:       msg.Sender,
-		Task:           payload.Task,
-		Budget:         payload.Budget,
-		MinReputation:  payload.MinReputation,
-		FreshnessHours: payload.FreshnessHours,
-		ContentType:    stripTagPrefix(payload.ContentType, "exchange:content-type:"),
-		Domains:        stripDomainPrefixes(payload.Domains),
-		MaxResults:     maxResults,
-		CreatedAt:      msg.Timestamp,
+		OrderID:         msg.ID,
+		BuyerKey:        msg.Sender,
+		Task:            payload.Task,
+		Budget:          payload.Budget,
+		MinReputation:   payload.MinReputation,
+		FreshnessHours:  payload.FreshnessHours,
+		ContentType:     stripTagPrefix(payload.ContentType, "exchange:content-type:"),
+		Domains:         stripDomainPrefixes(payload.Domains),
+		MaxResults:      maxResults,
+		CompressionTier: payload.CompressionTier,
+		CreatedAt:       msg.Timestamp,
 	}
 	s.activeOrders[msg.ID] = order
 }
