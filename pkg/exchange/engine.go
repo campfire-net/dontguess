@@ -1136,9 +1136,9 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 // The engine:
 //  1. Validates the match exists in state (antecedent must be a match message).
 //  2. Looks up the entry from the match.
-//  3. Calls PreviewAssembler.Assemble() with the entry details and nil content
-//     (actual content delivery is a future concern — the preview payload carries
-//     entry metadata and chunk descriptors, not the real content bytes).
+//  3. Calls PreviewAssembler.Assemble() with the entry details and full content
+//     to generate preview chunks. The preview is a subset of the full content
+//     (5 non-overlapping random chunks totaling 15-25% of the content).
 //  4. Sends a settle(preview) response with the antecedent set to the
 //     preview-request message ID.
 //
