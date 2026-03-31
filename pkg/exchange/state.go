@@ -266,6 +266,10 @@ const (
 	AssignAccepted
 	// AssignRejected means the operator rejected the result.
 	AssignRejected
+	// AssignPaid means the bounty has been paid to the claimant (terminal state).
+	// Transitions from AssignAccepted → AssignPaid in ClaimAssignPayment to
+	// prevent double-payment on replayed accept messages.
+	AssignPaid
 )
 
 // AssignRecord tracks the lifecycle of a single assign task.
@@ -1417,6 +1421,32 @@ func (s *State) applyAssignReject(msg *Message) {
 	rec.Status = AssignOpen
 }
 
+// ClaimAssignPayment atomically checks that the assign record for the given
+// completeMsgID is in AssignAccepted state and transitions it to AssignPaid,
+// returning the record. Returns nil if the record is not found or is not in
+// AssignAccepted state (e.g. a replayed accept whose bounty was already paid).
+//
+// This prevents double-payment on replayed exchange:assign-accept messages.
+// State.Apply transitions AssignCompleted → AssignAccepted on the first accept
+// and removes the record from pendingAssignResults. A replayed accept is a no-op
+// in State.Apply but handleAssignAccept would still find the record via assignByID.
+// ClaimAssignPayment gates payment to the single transition AssignAccepted → AssignPaid.
+// Thread-safe.
+func (s *State) ClaimAssignPayment(completeMsgID string) *AssignRecord {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, r := range s.assignByID {
+		if r.CompleteMsgID == completeMsgID {
+			if r.Status != AssignAccepted {
+				return nil
+			}
+			r.Status = AssignPaid
+			return r
+		}
+	}
+	return nil
+}
+
 // ActiveAssigns returns a snapshot of all AssignRecord entries associated with
 // the given entryID that are not yet in a terminal state (Accepted or Rejected).
 // Pass "" to query assigns with no associated entry.
@@ -1427,7 +1457,7 @@ func (s *State) ActiveAssigns(entryID string) []*AssignRecord {
 	recs := s.assignsByEntry[entryID]
 	out := make([]*AssignRecord, 0, len(recs))
 	for _, r := range recs {
-		if r.Status == AssignAccepted || r.Status == AssignRejected {
+		if r.Status == AssignAccepted || r.Status == AssignRejected || r.Status == AssignPaid {
 			continue
 		}
 		cp := *r
@@ -1886,6 +1916,25 @@ func (s *State) DeleteBuyMissOffer(taskHash string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.buyMissOffers, taskHash)
+}
+
+// ClaimBuyMissOffer atomically retrieves and removes the standing buy-miss offer
+// for the given task hash in a single mutex acquisition. Returns the offer if
+// one exists and is not expired; returns nil otherwise.
+//
+// Use this instead of separate GetBuyMissOffer + DeleteBuyMissOffer calls to
+// prevent TOCTOU races where two concurrent puts could both observe the offer
+// before either has deleted it.
+// Thread-safe.
+func (s *State) ClaimBuyMissOffer(taskHash string) *BuyMissOffer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	offer, ok := s.buyMissOffers[taskHash]
+	if !ok || offer.IsExpired() {
+		return nil
+	}
+	delete(s.buyMissOffers, taskHash)
+	return offer
 }
 
 // stripTagPrefix removes a convention tag prefix from a value if present.

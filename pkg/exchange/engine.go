@@ -657,7 +657,10 @@ func (e *Engine) handlePut(msg *Message) error {
 	}
 
 	taskHash := TaskDescriptionHash(pending.Description)
-	offer := e.state.GetBuyMissOffer(taskHash)
+	// ClaimBuyMissOffer atomically checks and removes the offer in one lock
+	// acquisition, preventing a TOCTOU race where two concurrent puts with the
+	// same task hash could both observe the offer and both get auto-accepted.
+	offer := e.state.ClaimBuyMissOffer(taskHash)
 	if offer == nil {
 		// No standing offer — leave pending for normal operator review.
 		return nil
@@ -715,8 +718,7 @@ func (e *Engine) handlePut(msg *Message) error {
 		e.state.Apply(rec)
 	}
 
-	// Consume the standing offer so it cannot be fulfilled again.
-	e.state.DeleteBuyMissOffer(taskHash)
+	// Standing offer already consumed by ClaimBuyMissOffer above (atomic get+delete).
 
 	// Pay the seller scrip immediately (same as scrip-put-pay in normal put-accept flow).
 	if e.opts.ScripStore != nil {
@@ -1339,21 +1341,14 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 	}
 	completeMsgID := msg.Antecedents[0]
 
-	// Read the assign record from state. State.Apply already accepted it, so
-	// look it up via assignByID by scanning pendingAssignResults (which was
-	// cleared on accept — use assignByID directly).
-	e.state.mu.RLock()
-	var rec *AssignRecord
-	for _, r := range e.state.assignByID {
-		if r.CompleteMsgID == completeMsgID {
-			rec = r
-			break
-		}
-	}
-	e.state.mu.RUnlock()
-
+	// ClaimAssignPayment atomically transitions the record from AssignAccepted →
+	// AssignPaid, returning the record only on that first transition. A replayed
+	// accept message finds the record already at AssignPaid and gets nil back,
+	// preventing a double-payment of the bounty.
+	rec := e.state.ClaimAssignPayment(completeMsgID)
 	if rec == nil {
-		e.opts.log("engine: assign-accept: no assign record for complete_id=%s", shortKey(completeMsgID))
+		e.opts.log("engine: assign-accept: no payable assign for complete_id=%s (already paid or unknown), ignoring msg=%s",
+			shortKey(completeMsgID), shortKey(msg.ID))
 		return nil
 	}
 
