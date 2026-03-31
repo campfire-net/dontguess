@@ -7,6 +7,7 @@ package exchange
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"strings"
@@ -84,6 +85,10 @@ const (
 	// MaxBuyMaxResults caps the MaxResults field on a buy request.
 	// Prevents OOM via large result-set allocations.
 	MaxBuyMaxResults = 100
+
+	// MaxContentBytes is the maximum allowed size for put content (1 MiB).
+	// Content is TAINTED — enforce this limit before storing or hashing.
+	MaxContentBytes = 1048576 // 1 MiB
 )
 
 // InventoryEntry is a single cache entry in the exchange inventory.
@@ -137,6 +142,11 @@ type InventoryEntry struct {
 	// derivative entries created by handleAssignAccept when task_type == "compress".
 	// The derivative entry is independently priced and matchable.
 	CompressedFrom string
+
+	// Content holds the raw bytes of the cached inference result.
+	// Populated at put time from the base64-encoded "content" payload field.
+	// ContentHash is computed from this field by applyPut — never trusted from payload.
+	Content []byte
 }
 
 // IsExpired returns true if the entry has passed its expiry time.
@@ -678,7 +688,7 @@ func settlePhaseFromTags(tags []string) string {
 func (s *State) applyPut(msg *Message) {
 	var payload struct {
 		Description string   `json:"description"`
-		ContentHash string   `json:"content_hash"`
+		Content     string   `json:"content"` // base64-encoded content bytes (TAINTED)
 		TokenCost   int64    `json:"token_cost"`
 		ContentType string   `json:"content_type"`
 		Domains     []string `json:"domains"`
@@ -699,17 +709,34 @@ func (s *State) applyPut(msg *Message) {
 	if payload.TokenCost <= 0 || payload.TokenCost > MaxTokenCost {
 		return
 	}
+	// Content is required. Reject puts with no content.
+	if payload.Content == "" {
+		return
+	}
+	// Decode content from base64. Drop silently on decode failure.
+	contentBytes, err := base64.StdEncoding.DecodeString(payload.Content)
+	if err != nil {
+		return
+	}
+	// Enforce size limit on decoded content (TAINTED).
+	if len(contentBytes) > MaxContentBytes {
+		return
+	}
+	// Compute content hash from the decoded bytes. Never trust hash from payload.
+	sum := sha256.Sum256(contentBytes)
+	contentHash := "sha256:" + hex.EncodeToString(sum[:])
 	entry := &InventoryEntry{
 		EntryID:      msg.ID,
 		PutMsgID:     msg.ID,
 		SellerKey:    msg.Sender,
 		Description:  payload.Description,
-		ContentHash:  payload.ContentHash,
+		ContentHash:  contentHash,
 		ContentType:  stripTagPrefix(payload.ContentType, "exchange:content-type:"),
 		Domains:      stripDomainPrefixes(payload.Domains),
 		TokenCost:    payload.TokenCost,
-		ContentSize:  payload.ContentSize,
+		ContentSize:  int64(len(contentBytes)),
 		PutTimestamp: msg.Timestamp,
+		Content:      contentBytes,
 	}
 	s.pendingPuts[msg.ID] = entry
 	s.putToEntry[msg.ID] = msg.ID
