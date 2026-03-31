@@ -977,6 +977,21 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if exchangeRevenue > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, operatorKey, scrip.BalanceKey, exchangeRevenue, ""); err != nil {
 			e.opts.log("engine: settle: add exchange revenue to operator: %v", err)
+			// Seller was already credited above; roll back that credit.
+			if residual > 0 {
+				if _, etag, getErr := e.opts.ScripStore.GetBudget(ctx, sellerKey, scrip.BalanceKey); getErr != nil {
+					e.opts.log("engine: settle: CRITICAL: failed to get seller etag for rollback of %s: %v",
+						shortKey(sellerKey), getErr)
+				} else if _, _, decrErr := e.opts.ScripStore.DecrementBudget(ctx, sellerKey, scrip.BalanceKey, residual, etag); decrErr != nil {
+					e.opts.log("engine: settle: CRITICAL: failed to roll back seller credit for %s after operator AddBudget failure: %v",
+						shortKey(sellerKey), decrErr)
+				}
+			}
+			// Restore the reservation so the settle can be retried.
+			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after operator AddBudget failure: %v",
+					shortKey(reservationID), restoreErr)
+			}
 			e.emitSettleFailed(msg, reservationID, fmt.Sprintf("add-exchange-revenue: %v", err))
 			return fmt.Errorf("scrip: settle: AddBudget(operator): %w", err)
 		}
