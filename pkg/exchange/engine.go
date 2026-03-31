@@ -407,14 +407,15 @@ func (e *Engine) handleBuy(msg *Message) error {
 	}
 
 	var payload struct {
-		Task           string   `json:"task"`
-		Budget         int64    `json:"budget"`
-		MaxPrice       int64    `json:"max_price"`
-		MinReputation  int      `json:"min_reputation"`
-		FreshnessHours int      `json:"freshness_hours"`
-		ContentType    string   `json:"content_type"`
-		Domains        []string `json:"domains"`
-		MaxResults     int      `json:"max_results"`
+		Task            string   `json:"task"`
+		Budget          int64    `json:"budget"`
+		MaxPrice        int64    `json:"max_price"`
+		MinReputation   int      `json:"min_reputation"`
+		FreshnessHours  int      `json:"freshness_hours"`
+		ContentType     string   `json:"content_type"`
+		Domains         []string `json:"domains"`
+		MaxResults      int      `json:"max_results"`
+		CompressionTier string   `json:"compression_tier"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("parsing buy payload: %w", err)
@@ -432,9 +433,9 @@ func (e *Engine) handleBuy(msg *Message) error {
 		maxResults = 3
 	}
 
-	// Search inventory for candidates (budget/reputation/freshness/type/domain filters).
+	// Search inventory for candidates (budget/reputation/freshness/type/domain/tier filters).
 	candidates := e.findCandidates(msg.Sender, payload.Budget, payload.MinReputation,
-		payload.FreshnessHours, payload.ContentType, payload.Domains)
+		payload.FreshnessHours, payload.ContentType, payload.Domains, payload.CompressionTier)
 
 	// Semantic ranking via the match index.
 	// Search returns all candidates ranked by TF-IDF similarity + 4-layer value stack.
@@ -1616,8 +1617,12 @@ func (e *Engine) entryForDeliver(deliverMsgID string) *InventoryEntry {
 }
 
 // findCandidates returns inventory entries that satisfy the buyer's filters.
+// compressionTier, when non-empty, restricts candidates to entries with a
+// matching CompressionTier. Entries with an unset tier ("") are excluded when
+// a tier filter is specified — a seller that did not declare a tier is not a
+// match for a buyer that requires one.
 func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
-	freshnessHours int, contentType string, domains []string) []*InventoryEntry {
+	freshnessHours int, contentType string, domains []string, compressionTier string) []*InventoryEntry {
 
 	// Layer 0 correctness gate: exclude entries with poor preview-to-purchase
 	// conversion rate (dontguess-5iz). Only applied once per call and keyed by
@@ -1673,6 +1678,13 @@ func (e *Engine) findCandidates(buyerKey string, budget int64, minRep int,
 
 		// Domain filter: entry must have at least one matching domain.
 		if len(domains) > 0 && !hasOverlap(entry.Domains, domains) {
+			continue
+		}
+
+		// Compression tier filter: when the buyer specifies a tier, only entries
+		// with an exact tier match are candidates. Entries with no tier set are
+		// excluded — an unspecified tier does not implicitly match all filters.
+		if compressionTier != "" && entry.CompressionTier != compressionTier {
 			continue
 		}
 

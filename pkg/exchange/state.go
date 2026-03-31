@@ -143,6 +143,11 @@ type InventoryEntry struct {
 	// The derivative entry is independently priced and matchable.
 	CompressedFrom string
 
+	// CompressionTier is the caching tier for this entry: "hot", "warm", "cold", or ""
+	// (unset). Set from the seller's put payload; defaults to "" when not provided.
+	// Buyers may filter by tier; entries with "" match any tier filter.
+	CompressionTier string
+
 	// Content holds the raw bytes of the cached inference result.
 	// Populated at put time from the base64-encoded "content" payload field.
 	// ContentHash is computed from this field by applyPut — never trusted from payload.
@@ -684,15 +689,24 @@ func settlePhaseFromTags(tags []string) string {
 	return ""
 }
 
+// validCompressionTiers is the set of accepted compression_tier values.
+// The empty string (unset) is also valid and means no tier preference.
+var validCompressionTiers = map[string]struct{}{
+	"hot":  {},
+	"warm": {},
+	"cold": {},
+}
+
 // applyPut processes an exchange:put message.
 func (s *State) applyPut(msg *Message) {
 	var payload struct {
-		Description string   `json:"description"`
-		Content     string   `json:"content"` // base64-encoded content bytes (TAINTED)
-		TokenCost   int64    `json:"token_cost"`
-		ContentType string   `json:"content_type"`
-		Domains     []string `json:"domains"`
-		ContentSize int64    `json:"content_size"`
+		Description     string   `json:"description"`
+		Content         string   `json:"content"` // base64-encoded content bytes (TAINTED)
+		TokenCost       int64    `json:"token_cost"`
+		ContentType     string   `json:"content_type"`
+		Domains         []string `json:"domains"`
+		ContentSize     int64    `json:"content_size"`
+		CompressionTier string   `json:"compression_tier"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
@@ -726,21 +740,29 @@ func (s *State) applyPut(msg *Message) {
 	if len(contentBytes) > MaxContentBytes {
 		return
 	}
+	// Validate compression_tier. Unknown values are silently dropped to "".
+	tier := payload.CompressionTier
+	if tier != "" {
+		if _, ok := validCompressionTiers[tier]; !ok {
+			tier = ""
+		}
+	}
 	// Compute content hash from the decoded bytes. Never trust hash from payload.
 	sum := sha256.Sum256(contentBytes)
 	contentHash := "sha256:" + hex.EncodeToString(sum[:])
 	entry := &InventoryEntry{
-		EntryID:      msg.ID,
-		PutMsgID:     msg.ID,
-		SellerKey:    msg.Sender,
-		Description:  payload.Description,
-		ContentHash:  contentHash,
-		ContentType:  stripTagPrefix(payload.ContentType, "exchange:content-type:"),
-		Domains:      stripDomainPrefixes(payload.Domains),
-		TokenCost:    payload.TokenCost,
-		ContentSize:  int64(len(contentBytes)),
-		PutTimestamp: msg.Timestamp,
-		Content:      contentBytes,
+		EntryID:         msg.ID,
+		PutMsgID:        msg.ID,
+		SellerKey:       msg.Sender,
+		Description:     payload.Description,
+		ContentHash:     contentHash,
+		ContentType:     stripTagPrefix(payload.ContentType, "exchange:content-type:"),
+		Domains:         stripDomainPrefixes(payload.Domains),
+		TokenCost:       payload.TokenCost,
+		ContentSize:     int64(len(contentBytes)),
+		PutTimestamp:    msg.Timestamp,
+		CompressionTier: tier,
+		Content:         contentBytes,
 	}
 	s.pendingPuts[msg.ID] = entry
 	s.putToEntry[msg.ID] = msg.ID
