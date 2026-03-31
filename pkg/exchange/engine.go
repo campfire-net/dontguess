@@ -937,6 +937,13 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if residual > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, sellerKey, scrip.BalanceKey, residual, ""); err != nil {
 			e.opts.log("engine: settle: add residual to seller %s: %v", shortKey(sellerKey), err)
+			// Restore reservation so the settle can be retried.
+			if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+				e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after AddBudget(seller) failure: %v",
+					shortKey(reservationID), restoreErr)
+			}
+			e.emitSettleFailed(msg, reservationID, fmt.Sprintf("add-residual: %v", err))
+			return fmt.Errorf("scrip: settle: AddBudget(seller %s): %w", shortKey(sellerKey), err)
 		}
 	}
 
@@ -944,6 +951,8 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if exchangeRevenue > 0 {
 		if _, _, err := e.opts.ScripStore.AddBudget(ctx, operatorKey, scrip.BalanceKey, exchangeRevenue, ""); err != nil {
 			e.opts.log("engine: settle: add exchange revenue to operator: %v", err)
+			e.emitSettleFailed(msg, reservationID, fmt.Sprintf("add-exchange-revenue: %v", err))
+			return fmt.Errorf("scrip: settle: AddBudget(operator): %w", err)
 		}
 	}
 
@@ -967,6 +976,30 @@ func (e *Engine) handleSettle(msg *Message) error {
 	e.opts.log("engine: settle: reservation=%s seller=%s price=%d residual=%d fee_burned=%d exchange=%d",
 		shortKey(reservationID), shortKey(sellerKey), price, residual, fee, exchangeRevenue)
 	return nil
+}
+
+// emitSettleFailed sends a settle(failed) message to the buyer so they receive
+// an observable signal when the settle(complete) flow cannot complete. The buyer
+// key is taken from msg.Sender (settle(complete) is always sent by the buyer).
+// A best-effort emit: failures are logged but not propagated to the caller.
+func (e *Engine) emitSettleFailed(completeMsg *Message, reservationID, errorCode string) {
+	payload, err := e.marshal(map[string]any{
+		"phase":          SettlePhaseStrFailed,
+		"error_code":     errorCode,
+		"reservation_id": reservationID,
+		"buyer":          completeMsg.Sender,
+	})
+	if err != nil {
+		e.opts.log("engine: settle-failed: marshal: %v", err)
+		return
+	}
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrFailed,
+	}
+	if _, emitErr := e.sendOperatorMessage(payload, tags, []string{completeMsg.ID}); emitErr != nil {
+		e.opts.log("engine: settle-failed: emit: %v", emitErr)
+	}
 }
 
 // handleSettleBuyerAcceptScrip performs the scrip hold when a buyer sends a

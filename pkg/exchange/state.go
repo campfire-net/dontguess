@@ -48,6 +48,7 @@ const (
 	SettlePhaseStrPreviewRequest      = "preview-request"
 	SettlePhaseStrPreview             = "preview"
 	SettlePhaseStrSmallContentDispute = "small-content-dispute"
+	SettlePhaseStrFailed              = "failed"
 
 	// SmallContentThreshold is the token count below which content is too small
 	// for meaningful preview. Entries below this threshold use the small-content
