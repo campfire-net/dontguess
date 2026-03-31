@@ -168,6 +168,30 @@ func (h *testHarness) newOperatorClient() *protocol.Client {
 	return h.operatorClient
 }
 
+// startEngine starts eng in a background goroutine using the provided context
+// and registers a t.Cleanup (LIFO — runs before h.st.Close()) that cancels the
+// context and waits for the engine goroutine to exit. This prevents the "Log in
+// goroutine after test has completed" panic that occurs when the engine's
+// background goroutine calls into the closed SQLite store after t.Cleanup fires.
+//
+// Usage:
+//
+//	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+//	h.startEngine(eng, ctx, cancel)
+//	// do work, then cancel() when done (or let timeout fire)
+//	// t.Cleanup will wait for the engine to exit before closing h.st
+func (h *testHarness) startEngine(eng *exchange.Engine, ctx context.Context, cancel context.CancelFunc) {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = eng.Start(ctx)
+	}()
+	h.t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
 // putPayload builds a minimal valid exchange:put payload.
 // contentHash is ignored — the engine now computes the hash from content.
 // Content is generated at the requested contentSize (capped at MaxContentBytes)

@@ -112,8 +112,7 @@ func TestLayer0_LowConversionEntryExcludedFromBuyResults(t *testing.T) {
 
 	// Collect all messages and dispatch the buy via the engine event loop.
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go func() { _ = eng.Start(ctx) }()
+	h.startEngine(eng, ctx, cancel)
 
 	var matchMsgs []store.MessageRecord
 	deadline := time.Now().Add(2 * time.Second)
@@ -212,8 +211,7 @@ func TestLayer0_HighConversionEntryIncluded(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go func() { _ = eng.Start(ctx) }()
+	h.startEngine(eng, ctx, cancel)
 
 	var matchMsgs []store.MessageRecord
 	deadline := time.Now().Add(2 * time.Second)
@@ -310,8 +308,7 @@ func TestLayer0_InsufficientPreviewsNotExcluded(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go func() { _ = eng.Start(ctx) }()
+	h.startEngine(eng, ctx, cancel)
 
 	var matchMsgs []store.MessageRecord
 	deadline := time.Now().Add(2 * time.Second)
@@ -473,8 +470,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	go func() { _ = eng.Start(ctx) }()
+	h.startEngine(eng, ctx, cancel)
 
 	var matchMsgs []store.MessageRecord
 	deadline := time.Now().Add(2 * time.Second)
