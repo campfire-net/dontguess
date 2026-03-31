@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -820,6 +821,11 @@ func (e *Engine) handleSettle(msg *Message) error {
 		return e.handleSettleSmallContentDispute(msg)
 	}
 
+	// Handle deliver: emit full content to buyer (does not require ScripStore).
+	if phase == SettlePhaseStrDeliver {
+		return e.handleSettleDeliverContent(msg)
+	}
+
 	if e.opts.ScripStore == nil {
 		return nil
 	}
@@ -832,7 +838,7 @@ func (e *Engine) handleSettle(msg *Message) error {
 	}
 
 	if phase != SettlePhaseStrComplete {
-		// Other phases (deliver, put-accept) are tracked in state only.
+		// Other phases (put-accept) are tracked in state only.
 		return nil
 	}
 
@@ -1230,6 +1236,92 @@ func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 
 	e.opts.log("engine: preview-request: sent preview for entry=%s match=%s buyer=%s",
 		shortKey(entry.EntryID), shortKey(matchMsgID), shortKey(msg.Sender))
+	return nil
+}
+
+// handleSettleDeliverContent processes a settle(deliver) message from the operator.
+//
+// When the operator sends a settle(deliver) trigger (without a content field),
+// the engine emits a new settle(deliver) message to the campfire with the full
+// content from the inventory entry. The buyer can identify this message by the
+// phase tag and the antecedent chain (operator's deliver → buyer-accept → match).
+//
+// If the incoming message already carries a content field, it is the engine's own
+// previously emitted content message — skip to avoid an infinite dispatch loop.
+//
+// Security: operator gating is enforced at the state layer (applySettleDeliver
+// rejects non-operator senders before populating deliverToMatch). The engine only
+// emits content when the deliver message is tracked in state (deliverToMatch is
+// populated), which guarantees the sender was the operator.
+func (e *Engine) handleSettleDeliverContent(msg *Message) error {
+	// Skip if this message already carries content — it is the engine's own
+	// emitted response and must not be re-processed.
+	var incoming struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(msg.Payload, &incoming); err == nil && incoming.Content != "" {
+		return nil
+	}
+
+	// Look up the entry via the antecedent chain: deliver → match → entry.
+	// EntryForDeliver uses deliverToMatch (set by applySettleDeliver), which only
+	// contains entries where the sender was the operator — auth is already enforced.
+	entry, ok := e.state.EntryForDeliver(msg.ID)
+	if !ok {
+		e.opts.log("engine: settle-deliver: cannot derive entry for deliver=%s — antecedent chain missing or non-operator sender", shortKey(msg.ID))
+		return nil
+	}
+
+	if len(entry.Content) == 0 {
+		e.opts.log("engine: settle-deliver: entry=%s has no content — cannot emit deliver", shortKey(entry.EntryID))
+		return nil
+	}
+
+	// Derive buyer key from the antecedent chain: deliver → match → matchToBuyer.
+	matchMsgID, ok := e.state.MatchForDeliver(msg.ID)
+	if !ok {
+		e.opts.log("engine: settle-deliver: cannot derive match for deliver=%s", shortKey(msg.ID))
+		return nil
+	}
+	e.state.mu.RLock()
+	buyerKey := e.state.matchToBuyer[matchMsgID]
+	e.state.mu.RUnlock()
+	if buyerKey == "" {
+		e.opts.log("engine: settle-deliver: no buyer key for match=%s", shortKey(matchMsgID))
+		return nil
+	}
+
+	// Compute content hash for buyer verification.
+	rawHash := sha256.Sum256(entry.Content)
+	contentHash := "sha256:" + hex.EncodeToString(rawHash[:])
+
+	// Emit the content-bearing settle(deliver) message. The antecedent is the
+	// operator's deliver trigger, preserving the antecedent chain for complete.
+	deliverContentPayload, err := e.marshal(map[string]any{
+		"phase":        SettlePhaseStrDeliver,
+		"entry_id":     entry.EntryID,
+		"content":      base64.StdEncoding.EncodeToString(entry.Content),
+		"content_hash": contentHash,
+		"buyer":        buyerKey,
+	})
+	if err != nil {
+		return fmt.Errorf("engine: settle-deliver: marshal content payload for entry=%s: %w", shortKey(entry.EntryID), err)
+	}
+
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrDeliver,
+	}
+	// Antecedent is the operator's deliver trigger — preserves the chain.
+	antecedents := []string{msg.ID}
+
+	_, err = e.sendOperatorMessage(deliverContentPayload, tags, antecedents)
+	if err != nil {
+		return fmt.Errorf("engine: settle-deliver: send content for entry=%s: %w", shortKey(entry.EntryID), err)
+	}
+
+	e.opts.log("engine: settle-deliver: emitted content for entry=%s buyer=%s content_hash=%s",
+		shortKey(entry.EntryID), shortKey(buyerKey), contentHash[:24])
 	return nil
 }
 
