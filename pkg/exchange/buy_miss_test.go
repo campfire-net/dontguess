@@ -680,3 +680,83 @@ func TestBuyMiss_InvalidHashRejected(t *testing.T) {
 		}
 	}
 }
+
+// TestBuyMiss_AutoAcceptEmitsCompressionAssign verifies that when a buy-miss
+// standing offer is fulfilled (seller puts a matching result), the engine also
+// emits a hot compression assign to the seller — consistent with AutoAcceptPut.
+func TestBuyMiss_AutoAcceptEmitsCompressionAssign(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	task := "Implement a Go circuit-breaker with exponential back-off"
+	taskHash := exchange.TaskDescriptionHash(task)
+	const tokenCost int64 = 40000
+
+	eng := h.newEngine()
+
+	// Replay current state (empty).
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// Inject a standing buy-miss offer for the seller (seller will do the work).
+	offer := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "fake-buy-msg-id",
+		BuyerKey:  h.seller.PublicKeyHex(), // seller fulfills their own offer
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	eng.State().SetBuyMissOffer(offer)
+
+	// Seller puts the result.
+	contentHash := "sha256:" + fmt.Sprintf("%064x", tokenCost)
+	putMsg := h.sendMessage(h.seller,
+		putPayload(task, contentHash, "code", tokenCost, tokenCost*2),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	putRec, err := h.st.GetMessage(putMsg.ID)
+	if err != nil || putRec == nil {
+		t.Fatal("put not in store")
+	}
+	putMsgObj := exchange.FromStoreRecord(putRec)
+	eng.State().Apply(putMsgObj)
+
+	if err := eng.DispatchForTest(putMsgObj); err != nil {
+		t.Fatalf("DispatchForTest put: %v", err)
+	}
+
+	// Verify a compression assign was emitted.
+	assignMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+	var compressionAssign *store.MessageRecord
+	for i := range assignMsgs {
+		var p struct {
+			TaskType string `json:"task_type"`
+		}
+		if json.Unmarshal(assignMsgs[i].Payload, &p) == nil && p.TaskType == "compress" {
+			compressionAssign = &assignMsgs[i]
+			break
+		}
+	}
+	if compressionAssign == nil {
+		t.Fatal("buy-miss auto-accept should emit hot compression assign, got none")
+	}
+
+	// Verify the assign targets the seller exclusively and carries a 50% bounty.
+	var ap struct {
+		TaskType        string `json:"task_type"`
+		EntryID         string `json:"entry_id"`
+		Reward          int64  `json:"reward"`
+		ExclusiveSender string `json:"exclusive_sender"`
+	}
+	if err := json.Unmarshal(compressionAssign.Payload, &ap); err != nil {
+		t.Fatalf("unmarshal compression assign payload: %v", err)
+	}
+	if ap.ExclusiveSender != h.seller.PublicKeyHex() {
+		t.Errorf("compression assign exclusive_sender = %q, want seller %q", ap.ExclusiveSender, h.seller.PublicKeyHex())
+	}
+	wantBounty := tokenCost / 2
+	if ap.Reward != wantBounty {
+		t.Errorf("compression assign reward = %d, want %d (50%% of token_cost)", ap.Reward, wantBounty)
+	}
+}
