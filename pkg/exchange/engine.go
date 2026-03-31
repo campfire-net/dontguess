@@ -307,6 +307,8 @@ func (e *Engine) dispatch(msg *Message) error {
 	}
 
 	switch op {
+	case TagPut:
+		return e.handlePut(msg)
 	case TagBuy:
 		return e.handleBuy(msg)
 	case TagSettle:
@@ -463,6 +465,13 @@ func (e *Engine) handleBuy(msg *Message) error {
 		semanticMatches = semanticMatches[:maxResults]
 	}
 
+	// Zero-match path: no inventory candidates passed filters or semantic threshold.
+	// Send a buy-miss standing offer to the buyer: if they compute the result and
+	// put it here, the exchange will auto-accept at token_cost * BuyMissOfferRate%.
+	if len(semanticMatches) == 0 {
+		return e.handleBuyMiss(msg, payload.Task, payload.Budget)
+	}
+
 	// Build match payload.
 	type MatchResult struct {
 		EntryID           string  `json:"entry_id"`
@@ -527,6 +536,162 @@ func (e *Engine) handleBuy(msg *Message) error {
 	if matchRec != nil {
 		e.state.Apply(matchRec)
 	}
+	return nil
+}
+
+// handleBuyMiss handles the zero-match path for a buy request.
+//
+// It records a standing buy-miss offer in state and emits an exchange:buy-miss
+// message back to the campfire (fulfilling the buy future) with:
+//   - offered_price_rate: BuyMissOfferRate (70% of token_cost)
+//   - task_hash: SHA-256 of the task description
+//   - expires_at: now + BuyMissOfferTTL
+//
+// One offer per task hash — if a non-expired offer already exists for this task
+// the engine still sends the buy-miss response (idempotent from buyer's view)
+// but does not create a duplicate offer in state.
+func (e *Engine) handleBuyMiss(msg *Message, task string, budget int64) error {
+	taskHash := TaskDescriptionHash(task)
+	expiresAt := time.Now().Add(BuyMissOfferTTL)
+
+	offer := &BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  msg.ID,
+		BuyerKey:  msg.Sender,
+		Task:      task,
+		ExpiresAt: expiresAt,
+	}
+	e.state.SetBuyMissOffer(offer)
+
+	buyMissPayload, err := e.marshal(map[string]any{
+		"task_hash":          taskHash,
+		"task":               task,
+		"offered_price_rate": BuyMissOfferRate,
+		"expires_at":         expiresAt.UTC().Format(time.RFC3339),
+		"buy_msg_id":         msg.ID,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding buy-miss payload: %w", err)
+	}
+
+	tags := []string{TagBuyMiss, TagMatch}
+	antecedents := []string{msg.ID}
+
+	rec, err := e.sendOperatorMessage(buyMissPayload, tags, antecedents)
+	if err != nil {
+		return err
+	}
+	if rec != nil {
+		e.state.Apply(rec)
+	}
+
+	e.opts.log("engine: buy-miss: order=%s task_hash=%s expires=%s",
+		msg.ID[:8], taskHash[:16], expiresAt.Format(time.RFC3339))
+	return nil
+}
+
+// handlePut processes an incoming exchange:put message.
+//
+// If a non-expired buy-miss standing offer exists for the put's task description
+// (matched by SHA-256 hash), the engine auto-accepts the put at the offered price
+// (token_cost * BuyMissOfferRate / 100) and pays the seller scrip immediately.
+//
+// If no standing offer matches, the put is left pending for normal operator review
+// via AutoAcceptPut.
+func (e *Engine) handlePut(msg *Message) error {
+	// Determine the description from state (applyPut already validated and stored it).
+	e.state.mu.RLock()
+	pending, ok := e.state.pendingPuts[msg.ID]
+	e.state.mu.RUnlock()
+	if !ok {
+		// Put was invalid (e.g. oversized description) — nothing to do.
+		return nil
+	}
+
+	taskHash := TaskDescriptionHash(pending.Description)
+	offer := e.state.GetBuyMissOffer(taskHash)
+	if offer == nil {
+		// No standing offer — leave pending for normal operator review.
+		return nil
+	}
+
+	// Standing offer found and not expired. Compute the offered price.
+	offeredPrice := pending.TokenCost * BuyMissOfferRate / 100
+	if offeredPrice <= 0 {
+		offeredPrice = 1
+	}
+
+	// Auto-accept at offered price (no expiry set on inventory entry — operator
+	// can expire later; consistent with normal AutoAcceptPut expiry handling).
+	expiresAt := time.Time{}
+	var expiresAtStr string
+	if !expiresAt.IsZero() {
+		expiresAtStr = expiresAt.UTC().Format(time.RFC3339)
+	}
+
+	putAcceptPayload, err := e.marshal(map[string]any{
+		"phase":      SettlePhaseStrPutAccept,
+		"entry_id":   msg.ID,
+		"price":      offeredPrice,
+		"expires_at": expiresAtStr,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding buy-miss put-accept payload: %w", err)
+	}
+
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrPutAccept,
+		TagVerdictPrefix + "accepted",
+		TagBuyMiss, // mark as buy-miss fulfillment
+	}
+	antecedents := []string{msg.ID}
+
+	rec, err := e.sendOperatorMessage(putAcceptPayload, tags, antecedents)
+	if err != nil {
+		return err
+	}
+	if rec != nil {
+		e.state.Apply(rec)
+	}
+
+	// Consume the standing offer so it cannot be fulfilled again.
+	e.state.DeleteBuyMissOffer(taskHash)
+
+	// Pay the seller scrip immediately (same as scrip-put-pay in normal put-accept flow).
+	if e.opts.ScripStore != nil {
+		ctx := context.Background()
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, pending.SellerKey, scrip.BalanceKey, offeredPrice, ""); err != nil {
+			e.opts.log("engine: buy-miss put-accept: AddBudget for seller %s: %v", shortKey(pending.SellerKey), err)
+		}
+		// Emit scrip-put-pay so CampfireScripStore can replay the payment.
+		payPayload, marshalErr := e.marshal(scrip.PutPayPayload{
+			Seller:      pending.SellerKey,
+			Amount:      offeredPrice,
+			TokenCost:   pending.TokenCost,
+			DiscountPct: 100 - BuyMissOfferRate,
+			ResultHash:  pending.ContentHash,
+			PutMsg:      msg.ID,
+		})
+		if marshalErr == nil {
+			if _, emitErr := e.sendOperatorMessage(payPayload,
+				[]string{scrip.TagScripPutPay}, []string{msg.ID}); emitErr != nil {
+				e.opts.log("engine: buy-miss put-accept: emit scrip-put-pay: %v", emitErr)
+			}
+		}
+	}
+
+	// Incrementally add the new entry to the match index.
+	inv := e.state.Inventory()
+	for _, entry := range inv {
+		if entry.PutMsgID == msg.ID {
+			e.matchIndex.Add(e.inventoryEntryToRankInput(entry))
+			break
+		}
+	}
+
+	e.opts.log("engine: buy-miss fulfilled: put=%s seller=%s price=%d offer_task_hash=%s",
+		msg.ID[:8], shortKey(pending.SellerKey), offeredPrice, taskHash[:16])
 	return nil
 }
 
