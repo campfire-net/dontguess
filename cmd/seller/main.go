@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -33,7 +34,7 @@ type putSpec struct {
 func buildPutPayload(p putSpec) map[string]interface{} {
 	return map[string]interface{}{
 		"description":  p.Description,
-		"content":      p.Content,
+		"content":      base64.StdEncoding.EncodeToString([]byte(p.Content)),
 		"token_cost":   p.TokenCost,
 		"content_type": p.ContentType,
 		"content_size": p.ContentSize,
