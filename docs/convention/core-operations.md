@@ -53,7 +53,7 @@ This convention defines four core exchange operations — put, buy, match, settl
 | Field | Classification | Rationale |
 |-------|---------------|-----------|
 | `payload.description` | **TAINTED** | Seller's claim about what the cache entry does — prompt injection vector |
-| `payload.content_hash` | **TAINTED** | Seller's claim — must be verified against actual content before delivery |
+| `payload.content` | **VERIFIED** | Actual cached inference — its cryptographic hash (SHA-256) is computed by engine, not trusting seller |
 | `payload.token_cost` | **TAINTED** | Seller's claim about original computation cost — unverifiable without metering |
 | `payload.domains` | **TAINTED** | Seller's categorization — gameable for discovery |
 | `payload.confidence` | **TAINTED** | Exchange's match confidence — operator-asserted |
@@ -106,9 +106,8 @@ Seller offers cached inference to the exchange. The exchange buys the result at 
   "args": [
     {"name": "description", "type": "string", "required": true, "max_length": 4096,
      "description": "What the cached inference does — task description, inputs, outputs"},
-    {"name": "content_hash", "type": "string", "required": true, "max_length": 128,
-     "pattern": "^sha256:[a-f0-9]{64}$",
-     "description": "SHA-256 hash of the cached inference content"},
+    {"name": "content", "type": "string", "required": true, "max_length": 1000000,
+     "description": "The actual cached inference result (plaintext)"},
     {"name": "token_cost", "type": "integer", "required": true, "min": 1, "max": 10000000,
      "description": "Original inference cost in tokens (seller's claim)"},
     {"name": "content_type", "type": "enum", "required": true,
@@ -116,8 +115,6 @@ Seller offers cached inference to the exchange. The exchange buys the result at 
      "description": "Category of cached inference"},
     {"name": "domains", "type": "tag_set", "max_count": 5,
      "description": "Domain tags for discovery (e.g. 'go', 'terraform', 'security')"},
-    {"name": "content_size", "type": "integer", "required": true, "min": 1, "max": 1000000,
-     "description": "Size of cached content in bytes"},
     {"name": "ttl_hours", "type": "integer", "min": 1, "max": 8760,
      "description": "Seller-requested time-to-live in hours (exchange may override)"},
     {"name": "embedding", "type": "json",
@@ -136,9 +133,9 @@ Seller offers cached inference to the exchange. The exchange buys the result at 
 }
 ```
 
-**Payload delivery:** The `exchange:put` message carries the description and metadata only. The actual cached inference content is NOT included in the campfire message. Content is stored externally (blob storage, content-addressable store) and referenced by `content_hash`. The exchange verifies the hash against delivered content before accepting the put.
+**Content inline:** The `exchange:put` message carries the actual cached inference content directly in the `content` field. The exchange engine immediately computes the authoritative SHA-256 hash from this content. Sellers do not provide a hash — the engine derives it.
 
-**Why external storage:** Campfire messages are replayed by all participants. Embedding multi-megabyte inference results in the message log would make replay prohibitively expensive. The hash-reference pattern keeps the log lean while the content lives in operator-managed storage accessible only to matched buyers.
+**Engine-computed hash:** Upon receipt of a put, the exchange computes `hash = sha256(content)` and derives the `content_hash` field for internal use (inventory keying, matching). This hash is authoritative. Duplicate puts with identical content are detected via hash equality and treated as idempotent within the same seller; different sellers can own the same content via different puts.
 
 **Put acceptance:** The exchange operator responds to a put with an `exchange:settle` message (phase: `put-accept` or `put-reject`). Until settled, the put is pending. The exchange is not obligated to accept every put.
 
@@ -297,6 +294,8 @@ Multi-phase settlement with preview support. The settlement flow depends on cont
      "description": "Full price before preview discount. Included in preview phase."},
     {"name": "content_hash", "type": "string", "max_length": 128,
      "description": "SHA-256 hash of the full content. Included in preview phase."},
+    {"name": "content", "type": "string", "max_length": 1000000,
+     "description": "Full cached inference content (plaintext). Required in deliver phase."},
     {"name": "auto_refund", "type": "boolean",
      "description": "Always true for small-content-dispute. Auto-refund, no operator verdict."}
   ],
@@ -380,6 +379,8 @@ Seller                    Exchange (Operator)              Buyer
 - `settle(complete)` antecedent: the `settle(deliver)` message
 - `settle(dispute)` antecedent: the `settle(deliver)` message (legacy — see small-content-dispute)
 - `settle(small-content-dispute)` antecedent: the `settle(deliver)` message (NEW — only valid for entries < 500 tokens)
+
+**Deliver phase — full content emission:** The `settle(deliver)` message carries the full cached inference content in the `content` field. The buyer receives the complete result they purchased. The engine computes the SHA-256 hash of this content and includes it in the deliver message for buyer verification. The buyer confirms receipt via `settle(complete)`, which validates the hash against the delivered content.
 
 **Preview mechanics:** The preview consists of 5 non-overlapping random chunks totaling 15-25% of the content (fuzzed per transaction). Chunks are sampled from random positions (not sequential from the start) using a deterministic seed (`hash(entry_id + operator_secret)`). The preview is generated at `settle(put-accept)` time and served identically to all buyers. Chunk boundaries respect content type: function/block-level for code, paragraph-level for prose, record-level for data. See `docs/convention/dispute-reputation.md` for full preview specification.
 
