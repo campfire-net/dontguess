@@ -681,6 +681,130 @@ func TestBuyMiss_InvalidHashRejected(t *testing.T) {
 	}
 }
 
+// TestBuyMiss_ExpiredOfferSkipped verifies that when ClaimBuyMissOffer is called
+// for a task hash whose offer has already expired, it returns nil and no
+// put-accept is emitted when the matching put is dispatched.
+//
+// This test exercises the ClaimBuyMissOffer path specifically (rather than
+// GetBuyMissOffer) to ensure the atomic claim+delete correctly respects expiry.
+func TestBuyMiss_ExpiredOfferSkipped(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	task := "Port a 2000-line Python ML pipeline to Go with ONNX inference"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	eng := h.newEngine()
+
+	// Replay existing state.
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// Inject an already-expired offer.
+	expired := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "fake-buy-msg-id",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(-1 * time.Hour), // past expiry
+	}
+	set := eng.State().SetBuyMissOffer(expired)
+	if !set {
+		t.Fatal("SetBuyMissOffer returned false for empty map insert")
+	}
+
+	// ClaimBuyMissOffer must return nil — the offer is expired.
+	claimed := eng.State().ClaimBuyMissOffer(taskHash)
+	if claimed != nil {
+		t.Errorf("ClaimBuyMissOffer returned non-nil for expired offer: %+v", claimed)
+	}
+
+	// Re-inject the expired offer (ClaimBuyMissOffer deleted it during the failed claim).
+	eng.State().SetBuyMissOffer(expired)
+
+	// Send a put for the same task from the buyer.
+	putMsg := h.sendMessage(h.buyer,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", 30000), "code", 30000, 60000),
+		[]string{exchange.TagPut},
+		nil,
+	)
+	putRec, _ := h.st.GetMessage(putMsg.ID)
+	if putRec == nil {
+		t.Fatal("put message not found in store")
+	}
+	putMsgObj := exchange.FromStoreRecord(putRec)
+	eng.State().Apply(putMsgObj)
+
+	// Dispatch the put — should not trigger auto-accept (no live offer).
+	if err := eng.DispatchForTest(putMsgObj); err != nil {
+		t.Fatalf("DispatchForTest(put): %v", err)
+	}
+
+	// No put-accept must have been emitted.
+	settleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	for _, sm := range settleMsgs {
+		if hasTag(sm.Tags, "exchange:phase:put-accept") {
+			t.Errorf("unexpected put-accept emitted for expired offer: msg %s", sm.ID)
+		}
+	}
+}
+
+// TestBuyMiss_ConcurrentBuyDedup verifies that when two buy messages arrive for
+// the same task description, SetBuyMissOffer records exactly one standing offer
+// (the second call is a no-op because a non-expired offer already exists).
+//
+// This directly tests the dedup guard in SetBuyMissOffer rather than relying on
+// the engine loop, ensuring the behavior is a correctness property of State, not
+// just a side-effect of message ordering.
+func TestBuyMiss_ConcurrentBuyDedup(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	task := "Write a distributed tracing library in Go compatible with OpenTelemetry"
+	taskHash := exchange.TaskDescriptionHash(task)
+
+	eng := h.newEngine()
+
+	// Inject the first offer.
+	offer1 := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-msg-001",
+		BuyerKey:  h.buyer.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	set1 := eng.State().SetBuyMissOffer(offer1)
+	if !set1 {
+		t.Fatal("SetBuyMissOffer returned false for first offer (empty map)")
+	}
+
+	// Attempt to set a second offer for the same task hash with a different buy msg ID.
+	buyer2 := newTestAgent(t)
+	offer2 := &exchange.BuyMissOffer{
+		TaskHash:  taskHash,
+		BuyMsgID:  "buy-msg-002",
+		BuyerKey:  buyer2.PublicKeyHex(),
+		Task:      task,
+		ExpiresAt: time.Now().Add(exchange.BuyMissOfferTTL),
+	}
+	set2 := eng.State().SetBuyMissOffer(offer2)
+	if set2 {
+		t.Error("SetBuyMissOffer returned true for duplicate non-expired offer — should be false (dedup)")
+	}
+
+	// State must still hold only the first offer (offer1 not overwritten by offer2).
+	got := eng.State().GetBuyMissOffer(taskHash)
+	if got == nil {
+		t.Fatal("GetBuyMissOffer returned nil — offer lost")
+	}
+	if got.BuyMsgID != offer1.BuyMsgID {
+		t.Errorf("offer BuyMsgID = %q, want %q (first offer should win)", got.BuyMsgID, offer1.BuyMsgID)
+	}
+	if got.BuyerKey != offer1.BuyerKey {
+		t.Errorf("offer BuyerKey = %q, want %q (first offer buyer should win)", got.BuyerKey, offer1.BuyerKey)
+	}
+}
+
 // TestBuyMiss_AutoAcceptEmitsCompressionAssign verifies that when a buy-miss
 // standing offer is fulfilled (seller puts a matching result), the engine also
 // emits a hot compression assign to the seller — consistent with AutoAcceptPut.
