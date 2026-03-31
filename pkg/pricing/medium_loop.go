@@ -623,6 +623,12 @@ func (l *MediumLoop) postCompressionAssigns(inventory []*exchange.InventoryEntry
 			continue
 		}
 
+		// Skip entries with TokenCost < 2: integer division would yield a zero
+		// bounty (TokenCost/2 == 0 for cost 0 or 1), producing a worthless assign.
+		if entry.TokenCost < 2 {
+			continue
+		}
+
 		// Post an open (non-exclusive) compression assign at break-even reward.
 		reward := entry.TokenCost / 2
 		spec := AssignSpec{
