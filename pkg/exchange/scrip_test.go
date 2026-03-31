@@ -856,3 +856,131 @@ func TestSettle_FakeSellerKeyIgnored(t *testing.T) {
 	}
 }
 
+// TestEngine_AssignFullLifecycleBountyPaid tests the full assign flow:
+// operator posts assign → external agent claims → completes → operator accepts →
+// engine pays bounty to claimant and emits a scrip-assign-pay message.
+func TestEngine_AssignFullLifecycleBountyPaid(t *testing.T) {
+	t.Parallel()
+
+	// Build harness and scrip store.
+	h := newTestHarness(t)
+	cs2, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore: %v", err)
+	}
+	// Replay so initial messages are consumed.
+	if err := cs2.Replay(); err != nil {
+		t.Fatalf("cs2.Replay: %v", err)
+	}
+
+	const reward int64 = 250
+	worker := newTestAgent(t)
+
+	// Build engine with the CampfireScripStore.
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:  h.cfID,
+		Store:       h.st,
+		ReadClient:  h.newOperatorClient(),
+		WriteClient: h.newOperatorClient(),
+		ScripStore:  cs2,
+		Logger: func(format string, args ...any) {
+			t.Logf("[engine] "+format, args...)
+		},
+	})
+
+	// Step 1: Operator posts assign.
+	assignPayload, _ := json.Marshal(map[string]any{
+		"entry_id":  "",
+		"task_type": "freshness",
+		"reward":    reward,
+	})
+	assignMsg := h.sendMessage(h.operator, assignPayload, []string{exchange.TagAssign}, nil)
+
+	// Replay state.
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	// Dispatch assign (no-op handler, just ensures routing works).
+	assignRec, err := h.st.GetMessage(assignMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage assign: %v", err)
+	}
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(assignRec)); err != nil {
+		t.Fatalf("DispatchForTest assign: %v", err)
+	}
+
+	// Step 2: External agent claims.
+	claimPayload := []byte(`{}`)
+	claimMsg := h.sendMessage(worker, claimPayload, []string{exchange.TagAssignClaim}, []string{assignMsg.ID})
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	claimRec, err := h.st.GetMessage(claimMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage claim: %v", err)
+	}
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(claimRec)); err != nil {
+		t.Fatalf("DispatchForTest claim: %v", err)
+	}
+
+	// Step 3: Worker completes.
+	completePayload := []byte(`{"output":"freshness check done"}`)
+	completeMsg := h.sendMessage(worker, completePayload, []string{exchange.TagAssignComplete}, []string{claimMsg.ID})
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	completeRec, err := h.st.GetMessage(completeMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage complete: %v", err)
+	}
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(completeRec)); err != nil {
+		t.Fatalf("DispatchForTest complete: %v", err)
+	}
+
+	// Step 4: Operator accepts — this should pay the bounty.
+	acceptPayload := []byte(`{}`)
+	acceptMsg := h.sendMessage(h.operator, acceptPayload, []string{exchange.TagAssignAccept}, []string{completeMsg.ID})
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	acceptRec, err := h.st.GetMessage(acceptMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage accept: %v", err)
+	}
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(acceptRec)); err != nil {
+		t.Fatalf("DispatchForTest accept: %v", err)
+	}
+
+	// Verify worker's balance equals the reward amount (started at zero).
+	workerAfter := cs2.Balance(worker.PublicKeyHex())
+	if workerAfter != reward {
+		t.Errorf("worker balance: got %d, want %d (reward)", workerAfter, reward)
+	}
+
+	// Verify scrip-assign-pay message was emitted.
+	payMsgs, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripAssignPay}})
+	if err != nil {
+		t.Fatalf("listing scrip-assign-pay messages: %v", err)
+	}
+	if len(payMsgs) == 0 {
+		t.Fatal("expected scrip-assign-pay message to be emitted, got none")
+	}
+	last := payMsgs[len(payMsgs)-1]
+	var payLoad scrip.AssignPayPayload
+	if err := json.Unmarshal(last.Payload, &payLoad); err != nil {
+		t.Fatalf("parsing scrip-assign-pay payload: %v", err)
+	}
+	if payLoad.Worker != worker.PublicKeyHex() {
+		t.Errorf("scrip-assign-pay worker = %q, want %q", payLoad.Worker, worker.PublicKeyHex())
+	}
+	if payLoad.Amount != reward {
+		t.Errorf("scrip-assign-pay amount = %d, want %d", payLoad.Amount, reward)
+	}
+	if payLoad.AssignMsg != assignMsg.ID {
+		t.Errorf("scrip-assign-pay assign_msg = %q, want %q", payLoad.AssignMsg, assignMsg.ID)
+	}
+}
+

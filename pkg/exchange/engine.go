@@ -264,8 +264,11 @@ func (e *Engine) replayAll() error {
 // ReadClient.Subscribe and dispatches messages as they arrive on the channel.
 func (e *Engine) run(ctx context.Context) error {
 	sub := e.opts.ReadClient.Subscribe(ctx, protocol.SubscribeRequest{
-		CampfireID:   e.opts.CampfireID,
-		Tags:         []string{TagPut, TagBuy, TagSettle},
+		CampfireID: e.opts.CampfireID,
+		Tags: []string{
+			TagPut, TagBuy, TagSettle,
+			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
+		},
 		PollInterval: e.opts.pollInterval(),
 	})
 
@@ -308,6 +311,16 @@ func (e *Engine) dispatch(msg *Message) error {
 		return e.handleBuy(msg)
 	case TagSettle:
 		return e.handleSettle(msg)
+	case TagAssign:
+		return e.handleAssign(msg)
+	case TagAssignClaim:
+		return e.handleAssignClaim(msg)
+	case TagAssignComplete:
+		return e.handleAssignComplete(msg)
+	case TagAssignAccept:
+		return e.handleAssignAccept(msg)
+	case TagAssignReject:
+		return e.handleAssignReject(msg)
 	}
 	return nil
 }
@@ -1054,6 +1067,114 @@ func (e *Engine) handleSettleSmallContentDispute(msg *Message) error {
 
 	e.opts.log("engine: small-content-dispute refund: reservation=%s buyer=%s amount=%d",
 		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
+	return nil
+}
+
+// handleAssign processes an exchange:assign message from the operator.
+//
+// State.Apply has already validated and recorded the assign (if the sender is
+// the operator). The engine has no additional side-effects to perform here —
+// the assign is now visible to agents polling the campfire.
+func (e *Engine) handleAssign(msg *Message) error {
+	e.opts.log("engine: assign posted assign_id=%s", shortKey(msg.ID))
+	return nil
+}
+
+// handleAssignClaim processes an exchange:assign-claim message from an agent.
+//
+// State.Apply has already validated constraints (exclusive sender, slot
+// availability). The engine logs the claim for diagnostics.
+func (e *Engine) handleAssignClaim(msg *Message) error {
+	e.opts.log("engine: assign-claim received claim_id=%s sender=%s",
+		shortKey(msg.ID), shortKey(msg.Sender))
+	return nil
+}
+
+// handleAssignComplete processes an exchange:assign-complete message from the
+// claiming agent. The result is stored in state; the engine logs the event and
+// waits for the operator to accept or reject.
+func (e *Engine) handleAssignComplete(msg *Message) error {
+	e.opts.log("engine: assign-complete received complete_id=%s sender=%s",
+		shortKey(msg.ID), shortKey(msg.Sender))
+	return nil
+}
+
+// handleAssignAccept processes an exchange:assign-accept message from the
+// operator. If ScripStore is configured, the bounty is paid to the claimant
+// and a scrip-assign-pay convention message is emitted so CampfireScripStore
+// can replay it.
+//
+// Antecedent: the assign-complete message ID. State.Apply has already
+// validated that the sender is the operator and transitioned the record to
+// AssignAccepted.
+func (e *Engine) handleAssignAccept(msg *Message) error {
+	if len(msg.Antecedents) == 0 {
+		e.opts.log("engine: assign-accept: no antecedents, ignoring msg=%s", shortKey(msg.ID))
+		return nil
+	}
+	completeMsgID := msg.Antecedents[0]
+
+	// Read the assign record from state. State.Apply already accepted it, so
+	// look it up via assignByID by scanning pendingAssignResults (which was
+	// cleared on accept — use assignByID directly).
+	e.state.mu.RLock()
+	var rec *AssignRecord
+	for _, r := range e.state.assignByID {
+		if r.CompleteMsgID == completeMsgID {
+			rec = r
+			break
+		}
+	}
+	e.state.mu.RUnlock()
+
+	if rec == nil {
+		e.opts.log("engine: assign-accept: no assign record for complete_id=%s", shortKey(completeMsgID))
+		return nil
+	}
+	if rec.Reward <= 0 {
+		e.opts.log("engine: assign-accept: zero reward, skipping scrip payment assign_id=%s", shortKey(rec.AssignID))
+		return nil
+	}
+	if rec.ClaimantKey == "" {
+		e.opts.log("engine: assign-accept: no claimant recorded for assign_id=%s", shortKey(rec.AssignID))
+		return nil
+	}
+
+	// Pay bounty to claimant.
+	if e.opts.ScripStore != nil {
+		ctx := e.engineCtx()
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, rec.ClaimantKey, scrip.BalanceKey, rec.Reward, ""); err != nil {
+			e.opts.log("engine: assign-accept: add bounty to worker %s: %v", shortKey(rec.ClaimantKey), err)
+			return fmt.Errorf("assign-accept: pay bounty: %w", err)
+		}
+
+		// Emit scrip-assign-pay so CampfireScripStore can replay the payment.
+		payPayload, err := e.marshal(scrip.AssignPayPayload{
+			Worker:    rec.ClaimantKey,
+			Amount:    rec.Reward,
+			TaskType:  rec.TaskType,
+			AssignMsg: rec.AssignID,
+		})
+		if err != nil {
+			e.opts.log("engine: assign-accept: marshal scrip-assign-pay: %v", err)
+			return fmt.Errorf("assign-accept: marshal scrip-assign-pay: %w", err)
+		}
+		if _, emitErr := e.sendOperatorMessage(payPayload,
+			[]string{scrip.TagScripAssignPay}, []string{msg.ID}); emitErr != nil {
+			e.opts.log("engine: warning: emit scrip-assign-pay: %v", emitErr)
+		}
+	}
+
+	e.opts.log("engine: assign-accept: bounty paid assign_id=%s worker=%s amount=%d",
+		shortKey(rec.AssignID), shortKey(rec.ClaimantKey), rec.Reward)
+	return nil
+}
+
+// handleAssignReject processes an exchange:assign-reject message from the
+// operator. The task is re-opened in state (State.Apply handles this).
+// No scrip action is required on reject — the bounty was never paid.
+func (e *Engine) handleAssignReject(msg *Message) error {
+	e.opts.log("engine: assign-reject received reject_id=%s", shortKey(msg.ID))
 	return nil
 }
 
