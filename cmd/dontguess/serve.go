@@ -103,6 +103,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	// Self-claim the operator and all existing campfire members so they can
 	// participate immediately. Anonymous provenance blocks all operations.
 	operatorKey := writeClient.PublicKeyHex()
+	provenanceStore.TrustVerifier(operatorKey, 0)
 	provenanceStore.SetSelfClaimed(operatorKey)
 	// Self-attest the operator to reach "present" level — required for
 	// match, settle(put-accept/reject/deliver), mint, burn, rate-publish.
