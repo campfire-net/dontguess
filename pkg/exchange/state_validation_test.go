@@ -18,6 +18,7 @@ package exchange_test
 //   - Buy: valid values accepted (including MaxResults == 100)
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -28,13 +29,15 @@ import (
 )
 
 // buildPutPayload constructs an exchange:put JSON payload with explicit fields.
+// content is generated from desc to satisfy the engine's content-required check.
 func buildPutPayload(desc string, tokenCost int64, domains []string) []byte {
+	contentBytes := []byte("cached inference result: " + desc)
+	contentB64 := base64.StdEncoding.EncodeToString(contentBytes)
 	p, _ := json.Marshal(map[string]any{
 		"description":  desc,
-		"content_hash": "sha256:" + fmt.Sprintf("%064x", 999),
+		"content":      contentB64,
 		"token_cost":   tokenCost,
 		"content_type": "code",
-		"content_size": 1024,
 		"domains":      domains,
 	})
 	return p

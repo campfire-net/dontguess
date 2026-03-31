@@ -624,10 +624,15 @@ func TestBuyMiss_TokenCostCapped(t *testing.T) {
 	}
 }
 
-// TestBuyMiss_InvalidHashRejected verifies that a put with a content_hash that
-// does not start with "sha256:" is rejected in the buy-miss auto-accept path
-// (engine returns an error; no put-accept is emitted).
-func TestBuyMiss_InvalidHashRejected(t *testing.T) {
+// TestBuyMiss_NoContentRejected verifies that a put with no content field is
+// dropped at the state layer (not added to pendingPuts), causing dispatch to
+// return an error and emit no put-accept.
+//
+// Previously this test verified an invalid content_hash was rejected at dispatch.
+// Content hashing is now engine-computed; the invariant being tested is the same
+// (malformed put → no buy-miss auto-accept), but the rejection point moved
+// upstream to applyPut.
+func TestBuyMiss_NoContentRejected(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
@@ -650,11 +655,16 @@ func TestBuyMiss_InvalidHashRejected(t *testing.T) {
 	}
 	eng.State().SetBuyMissOffer(offer)
 
-	// Buyer puts with an invalid content_hash (no sha256: prefix).
+	// Buyer puts with no content field — applyPut silently drops the message.
 	// Use Apply (not Replay) to add the put to state without wiping the injected offer.
-	invalidHash := "md5:d41d8cd98f00b204e9800998ecf8427e"
+	noContentPayload, _ := json.Marshal(map[string]any{
+		"description":  task,
+		"token_cost":   int64(20000),
+		"content_type": "code",
+		"domains":      []string{"go", "testing"},
+	})
 	putMsg := h.sendMessage(h.buyer,
-		putPayload(task, invalidHash, "code", 20000, 40000),
+		noContentPayload,
 		[]string{exchange.TagPut},
 		nil,
 	)
@@ -666,17 +676,17 @@ func TestBuyMiss_InvalidHashRejected(t *testing.T) {
 	putMsgObj := exchange.FromStoreRecord(putRec)
 	eng.State().Apply(putMsgObj)
 
-	// Dispatch should return an error for the invalid hash.
-	err := eng.DispatchForTest(putMsgObj)
-	if err == nil {
-		t.Error("expected error for invalid content_hash, got nil")
+	// Dispatch must not return an error (put is silently ignored at state layer).
+	// The put was never added to pendingPuts, so handlePut exits early with nil.
+	if err := eng.DispatchForTest(putMsgObj); err != nil {
+		t.Errorf("unexpected error dispatching no-content put: %v", err)
 	}
 
-	// No put-accept must have been emitted.
+	// No put-accept must have been emitted — the buy-miss offer must not be fulfilled.
 	settleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	for _, sm := range settleMsgs {
 		if hasTag(sm.Tags, "exchange:phase:put-accept") {
-			t.Errorf("unexpected put-accept emitted for invalid content_hash: msg %s", sm.ID)
+			t.Errorf("unexpected put-accept emitted for put with no content: msg %s", sm.ID)
 		}
 	}
 }

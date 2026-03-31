@@ -4,6 +4,7 @@ package exchange_test
 // when configured, and passes all operations when ProvenanceChecker is nil.
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"testing"
 	"time"
@@ -59,12 +60,13 @@ func countMatchMessages(t *testing.T, h *testHarness) int {
 // Bypasses message signing — used to test provenance gating at the dispatch level.
 func injectPutMsg(t *testing.T, h *testHarness, senderKey string) *store.MessageRecord {
 	t.Helper()
+	contentBytes := []byte("test entry content bytes for provenance testing")
+	contentB64 := base64.StdEncoding.EncodeToString(contentBytes)
 	payload, _ := json.Marshal(map[string]any{
 		"description":  "test entry",
-		"content_hash": "sha256:" + "a" + "0000000000000000000000000000000000000000000000000000000000000001",
+		"content":      contentB64,
 		"token_cost":   int64(1000),
 		"content_type": "text",
-		"content_size": int64(512),
 		"domains":      []string{"test"},
 	})
 	rec := store.MessageRecord{

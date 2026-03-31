@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -168,13 +169,34 @@ func (h *testHarness) newOperatorClient() *protocol.Client {
 }
 
 // putPayload builds a minimal valid exchange:put payload.
+// contentHash is ignored — the engine now computes the hash from content.
+// Content is generated at the requested contentSize (capped at MaxContentBytes)
+// so ContentSize on the entry matches what tests expect (e.g. boundary tests
+// for small-content dispute). Sizes above MaxContentBytes are clamped so the
+// put is still accepted — tests that pass inflated sizes (e.g. token-cost cap
+// tests) just need the put to land; they don't care about the exact content size.
 func putPayload(desc, contentHash, contentType string, tokenCost, contentSize int64) []byte {
+	// Generate content of the requested size so entry.ContentSize reflects
+	// caller intent. Cap at MaxContentBytes to stay within the size limit.
+	prefix := []byte("cached inference result: " + desc + " ")
+	size := int(contentSize)
+	if size > exchange.MaxContentBytes {
+		size = exchange.MaxContentBytes
+	}
+	if size < len(prefix) {
+		size = len(prefix)
+	}
+	contentBytes := make([]byte, size)
+	copy(contentBytes, prefix)
+	for i := len(prefix); i < size; i++ {
+		contentBytes[i] = byte('a' + i%26)
+	}
+	contentB64 := base64.StdEncoding.EncodeToString(contentBytes)
 	p, _ := json.Marshal(map[string]any{
 		"description":  desc,
-		"content_hash": contentHash,
+		"content":      contentB64,
 		"token_cost":   tokenCost,
 		"content_type": contentType,
-		"content_size": contentSize,
 		"domains":      []string{"go", "testing"},
 	})
 	return p
