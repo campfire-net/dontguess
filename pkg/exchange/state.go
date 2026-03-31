@@ -1777,19 +1777,6 @@ func (s *State) EntryPreviewCount(entryID string) int {
 	return s.entryPreviewCount[entryID]
 }
 
-// operatorKeyHex converts a raw Ed25519 public key to its hex representation.
-func operatorKeyHex(pub []byte) string {
-	return fmt.Sprintf("%x", pub)
-}
-
-// decodeHexKey decodes a hex-encoded key to bytes. Returns nil on error.
-func decodeHexKey(hexKey string) []byte {
-	b, err := hex.DecodeString(hexKey)
-	if err != nil {
-		return nil
-	}
-	return b
-}
 
 // SetPriceAdjustment writes a dynamic price adjustment for an entry.
 // Overwrites any prior adjustment for the same entry.
@@ -1916,15 +1903,6 @@ func (s *State) GetBuyMissOffer(taskHash string) *BuyMissOffer {
 		return nil
 	}
 	return offer
-}
-
-// DeleteBuyMissOffer removes the standing offer for the given task hash.
-// Called when a put fulfills the offer (auto-accept path).
-// Thread-safe.
-func (s *State) DeleteBuyMissOffer(taskHash string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	delete(s.buyMissOffers, taskHash)
 }
 
 // ClaimBuyMissOffer atomically retrieves and removes the standing buy-miss offer
