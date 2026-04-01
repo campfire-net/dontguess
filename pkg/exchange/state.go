@@ -10,6 +10,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -325,6 +326,26 @@ const (
 	// prevent double-payment on replayed accept messages.
 	AssignPaid
 )
+
+// String returns a human-readable name for the AssignStatus value.
+func (s AssignStatus) String() string {
+	switch s {
+	case AssignOpen:
+		return "assign-open"
+	case AssignClaimed:
+		return "assign-claimed"
+	case AssignCompleted:
+		return "assign-completed"
+	case AssignAccepted:
+		return "assign-accepted"
+	case AssignRejected:
+		return "assign-rejected"
+	case AssignPaid:
+		return "assign-paid"
+	default:
+		return fmt.Sprintf("assign-unknown(%d)", int(s))
+	}
+}
 
 // AssignRecord tracks the lifecycle of a single assign task.
 type AssignRecord struct {
@@ -3119,4 +3140,86 @@ func (s *State) ClearMatchGuarantee(matchMsgID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.matchGuarantee, matchMsgID)
+}
+
+// GetPendingPut returns the pending put entry for the given message ID, and
+// whether it exists. Thread-safe.
+func (s *State) GetPendingPut(msgID string) (*InventoryEntry, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	entry, ok := s.pendingPuts[msgID]
+	return entry, ok
+}
+
+// ResolveMatchFromAntecedent resolves the match message ID from an antecedent
+// ID (which may be a preview message or a match message directly), and returns
+// the buyer key for that match. Returns found=false if the antecedent does not
+// resolve to a known match. Thread-safe.
+func (s *State) ResolveMatchFromAntecedent(antecedentID string) (matchMsgID string, buyerKey string, found bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	matchMsgID, found = s.previewToMatch[antecedentID]
+	if !found {
+		// Legacy/small-content path: antecedent is the match message directly.
+		matchMsgID = antecedentID
+		_, found = s.matchToBuyer[matchMsgID]
+	}
+	buyerKey = s.matchToBuyer[matchMsgID]
+	return matchMsgID, buyerKey, found
+}
+
+// MatchEntryID returns the inventory entry ID for the given match message ID.
+// Returns empty string if the match is unknown. Thread-safe.
+func (s *State) MatchEntryID(matchMsgID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.matchToEntry[matchMsgID]
+}
+
+// MatchInfo returns the buyer key, entry ID, and a flag indicating whether the
+// preview-request message msgID has been tracked for the given match. Used by
+// the engine to validate preview-request messages atomically. Thread-safe.
+func (s *State) MatchInfo(matchMsgID string, previewReqMsgID string) (buyerKey string, entryID string, matchKnown bool, previewTracked bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	buyerKey, matchKnown = s.matchToBuyer[matchMsgID]
+	entryID = s.matchToEntry[matchMsgID]
+	_, previewTracked = s.previewRequestToMatch[previewReqMsgID]
+	return buyerKey, entryID, matchKnown, previewTracked
+}
+
+// MatchBuyerKey returns the buyer key for the given match message ID.
+// Returns empty string if the match is unknown. Thread-safe.
+func (s *State) MatchBuyerKey(matchMsgID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.matchToBuyer[matchMsgID]
+}
+
+// InsertDerivativePut inserts a derivative inventory entry atomically. It is
+// the thread-safe equivalent of calling applyDerivativePut while holding
+// s.mu.Lock(). Idempotent — a second call with the same entry ID is a no-op.
+// Thread-safe.
+func (s *State) InsertDerivativePut(entry *InventoryEntry) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.applyDerivativePut(entry)
+}
+
+// ExpireStaleClaimsTS is the thread-safe wrapper around ExpireStaleClaims.
+// It acquires a read lock, scans for expired claims, and returns claim message
+// IDs. Callers must NOT hold s.mu when calling this method.
+func (s *State) ExpireStaleClaimsTS() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.ExpireStaleClaims()
+}
+
+// PendingAuctionCloseTS is the thread-safe wrapper around PendingAuctionClose.
+// It acquires a read lock and returns assign IDs ready for auction close.
+// Callers must NOT hold s.mu when calling this method.
+func (s *State) PendingAuctionCloseTS() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.PendingAuctionClose()
 }

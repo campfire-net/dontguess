@@ -803,9 +803,7 @@ func (e *Engine) handleBuyMiss(msg *Message, task string, budget int64) error {
 // via AutoAcceptPut.
 func (e *Engine) handlePut(msg *Message) error {
 	// Determine the description from state (applyPut already validated and stored it).
-	e.state.mu.RLock()
-	pending, ok := e.state.pendingPuts[msg.ID]
-	e.state.mu.RUnlock()
+	pending, ok := e.state.GetPendingPut(msg.ID)
 	if !ok {
 		// Put was invalid (e.g. oversized description) — nothing to do.
 		return nil
@@ -1216,16 +1214,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 
 	// Resolve the match message ID from the antecedent.
 	// Try preview path first (antecedent is a preview message).
-	e.state.mu.RLock()
-	matchMsgID, hasMatch := e.state.previewToMatch[antecedentID]
-	if !hasMatch {
-		// Legacy/small-content path: antecedent is the match message directly.
-		matchMsgID = antecedentID
-		// Validate that this is a known match (security: reject spoofed buyer-accept).
-		_, hasMatch = e.state.matchToBuyer[matchMsgID]
-	}
-	expectedBuyer, _ := e.state.matchToBuyer[matchMsgID]
-	e.state.mu.RUnlock()
+	matchMsgID, expectedBuyer, hasMatch := e.state.ResolveMatchFromAntecedent(antecedentID)
 
 	if !hasMatch {
 		e.opts.log("engine: buyer-accept scrip: unknown match %s, ignoring", shortKey(matchMsgID))
@@ -1248,9 +1237,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 		ctx := e.engineCtx()
 		_, currentETag, _ := e.opts.ScripStore.GetBudget(ctx, msg.Sender, scrip.BalanceKey)
 		// Look up the entry price to reconstruct holdAmount.
-		e.state.mu.RLock()
-		entryID := e.state.matchToEntry[matchMsgID]
-		e.state.mu.RUnlock()
+		entryID := e.state.MatchEntryID(matchMsgID)
 		entry := e.state.GetInventoryEntry(entryID)
 		var holdAmount int64
 		if entry != nil {
@@ -1276,9 +1263,7 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 	}
 
 	// Determine the price for the entry offered in this match.
-	e.state.mu.RLock()
-	entryID := e.state.matchToEntry[matchMsgID]
-	e.state.mu.RUnlock()
+	entryID := e.state.MatchEntryID(matchMsgID)
 	entry := e.state.GetInventoryEntry(entryID)
 	if entry == nil {
 		e.opts.log("engine: buyer-accept scrip: entry %s not found for match %s, ignoring",
@@ -1374,12 +1359,8 @@ func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 	matchMsgID := msg.Antecedents[0]
 
 	// Validate match exists and sender is the expected buyer.
-	e.state.mu.RLock()
-	expectedBuyer, matchKnown := e.state.matchToBuyer[matchMsgID]
-	matchEntryID := e.state.matchToEntry[matchMsgID]
 	// Also confirm that state applied the preview-request (previewRequestToMatch populated).
-	_, previewTracked := e.state.previewRequestToMatch[msg.ID]
-	e.state.mu.RUnlock()
+	expectedBuyer, matchEntryID, matchKnown, previewTracked := e.state.MatchInfo(matchMsgID, msg.ID)
 
 	if !matchKnown {
 		e.opts.log("engine: preview-request: unknown match %s, ignoring", shortKey(matchMsgID))
@@ -1505,9 +1486,7 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 		e.opts.log("engine: settle-deliver: cannot derive match for deliver=%s", shortKey(msg.ID))
 		return nil
 	}
-	e.state.mu.RLock()
-	buyerKey := e.state.matchToBuyer[matchMsgID]
-	e.state.mu.RUnlock()
+	buyerKey := e.state.MatchBuyerKey(matchMsgID)
 	if buyerKey == "" {
 		e.opts.log("engine: settle-deliver: no buyer key for match=%s", shortKey(matchMsgID))
 		return nil
@@ -1885,10 +1864,8 @@ func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID stri
 		// provenance checking is done at put-accept time for primary entries.
 	}
 
-	// Insert into state inventory (holds state mutex internally).
-	e.state.mu.Lock()
-	e.state.applyDerivativePut(derivative)
-	e.state.mu.Unlock()
+	// Insert into state inventory (thread-safe via accessor).
+	e.state.InsertDerivativePut(derivative)
 
 	// Add to match index so buyers can find the derivative.
 	e.matchIndex.Add(e.inventoryEntryToRankInput(derivative))
@@ -1928,9 +1905,7 @@ func (e *Engine) sweepExpiredClaims() {
 	if e.opts.WriteClient == nil {
 		return
 	}
-	e.state.mu.RLock()
-	expired := e.state.ExpireStaleClaims()
-	e.state.mu.RUnlock()
+	expired := e.state.ExpireStaleClaimsTS()
 
 	for _, claimMsgID := range expired {
 		payload, err := json.Marshal(map[string]string{
@@ -1965,9 +1940,7 @@ func (e *Engine) sweepExpiredAuctions() {
 	if e.opts.WriteClient == nil {
 		return
 	}
-	e.state.mu.RLock()
-	pendingIDs := e.state.PendingAuctionClose()
-	e.state.mu.RUnlock()
+	pendingIDs := e.state.PendingAuctionCloseTS()
 
 	for _, assignID := range pendingIDs {
 		payload, err := json.Marshal(map[string]string{
@@ -2336,14 +2309,12 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 		return fmt.Errorf("replay before put-accept: %w", err)
 	}
 
-	e.state.mu.RLock()
-	pendingEntry, pending := e.state.pendingPuts[putMsgID]
+	pendingEntry, pending := e.state.GetPendingPut(putMsgID)
 	var putSellerKey string
 	if pending {
 		putSellerKey = pendingEntry.SellerKey
 	}
 	_ = putSellerKey // used below after e.state.Apply(rec)
-	e.state.mu.RUnlock()
 	if !pending {
 		return fmt.Errorf("put %s is not pending", putMsgID)
 	}
