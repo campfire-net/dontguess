@@ -75,6 +75,13 @@ type CampfireScripStore struct {
 	// Uses sync.Map for lock-free concurrent reads.
 	seenMsgIDs sync.Map
 
+	// replayMu guards the entire Replay operation. Replay holds the write lock
+	// for the full duration of a replay; ApplyMessage holds the read lock while
+	// processing a single live message. This prevents a concurrent ApplyMessage
+	// from interleaving with a Replay reset window (the gap between map reset
+	// and replaying.Store(true)) and seeing empty balances in live mode.
+	replayMu sync.RWMutex
+
 	// replaying is true while Replay() is executing. subtractFromBalance uses
 	// this flag to decide whether to permit negative balances (replay trusts the
 	// log) or clamp to zero (live mode prevents permanent buyer lockout).
@@ -121,7 +128,14 @@ func NewCampfireScripStore(campfireID string, client *protocol.Client, operatorK
 // Replay rebuilds balance state from the campfire message log.
 // It resets all balances and re-derives them from scratch.
 // Called on construction; can be called again to resync.
+//
+// Replay holds replayMu exclusively for the entire operation so that no
+// concurrent ApplyMessage can observe the window between map reset and
+// replaying.Store(true) with empty balances in live mode.
 func (s *CampfireScripStore) Replay() error {
+	s.replayMu.Lock()
+	defer s.replayMu.Unlock()
+
 	result, err := s.client.Read(protocol.ReadRequest{
 		CampfireID:       s.campfireID,
 		AfterTimestamp:   0,
@@ -164,7 +178,12 @@ func (s *CampfireScripStore) Replay() error {
 // In live mode, subtractFromBalance hard-rejects underflow: a message that would
 // drive any balance negative is dropped without partial writes. This enforces the
 // A12 constraint that no balance may go below zero via any live code path.
+//
+// ApplyMessage holds replayMu.RLock so it blocks while a Replay is in progress.
+// Multiple concurrent ApplyMessage calls are still allowed (shared read lock).
 func (s *CampfireScripStore) ApplyMessage(msg *proto.Message) {
+	s.replayMu.RLock()
+	defer s.replayMu.RUnlock()
 	s.applyMessage(msg)
 }
 
