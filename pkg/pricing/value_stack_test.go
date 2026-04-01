@@ -112,6 +112,7 @@ func (s *valueStackStubState) PurchaseCount(entryID string) int {
 	return s.demandCounts[entryID]
 }
 func (s *valueStackStubState) ActiveAssigns(_ string) []*exchange.AssignRecord { return nil }
+func (s *valueStackStubState) DebtorScore(_ string) float64                   { return 1.0 } // no debt by default
 
 // ---- value stack interface ----
 func (s *valueStackStubState) TaskCompletionRate() float64 {

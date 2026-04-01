@@ -1701,3 +1701,279 @@ func TestEngine_RestartNoDuplicateMatchForAlreadyMatchedOrder(t *testing.T) {
 	}
 }
 
+// =============================================================================
+// S7 — Debtor Priority Scoring Tests
+// =============================================================================
+
+// TestState_DebtorScore_DefaultIsOne verifies that DebtorScore returns 1.0
+// (full priority) for any agent with no recorded debt signal.
+func TestState_DebtorScore_DefaultIsOne(t *testing.T) {
+	t.Parallel()
+	s := exchange.NewState()
+	score := s.DebtorScore("unknown-agent-key")
+	if score != 1.0 {
+		t.Errorf("DebtorScore for unknown agent = %.3f, want 1.0", score)
+	}
+}
+
+// TestState_SetDebtorScore_RoundTrip verifies that SetDebtorScore and
+// DebtorScore roundtrip correctly and clamp to [0.0, 1.0].
+func TestState_SetDebtorScore_RoundTrip(t *testing.T) {
+	t.Parallel()
+	s := exchange.NewState()
+
+	// Normal score in range.
+	s.SetDebtorScore("agent-a", 0.6)
+	if got := s.DebtorScore("agent-a"); got != 0.6 {
+		t.Errorf("DebtorScore after Set = %.3f, want 0.6", got)
+	}
+
+	// Clamped below zero.
+	s.SetDebtorScore("agent-b", -0.5)
+	if got := s.DebtorScore("agent-b"); got != 0.0 {
+		t.Errorf("DebtorScore clamped low = %.3f, want 0.0", got)
+	}
+
+	// Clamped above one.
+	s.SetDebtorScore("agent-c", 1.5)
+	if got := s.DebtorScore("agent-c"); got != 1.0 {
+		t.Errorf("DebtorScore clamped high = %.3f, want 1.0", got)
+	}
+
+	// Exact boundary values.
+	s.SetDebtorScore("agent-d", 0.0)
+	if got := s.DebtorScore("agent-d"); got != 0.0 {
+		t.Errorf("DebtorScore(0.0) = %.3f, want 0.0", got)
+	}
+	s.SetDebtorScore("agent-e", 1.0)
+	if got := s.DebtorScore("agent-e"); got != 1.0 {
+		t.Errorf("DebtorScore(1.0) = %.3f, want 1.0", got)
+	}
+}
+
+// TestState_DebtorScore_SurvivesReplay verifies that debtorScores are NOT
+// reset on Replay (they are externally injected, not derived from the log).
+func TestState_DebtorScore_SurvivesReplay(t *testing.T) {
+	t.Parallel()
+	s := exchange.NewState()
+	s.SetDebtorScore("agent-a", 0.4)
+
+	// Replay with empty log — should not wipe debtorScores.
+	s.Replay(nil)
+
+	if got := s.DebtorScore("agent-a"); got != 0.4 {
+		t.Errorf("DebtorScore after Replay = %.3f, want 0.4 (should survive replay)", got)
+	}
+}
+
+// TestEngine_HandleBuy_DebtorPriorityReducesResults verifies that a buyer with
+// a low DebtorScore (high debt) receives fewer match results than a buyer with
+// full priority (score=1.0).
+//
+// Setup: 5 inventory entries, buyer requests max_results=4.
+// A debtor at score 0.5 gets floor(4*0.5)=2 results.
+// A non-debtor at score 1.0 gets the full 4 results.
+func TestEngine_HandleBuy_DebtorPriorityReducesResults(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Seed 5 inventory entries so there are more results than any MaxResults cap.
+	contentTypes := []string{"code", "code", "analysis", "code", "analysis"}
+	entryCount := 5
+	for i := 0; i < entryCount; i++ {
+		putMsg := h.sendMessage(h.seller,
+			putPayload(
+				fmt.Sprintf("Go HTTP handler for endpoint %d", i),
+				fmt.Sprintf("sha256:%064x", i+100),
+				contentTypes[i%len(contentTypes)],
+				8000,
+				12000,
+			),
+			[]string{exchange.TagPut, "exchange:content-type:code"},
+			nil,
+		)
+		msgs, _ := h.st.ListMessages(h.cfID, 0)
+		eng.State().Replay(exchange.FromStoreRecords(msgs))
+		if err := eng.AutoAcceptPut(putMsg.ID, 5600, time.Now().Add(72*time.Hour)); err != nil {
+			t.Fatalf("AutoAcceptPut entry %d: %v", i, err)
+		}
+	}
+
+	// Verify all 5 entries are in inventory.
+	if got := len(eng.State().Inventory()); got != entryCount {
+		t.Fatalf("expected %d inventory entries, got %d", entryCount, got)
+	}
+
+	// --- Non-debtor buyer: score=1.0 (default), max_results=4 → expects up to 4 ---
+	buyPayloadWithResults := func(task string, budget int64, maxResults int) []byte {
+		p, _ := json.Marshal(map[string]any{
+			"task":        task,
+			"budget":      budget,
+			"max_results": maxResults,
+		})
+		return p
+	}
+
+	waitForMatchCount := func(t *testing.T, eng *exchange.Engine, startCount int, timeout time.Duration) []store.MessageRecord {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{
+				Tags: []string{exchange.TagMatch},
+			})
+			if len(msgs) > startCount {
+				return msgs
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		return nil
+	}
+
+	// Non-debtor buy: score=1.0 implicitly. Request 4 results.
+	nonDebtorBuyer := newTestAgent(t)
+	// DebtorScore not set → defaults to 1.0 → full priority
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	preCount := len(preMsgs)
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel1()
+	go func() { _ = eng.Start(ctx1) }()
+
+	h.sendMessage(nonDebtorBuyer,
+		buyPayloadWithResults("Go HTTP handler implementation", 50000, 4),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsgs := waitForMatchCount(t, eng, preCount, 2*time.Second)
+	cancel1()
+
+	if len(matchMsgs) <= preCount {
+		t.Fatal("non-debtor: no match message emitted")
+	}
+	var mp1 struct {
+		Results []struct{ EntryID string `json:"entry_id"` } `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsgs[len(matchMsgs)-1].Payload, &mp1); err != nil {
+		t.Fatalf("parsing non-debtor match: %v", err)
+	}
+	nonDebtorResultCount := len(mp1.Results)
+	if nonDebtorResultCount == 0 {
+		t.Fatal("non-debtor: expected at least 1 result")
+	}
+
+	// --- Debtor buyer: score=0.5, max_results=4 → expects floor(4*0.5)=2 results ---
+	debtorBuyer := newTestAgent(t)
+	eng.State().SetDebtorScore(debtorBuyer.PublicKeyHex(), 0.5)
+
+	preMsgs2, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	preCount2 := len(preMsgs2)
+
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	go func() { _ = eng.Start(ctx2) }()
+
+	h.sendMessage(debtorBuyer,
+		buyPayloadWithResults("Go HTTP handler implementation", 50000, 4),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsgs2 := waitForMatchCount(t, eng, preCount2, 2*time.Second)
+	cancel2()
+
+	if len(matchMsgs2) <= preCount2 {
+		t.Fatal("debtor: no match message emitted")
+	}
+	var mp2 struct {
+		Results []struct{ EntryID string `json:"entry_id"` } `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsgs2[len(matchMsgs2)-1].Payload, &mp2); err != nil {
+		t.Fatalf("parsing debtor match: %v", err)
+	}
+	debtorResultCount := len(mp2.Results)
+
+	// Debtor must receive fewer results than non-debtor (or equal if inventory
+	// is too small to distinguish, but 5 entries + 4 max_results makes this clear).
+	if debtorResultCount >= nonDebtorResultCount {
+		t.Errorf("debtor priority not applied: debtor got %d results, non-debtor got %d; debtor should get fewer",
+			debtorResultCount, nonDebtorResultCount)
+	}
+	// Exact check: floor(4 * 0.5) = 2.
+	if debtorResultCount > 2 {
+		t.Errorf("debtor result count = %d, want ≤ 2 (floor(4*0.5))", debtorResultCount)
+	}
+}
+
+// TestEngine_HandleBuy_MaximumDebtorAlwaysGetsOne verifies that even a buyer
+// at the maximum debt floor (score=0.0) still receives at least 1 result.
+// Debtors are deprioritized, never blocked.
+func TestEngine_HandleBuy_MaximumDebtorAlwaysGetsOne(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// Seed 1 inventory entry.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Kubernetes deployment YAML generator", "sha256:"+fmt.Sprintf("%064x", 999), "code", 10000, 15000),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Maximum debtor: score = 0.0 (floor behavior).
+	debtorBuyer := newTestAgent(t)
+	eng.State().SetDebtorScore(debtorBuyer.PublicKeyHex(), 0.0)
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	preCount := len(preMsgs)
+
+	buyPayloadWithResults := func(task string, budget int64, maxResults int) []byte {
+		p, _ := json.Marshal(map[string]any{
+			"task":        task,
+			"budget":      budget,
+			"max_results": maxResults,
+		})
+		return p
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	h.sendMessage(debtorBuyer,
+		buyPayloadWithResults("Kubernetes deployment YAML", 50000, 5),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	deadline := time.Now().Add(2 * time.Second)
+	var matchMsgs []store.MessageRecord
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > preCount {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= preCount {
+		t.Fatal("maximum debtor: no match message emitted (debtor should still be served, not blocked)")
+	}
+	var mp struct {
+		Results []struct{ EntryID string `json:"entry_id"` } `json:"results"`
+	}
+	if err := json.Unmarshal(matchMsgs[len(matchMsgs)-1].Payload, &mp); err != nil {
+		t.Fatalf("parsing match: %v", err)
+	}
+	if len(mp.Results) < 1 {
+		t.Errorf("maximum debtor got 0 results; want at least 1 (floor is 1, never blocked)")
+	}
+}

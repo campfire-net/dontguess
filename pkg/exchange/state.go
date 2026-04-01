@@ -606,6 +606,17 @@ type State struct {
 	// brokeredCompletions is the count of settle(complete) messages whose
 	// antecedent chain traces back to a brokered match. Reset on Replay.
 	brokeredCompletions int
+
+	// debtorScores holds pre-computed debtor priority scores per buyer key.
+	// Key: agentKey (hex-encoded Ed25519 public key of the buyer).
+	// Value: score in [0.0, 1.0] — 1.0 means no debt (full priority), lower
+	// means higher outstanding debt (lower match priority).
+	//
+	// This map is NOT reset on Replay — it is externally written via
+	// SetDebtorScore when the scrip store signals debt changes (e.g. after
+	// loan-mint or loan-repay). It is a callback/hook pattern to avoid a
+	// cross-package import of pkg/scrip inside pkg/exchange.
+	debtorScores map[string]float64
 }
 
 // NewState creates an empty exchange state.
@@ -643,6 +654,7 @@ func NewState() *State {
 		buyMissOffers:        make(map[string]*BuyMissOffer),
 		brokerAssigns:        make(map[string]string),
 		brokerMatchIDs:       make(map[string]struct{}),
+		debtorScores:         make(map[string]float64),
 	}
 }
 
@@ -2222,6 +2234,49 @@ func (s *State) AllPriceAdjustments() map[string]PriceAdjustment {
 		}
 	}
 	return out
+}
+
+// SetDebtorScore writes the debtor priority score for an agent.
+//
+// score must be in [0.0, 1.0]:
+//   - 1.0 = no outstanding debt (full match priority)
+//   - 0.0 = maximum debt / chronic defaulter (lowest priority)
+//
+// This is called externally (e.g. by the engine after scrip signals a loan
+// state change) rather than derived from the campfire log, so it survives
+// Replay and is not reset. It is intentionally NOT imported from pkg/scrip to
+// avoid a cross-package dependency — callers derive the score from loan records
+// and inject it via this hook.
+//
+// Thread-safe.
+func (s *State) SetDebtorScore(agentKey string, score float64) {
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.debtorScores[agentKey] = score
+}
+
+// DebtorScore returns the debtor priority score for an agent in [0.0, 1.0].
+// Returns 1.0 (full priority) for agents with no recorded score, since absence
+// of debt signal means no known debt.
+//
+// 1.0 = no debt / full priority
+// 0.0 = maximum debt / lowest priority
+//
+// Thread-safe.
+func (s *State) DebtorScore(agentKey string) float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	score, ok := s.debtorScores[agentKey]
+	if !ok {
+		return 1.0 // no debt signal recorded → full priority
+	}
+	return score
 }
 
 // TaskCompletionRate returns the fraction of buyer-accepted orders that have
