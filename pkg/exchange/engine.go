@@ -41,6 +41,12 @@ const WarmCompressionBountyPct = 30
 // reservation is valid. After expiry, the scrip hold is released.
 const ReservationExpiryDuration = 5 * time.Minute
 
+// BrokeredMatchDefaultReward is the default scrip reward for a brokered-match
+// assign when BrokeredMatchReward is not configured on EngineOptions.
+// 100 scrip is a nominal value; operators should calibrate based on inventory size
+// and expected worker demand.
+const BrokeredMatchDefaultReward = 100
+
 // Layer0MinPreviews is the minimum number of previews before conversion-rate
 // exclusion kicks in. Below this, entries have insufficient data for exclusion.
 const Layer0MinPreviews = 10
@@ -110,6 +116,20 @@ type EngineOptions struct {
 	// scrip payout by submitting an artificially large token_cost. Defaults to
 	// 1_000_000 if zero.
 	MaxTokenCost int64
+
+	// BrokeredMatchMode enables the brokered matching path. When true,
+	// handleBuy posts an exchange:assign with task_type="brokered-match"
+	// instead of running inline semantic matching. Workers claim the assign,
+	// search inventory, and deliver ranked results. The operator then accepts
+	// the result and emits exchange:match to the buyer. Inline matching is
+	// the default (BrokeredMatchMode=false) and always coexists: operators
+	// may toggle this flag to switch routing without affecting either path's
+	// state machine.
+	BrokeredMatchMode bool
+
+	// BrokeredMatchReward is the scrip reward posted on brokered-match assigns.
+	// If zero, defaults to BrokeredMatchDefaultReward.
+	BrokeredMatchReward int64
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -133,6 +153,13 @@ func (o *EngineOptions) maxTokenCost() int64 {
 		return o.MaxTokenCost
 	}
 	return 1_000_000
+}
+
+func (o *EngineOptions) brokeredMatchReward() int64 {
+	if o.BrokeredMatchReward > 0 {
+		return o.BrokeredMatchReward
+	}
+	return BrokeredMatchDefaultReward
 }
 
 func (o *EngineOptions) log(format string, args ...any) {
@@ -313,7 +340,7 @@ func (e *Engine) run(ctx context.Context) error {
 		Tags: []string{
 			TagPut, TagBuy, TagSettle,
 			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
-			TagAssignExpire,
+			TagAssignExpire, TagAssignAuctionClose,
 		},
 		PollInterval: e.opts.pollInterval(),
 	})
@@ -341,11 +368,13 @@ func (e *Engine) run(ctx context.Context) error {
 			if err := e.dispatch(msg); err != nil {
 				e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
 			}
-			// Lazy expiry sweep on every received message.
+			// Lazy sweeps on every received message.
 			e.sweepExpiredClaims()
+			e.sweepExpiredAuctions()
 		case <-expirySweepTicker.C:
-			// Periodic backstop sweep.
+			// Periodic backstop sweeps.
 			e.sweepExpiredClaims()
+			e.sweepExpiredAuctions()
 		case <-ctx.Done():
 			return ctx.Err()
 		}
@@ -391,6 +420,8 @@ func (e *Engine) dispatch(msg *Message) error {
 		return e.handleAssignReject(msg)
 	case TagAssignExpire:
 		return e.handleAssignExpire(msg)
+	case TagAssignAuctionClose:
+		return nil // state.Apply handles finalization; engine logs only
 	}
 	return nil
 }
@@ -456,6 +487,14 @@ func (e *Engine) handleBuy(msg *Message) error {
 	maxResults := payload.MaxResults
 	if maxResults <= 0 {
 		maxResults = 3
+	}
+
+	// Brokered-match mode: post an assign for workers to perform matching
+	// instead of running inline semantic search. Workers claim the assign,
+	// search inventory, and deliver ranked results via assign-complete.
+	// The operator then accepts and emits exchange:match to the buyer.
+	if e.opts.BrokeredMatchMode {
+		return e.sendBrokeredMatchAssign(msg, payload.Task, maxResults)
 	}
 
 	// Search inventory for candidates (budget/reputation/freshness/type/domain/tier filters).
@@ -1558,7 +1597,14 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 		}
 	}
 
-	if rec.Reward <= 0 {
+	// Determine payment amount: for Vickrey auctions use the clearing price;
+	// for standard assigns use the base reward.
+	payAmount := rec.Reward
+	if rec.VickreyPrice > 0 {
+		payAmount = rec.VickreyPrice
+	}
+
+	if payAmount <= 0 {
 		e.opts.log("engine: assign-accept: zero reward, skipping scrip payment assign_id=%s", shortKey(rec.AssignID))
 		return nil
 	}
@@ -1570,7 +1616,7 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 	// Pay bounty to claimant.
 	if e.opts.ScripStore != nil {
 		ctx := e.engineCtx()
-		if _, _, err := e.opts.ScripStore.AddBudget(ctx, rec.ClaimantKey, scrip.BalanceKey, rec.Reward, ""); err != nil {
+		if _, _, err := e.opts.ScripStore.AddBudget(ctx, rec.ClaimantKey, scrip.BalanceKey, payAmount, ""); err != nil {
 			e.opts.log("engine: assign-accept: add bounty to worker %s: %v", shortKey(rec.ClaimantKey), err)
 			return fmt.Errorf("assign-accept: pay bounty: %w", err)
 		}
@@ -1578,7 +1624,7 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 		// Emit scrip-assign-pay so CampfireScripStore can replay the payment.
 		payPayload, err := e.marshal(scrip.AssignPayPayload{
 			Worker:    rec.ClaimantKey,
-			Amount:    rec.Reward,
+			Amount:    payAmount,
 			TaskType:  rec.TaskType,
 			AssignMsg: rec.AssignID,
 		})
@@ -1722,6 +1768,41 @@ func (e *Engine) sweepExpiredClaims() {
 		// the next subscribe loop iteration to pick it up.
 		e.state.Apply(expireMsg)
 		e.opts.log("engine: sweep: claim expired, task reopened claim=%s", shortKey(claimMsgID))
+	}
+}
+
+// sweepExpiredAuctions detects AssignOpen records whose AuctionDeadline has
+// passed and that have at least one bid. For each such assign it emits an
+// exchange:assign-auction-close message so that state finalizes the Vickrey
+// auction and transitions the winner to AssignClaimed.
+//
+// sweepExpiredAuctions is called on every received message (lazy) and on the
+// periodic expiry sweep ticker (backstop). It is a no-op if WriteClient is
+// not configured.
+func (e *Engine) sweepExpiredAuctions() {
+	if e.opts.WriteClient == nil {
+		return
+	}
+	e.state.mu.RLock()
+	pendingIDs := e.state.PendingAuctionClose()
+	e.state.mu.RUnlock()
+
+	for _, assignID := range pendingIDs {
+		payload, err := json.Marshal(map[string]string{
+			"assign_id":  assignID,
+			"closed_at":  time.Now().UTC().Format(time.RFC3339),
+		})
+		if err != nil {
+			e.opts.log("engine: sweep auctions: marshal auction-close payload: %v", err)
+			continue
+		}
+		closeMsg, err := e.sendOperatorMessage(payload, []string{TagAssignAuctionClose}, []string{assignID})
+		if err != nil {
+			e.opts.log("engine: sweep auctions: emit assign-auction-close for assign=%s: %v", shortKey(assignID), err)
+			continue
+		}
+		e.state.Apply(closeMsg)
+		e.opts.log("engine: sweep auctions: auction closed assign=%s", shortKey(assignID))
 	}
 }
 
@@ -2126,6 +2207,47 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 			e.opts.log("engine: compression assign failed entry=%s err=%v", putMsgID, err)
 		}
 	}
+	return nil
+}
+
+// sendBrokeredMatchAssign posts an exchange:assign with task_type="brokered-match"
+// for the given buy message. Workers claim, search inventory, and deliver ranked
+// results. The assign payload carries the buyer's task description, the buy message
+// ID (for correlation), and the maximum results count.
+//
+// Called from handleBuy when BrokeredMatchMode is enabled. Failure is fatal to
+// the caller — the buy cannot proceed without the assign.
+func (e *Engine) sendBrokeredMatchAssign(buyMsg *Message, task string, maxResults int) error {
+	// Idempotency: if this buy already has a brokered-match assign (e.g. engine
+	// restarted after posting the assign but before processing the complete), skip.
+	if _, exists := e.state.BrokerAssignForBuy(buyMsg.ID); exists {
+		e.opts.log("engine: brokered-match assign already exists for buy=%s, skipping", shortKey(buyMsg.ID))
+		return nil
+	}
+	if maxResults <= 0 {
+		maxResults = 3
+	}
+	reward := e.opts.brokeredMatchReward()
+	payload, err := json.Marshal(map[string]any{
+		"task_type":        "brokered-match",
+		"buy_msg_id":       buyMsg.ID,
+		"task_description": task,
+		"max_results":      maxResults,
+		"reward":           reward,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding brokered-match assign payload: %w", err)
+	}
+	tags := []string{TagAssign}
+	msg, err := e.sendOperatorMessage(payload, tags, []string{buyMsg.ID})
+	if err != nil {
+		return fmt.Errorf("sending brokered-match assign: %w", err)
+	}
+	if msg != nil {
+		e.state.Apply(msg)
+	}
+	e.opts.log("engine: brokered-match assign sent assign_id=%s buy=%s task=%q reward=%d",
+		shortKey(msg.ID), shortKey(buyMsg.ID), task, reward)
 	return nil
 }
 
