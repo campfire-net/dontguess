@@ -118,3 +118,25 @@ func (s *State) SweepExpiredClaimsForTest() []string {
 	defer s.mu.RUnlock()
 	return s.ExpireStaleClaims()
 }
+
+// CoOccurrenceCountForTest returns the co-occurrence count between two entries.
+// Returns 0 if no data exists. Used for white-box testing of UpdateCoOccurrence.
+func (s *State) CoOccurrenceCountForTest(entryA, entryB string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.coOccurrence[entryA]
+	if !ok {
+		return 0
+	}
+	return m.counts[entryB]
+}
+
+// RecordBuyerSettlementForTest exposes recordBuyerSettlement for unit tests.
+func (e *Engine) RecordBuyerSettlementForTest(buyerKey, entryID string) {
+	e.recordBuyerSettlement(buyerKey, entryID)
+}
+
+// StagePredictionsForTest exposes stagePredictions for unit tests.
+func (e *Engine) StagePredictionsForTest(settledEntryID string) {
+	e.stagePredictions(settledEntryID)
+}

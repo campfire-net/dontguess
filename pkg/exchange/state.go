@@ -61,6 +61,10 @@ const (
 	// dispute path instead.
 	SmallContentThreshold = 500
 
+	// CoOccurrenceK is the maximum number of co-occurring entries tracked per entry.
+	// When the bounded map reaches capacity, the entry with the lowest count is evicted.
+	CoOccurrenceK = 20
+
 	// SmallContentReputationPenalty is the per-refund reputation hit for
 	// small-content disputes.
 	SmallContentReputationPenalty = 3
@@ -368,6 +372,12 @@ type AssignRecord struct {
 	// triggered this assign. Non-empty only for task_type="brokered-match" assigns.
 	// Used to correlate the brokered-match assign back to its originating buy order.
 	BuyMsgID string
+
+	// DeadlineAt is the absolute time after which this standing assign should be
+	// ignored even if unclaimed. Used for prediction-derived brokered-match assigns
+	// to bound assignByID growth (A9 mitigation). Zero means no deadline.
+	// Workers may not claim assigns past their DeadlineAt.
+	DeadlineAt time.Time
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -441,6 +451,72 @@ type AuctionBid struct {
 	BidAmount int64
 	// Timestamp is the time the bid was recorded (derived from the assign-claim message).
 	Timestamp time.Time
+}
+
+// coOccurrenceMap is a bounded map tracking how often entry IDs co-occur with
+// a given entry. When the map reaches CoOccurrenceK entries, the entry with the
+// lowest count is evicted before inserting the new one. This bounds memory to
+// O(K) per entry without requiring an external LRU package.
+type coOccurrenceMap struct {
+	counts map[string]int // entryID -> co-occurrence count
+}
+
+// newCoOccurrenceMap allocates an empty co-occurrence map.
+func newCoOccurrenceMap() *coOccurrenceMap {
+	return &coOccurrenceMap{counts: make(map[string]int)}
+}
+
+// increment adds one to the count for peerID, evicting the lowest-count entry
+// if the map is at capacity (CoOccurrenceK).
+func (m *coOccurrenceMap) increment(peerID string) {
+	if _, exists := m.counts[peerID]; exists {
+		m.counts[peerID]++
+		return
+	}
+	// Evict lowest-count entry if at capacity.
+	if len(m.counts) >= CoOccurrenceK {
+		minKey := ""
+		minVal := int(^uint(0) >> 1) // MaxInt
+		for k, v := range m.counts {
+			if v < minVal {
+				minVal = v
+				minKey = k
+			}
+		}
+		delete(m.counts, minKey)
+	}
+	m.counts[peerID] = 1
+}
+
+// topK returns up to k entry IDs sorted by co-occurrence count descending.
+// Returns IDs only (not counts).
+func (m *coOccurrenceMap) topK(k int) []string {
+	if len(m.counts) == 0 {
+		return nil
+	}
+	// Collect and sort by count descending.
+	type kv struct {
+		id    string
+		count int
+	}
+	pairs := make([]kv, 0, len(m.counts))
+	for id, c := range m.counts {
+		pairs = append(pairs, kv{id, c})
+	}
+	// Insertion sort is fine for K=20 (small n).
+	for i := 1; i < len(pairs); i++ {
+		for j := i; j > 0 && pairs[j].count > pairs[j-1].count; j-- {
+			pairs[j], pairs[j-1] = pairs[j-1], pairs[j]
+		}
+	}
+	if k > len(pairs) {
+		k = len(pairs)
+	}
+	out := make([]string, k)
+	for i := 0; i < k; i++ {
+		out[i] = pairs[i].id
+	}
+	return out
 }
 
 // State is the in-memory materialized view of the exchange campfire log.
@@ -617,6 +693,12 @@ type State struct {
 	// loan-mint or loan-repay). It is a callback/hook pattern to avoid a
 	// cross-package import of pkg/scrip inside pkg/exchange.
 	debtorScores map[string]float64
+
+	// coOccurrence tracks which entries co-occur in buyer sessions.
+	// Key: entryID. Value: bounded map of peer entryID -> co-occurrence count.
+	// Updated by UpdateCoOccurrence after each settle(complete).
+	// Reset on Replay — derived from the settle log. Reset on Replay.
+	coOccurrence map[string]*coOccurrenceMap
 }
 
 // NewState creates an empty exchange state.
@@ -655,6 +737,7 @@ func NewState() *State {
 		brokerAssigns:        make(map[string]string),
 		brokerMatchIDs:       make(map[string]struct{}),
 		debtorScores:         make(map[string]float64),
+		coOccurrence:         make(map[string]*coOccurrenceMap),
 	}
 }
 
@@ -695,6 +778,7 @@ func (s *State) Replay(msgs []Message) {
 	s.pendingAssignResults = make(map[string]*AssignRecord)
 	s.buyMissOffers = make(map[string]*BuyMissOffer)
 	s.brokerAssigns = make(map[string]string)
+	s.coOccurrence = make(map[string]*coOccurrenceMap)
 	// Note: priceAdjustments and brokerMatchIDs are intentionally NOT reset on
 	// Replay. They are externally written (by the fast pricing loop and engine
 	// respectively), not derived from the campfire log.
@@ -1452,6 +1536,7 @@ func (s *State) applyAssign(msg *Message) {
 		ClaimTimeoutMinutes  int    `json:"claim_timeout_minutes"`
 		AuctionWindowSeconds int    `json:"auction_window_seconds"`
 		BuyMsgID             string `json:"buy_msg_id"`
+		DeadlineAt           string `json:"deadline_at"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
@@ -1476,6 +1561,12 @@ func (s *State) applyAssign(msg *Message) {
 		ClaimTimeoutMinutes: timeoutMinutes,
 		AssignReceivedAt:    receivedAt,
 		BuyMsgID:            payload.BuyMsgID,
+	}
+	// Parse deadline_at for standing assigns (e.g. prediction-derived brokered-match).
+	if payload.DeadlineAt != "" {
+		if t, err := time.Parse(time.RFC3339, payload.DeadlineAt); err == nil {
+			rec.DeadlineAt = t.UTC()
+		}
 	}
 	// If the operator requested an auction window, set the deadline.
 	if payload.AuctionWindowSeconds > 0 {
@@ -1511,6 +1602,10 @@ func (s *State) applyAssignClaim(msg *Message) {
 	}
 	// Exclusive sender constraint: if set, only the designated key may claim.
 	if rec.ExclusiveSender != "" && msg.Sender != rec.ExclusiveSender {
+		return
+	}
+	// DeadlineAt constraint: standing assigns past their deadline are unclaim-able.
+	if !rec.DeadlineAt.IsZero() && time.Now().UTC().After(rec.DeadlineAt) {
 		return
 	}
 
@@ -2500,4 +2595,99 @@ func stripDomainPrefixes(domains []string) []string {
 		out[i] = stripTagPrefix(d, "exchange:domain:")
 	}
 	return out
+}
+
+// UpdateCoOccurrence records that entryA and entryB co-occurred in the same
+// buyer session (both were settled by the same buyer within a session window).
+// The co-occurrence is bidirectional: both A→B and B→A are updated.
+// Increments by 1 per call; the bounded map evicts the lowest-count peer when
+// at capacity (K=20). Self-pairs (entryA == entryB) are silently ignored.
+// Thread-safe.
+func (s *State) UpdateCoOccurrence(entryA, entryB string) {
+	if entryA == "" || entryB == "" || entryA == entryB {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	// A → B
+	if s.coOccurrence[entryA] == nil {
+		s.coOccurrence[entryA] = newCoOccurrenceMap()
+	}
+	s.coOccurrence[entryA].increment(entryB)
+	// B → A
+	if s.coOccurrence[entryB] == nil {
+		s.coOccurrence[entryB] = newCoOccurrenceMap()
+	}
+	s.coOccurrence[entryB].increment(entryA)
+}
+
+// PredictNext returns the top-K entry IDs most likely to be needed after entryID,
+// based on co-occurrence patterns from prior settled buyer sessions. Returns at
+// most CoOccurrenceK results (or fewer if less data is available). Returns nil if
+// no co-occurrence data exists for entryID.
+// Thread-safe.
+func (s *State) PredictNext(entryID string) []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	m, ok := s.coOccurrence[entryID]
+	if !ok {
+		return nil
+	}
+	return m.topK(CoOccurrenceK)
+}
+
+// OpenPredictionAssignsForEntry returns the count of open (unclaimed or actively
+// claimed) brokered-match assigns whose entry_id matches entryID and whose
+// DeadlineAt is in the future (or zero). Used to enforce the MaxPredictionFanout
+// limit when pre-staging standing assigns.
+// Caller must hold s.mu (at least read lock).
+func (s *State) openPredictionAssignsForEntry(entryID string) int {
+	now := time.Now().UTC()
+	count := 0
+	for _, rec := range s.assignsByEntry[entryID] {
+		if rec.TaskType != "brokered-match" {
+			continue
+		}
+		if rec.Status == AssignAccepted || rec.Status == AssignRejected || rec.Status == AssignPaid {
+			continue
+		}
+		// Expired standing assigns don't count toward the fanout limit.
+		if !rec.DeadlineAt.IsZero() && now.After(rec.DeadlineAt) {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+// OpenPredictionAssignsForEntry is the exported thread-safe version for the engine.
+// Thread-safe.
+func (s *State) OpenPredictionAssignsForEntry(entryID string) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.openPredictionAssignsForEntry(entryID)
+}
+
+// StalePredictionAssigns returns the assign IDs of AssignOpen brokered-match
+// assigns whose DeadlineAt is non-zero and has passed. These are safe to cancel
+// (they will not be claimed by any worker after their deadline).
+// Caller must hold s.mu (read lock is sufficient).
+func (s *State) StalePredictionAssigns() []string {
+	now := time.Now().UTC()
+	var stale []string
+	for id, rec := range s.assignByID {
+		if rec.TaskType != "brokered-match" {
+			continue
+		}
+		if rec.Status != AssignOpen {
+			continue
+		}
+		if rec.DeadlineAt.IsZero() {
+			continue
+		}
+		if now.After(rec.DeadlineAt) {
+			stale = append(stale, id)
+		}
+	}
+	return stale
 }
