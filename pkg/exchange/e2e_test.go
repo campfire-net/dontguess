@@ -15,8 +15,12 @@ package exchange_test
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1522,4 +1526,303 @@ func sendBuyerAcceptViaPreview(t *testing.T, h *testHarness, eng *exchange.Engin
 		t.Fatalf("DispatchForTest buyer-accept (preview path): %v", err)
 	}
 	return msg
+}
+
+// ----------------------------------------------------------------------------
+// E2E content delivery round-trip:
+//   put (with real content bytes) → accept → buy → match → preview-request →
+//   preview → buyer-accept → operator deliver trigger → engine emits
+//   content-bearing deliver → settle(complete)
+//
+// Assertions:
+//   1. Buyer receives deliver message with base64-encoded content whose
+//      sha256 matches the original put content bytes.
+//   2. Seller scrip balance increases after settle(complete).
+//   3. No error-level log entries emitted by the engine.
+// ----------------------------------------------------------------------------
+
+// TestE2E_ContentDeliveryRoundTrip verifies the full content delivery contract
+// end-to-end using a real engine harness (no mocks):
+//
+//  1. Seller puts cached inference with known content bytes.
+//  2. Operator accepts, buyer buys, engine matches.
+//  3. Buyer sends preview-request; engine emits settle(preview).
+//  4. Buyer accepts preview; engine creates scrip hold.
+//  5. Operator sends settle(deliver) trigger (no content field).
+//  6. Engine emits content-bearing settle(deliver) with base64 content.
+//  7. Decoded content sha256 matches original.
+//  8. Buyer sends settle(complete); seller scrip balance increases.
+//  9. Engine emits no error-level log lines.
+func TestE2E_ContentDeliveryRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	// --- Error log collector ---
+	var (
+		logMu    sync.Mutex
+		errorLog []string
+	)
+	collectLog := func(format string, args ...any) {
+		line := fmt.Sprintf(format, args...)
+		t.Logf("[engine] %s", line)
+		// Engine logs warnings/errors with keywords: error, cannot, critical, failed.
+		lower := strings.ToLower(line)
+		if strings.Contains(lower, "error") ||
+			strings.Contains(lower, "cannot") ||
+			strings.Contains(lower, "critical") ||
+			strings.Contains(lower, "failed") {
+			logMu.Lock()
+			errorLog = append(errorLog, line)
+			logMu.Unlock()
+		}
+	}
+
+	h := newTestHarness(t)
+
+	// Wire a real CampfireScripStore for scrip balance assertions.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:  h.cfID,
+		Store:       h.st,
+		ReadClient:  h.newOperatorClient(),
+		WriteClient: h.newOperatorClient(),
+		ScripStore:  cs,
+		Logger:      collectLog,
+	})
+
+	// --- Step 1: Seller puts cached inference with known content bytes ---
+	originalContent := []byte("test content for delivery: Go HTTP handler unit test suite body")
+	contentB64 := base64.StdEncoding.EncodeToString(originalContent)
+	originalHash := sha256.Sum256(originalContent)
+
+	putPayloadBytes, _ := json.Marshal(map[string]any{
+		"description":  "Go HTTP handler unit test suite for E2E content delivery",
+		"content":      contentB64,
+		"token_cost":   int64(12000),
+		"content_type": "code",
+		"domains":      []string{"go", "testing"},
+	})
+
+	putMsg := h.sendMessage(h.seller, putPayloadBytes,
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("step 1: listing messages: %v", err)
+	}
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+
+	// --- Step 2: Operator accepts the put; mint buyer scrip ---
+	const putPrice = int64(8400)
+	if err := eng.AutoAcceptPut(putMsg.ID, putPrice, time.Now().Add(168*time.Hour)); err != nil {
+		t.Fatalf("step 2: AutoAcceptPut: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("step 2: expected 1 inventory entry after put-accept, got %d", len(inv))
+	}
+	entry := inv[0]
+
+	// Compute expected scrip amounts.
+	salePrice := eng.ComputePriceForTest(entry)
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+	enginePrice := holdAmount * exchange.MatchingFeeRate / (exchange.MatchingFeeRate + 1)
+	expectedResidual := enginePrice / exchange.ResidualRate
+
+	// Mint put-pay for seller and purchase funds for buyer.
+	const discountPct = int64(30)
+	addScripPutPayMsg(t, h, putMsg.ID, h.seller.PublicKeyHex(), putPrice, int64(12000), discountPct, entry.ContentHash)
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+1000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("step 2: cs.Replay after mint: %v", err)
+	}
+
+	sellerBalanceAfterPutPay := cs.Balance(h.seller.PublicKeyHex())
+	if sellerBalanceAfterPutPay != putPrice {
+		t.Errorf("step 2 (put-pay): seller balance = %d, want %d", sellerBalanceAfterPutPay, putPrice)
+	}
+
+	// --- Step 3: Buyer buys; engine matches ---
+	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	h.sendMessage(h.buyer,
+		buyPayload("Generate unit tests for a Go HTTP handler accepting JSON POST with validation", salePrice+5000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	matchMsg := waitForMatchMessage(t, h, preMatchMsgs, 2*time.Second)
+	cancel()
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	// --- Step 4: Buyer sends preview-request; engine emits settle(preview) ---
+	preqPayload, _ := json.Marshal(map[string]any{
+		"phase":    "preview-request",
+		"entry_id": entry.EntryID,
+	})
+	preqMsg := h.sendMessage(h.buyer, preqPayload,
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreviewRequest},
+		[]string{matchMsg.ID},
+	)
+	preqRec, _ := h.st.GetMessage(preqMsg.ID)
+	eng.State().Apply(exchange.FromStoreRecord(preqRec))
+
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(preqRec)); err != nil {
+		t.Fatalf("step 4: DispatchForTest preview-request: %v", err)
+	}
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	previewMsgs, _ := h.st.ListMessages(h.cfID, 0,
+		store.MessageFilter{Tags: []string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrPreview}})
+	if len(previewMsgs) == 0 {
+		t.Fatal("step 4: no preview message emitted")
+	}
+	previewRec := previewMsgs[len(previewMsgs)-1]
+
+	// --- Step 5: Buyer accepts preview; scrip hold created ---
+	buyerAcceptMsg := sendBuyerAcceptViaPreview(t, h, eng, previewRec.ID, entry.EntryID)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	if !eng.State().IsMatchAccepted(matchMsg.ID) {
+		t.Error("step 5: match should be accepted in state after buyer-accept via preview")
+	}
+
+	// --- Step 6: Operator sends deliver trigger (no content field) ---
+	deliverTriggerPayload, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entry.EntryID,
+		"content_ref":  entry.ContentHash,
+		"content_size": len(originalContent),
+	})
+	deliverTriggerMsg := h.sendMessage(h.operator, deliverTriggerPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	// Engine dispatches deliver trigger → emits content-bearing deliver.
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	preCount := len(preMsgs)
+
+	deliverRec, _ := h.st.GetMessage(deliverTriggerMsg.ID)
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(deliverRec)); err != nil {
+		t.Fatalf("step 6: DispatchForTest deliver trigger: %v", err)
+	}
+
+	// --- Step 7: Assert buyer receives content with correct sha256 ---
+	postMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	if len(postMsgs) <= preCount {
+		t.Fatal("step 7: engine did not emit a new settle message after deliver trigger")
+	}
+
+	// Find the engine-emitted content-bearing deliver message.
+	var contentMsg *store.MessageRecord
+	for i := range postMsgs {
+		m := &postMsgs[i]
+		if m.Sender != h.operator.PublicKeyHex() {
+			continue
+		}
+		hasDeliverPhase := false
+		for _, tag := range m.Tags {
+			if tag == exchange.TagPhasePrefix+exchange.SettlePhaseStrDeliver {
+				hasDeliverPhase = true
+				break
+			}
+		}
+		if !hasDeliverPhase {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(m.Payload, &p); err != nil {
+			continue
+		}
+		if _, hasContent := p["content"]; hasContent {
+			contentMsg = m
+			break
+		}
+	}
+	if contentMsg == nil {
+		t.Fatal("step 7: engine did not emit a settle(deliver) message with content field")
+	}
+
+	// Decode and verify sha256.
+	var deliverPayload struct {
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(contentMsg.Payload, &deliverPayload); err != nil {
+		t.Fatalf("step 7: unmarshal deliver content payload: %v", err)
+	}
+	deliveredBytes, err := base64.StdEncoding.DecodeString(deliverPayload.Content)
+	if err != nil {
+		t.Fatalf("step 7: base64-decode delivered content: %v", err)
+	}
+	deliveredHash := sha256.Sum256(deliveredBytes)
+
+	// Assertion 1: delivered content sha256 matches original bytes.
+	if originalHash != deliveredHash {
+		t.Errorf("step 7 (sha256 match): delivered content hash mismatch:\n  got  sha256:%x\n  want sha256:%x",
+			deliveredHash, originalHash)
+	}
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	// --- Step 8: Buyer sends settle(complete); seller scrip balance increases ---
+	// Antecedent for settle(complete) is the operator's deliver trigger message
+	// (deliverTriggerMsg), not the engine-emitted content message. The state
+	// machine uses deliverToMatch which maps the operator trigger ID → match ID.
+	sellerBalanceBefore := cs.Balance(h.seller.PublicKeyHex())
+
+	completeP, _ := json.Marshal(map[string]any{"entry_id": entry.EntryID})
+	completeMsg := h.sendMessage(h.buyer, completeP,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverTriggerMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	completeMsgRec, err := h.st.GetMessage(completeMsg.ID)
+	if err != nil {
+		t.Fatalf("step 8: GetMessage complete: %v", err)
+	}
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(completeMsgRec)); err != nil {
+		t.Fatalf("step 8: DispatchForTest complete: %v", err)
+	}
+
+	// Assertion 2: seller scrip balance increased after settle(complete).
+	sellerBalanceAfter := cs.Balance(h.seller.PublicKeyHex())
+	if sellerBalanceAfter != sellerBalanceBefore+expectedResidual {
+		t.Errorf("step 8 (seller scrip): seller balance = %d, want %d (before=%d + residual=%d)",
+			sellerBalanceAfter, sellerBalanceBefore+expectedResidual, sellerBalanceBefore, expectedResidual)
+	}
+
+	// Assertion 3: no engine error log entries.
+	logMu.Lock()
+	errs := append([]string(nil), errorLog...)
+	logMu.Unlock()
+	if len(errs) > 0 {
+		t.Errorf("step 9 (no errors): engine emitted %d error-level log lines:\n  %s",
+			len(errs), strings.Join(errs, "\n  "))
+	}
 }
