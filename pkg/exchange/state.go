@@ -769,7 +769,7 @@ func exchangeOp(tags []string) string {
 		switch t {
 		case TagPut, TagBuy, TagMatch, TagSettle,
 			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
-			TagAssignExpire:
+			TagAssignExpire, TagAssignAuctionClose:
 			return t
 		}
 	}

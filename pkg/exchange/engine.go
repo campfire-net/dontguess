@@ -1639,7 +1639,7 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 	}
 
 	e.opts.log("engine: assign-accept: bounty paid assign_id=%s worker=%s amount=%d",
-		shortKey(rec.AssignID), shortKey(rec.ClaimantKey), rec.Reward)
+		shortKey(rec.AssignID), shortKey(rec.ClaimantKey), payAmount)
 	return nil
 }
 
