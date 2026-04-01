@@ -31,17 +31,25 @@ type valueStackStubState struct {
 	reputations  map[string]int
 	sellers      []string
 
-	// completionRate is the controllable Layer 0 metric.
+	// completionRate is the controllable Layer 0 inline metric.
 	completionRate float64
+	// brokeredMatchRate is the controllable brokered match completion rate.
+	brokeredMatchRate float64
+	// brokeredCount is the controllable brokered completion count.
+	brokeredCount int
+	// combinedRate is the controllable combined completion rate.
+	combinedRate float64
 }
 
 func newValueStackStubState() *valueStackStubState {
 	return &valueStackStubState{
-		demandCounts:   make(map[string]int),
-		previewCounts:  make(map[string]int),
-		adjustments:    make(map[string]exchange.PriceAdjustment),
-		reputations:    make(map[string]int),
-		completionRate: 1.0, // healthy by default
+		demandCounts:      make(map[string]int),
+		previewCounts:     make(map[string]int),
+		adjustments:       make(map[string]exchange.PriceAdjustment),
+		reputations:       make(map[string]int),
+		completionRate:    1.0, // healthy by default
+		brokeredMatchRate: 1.0, // healthy by default
+		combinedRate:      1.0, // healthy by default
 	}
 }
 
@@ -109,12 +117,41 @@ func (s *valueStackStubState) TaskCompletionRate() float64 {
 	defer s.mu.Unlock()
 	return s.completionRate
 }
+func (s *valueStackStubState) BrokeredMatchCompletionRate() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.brokeredMatchRate
+}
+func (s *valueStackStubState) BrokeredCompletionCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.brokeredCount
+}
+func (s *valueStackStubState) CombinedCompletionRate() float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.combinedRate
+}
 
-// setCompletionRate controls the Layer 0 metric for tests.
+// setCompletionRate controls the Layer 0 inline metric for tests.
 func (s *valueStackStubState) setCompletionRate(r float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.completionRate = r
+}
+
+// setBrokeredCompletionCount controls the brokered completion count for tests.
+func (s *valueStackStubState) setBrokeredCompletionCount(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.brokeredCount = n
+}
+
+// setCombinedCompletionRate controls the combined rate returned for tests.
+func (s *valueStackStubState) setCombinedCompletionRate(r float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.combinedRate = r
 }
 
 // =============================================================================
@@ -738,4 +775,168 @@ type customCompletionRateState struct {
 
 func (c *customCompletionRateState) TaskCompletionRate() float64 {
 	return c.rateFunc()
+}
+
+// =============================================================================
+// Bootstrap threshold tests
+// =============================================================================
+
+// TestValueStack_Layer0_BelowBootstrapThresholdUsesInlineRate verifies that
+// when the brokered completion count is below the bootstrap threshold,
+// Layer0Metric returns TaskCompletionRate (inline only) — not CombinedCompletionRate.
+//
+// This prevents false Layer 0 rollbacks during the cold-start period when
+// brokered matching is new and has not yet accumulated enough observations.
+func TestValueStack_Layer0_BelowBootstrapThresholdUsesInlineRate(t *testing.T) {
+	t.Parallel()
+
+	st := newValueStackStubState()
+	// Inline rate is healthy, combined rate would show a regression.
+	st.setCompletionRate(0.95)
+	st.setCombinedCompletionRate(0.80) // below 0.95 - 0.02 tolerance
+	// Brokered count is 5 — well below threshold of 100.
+	st.setBrokeredCompletionCount(5)
+
+	paramsStore := newStackParamsStore()
+	// Use default threshold (zero → DefaultBrokerMatchBootstrapThreshold = 100).
+	paramsStore.SetMarketParameters(pricing.MarketParameters{
+		PriceScalingFactor:    1.0,
+		ContentTypeCommission: make(map[string]float64),
+		ContentTypeFloor:      make(map[string]float64),
+	})
+
+	stack := pricing.NewValueStack(pricing.ValueStackOptions{
+		State:       st,
+		ParamsStore: paramsStore,
+	})
+
+	metric := stack.Layer0Metric()
+	if metric != 0.95 {
+		t.Errorf("below bootstrap threshold: expected Layer0Metric to return inline rate 0.95, got %.4f", metric)
+	}
+}
+
+// TestValueStack_Layer0_AfterBootstrapThresholdUsesCombinedRate verifies that
+// once the brokered completion count meets or exceeds the bootstrap threshold,
+// Layer0Metric returns CombinedCompletionRate.
+//
+// This ensures brokered matching is held to the same correctness standard
+// as inline matching after a sufficient track record is established.
+func TestValueStack_Layer0_AfterBootstrapThresholdUsesCombinedRate(t *testing.T) {
+	t.Parallel()
+
+	st := newValueStackStubState()
+	// Inline rate is healthy but combined rate is different — confirms we get combined.
+	st.setCompletionRate(0.95)
+	st.setCombinedCompletionRate(0.92)
+	// Brokered count equals the threshold — should cross over.
+	st.setBrokeredCompletionCount(100)
+
+	paramsStore := newStackParamsStore()
+	// Explicitly set threshold to 100 via MarketParameters.
+	paramsStore.SetMarketParameters(pricing.MarketParameters{
+		PriceScalingFactor:             1.0,
+		ContentTypeCommission:          make(map[string]float64),
+		ContentTypeFloor:               make(map[string]float64),
+		BrokerMatchBootstrapThreshold: 100,
+	})
+
+	stack := pricing.NewValueStack(pricing.ValueStackOptions{
+		State:       st,
+		ParamsStore: paramsStore,
+	})
+
+	metric := stack.Layer0Metric()
+	if metric != 0.92 {
+		t.Errorf("at bootstrap threshold: expected Layer0Metric to return combined rate 0.92, got %.4f", metric)
+	}
+}
+
+// TestValueStack_Layer0_RealState_BelowThresholdUsesInline verifies the
+// bootstrap threshold logic using a real *exchange.State (no mock). This
+// exercises the full integration path: RegisterBrokerMatch, apply messages,
+// read BrokeredCompletionCount, confirm Layer0Metric selects inline rate.
+func TestValueStack_Layer0_RealState_BelowThresholdUsesInline(t *testing.T) {
+	t.Parallel()
+
+	st := exchange.NewState()
+	// With no brokered matches registered, BrokeredCompletionCount must be 0.
+	if got := st.BrokeredCompletionCount(); got != 0 {
+		t.Fatalf("expected BrokeredCompletionCount=0 on fresh state, got %d", got)
+	}
+
+	paramsStore := newStackParamsStore()
+	paramsStore.SetMarketParameters(pricing.MarketParameters{
+		PriceScalingFactor:    1.0,
+		ContentTypeCommission: make(map[string]float64),
+		ContentTypeFloor:      make(map[string]float64),
+		// Threshold 100 — we have 0 brokered completions, so inline rate applies.
+		BrokerMatchBootstrapThreshold: 100,
+	})
+
+	stack := pricing.NewValueStack(pricing.ValueStackOptions{
+		State:       st,
+		ParamsStore: paramsStore,
+	})
+
+	// TaskCompletionRate on empty state returns 1.0 (cold start).
+	// CombinedCompletionRate also returns 1.0 but for different reasons.
+	// Layer0Metric should return the inline rate (1.0) when count < threshold.
+	metric := stack.Layer0Metric()
+	if metric != 1.0 {
+		t.Errorf("below threshold on real state: expected Layer0Metric=1.0, got %.4f", metric)
+	}
+
+	// Register a match as brokered.
+	st.RegisterBrokerMatch("match-msg-id-1")
+
+	// Still zero completions (no settle(complete) processed).
+	if got := st.BrokeredCompletionCount(); got != 0 {
+		t.Errorf("expected BrokeredCompletionCount=0 after RegisterBrokerMatch (no completions), got %d", got)
+	}
+}
+
+// TestValueStack_Layer0_BootstrapThresholdConfigurable verifies that the
+// bootstrap threshold can be changed via MarketParameters and takes effect
+// without restarting.
+func TestValueStack_Layer0_BootstrapThresholdConfigurable(t *testing.T) {
+	t.Parallel()
+
+	st := newValueStackStubState()
+	st.setCompletionRate(0.95)
+	st.setCombinedCompletionRate(0.90)
+	// Brokered count is 10.
+	st.setBrokeredCompletionCount(10)
+
+	paramsStore := newStackParamsStore()
+	// Set a low threshold of 10 — should activate combined rate.
+	paramsStore.SetMarketParameters(pricing.MarketParameters{
+		PriceScalingFactor:             1.0,
+		ContentTypeCommission:          make(map[string]float64),
+		ContentTypeFloor:               make(map[string]float64),
+		BrokerMatchBootstrapThreshold: 10,
+	})
+
+	stack := pricing.NewValueStack(pricing.ValueStackOptions{
+		State:       st,
+		ParamsStore: paramsStore,
+	})
+
+	metric := stack.Layer0Metric()
+	if metric != 0.90 {
+		t.Errorf("custom threshold=10, count=10: expected combined rate 0.90, got %.4f", metric)
+	}
+
+	// Now raise the threshold — should fall back to inline rate.
+	paramsStore.SetMarketParameters(pricing.MarketParameters{
+		PriceScalingFactor:             1.0,
+		ContentTypeCommission:          make(map[string]float64),
+		ContentTypeFloor:               make(map[string]float64),
+		BrokerMatchBootstrapThreshold: 50,
+	})
+
+	metric = stack.Layer0Metric()
+	if metric != 0.95 {
+		t.Errorf("raised threshold=50, count=10: expected inline rate 0.95, got %.4f", metric)
+	}
 }

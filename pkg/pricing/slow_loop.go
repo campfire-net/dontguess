@@ -86,6 +86,12 @@ const OscillationWindow = 10
 // is considered to be fitting noise. Below this, step size is halved.
 const OscillationThreshold = -0.3
 
+// DefaultBrokerMatchBootstrapThreshold is the default minimum number of
+// brokered-match completions before BrokeredMatchCompletionRate is folded into
+// the Layer 0 gate via CombinedCompletionRate. Configurable via
+// MarketParameters.BrokerMatchBootstrapThreshold.
+const DefaultBrokerMatchBootstrapThreshold = 100
+
 // MarketParameters holds the current market-level parameters written by the
 // slow loop. The exchange engine reads these to apply structural adjustments
 // above and beyond the fast and medium loop corrections.
@@ -103,6 +109,13 @@ type MarketParameters struct {
 	// Entries of this type will not be priced below this relative floor.
 	// Types not in this map use DefaultFloorMultiplier.
 	ContentTypeFloor map[string]float64
+
+	// BrokerMatchBootstrapThreshold is the minimum number of brokered-match
+	// completions required before BrokeredMatchCompletionRate is included in
+	// the Layer 0 gate via CombinedCompletionRate. Below this threshold, Layer 0
+	// uses only TaskCompletionRate (inline matches). Default: 100. Zero means
+	// use the package default (DefaultBrokerMatchBootstrapThreshold).
+	BrokerMatchBootstrapThreshold int
 
 	// UpdatedAt is when these parameters were last written.
 	UpdatedAt time.Time

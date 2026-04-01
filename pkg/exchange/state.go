@@ -542,6 +542,21 @@ type State struct {
 	// One offer per task hash — no duplicates. Offers expire after BuyMissOfferTTL.
 	// Key: SHA-256 hex of canonical task description.
 	buyMissOffers map[string]*BuyMissOffer
+
+	// brokerMatchIDs is the set of exchange:match message IDs that were produced
+	// by a brokered-match assign (task_type="brokered-match"). Populated externally
+	// by the engine when a brokered-match assign is accepted; NOT reset on Replay
+	// (it is written by the engine, not derived from the campfire log).
+	// Key: matchMsgID.
+	brokerMatchIDs map[string]struct{}
+
+	// brokeredAcceptedOrders is the count of accepted orders whose fulfilling
+	// match was brokered. Reset on Replay; derived from brokerMatchIDs + log.
+	brokeredAcceptedOrders int
+
+	// brokeredCompletions is the count of settle(complete) messages whose
+	// antecedent chain traces back to a brokered match. Reset on Replay.
+	brokeredCompletions int
 }
 
 // NewState creates an empty exchange state.
@@ -577,6 +592,7 @@ func NewState() *State {
 		claimedAssigns:       make(map[string]string),
 		pendingAssignResults: make(map[string]*AssignRecord),
 		buyMissOffers:        make(map[string]*BuyMissOffer),
+		brokerMatchIDs:       make(map[string]struct{}),
 	}
 }
 
@@ -616,8 +632,11 @@ func (s *State) Replay(msgs []Message) {
 	s.claimedAssigns = make(map[string]string)
 	s.pendingAssignResults = make(map[string]*AssignRecord)
 	s.buyMissOffers = make(map[string]*BuyMissOffer)
-	// Note: priceAdjustments is intentionally NOT reset on Replay.
-	// It is externally written by the fast pricing loop, not derived from the log.
+	// Note: priceAdjustments and brokerMatchIDs are intentionally NOT reset on
+	// Replay. They are externally written (by the fast pricing loop and engine
+	// respectively), not derived from the campfire log.
+	s.brokeredAcceptedOrders = 0
+	s.brokeredCompletions = 0
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -998,6 +1017,10 @@ func (s *State) applySettleBuyerAccept(msg *Message) {
 		// Update matchToEntry to the selected entry so the downstream chain
 		// (deliver → complete) resolves to the buyer's chosen entry.
 		s.matchToEntry[matchMsgID] = selectedEntry
+		// Track brokered accepted orders separately for Layer 0 bootstrap gate.
+		if _, brokered := s.brokerMatchIDs[matchMsgID]; brokered {
+			s.brokeredAcceptedOrders++
+		}
 	}
 	// Record buyer-accept → match mapping so deliver can trace the chain.
 	s.buyerAcceptToMatch[msg.ID] = matchMsgID
@@ -1117,6 +1140,11 @@ func (s *State) applySettleComplete(msg *Message) {
 
 	// Mark this message as processed before mutating any state.
 	s.completedSettlements[msg.ID] = struct{}{}
+
+	// Track brokered completions separately for the Layer 0 bootstrap gate.
+	if _, brokered := s.brokerMatchIDs[matchMsgID]; brokered {
+		s.brokeredCompletions++
+	}
 
 	buyerKey := msg.Sender
 	s.completedEntries[deliverMsgID] = buyerKey
@@ -2015,6 +2043,88 @@ func (s *State) TaskCompletionRate() float64 {
 	}
 	completed := len(s.completedSettlements)
 	return float64(completed) / float64(accepted)
+}
+
+// RegisterBrokerMatch marks a match message ID as having been produced by a
+// brokered-match assign. Called by the engine when it accepts an
+// exchange:assign-complete for a task_type="brokered-match" assign.
+//
+// This is NOT reset on Replay — the brokerMatchIDs set is externally managed
+// by the engine (not derived from the campfire log). The engine must re-register
+// all brokered match IDs after a Replay to ensure the counters are correct.
+// Thread-safe.
+func (s *State) RegisterBrokerMatch(matchMsgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.brokerMatchIDs[matchMsgID] = struct{}{}
+}
+
+// BrokeredMatchCompletionRate returns the fraction of brokered-match accepted
+// orders that have reached settle(complete). Used by the Layer 0 bootstrap gate
+// to measure brokered matching correctness independently from inline matching.
+//
+// Returns 1.0 when there are no brokered accepted orders yet (cold start).
+// The numerator is brokered completions; the denominator is brokered accepted orders.
+func (s *State) BrokeredMatchCompletionRate() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.brokeredAcceptedOrders == 0 {
+		return 1.0 // cold start: no brokered orders yet
+	}
+	return float64(s.brokeredCompletions) / float64(s.brokeredAcceptedOrders)
+}
+
+// BrokeredCompletionCount returns the raw count of brokered-match
+// settle(complete) messages processed. Used by the Layer 0 bootstrap gate
+// to determine whether the threshold for including brokered rate has been crossed.
+// Thread-safe.
+func (s *State) BrokeredCompletionCount() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.brokeredCompletions
+}
+
+// CombinedCompletionRate returns a weighted average of TaskCompletionRate and
+// BrokeredMatchCompletionRate. The weight is proportional to each path's share
+// of total accepted orders.
+//
+// Used by Layer0Metric after the bootstrap threshold is reached.
+// Returns 1.0 when there are no accepted orders at all (cold start).
+func (s *State) CombinedCompletionRate() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	total := len(s.acceptedOrders)
+	if total == 0 {
+		return 1.0 // cold start
+	}
+	inlineAccepted := total - s.brokeredAcceptedOrders
+	if inlineAccepted < 0 {
+		inlineAccepted = 0
+	}
+
+	// Compute inline and brokered rates independently.
+	var inlineRate float64
+	if inlineAccepted == 0 {
+		inlineRate = 1.0
+	} else {
+		inlineCompleted := len(s.completedSettlements) - s.brokeredCompletions
+		if inlineCompleted < 0 {
+			inlineCompleted = 0
+		}
+		inlineRate = float64(inlineCompleted) / float64(inlineAccepted)
+	}
+
+	var brokerRate float64
+	if s.brokeredAcceptedOrders == 0 {
+		brokerRate = 1.0
+	} else {
+		brokerRate = float64(s.brokeredCompletions) / float64(s.brokeredAcceptedOrders)
+	}
+
+	// Weighted average by share of total accepted orders.
+	inlineWeight := float64(inlineAccepted) / float64(total)
+	brokerWeight := float64(s.brokeredAcceptedOrders) / float64(total)
+	return inlineRate*inlineWeight + brokerRate*brokerWeight
 }
 
 // AllSellerKeys returns the deduplicated set of seller public keys that have
