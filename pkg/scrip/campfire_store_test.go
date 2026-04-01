@@ -1874,3 +1874,49 @@ func TestTotalOutstandingVig_AcrossLoans(t *testing.T) {
 		t.Errorf("TotalOutstandingVig = %d, want 300", got)
 	}
 }
+
+// TestLoanRepay_ClearsOutstandingVig verifies that a full repayment zeroes
+// LoanRecord.Outstanding even when vig was accrued before repayment.
+//
+// Scenario: mint loan (principal=1000), accrue vig (50), fully repay (1000).
+// After repayment: Outstanding must be 0, Status must be LoanRepaid.
+// TotalOutstandingVig must also be 0.
+func TestLoanRepay_ClearsOutstandingVig(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 1000,
+		DueAt:     dueAt,
+		LoanID:    "loan-repay-clears-vig",
+	})
+
+	// Accrue vig before repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "loan-repay-clears-vig",
+		Amount: 50,
+	})
+
+	// Full repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-clears-vig",
+		Amount: 1000,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-repay-clears-vig")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Status != scrip.LoanRepaid {
+		t.Errorf("Status = %v, want LoanRepaid", rec.Status)
+	}
+	if rec.Outstanding != 0 {
+		t.Errorf("Outstanding = %d, want 0 after full repayment (accrued vig must be cleared)", rec.Outstanding)
+	}
+	if got := cs.TotalOutstandingVig(); got != 0 {
+		t.Errorf("TotalOutstandingVig = %d, want 0 (repaid loan must not contribute to vig pressure)", got)
+	}
+}
