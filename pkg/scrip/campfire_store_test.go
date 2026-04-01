@@ -1198,3 +1198,329 @@ func TestConcurrentGetReservation_NoDeadlock(t *testing.T) {
 		}
 	}
 }
+
+// --- scrip:loan-mint tests ---
+
+// TestLoanMint_LoanRecordStored verifies that applyLoanMint creates a LoanRecord
+// in the store, credits the borrower's balance, and indexes by borrower key.
+func TestLoanMint_LoanRecordStored(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         500,
+		VigRateBPS:        200,
+		DueAt:             dueAt,
+		LoanID:            "loan-001",
+		SettlementMsgID:   "settle-msg-abc",
+		CommitmentTokenID: "token-xyz",
+	})
+
+	cs := newStore(t, env)
+
+	// Borrower balance must equal the minted principal.
+	bal := cs.Balance(agentAlice)
+	if bal != 500 {
+		t.Errorf("balance = %d, want 500", bal)
+	}
+
+	// LoanRecord must be retrievable.
+	rec, ok := cs.GetLoan("loan-001")
+	if !ok {
+		t.Fatal("GetLoan(loan-001): not found")
+	}
+	if rec.BorrowerKey != agentAlice {
+		t.Errorf("BorrowerKey = %q, want %q", rec.BorrowerKey, agentAlice)
+	}
+	if rec.Principal != 500 {
+		t.Errorf("Principal = %d, want 500", rec.Principal)
+	}
+	if rec.VigRateBPS != 200 {
+		t.Errorf("VigRateBPS = %d, want 200", rec.VigRateBPS)
+	}
+	if rec.SettlementMsgID != "settle-msg-abc" {
+		t.Errorf("SettlementMsgID = %q, want settle-msg-abc", rec.SettlementMsgID)
+	}
+	if rec.CommitmentID != "token-xyz" {
+		t.Errorf("CommitmentID = %q, want token-xyz", rec.CommitmentID)
+	}
+	if rec.Status != scrip.LoanActive {
+		t.Errorf("Status = %v, want LoanActive", rec.Status)
+	}
+
+	// loansByBorrower index must include the loan.
+	ids := cs.LoansByBorrower(agentAlice)
+	if len(ids) != 1 || ids[0] != "loan-001" {
+		t.Errorf("LoansByBorrower = %v, want [loan-001]", ids)
+	}
+}
+
+// TestLoanMint_TotalSupplyInvariant verifies that loan-mint increments totalSupply
+// and totalLoanPrincipal by the principal, and that they track independently of
+// regular mints.
+func TestLoanMint_TotalSupplyInvariant(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Regular mint for 1000 to Bob.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripMint, scrip.MintPayload{
+		Recipient: agentBob,
+		Amount:    1000,
+		Rate:      1000,
+	})
+
+	// Loan mint for 500 to Alice.
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         500,
+		VigRateBPS:        200,
+		DueAt:             dueAt,
+		LoanID:            "loan-supply-test",
+		SettlementMsgID:   "settle-msg-supply",
+		CommitmentTokenID: "token-supply",
+	})
+
+	cs := newStore(t, env)
+
+	// TotalSupply = regular mint + loan mint.
+	if got := cs.TotalSupply(); got != 1500 {
+		t.Errorf("TotalSupply = %d, want 1500", got)
+	}
+
+	// TotalLoanPrincipal tracks only the loan portion.
+	if got := cs.TotalLoanPrincipal(); got != 500 {
+		t.Errorf("TotalLoanPrincipal = %d, want 500", got)
+	}
+}
+
+// TestLoanMint_Replay verifies that a loan-mint message is correctly replayed
+// on Replay(), producing identical state to an initial build from the log.
+func TestLoanMint_Replay(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(12 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         300,
+		VigRateBPS:        100,
+		DueAt:             dueAt,
+		LoanID:            "loan-replay",
+		SettlementMsgID:   "settle-replay",
+		CommitmentTokenID: "token-replay",
+	})
+
+	cs := newStore(t, env)
+
+	// Verify state before replay.
+	if cs.Balance(agentAlice) != 300 {
+		t.Fatalf("pre-replay balance = %d, want 300", cs.Balance(agentAlice))
+	}
+
+	// Force a Replay and verify state is identical.
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+
+	if bal := cs.Balance(agentAlice); bal != 300 {
+		t.Errorf("post-replay balance = %d, want 300", bal)
+	}
+	if got := cs.TotalSupply(); got != 300 {
+		t.Errorf("post-replay TotalSupply = %d, want 300", got)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 300 {
+		t.Errorf("post-replay TotalLoanPrincipal = %d, want 300", got)
+	}
+
+	rec, ok := cs.GetLoan("loan-replay")
+	if !ok {
+		t.Fatal("post-replay GetLoan(loan-replay): not found")
+	}
+	if rec.Principal != 300 {
+		t.Errorf("post-replay Principal = %d, want 300", rec.Principal)
+	}
+}
+
+// TestLoanMint_LiveMode verifies that ApplyMessage in live mode applies a loan-mint
+// message and updates balance, supply, and loan records correctly.
+func TestLoanMint_LiveMode(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Build a store with no prior messages.
+	cs := newStore(t, env)
+
+	dueAt := time.Now().Add(6 * time.Hour).UTC().Format(time.RFC3339)
+	payloadBytes, err := json.Marshal(scrip.LoanMintPayload{
+		Borrower:          agentBob,
+		Principal:         750,
+		VigRateBPS:        150,
+		DueAt:             dueAt,
+		LoanID:            "loan-live",
+		SettlementMsgID:   "settle-live",
+		CommitmentTokenID: "token-live",
+	})
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+
+	liveMsg := proto.Message{
+		ID:         "loan-live-msg-id",
+		CampfireID: env.campfireID,
+		Sender:     env.operatorKey,
+		Payload:    payloadBytes,
+		Tags:       []string{scrip.TagScripLoanMint},
+		Timestamp:  time.Now().UnixNano(),
+	}
+	cs.ApplyMessage(&liveMsg)
+
+	if bal := cs.Balance(agentBob); bal != 750 {
+		t.Errorf("live mode balance = %d, want 750", bal)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 750 {
+		t.Errorf("live mode TotalLoanPrincipal = %d, want 750", got)
+	}
+	rec, ok := cs.GetLoan("loan-live")
+	if !ok {
+		t.Fatal("live mode GetLoan(loan-live): not found")
+	}
+	if rec.BorrowerKey != agentBob {
+		t.Errorf("live mode BorrowerKey = %q, want %q", rec.BorrowerKey, agentBob)
+	}
+}
+
+// TestLoanMint_DuplicateLoanID_Idempotent verifies that a duplicate loan_id in two
+// distinct messages does not double-credit the borrower or create a duplicate record.
+func TestLoanMint_DuplicateLoanID_Idempotent(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	payload := scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         400,
+		VigRateBPS:        200,
+		DueAt:             dueAt,
+		LoanID:            "loan-dup",
+		SettlementMsgID:   "settle-dup",
+		CommitmentTokenID: "token-dup",
+	}
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, payload)
+
+	// Second message — same loan_id, different message ID (seenMsgIDs won't filter it).
+	payload2 := scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         400,
+		VigRateBPS:        200,
+		DueAt:             dueAt,
+		LoanID:            "loan-dup", // same loan_id
+		SettlementMsgID:   "settle-dup-2",
+		CommitmentTokenID: "token-dup-2",
+	}
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, payload2)
+
+	cs := newStore(t, env)
+
+	// Only the first loan should have been applied; balance must be 400, not 800.
+	if bal := cs.Balance(agentAlice); bal != 400 {
+		t.Errorf("balance = %d, want 400 (duplicate loan_id must not double-credit)", bal)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 400 {
+		t.Errorf("TotalLoanPrincipal = %d, want 400", got)
+	}
+	ids := cs.LoansByBorrower(agentAlice)
+	if len(ids) != 1 {
+		t.Errorf("LoansByBorrower len = %d, want 1 (duplicate must not create second record)", len(ids))
+	}
+}
+
+// TestLoanMint_InvalidPayload_Rejected verifies that loan-mint messages with missing
+// required fields (borrower, loan_id, principal <= 0) are silently ignored.
+func TestLoanMint_InvalidPayload_Rejected(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Missing borrower.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+		"principal": int64(100),
+		"loan_id":   "loan-no-borrower",
+	})
+	// Missing loan_id.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+		"borrower":  agentAlice,
+		"principal": int64(100),
+	})
+	// Zero principal.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+		"borrower":  agentAlice,
+		"loan_id":   "loan-zero-principal",
+		"principal": int64(0),
+	})
+
+	cs := newStore(t, env)
+
+	if bal := cs.Balance(agentAlice); bal != 0 {
+		t.Errorf("balance = %d, want 0 (invalid messages must not credit borrower)", bal)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 0 {
+		t.Errorf("TotalLoanPrincipal = %d, want 0", got)
+	}
+}
+
+// TestLoanMint_MultipleBorrowers verifies that multiple borrowers each get their own
+// loan records and balances, and loansByBorrower indexes them separately.
+func TestLoanMint_MultipleBorrowers(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         600,
+		VigRateBPS:        200,
+		DueAt:             dueAt,
+		LoanID:            "loan-alice-1",
+		SettlementMsgID:   "settle-a1",
+		CommitmentTokenID: "token-a1",
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentAlice,
+		Principal:         400,
+		VigRateBPS:        150,
+		DueAt:             dueAt,
+		LoanID:            "loan-alice-2",
+		SettlementMsgID:   "settle-a2",
+		CommitmentTokenID: "token-a2",
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:          agentBob,
+		Principal:         200,
+		VigRateBPS:        300,
+		DueAt:             dueAt,
+		LoanID:            "loan-bob-1",
+		SettlementMsgID:   "settle-b1",
+		CommitmentTokenID: "token-b1",
+	})
+
+	cs := newStore(t, env)
+
+	if bal := cs.Balance(agentAlice); bal != 1000 {
+		t.Errorf("Alice balance = %d, want 1000", bal)
+	}
+	if bal := cs.Balance(agentBob); bal != 200 {
+		t.Errorf("Bob balance = %d, want 200", bal)
+	}
+
+	aliceLoans := cs.LoansByBorrower(agentAlice)
+	if len(aliceLoans) != 2 {
+		t.Errorf("Alice loan count = %d, want 2", len(aliceLoans))
+	}
+	bobLoans := cs.LoansByBorrower(agentBob)
+	if len(bobLoans) != 1 {
+		t.Errorf("Bob loan count = %d, want 1", len(bobLoans))
+	}
+
+	// TotalSupply and TotalLoanPrincipal cover all three loans.
+	if got := cs.TotalSupply(); got != 1200 {
+		t.Errorf("TotalSupply = %d, want 1200", got)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 1200 {
+		t.Errorf("TotalLoanPrincipal = %d, want 1200", got)
+	}
+}
