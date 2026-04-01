@@ -197,6 +197,17 @@ type ActiveOrder struct {
 	CompressionTier string
 	// CreatedAt is when the buy message was received (nanoseconds).
 	CreatedAt int64
+
+	// GuaranteeDeadline is the absolute time by which the exchange guarantees
+	// delivery for insured orders. Zero means no guarantee was purchased.
+	// Set from the buy payload's guarantee_deadline field (seconds from receive
+	// time). Engine checks this in handleSettle(complete) to detect misses.
+	GuaranteeDeadline time.Time
+
+	// InsuredAmount is the total scrip (match_price + premium) escrowed for an
+	// insured order. Non-zero only when GuaranteeDeadline is set. Used by the
+	// engine to issue the full refund on deadline miss.
+	InsuredAmount int64
 }
 
 // IsExpired returns true if the order is more than OrderExpiry old.
@@ -378,6 +389,28 @@ type AssignRecord struct {
 	// to bound assignByID growth (A9 mitigation). Zero means no deadline.
 	// Workers may not claim assigns past their DeadlineAt.
 	DeadlineAt time.Time
+
+	// ClaimedAt is the wall-clock time when the assign was claimed. Populated by
+	// applyAssignClaim (and applyAssignAuctionClose for auction-based claims).
+	// Used together with CompletedAt to compute claim-to-complete latency for the
+	// actuarial table.
+	ClaimedAt time.Time
+
+	// CompletedAt is the wall-clock time when assign-complete was processed.
+	// Populated by applyAssignComplete. Zero if the assign was never completed.
+	CompletedAt time.Time
+
+	// GuaranteeDeadline is the absolute time by which the exchange guarantees
+	// delivery for insured orders. Zero means no guarantee was purchased.
+	// Set from the buy payload's guarantee_deadline field (converted to absolute
+	// time at buy-time). Engine checks this in handleSettle(complete) to detect
+	// deadline misses and issue automatic dispute-refunds.
+	GuaranteeDeadline time.Time
+
+	// InsuredAmount is the total scrip amount (match_price + premium) held in
+	// escrow for an insured order. Non-zero only when GuaranteeDeadline is set.
+	// Used by the engine to issue the full refund on deadline miss.
+	InsuredAmount int64
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -716,6 +749,17 @@ type State struct {
 	// Key: SHA-256 hex of canonical task description.
 	buyMissOffers map[string]*BuyMissOffer
 
+	// matchToBuyMsgID maps a match message ID to the buy message ID it fulfills.
+	// Populated by applyMatch from the match antecedent.
+	matchToBuyMsgID map[string]string
+
+	// matchGuarantee maps a match message ID to the insurance terms for the
+	// corresponding buy order. Set in applyMatch when the buy order has a
+	// GuaranteeDeadline. Persists after the order leaves activeOrders so the
+	// settle(complete) handler can still check the deadline.
+	// Key: matchMsgID. Value: [deadline, insuredAmount].
+	matchGuarantee map[string][2]int64 // [deadline_unix_ns, insured_amount]
+
 	// brokerAssigns maps buy message IDs to the assign message IDs of the
 	// brokered-match task posted for that buy. Populated by applyAssign when
 	// task_type="brokered-match" and buy_msg_id is present. Derived from the
@@ -800,6 +844,8 @@ func NewState() *State {
 		claimedAssigns:       make(map[string]string),
 		pendingAssignResults: make(map[string]*AssignRecord),
 		buyMissOffers:        make(map[string]*BuyMissOffer),
+		matchToBuyMsgID:      make(map[string]string),
+		matchGuarantee:       make(map[string][2]int64),
 		brokerAssigns:        make(map[string]string),
 		brokerMatchIDs:       make(map[string]struct{}),
 		debtorScores:         make(map[string]float64),
@@ -845,6 +891,8 @@ func (s *State) Replay(msgs []Message) {
 	s.claimedAssigns = make(map[string]string)
 	s.pendingAssignResults = make(map[string]*AssignRecord)
 	s.buyMissOffers = make(map[string]*BuyMissOffer)
+	s.matchToBuyMsgID = make(map[string]string)
+	s.matchGuarantee = make(map[string][2]int64)
 	s.brokerAssigns = make(map[string]string)
 	s.coOccurrence = make(map[string]*coOccurrenceMap)
 	// Note: priceAdjustments and brokerMatchIDs are intentionally NOT reset on
@@ -1047,14 +1095,16 @@ func (s *State) applyPut(msg *Message) {
 // applyBuy processes an exchange:buy message.
 func (s *State) applyBuy(msg *Message) {
 	var payload struct {
-		Task            string   `json:"task"`
-		Budget          int64    `json:"budget"`
-		MinReputation   int      `json:"min_reputation"`
-		FreshnessHours  int      `json:"freshness_hours"`
-		ContentType     string   `json:"content_type"`
-		Domains         []string `json:"domains"`
-		MaxResults      int      `json:"max_results"`
-		CompressionTier string   `json:"compression_tier"`
+		Task                     string   `json:"task"`
+		Budget                   int64    `json:"budget"`
+		MinReputation            int      `json:"min_reputation"`
+		FreshnessHours           int      `json:"freshness_hours"`
+		ContentType              string   `json:"content_type"`
+		Domains                  []string `json:"domains"`
+		MaxResults               int      `json:"max_results"`
+		CompressionTier          string   `json:"compression_tier"`
+		GuaranteeDeadlineSeconds int      `json:"guarantee_deadline_seconds"`
+		InsuredAmount            int64    `json:"insured_amount"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
@@ -1082,6 +1132,17 @@ func (s *State) applyBuy(msg *Message) {
 		MaxResults:      maxResults,
 		CompressionTier: payload.CompressionTier,
 		CreatedAt:       msg.Timestamp,
+		InsuredAmount:   payload.InsuredAmount,
+	}
+	// Set guarantee deadline: receive time + deadline seconds from payload.
+	if payload.GuaranteeDeadlineSeconds > 0 {
+		receivedAt := time.Now().UTC()
+		if msg.Timestamp > 0 {
+			receivedAt = time.Unix(0, msg.Timestamp).UTC()
+		}
+		order.GuaranteeDeadline = receivedAt.Add(
+			time.Duration(payload.GuaranteeDeadlineSeconds) * time.Second,
+		)
 	}
 	s.activeOrders[msg.ID] = order
 }
@@ -1097,10 +1158,18 @@ func (s *State) applyMatch(msg *Message) {
 	}
 	buyMsgID := msg.Antecedents[0]
 	s.matchedOrders[buyMsgID] = struct{}{}
+	// Track match → buy correlation for guarantee deadline lookup at settle time.
+	s.matchToBuyMsgID[msg.ID] = buyMsgID
 
-	// Find the buyer key from the order.
+	// Find the buyer key from the order; also snapshot guarantee terms.
 	if order, ok := s.activeOrders[buyMsgID]; ok {
 		s.matchToBuyer[msg.ID] = order.BuyerKey
+		if !order.GuaranteeDeadline.IsZero() {
+			s.matchGuarantee[msg.ID] = [2]int64{
+				order.GuaranteeDeadline.UnixNano(),
+				order.InsuredAmount,
+			}
+		}
 	}
 
 	// Extract all result entry_ids.
@@ -1765,10 +1834,15 @@ func (s *State) applyAssignClaim(msg *Message) {
 			}
 		}
 	}
+	claimTime := time.Now().UTC()
+	if msg.Timestamp > 0 {
+		claimTime = time.Unix(0, msg.Timestamp).UTC()
+	}
 	rec.Status = AssignClaimed
 	rec.ClaimantKey = msg.Sender
 	rec.ClaimMsgID = msg.ID
 	rec.ClaimExpiresAt = expiresAt
+	rec.ClaimedAt = claimTime
 	s.claimedAssigns[msg.Sender] = assignID
 }
 
@@ -1828,6 +1902,10 @@ func (s *State) applyAssignAuctionClose(msg *Message) {
 	}
 
 	// Transition to AssignClaimed with the Vickrey winner.
+	auctionCloseTime := time.Now().UTC()
+	if msg.Timestamp > 0 {
+		auctionCloseTime = time.Unix(0, msg.Timestamp).UTC()
+	}
 	ceiling := rec.AssignReceivedAt.Add(time.Duration(rec.ClaimTimeoutMinutes) * time.Minute)
 	rec.Status = AssignClaimed
 	rec.ClaimantKey = winner.WorkerKey
@@ -1835,6 +1913,7 @@ func (s *State) applyAssignAuctionClose(msg *Message) {
 	rec.ClaimExpiresAt = ceiling
 	rec.VickreyPrice = clearingPrice
 	rec.DifficultyTier = tier
+	rec.ClaimedAt = auctionCloseTime
 	s.claimedAssigns[winner.WorkerKey] = assignID
 }
 
@@ -1875,9 +1954,14 @@ func (s *State) applyAssignComplete(msg *Message) {
 	if !rec.ClaimExpiresAt.IsZero() && time.Now().UTC().After(rec.ClaimExpiresAt) {
 		return
 	}
+	completeTime := time.Now().UTC()
+	if msg.Timestamp > 0 {
+		completeTime = time.Unix(0, msg.Timestamp).UTC()
+	}
 	rec.Status = AssignCompleted
 	rec.CompleteMsgID = msg.ID
 	rec.Result = msg.Payload
+	rec.CompletedAt = completeTime
 	// Release the agent's active claim slot.
 	delete(s.claimedAssigns, msg.Sender)
 	// Index for operator review.
@@ -2927,4 +3011,61 @@ func medianInt(vals []int) int {
 		return (cp[mid-1] + cp[mid]) / 2
 	}
 	return cp[mid]
+}
+
+// AssignCompletionSample holds a single assign lifecycle observation for
+// actuarial table computation. Returned by AssignCompletionSamples() for the
+// slow loop to build per-task-type latency statistics and fill rates.
+type AssignCompletionSample struct {
+	// TaskType is the assign task_type field (e.g. "brokered-match", "freshness").
+	TaskType string
+	// Latency is the time from claim to complete. Zero if Completed is false.
+	Latency time.Duration
+	// Completed is true when the assign reached AssignCompleted state.
+	// False means it was posted but never reached assign-complete (reduces fill rate).
+	Completed bool
+}
+
+// AssignCompletionSamples returns all assign lifecycle samples for actuarial
+// table computation by the slow loop. One sample per assign record.
+//
+// A sample is "Completed" if the assign reached AssignCompleted (or beyond) and
+// both ClaimedAt and CompletedAt are non-zero. Latency is CompletedAt - ClaimedAt.
+//
+// Thread-safe.
+func (s *State) AssignCompletionSamples() []AssignCompletionSample {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	out := make([]AssignCompletionSample, 0, len(s.assignByID))
+	for _, rec := range s.assignByID {
+		sample := AssignCompletionSample{
+			TaskType: rec.TaskType,
+		}
+		if !rec.ClaimedAt.IsZero() && !rec.CompletedAt.IsZero() &&
+			rec.Status >= AssignCompleted {
+			sample.Completed = true
+			latency := rec.CompletedAt.Sub(rec.ClaimedAt)
+			if latency > 0 {
+				sample.Latency = latency
+			}
+		}
+		out = append(out, sample)
+	}
+	return out
+}
+
+// GuaranteeForMatch returns the GuaranteeDeadline and InsuredAmount for the
+// order that was fulfilled by the given match message ID. Returns zero values
+// if the match has no corresponding insured order or the deadline is zero.
+// Thread-safe.
+func (s *State) GuaranteeForMatch(matchMsgID string) (deadline time.Time, insuredAmount int64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	g, found := s.matchGuarantee[matchMsgID]
+	if !found || g[0] == 0 {
+		return
+	}
+	return time.Unix(0, g[0]).UTC(), g[1], true
 }
