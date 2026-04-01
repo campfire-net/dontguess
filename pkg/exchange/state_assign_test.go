@@ -1100,3 +1100,156 @@ func TestPendingAuctionClose(t *testing.T) {
 		t.Errorf("expected assign-pa1, got %s", pending[0])
 	}
 }
+
+// TestAssignLookupByClaimMsgID verifies that claimMsgToAssign is populated on
+// claim and used for O(1) lookup in applyAssignComplete/applyAssignExpire.
+func TestAssignLookupByClaimMsgID(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	// Assign → Claim
+	s.Apply(ptr(makeAssignMsg("assign-idx1", operatorKey, "entry-x", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-idx1", agentKey, "assign-idx1")))
+
+	// Index must be populated after claim.
+	s.mu.RLock()
+	assignID, ok := s.claimMsgToAssign["claim-idx1"]
+	s.mu.RUnlock()
+	if !ok {
+		t.Fatal("claimMsgToAssign missing entry for claim-idx1 after claim")
+	}
+	if assignID != "assign-idx1" {
+		t.Errorf("claimMsgToAssign[claim-idx1] = %q, want %q", assignID, "assign-idx1")
+	}
+
+	// Complete uses the index (no linear scan): index entry should be removed,
+	// and the record transitions to AssignCompleted.
+	s.Apply(ptr(makeAssignCompleteMsg("complete-idx1", agentKey, "claim-idx1", nil)))
+
+	s.mu.RLock()
+	_, stillPresent := s.claimMsgToAssign["claim-idx1"]
+	rec := s.assignByID["assign-idx1"]
+	s.mu.RUnlock()
+
+	if stillPresent {
+		t.Error("claimMsgToAssign entry should be removed after complete")
+	}
+	if rec == nil {
+		t.Fatal("assign record not found after complete")
+	}
+	if rec.Status != AssignCompleted {
+		t.Errorf("expected AssignCompleted, got %v", rec.Status)
+	}
+}
+
+// TestAssignLookupByClaimMsgIDExpire verifies that claimMsgToAssign is removed
+// on expire (applyAssignExpire path).
+func TestAssignLookupByClaimMsgIDExpire(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-exp2", operatorKey, "entry-y", "freshness", 50, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-exp2", agentKey, "assign-exp2")))
+
+	// Verify index populated.
+	s.mu.RLock()
+	_, ok := s.claimMsgToAssign["claim-exp2"]
+	s.mu.RUnlock()
+	if !ok {
+		t.Fatal("claimMsgToAssign missing after claim")
+	}
+
+	// Expire the claim.
+	expireMsg := Message{
+		ID:          "expire-exp2",
+		Sender:      operatorKey,
+		Tags:        []string{TagAssignExpire},
+		Antecedents: []string{"claim-exp2"},
+		Payload:     []byte(`{}`),
+	}
+	s.Apply(&expireMsg)
+
+	s.mu.RLock()
+	_, stillPresent := s.claimMsgToAssign["claim-exp2"]
+	rec := s.assignByID["assign-exp2"]
+	s.mu.RUnlock()
+
+	if stillPresent {
+		t.Error("claimMsgToAssign entry should be removed after expire")
+	}
+	if rec == nil || rec.Status != AssignOpen {
+		t.Errorf("expected assign back to AssignOpen after expire, got %v", rec)
+	}
+}
+
+// TestAssignLookupByCompleteMsgID verifies that completeMsgToAssign is populated
+// after complete and used for O(1) lookup in ClaimAssignPayment.
+func TestAssignLookupByCompleteMsgID(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	// Full lifecycle: assign → claim → complete → accept
+	s.Apply(ptr(makeAssignMsg("assign-pay1", operatorKey, "entry-z", "freshness", 200, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-pay1", agentKey, "assign-pay1")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-pay1", agentKey, "claim-pay1", nil)))
+
+	// completeMsgToAssign must be populated after complete.
+	s.mu.RLock()
+	assignID, ok := s.completeMsgToAssign["complete-pay1"]
+	s.mu.RUnlock()
+	if !ok {
+		t.Fatal("completeMsgToAssign missing entry for complete-pay1 after complete")
+	}
+	if assignID != "assign-pay1" {
+		t.Errorf("completeMsgToAssign[complete-pay1] = %q, want %q", assignID, "assign-pay1")
+	}
+
+	// Accept the result.
+	s.Apply(ptr(makeAssignAcceptMsg("accept-pay1", operatorKey, "complete-pay1")))
+
+	// ClaimAssignPayment should use the index and return the record.
+	rec := s.ClaimAssignPayment("complete-pay1")
+	if rec == nil {
+		t.Fatal("ClaimAssignPayment returned nil — index lookup failed")
+	}
+	if rec.Status != AssignPaid {
+		t.Errorf("expected AssignPaid, got %v", rec.Status)
+	}
+	if rec.AssignID != "assign-pay1" {
+		t.Errorf("expected assign-pay1, got %s", rec.AssignID)
+	}
+}
+
+// TestAssignLookupByCompleteMsgIDReject verifies that completeMsgToAssign is
+// removed on reject (applyAssignReject path).
+func TestAssignLookupByCompleteMsgIDReject(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	s.Apply(ptr(makeAssignMsg("assign-rej2", operatorKey, "entry-w", "freshness", 50, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-rej2", agentKey, "assign-rej2")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-rej2", agentKey, "claim-rej2", nil)))
+
+	// Verify index populated.
+	s.mu.RLock()
+	_, ok := s.completeMsgToAssign["complete-rej2"]
+	s.mu.RUnlock()
+	if !ok {
+		t.Fatal("completeMsgToAssign missing after complete")
+	}
+
+	// Reject — assign resets to open, index entry removed.
+	s.Apply(ptr(makeAssignRejectMsg("reject-rej2", operatorKey, "complete-rej2")))
+
+	s.mu.RLock()
+	_, stillPresent := s.completeMsgToAssign["complete-rej2"]
+	rec := s.assignByID["assign-rej2"]
+	s.mu.RUnlock()
+
+	if stillPresent {
+		t.Error("completeMsgToAssign entry should be removed after reject")
+	}
+	if rec == nil || rec.Status != AssignOpen {
+		t.Errorf("expected assign back to AssignOpen after reject, got %v", rec)
+	}
+}

@@ -750,6 +750,17 @@ type State struct {
 	// for operator accept/reject. Key: completeMsgID -> *AssignRecord.
 	pendingAssignResults map[string]*AssignRecord
 
+	// claimMsgToAssign maps a claim message ID to the assign ID it corresponds to.
+	// Populated when an assign is claimed; deleted on expire or reject.
+	// Enables O(1) lookup in applyAssignComplete and applyAssignExpire.
+	// Key: claimMsgID -> assignID.
+	claimMsgToAssign map[string]string
+
+	// completeMsgToAssign maps a complete message ID to the assign ID it corresponds to.
+	// Populated when an assign is completed; enables O(1) lookup in ClaimAssignPayment.
+	// Key: completeMsgID -> assignID.
+	completeMsgToAssign map[string]string
+
 	// buyMissOffers tracks standing buy-miss offers keyed by task description hash.
 	// One offer per task hash — no duplicates. Offers expire after BuyMissOfferTTL.
 	// Key: SHA-256 hex of canonical task description.
@@ -849,6 +860,8 @@ func NewState() *State {
 		assignByID:           make(map[string]*AssignRecord),
 		claimedAssigns:       make(map[string]string),
 		pendingAssignResults: make(map[string]*AssignRecord),
+		claimMsgToAssign:     make(map[string]string),
+		completeMsgToAssign:  make(map[string]string),
 		buyMissOffers:        make(map[string]*BuyMissOffer),
 		matchToBuyMsgID:      make(map[string]string),
 		matchGuarantee:       make(map[string][2]int64),
@@ -896,6 +909,8 @@ func (s *State) Replay(msgs []Message) {
 	s.assignByID = make(map[string]*AssignRecord)
 	s.claimedAssigns = make(map[string]string)
 	s.pendingAssignResults = make(map[string]*AssignRecord)
+	s.claimMsgToAssign = make(map[string]string)
+	s.completeMsgToAssign = make(map[string]string)
 	s.buyMissOffers = make(map[string]*BuyMissOffer)
 	s.matchToBuyMsgID = make(map[string]string)
 	s.matchGuarantee = make(map[string][2]int64)
@@ -1850,6 +1865,7 @@ func (s *State) applyAssignClaim(msg *Message) {
 	rec.ClaimExpiresAt = expiresAt
 	rec.ClaimedAt = claimTime
 	s.claimedAssigns[msg.Sender] = assignID
+	s.claimMsgToAssign[msg.ID] = assignID
 }
 
 // applyAssignAuctionClose finalizes a Vickrey auction for the assign referenced
@@ -1921,6 +1937,7 @@ func (s *State) applyAssignAuctionClose(msg *Message) {
 	rec.DifficultyTier = tier
 	rec.ClaimedAt = auctionCloseTime
 	s.claimedAssigns[winner.WorkerKey] = assignID
+	s.claimMsgToAssign[msg.ID] = assignID
 }
 
 // applyAssignComplete processes an exchange:assign-complete message.
@@ -1939,14 +1956,12 @@ func (s *State) applyAssignComplete(msg *Message) {
 		return
 	}
 	claimMsgID := msg.Antecedents[0]
-	// Find the assign record via the claim message ID.
-	var rec *AssignRecord
-	for _, r := range s.assignByID {
-		if r.ClaimMsgID == claimMsgID {
-			rec = r
-			break
-		}
+	// Find the assign record via the O(1) claim-msg index.
+	assignID, ok := s.claimMsgToAssign[claimMsgID]
+	if !ok {
+		return
 	}
+	rec := s.assignByID[assignID]
 	if rec == nil || rec.Status != AssignClaimed {
 		return
 	}
@@ -1970,6 +1985,10 @@ func (s *State) applyAssignComplete(msg *Message) {
 	rec.CompletedAt = completeTime
 	// Release the agent's active claim slot.
 	delete(s.claimedAssigns, msg.Sender)
+	// Release the claim-msg index (claim is no longer active).
+	delete(s.claimMsgToAssign, claimMsgID)
+	// Index complete msg for O(1) lookup in ClaimAssignPayment.
+	s.completeMsgToAssign[msg.ID] = assignID
 	// Index for operator review.
 	s.pendingAssignResults[msg.ID] = rec
 }
@@ -2027,6 +2046,8 @@ func (s *State) applyAssignReject(msg *Message) {
 		return
 	}
 	delete(s.pendingAssignResults, completeMsgID)
+	// Remove from complete-msg index (assign is no longer in completed state).
+	delete(s.completeMsgToAssign, completeMsgID)
 	// Reset to open so a different agent may claim the task.
 	rec.ClaimantKey = ""
 	rec.ClaimMsgID = ""
@@ -2055,19 +2076,19 @@ func (s *State) applyAssignExpire(msg *Message) {
 		return
 	}
 	claimMsgID := msg.Antecedents[0]
-	// Find the assign record whose claim matches.
-	var rec *AssignRecord
-	for _, r := range s.assignByID {
-		if r.ClaimMsgID == claimMsgID {
-			rec = r
-			break
-		}
+	// Find the assign record via the O(1) claim-msg index.
+	assignID, ok := s.claimMsgToAssign[claimMsgID]
+	if !ok {
+		return // idempotent: already expired/open or unknown
 	}
+	rec := s.assignByID[assignID]
 	if rec == nil || rec.Status != AssignClaimed {
 		return // idempotent: already expired/open or unknown
 	}
 	// Free the agent's claim slot.
 	delete(s.claimedAssigns, rec.ClaimantKey)
+	// Remove from claim-msg index.
+	delete(s.claimMsgToAssign, claimMsgID)
 	// Reset to open so a different agent may claim the task.
 	rec.ClaimantKey = ""
 	rec.ClaimMsgID = ""
@@ -2125,16 +2146,16 @@ func (s *State) PendingAuctionClose() []string {
 func (s *State) ClaimAssignPayment(completeMsgID string) *AssignRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, r := range s.assignByID {
-		if r.CompleteMsgID == completeMsgID {
-			if r.Status != AssignAccepted {
-				return nil
-			}
-			r.Status = AssignPaid
-			return r
-		}
+	assignID, ok := s.completeMsgToAssign[completeMsgID]
+	if !ok {
+		return nil
 	}
-	return nil
+	r := s.assignByID[assignID]
+	if r == nil || r.Status != AssignAccepted {
+		return nil
+	}
+	r.Status = AssignPaid
+	return r
 }
 
 // ActiveAssigns returns a snapshot of all AssignRecord entries associated with
