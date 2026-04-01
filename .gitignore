@@ -1,6 +1,8 @@
 # Binaries
 /dontguess
+/seller
 /bin/dontguess
+/dist/
 *.exe
 
 # IDE
