@@ -764,3 +764,199 @@ func TestSlowLoop_UpdatedAtIsSet(t *testing.T) {
 		}
 	}
 }
+
+// =============================================================================
+// Federation trust_score tests (§4A)
+// =============================================================================
+
+// federationStubState implements FederationStateReader and FederationStateWriter
+// for testing the slow loop's federation trust_score computation.
+type federationStubState struct {
+	mu       sync.Mutex
+	profiles map[string]*exchange.FederationNodeProfile
+	hopDepth map[string][]int
+}
+
+func newFederationStubState() *federationStubState {
+	return &federationStubState{
+		profiles: make(map[string]*exchange.FederationNodeProfile),
+		hopDepth: make(map[string][]int),
+	}
+}
+
+func (f *federationStubState) AllFederationProfileKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	keys := make([]string, 0, len(f.profiles))
+	for k := range f.profiles {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func (f *federationStubState) SenderHopDepths(senderKey string) []int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	src := f.hopDepth[senderKey]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]int, len(src))
+	copy(out, src)
+	return out
+}
+
+func (f *federationStubState) FederationProfile(senderKey string) *exchange.FederationNodeProfile {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p := f.profiles[senderKey]
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
+}
+
+func (f *federationStubState) SetFederationTrustScore(senderKey string, score float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	p, ok := f.profiles[senderKey]
+	if !ok {
+		p = &exchange.FederationNodeProfile{SenderKey: senderKey}
+		f.profiles[senderKey] = p
+	}
+	p.TrustScore = score
+}
+
+func (f *federationStubState) addProfile(key string, hopDepths []int, txCount int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.profiles[key] = &exchange.FederationNodeProfile{
+		SenderKey:        key,
+		TrustScore:       exchange.NewNodeTrustScoreStart,
+		TransactionCount: txCount,
+		FirstSeenAt:      time.Now().Add(-time.Hour),
+	}
+	f.hopDepth[key] = hopDepths
+}
+
+// TestSlowLoop_FederationTrustScore_LocalSenderConverges verifies that a sender
+// with hop depth 0 (local) receives a trust_score above NewNodeTrustScoreStart
+// after a single slow loop tick.
+func TestSlowLoop_FederationTrustScore_LocalSenderConverges(t *testing.T) {
+	t.Parallel()
+
+	st := newSlowStubState()
+	fs := newFederationStubState()
+
+	// One local sender: hop depth 0, no transactions yet.
+	const senderA = "aaaaaaaabbbbbbbbccccccccdddddddd"
+	fs.addProfile(senderA, []int{0}, 0)
+
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:           st,
+		FederationState: fs,
+		Now:             func() time.Time { return now },
+	})
+	result := loop.Tick()
+
+	if len(result.FederationTrustUpdates) != 1 {
+		t.Fatalf("expected 1 trust update, got %d", len(result.FederationTrustUpdates))
+	}
+	u := result.FederationTrustUpdates[0]
+	if u.SenderKey != senderA {
+		t.Errorf("unexpected sender key: got %q, want %q", u.SenderKey, senderA)
+	}
+	// Local sender (hop 0): depth term = 1/(1+0) = 1.0, so total score approaches 1.0.
+	if u.TrustScore <= exchange.NewNodeTrustScoreStart {
+		t.Errorf("expected trust_score > %.2f for local sender, got %.4f",
+			exchange.NewNodeTrustScoreStart, u.TrustScore)
+	}
+}
+
+// TestSlowLoop_FederationTrustScore_DistantSenderLowerScore verifies that a
+// sender with high hop depth receives a lower trust_score than a local sender.
+func TestSlowLoop_FederationTrustScore_DistantSenderLowerScore(t *testing.T) {
+	t.Parallel()
+
+	st := newSlowStubState()
+	fs := newFederationStubState()
+
+	const (
+		localSender   = "local000000000000000000000000001"
+		distantSender = "distant0000000000000000000000001"
+	)
+	// Local: hop depth 0. Distant: hop depth 8.
+	fs.addProfile(localSender, []int{0}, 5)
+	fs.addProfile(distantSender, []int{8}, 5)
+
+	now := time.Date(2026, 2, 1, 12, 0, 0, 0, time.UTC)
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:           st,
+		FederationState: fs,
+		Now:             func() time.Time { return now },
+	})
+	result := loop.Tick()
+
+	if len(result.FederationTrustUpdates) != 2 {
+		t.Fatalf("expected 2 trust updates, got %d", len(result.FederationTrustUpdates))
+	}
+
+	scores := make(map[string]float64)
+	for _, u := range result.FederationTrustUpdates {
+		scores[u.SenderKey] = u.TrustScore
+	}
+
+	localScore, ok := scores[localSender]
+	if !ok {
+		t.Fatal("no score for local sender")
+	}
+	distantScore, ok := scores[distantSender]
+	if !ok {
+		t.Fatal("no score for distant sender")
+	}
+
+	if localScore <= distantScore {
+		t.Errorf("local sender (hop 0) should score higher than distant (hop 8): local=%.4f distant=%.4f",
+			localScore, distantScore)
+	}
+}
+
+// TestSlowLoop_FederationTrustScore_EmptyProfilesIsNoop verifies that the slow
+// loop does not panic or error when there are no federation profiles.
+func TestSlowLoop_FederationTrustScore_EmptyProfilesIsNoop(t *testing.T) {
+	t.Parallel()
+
+	st := newSlowStubState()
+	fs := newFederationStubState() // empty
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:           st,
+		FederationState: fs,
+		Now:             func() time.Time { return time.Now() },
+	})
+	result := loop.Tick()
+
+	if len(result.FederationTrustUpdates) != 0 {
+		t.Errorf("expected 0 trust updates for empty profiles, got %d", len(result.FederationTrustUpdates))
+	}
+}
+
+// TestSlowLoop_FederationTrustScore_NilFederationStateSkips verifies that when
+// FederationState is nil, the tick proceeds normally without federation updates.
+func TestSlowLoop_FederationTrustScore_NilFederationStateSkips(t *testing.T) {
+	t.Parallel()
+
+	st := newSlowStubState()
+	// FederationState is nil — should be skipped.
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State: st,
+		Now:   func() time.Time { return time.Now() },
+	})
+	result := loop.Tick()
+
+	if len(result.FederationTrustUpdates) != 0 {
+		t.Errorf("expected 0 trust updates when FederationState=nil, got %d", len(result.FederationTrustUpdates))
+	}
+}

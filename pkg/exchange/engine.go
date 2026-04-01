@@ -144,6 +144,14 @@ type EngineOptions struct {
 	// BrokeredMatchReward is the scrip reward posted on brokered-match assigns.
 	// If zero, defaults to BrokeredMatchDefaultReward.
 	BrokeredMatchReward int64
+
+	// FederationGuardEnabled enables the new-node dual guard in handleBuy (§4A).
+	// When true, senders whose TrustScore is below NewNodeTrustThreshold (0.6) are
+	// routed to inline matching regardless of BrokeredMatchMode. When false (the
+	// default), all senders with BrokeredMatchMode=true receive brokered routing.
+	// Set true in production deployments where the slow loop populates federation
+	// trust profiles.
+	FederationGuardEnabled bool
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -548,7 +556,20 @@ func (e *Engine) handleBuy(msg *Message) error {
 	// instead of running inline semantic search. Workers claim the assign,
 	// search inventory, and deliver ranked results via assign-complete.
 	// The operator then accepts and emits exchange:match to the buyer.
-	if e.opts.BrokeredMatchMode {
+	//
+	// New-node dual guard (§4A): when FederationGuardEnabled is set, senders
+	// whose TrustScore is below NewNodeTrustThreshold are routed to inline
+	// matching regardless of BrokeredMatchMode. This limits exposure from new
+	// or distant nodes that have not yet established sufficient behavioral history.
+	// The guard is opt-in (FederationGuardEnabled=false by default) to preserve
+	// backward compatibility with deployments that do not run the slow loop's
+	// federation trust computation.
+	useBrokered := e.opts.BrokeredMatchMode
+	if useBrokered && e.opts.FederationGuardEnabled && e.isLowTrustSender(msg.Sender) {
+		useBrokered = false
+		e.opts.log("engine: handleBuy federation guard: sender=%s low trust, routing inline", shortKey(msg.Sender))
+	}
+	if useBrokered {
 		return e.sendBrokeredMatchAssign(msg, payload.Task, maxResults)
 	}
 
@@ -2450,6 +2471,21 @@ func newReservationID() string {
 		panic(fmt.Sprintf("rand.Read: %v", err))
 	}
 	return hex.EncodeToString(b)
+}
+
+// isLowTrustSender returns true if the sender's TrustScore is below
+// NewNodeTrustThreshold, indicating the sender has not yet established
+// sufficient behavioral history to receive brokered-match routing.
+//
+// Senders with no recorded profile are treated as new nodes (low trust).
+// This implements the new-node dual guard described in §4A of the design spec.
+func (e *Engine) isLowTrustSender(senderKey string) bool {
+	profile := e.state.FederationProfile(senderKey)
+	if profile == nil {
+		// Unknown sender — treat as new node (low trust).
+		return true
+	}
+	return profile.TrustScore < NewNodeTrustThreshold
 }
 
 // hasOverlap returns true if any element of a appears in b.

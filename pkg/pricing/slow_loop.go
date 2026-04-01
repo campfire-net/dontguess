@@ -92,6 +92,19 @@ const OscillationThreshold = -0.3
 // MarketParameters.BrokerMatchBootstrapThreshold.
 const DefaultBrokerMatchBootstrapThreshold = 100
 
+// Default trust_score formula weights (§4A).
+//
+// trust_score = w_history * history_score + w_depth * (1 / (1 + median_hop_depth)) + w_volume * volume_fraction
+//
+// Weights are intentionally asymmetric: history is the primary signal;
+// hop depth is advisory (F4 permanent constraint); volume_fraction is
+// secondary corroboration.
+const (
+	DefaultTrustWeightHistory = 0.70
+	DefaultTrustWeightDepth   = 0.15
+	DefaultTrustWeightVolume  = 0.15
+)
+
 // MarketParameters holds the current market-level parameters written by the
 // slow loop. The exchange engine reads these to apply structural adjustments
 // above and beyond the fast and medium loop corrections.
@@ -131,6 +144,12 @@ type NoveltyScore struct {
 	Score            float64 // buyer_count / competing_entries * discovery_rate
 }
 
+// FederationTrustUpdate records the trust_score update for a single sender.
+type FederationTrustUpdate struct {
+	SenderKey  string
+	TrustScore float64
+}
+
 // SlowLoopResult summarises the outcome of a single slow loop tick.
 // Exported for use in tests and diagnostics.
 type SlowLoopResult struct {
@@ -149,6 +168,9 @@ type SlowLoopResult struct {
 	OscillationDetected bool
 	// StepSize is the adaptive step size used this tick.
 	StepSize float64
+	// FederationTrustUpdates contains the trust_score written for each sender
+	// this tick. Empty if FederationState is not configured.
+	FederationTrustUpdates []FederationTrustUpdate
 }
 
 // SlowStateReader is the read interface the slow loop needs from exchange state.
@@ -159,6 +181,24 @@ type SlowStateReader interface {
 	PriceHistory() []exchange.PriceRecord
 	// EntryDemandCount returns the number of distinct completed buyers for an entry.
 	EntryDemandCount(entryID string) int
+}
+
+// FederationStateReader is the read interface for federation trust data.
+// Implemented by *exchange.State.
+type FederationStateReader interface {
+	// AllFederationProfileKeys returns all sender keys with a known profile.
+	AllFederationProfileKeys() []string
+	// SenderHopDepths returns the observed hop depth history for a sender key.
+	SenderHopDepths(senderKey string) []int
+	// FederationProfile returns the trust profile for a sender key, or nil.
+	FederationProfile(senderKey string) *exchange.FederationNodeProfile
+}
+
+// FederationStateWriter is the write interface for federation trust data.
+// Implemented by *exchange.State.
+type FederationStateWriter interface {
+	// SetFederationTrustScore writes the computed trust_score for a sender.
+	SetFederationTrustScore(senderKey string, score float64)
 }
 
 // SlowStateWriter is the write interface the slow loop needs.
@@ -187,6 +227,19 @@ type SlowLoopOptions struct {
 	// If nil, parameter changes are computed but not persisted (useful in tests
 	// that only verify the analysis logic).
 	ParamsStore SlowStateWriter
+	// FederationState provides read/write access to federation trust profiles.
+	// If nil, the federation trust_score computation is skipped.
+	FederationState interface {
+		FederationStateReader
+		FederationStateWriter
+	}
+	// TrustWeightHistory is the weight of history_score in the trust_score formula.
+	// Defaults to DefaultTrustWeightHistory.
+	TrustWeightHistory float64
+	// TrustWeightDepth is the weight of the hop-depth term. Defaults to DefaultTrustWeightDepth.
+	TrustWeightDepth float64
+	// TrustWeightVolume is the weight of the volume_fraction term. Defaults to DefaultTrustWeightVolume.
+	TrustWeightVolume float64
 	// Interval is how often the loop runs. Defaults to DefaultSlowLoopInterval.
 	Interval time.Duration
 	// Window is the lookback window for price/volume history.
@@ -199,6 +252,27 @@ type SlowLoopOptions struct {
 	Logger func(format string, args ...any)
 	// Now overrides time.Now for testing determinism.
 	Now func() time.Time
+}
+
+func (o *SlowLoopOptions) trustWeightHistory() float64 {
+	if o.TrustWeightHistory > 0 {
+		return o.TrustWeightHistory
+	}
+	return DefaultTrustWeightHistory
+}
+
+func (o *SlowLoopOptions) trustWeightDepth() float64 {
+	if o.TrustWeightDepth > 0 {
+		return o.TrustWeightDepth
+	}
+	return DefaultTrustWeightDepth
+}
+
+func (o *SlowLoopOptions) trustWeightVolume() float64 {
+	if o.TrustWeightVolume > 0 {
+		return o.TrustWeightVolume
+	}
+	return DefaultTrustWeightVolume
 }
 
 func (o *SlowLoopOptions) interval() time.Duration {
@@ -393,18 +467,25 @@ func (l *SlowLoop) Tick() SlowLoopResult {
 	}
 	scalingDelta := proposed.PriceScalingFactor - current.PriceScalingFactor
 
-	result := SlowLoopResult{
-		ContentTypesAnalysed:  len(typeStats),
-		NoveltyScores:         noveltyScores,
-		CommissionAdjustments: commAdj,
-		FloorAdjustments:      floorAdj,
-		ScalingFactorDelta:    scalingDelta,
-		OscillationDetected:   oscillationDetected,
-		StepSize:              l.currentStep,
+	// --- Step 11: Federation trust_score computation ---
+	var trustUpdates []FederationTrustUpdate
+	if l.opts.FederationState != nil {
+		trustUpdates = l.computeFederationTrustScores(now)
 	}
 
-	l.opts.log("slow loop tick: window=%s, history_records=%d, types=%d, novelty=%.4f, step=%.4f, kept=%v, oscillation=%v",
-		window, len(recent), len(typeStats), totalNoveltyProposed, l.currentStep, kept, oscillationDetected)
+	result := SlowLoopResult{
+		ContentTypesAnalysed:   len(typeStats),
+		NoveltyScores:          noveltyScores,
+		CommissionAdjustments:  commAdj,
+		FloorAdjustments:       floorAdj,
+		ScalingFactorDelta:     scalingDelta,
+		OscillationDetected:    oscillationDetected,
+		StepSize:               l.currentStep,
+		FederationTrustUpdates: trustUpdates,
+	}
+
+	l.opts.log("slow loop tick: window=%s, history_records=%d, types=%d, novelty=%.4f, step=%.4f, kept=%v, oscillation=%v, federation_updates=%d",
+		window, len(recent), len(typeStats), totalNoveltyProposed, l.currentStep, kept, oscillationDetected, len(trustUpdates))
 
 	return result
 }
@@ -797,6 +878,114 @@ func lagOneAutocorrelation(series []float64) float64 {
 	}
 
 	return cov / variance
+}
+
+// computeFederationTrustScores computes and writes the trust_score for every
+// known sender key using the §4A tolerance function:
+//
+//	trust_score = w_history * history_score + w_depth * (1 / (1 + median_hop_depth)) + w_volume * volume_fraction
+//
+// history_score: 1.0 for all senders in this tick (no default-rate data yet;
+// the medium loop will extend this once actuarial tables are implemented).
+// median_hop_depth: from SenderHopDepths.
+// volume_fraction: fraction of total federation transaction count attributed to
+// this sender (proxy for legitimate third-party volume share).
+//
+// New nodes (IsNewNode == true) converge toward 1.0 but are capped below it
+// until they exit new-node status.
+func (l *SlowLoop) computeFederationTrustScores(now time.Time) []FederationTrustUpdate {
+	fs := l.opts.FederationState
+	keys := fs.AllFederationProfileKeys()
+	if len(keys) == 0 {
+		return nil
+	}
+
+	wHistory := l.opts.trustWeightHistory()
+	wDepth := l.opts.trustWeightDepth()
+	wVolume := l.opts.trustWeightVolume()
+
+	// Compute total transaction count across all senders for volume_fraction.
+	totalTx := 0
+	profiles := make(map[string]*exchange.FederationNodeProfile, len(keys))
+	for _, k := range keys {
+		p := fs.FederationProfile(k)
+		if p == nil {
+			continue
+		}
+		profiles[k] = p
+		totalTx += p.TransactionCount
+	}
+
+	updates := make([]FederationTrustUpdate, 0, len(keys))
+	for _, k := range keys {
+		p := profiles[k]
+		if p == nil {
+			continue
+		}
+
+		hopDepths := fs.SenderHopDepths(k)
+		medianHop := medianIntSlice(hopDepths)
+
+		// history_score: 1.0 − (default_rate × recency_weight).
+		// Default rate data will be wired from actuarial tables (dontguess-5d2).
+		// For now, observable: no defaults yet → history_score = 1.0.
+		historyScore := 1.0
+
+		// depth term: 1 / (1 + median_hop_depth). A local sender (hop 0) scores 1.0.
+		// Advisory only (F4 permanent constraint).
+		depthTerm := 1.0 / (1.0 + float64(medianHop))
+
+		// volume_fraction: this sender's transaction count / total.
+		volumeFraction := 0.0
+		if totalTx > 0 {
+			volumeFraction = float64(p.TransactionCount) / float64(totalTx)
+		}
+
+		score := wHistory*historyScore + wDepth*depthTerm + wVolume*volumeFraction
+
+		// Clamp to [0, 1].
+		if score < 0 {
+			score = 0
+		}
+		if score > 1 {
+			score = 1
+		}
+
+		fs.SetFederationTrustScore(k, score)
+		updates = append(updates, FederationTrustUpdate{SenderKey: k, TrustScore: score})
+		l.opts.log("slow loop: federation trust_score sender=%s hop_median=%d tx=%d score=%.4f new_node=%v",
+			k[:min(8, len(k))], medianHop, p.TransactionCount, score, p.IsNewNode(now))
+	}
+
+	return updates
+}
+
+// medianIntSlice returns the median of a slice of ints. Returns 0 for empty input.
+// Does NOT modify the input slice.
+func medianIntSlice(vals []int) int {
+	if len(vals) == 0 {
+		return 0
+	}
+	cp := make([]int, len(vals))
+	copy(cp, vals)
+	for i := 1; i < len(cp); i++ {
+		for j := i; j > 0 && cp[j] < cp[j-1]; j-- {
+			cp[j], cp[j-1] = cp[j-1], cp[j]
+		}
+	}
+	mid := len(cp) / 2
+	if len(cp)%2 == 0 {
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+	return cp[mid]
+}
+
+// min returns the smaller of a and b.
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 // computePriceTrend computes a simple linear regression slope for a price
