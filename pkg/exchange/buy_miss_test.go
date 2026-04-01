@@ -1106,3 +1106,164 @@ func TestBuyMiss_AutoAcceptEmitsCompressionAssign(t *testing.T) {
 		t.Errorf("compression assign reward = %d, want %d (50%% of token_cost)", ap.Reward, wantBounty)
 	}
 }
+
+// TestBuyMiss_AutoAcceptEmitsHotCompressionAssignToSeller verifies the full
+// end-to-end path: seller sends buy (no inventory) → engine emits buy-miss offer
+// → same seller puts the result (fulfilling their own miss) → engine auto-accepts
+// → compression assign (hot-compression, task_type="compress") is emitted
+// exclusively to the seller.
+//
+// The buy-miss protocol requires the putter to be the same agent who received
+// the offer (BuyerKey). Here h.seller plays both roles: it sends the buy, receives
+// the miss offer, computes the result, and puts it. The compression assign then
+// targets h.seller as exclusive_sender.
+//
+// This test uses the real engine harness (newTestHarness + startEngine) with
+// real put+buy messages in the store. No mocking of sendCompressionAssign.
+func TestBuyMiss_AutoAcceptEmitsHotCompressionAssignToSeller(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// -----------------------------------------------------------------------
+	// Step 1: Seller sends buy — no inventory, engine emits buy-miss offer.
+	// The seller is the requester here; it will also fulfill its own miss.
+	// -----------------------------------------------------------------------
+	task := "Implement a Rust async executor with work-stealing scheduler"
+	const tokenCost int64 = 60000
+
+	// h.seller sends the buy (no inventory → buy-miss emitted with BuyerKey=seller).
+	_ = h.sendMessage(h.seller,
+		buyPayload(task, tokenCost*2),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	preBuyMiss, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagBuyMiss}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	// Wait for buy-miss offer.
+	var buyMissMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		buyMissMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagBuyMiss}})
+		if len(buyMissMsgs) > len(preBuyMiss) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if len(buyMissMsgs) <= len(preBuyMiss) {
+		t.Fatal("step 1: no buy-miss offer emitted by engine")
+	}
+
+	// -----------------------------------------------------------------------
+	// Step 2: Seller puts the result matching the buy-miss task description.
+	// The sender must match the BuyerKey of the standing offer (h.seller).
+	// -----------------------------------------------------------------------
+	preAssigns, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+	preAssignCount := len(preAssigns)
+
+	// h.seller sends the put — matches BuyerKey so the engine auto-accepts.
+	putMsg := h.sendMessage(h.seller,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", tokenCost), "code", tokenCost, tokenCost*2),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+
+	// -----------------------------------------------------------------------
+	// Step 3: Wait for compression assign to appear in the store.
+	// -----------------------------------------------------------------------
+	var assignMsgs []store.MessageRecord
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		assignMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+		// Look for a new assign with task_type="compress" for this put entry.
+		var found bool
+		for i := range assignMsgs {
+			if i < preAssignCount {
+				continue
+			}
+			var p struct {
+				TaskType string `json:"task_type"`
+				EntryID  string `json:"entry_id"`
+			}
+			if json.Unmarshal(assignMsgs[i].Payload, &p) == nil &&
+				p.TaskType == "compress" && p.EntryID == putMsg.ID {
+				found = true
+				break
+			}
+		}
+		if found {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	// -----------------------------------------------------------------------
+	// Step 4: Assert the assign message properties.
+	// -----------------------------------------------------------------------
+	var compressionAssign *store.MessageRecord
+	for i := range assignMsgs {
+		var p struct {
+			TaskType string `json:"task_type"`
+			EntryID  string `json:"entry_id"`
+		}
+		if json.Unmarshal(assignMsgs[i].Payload, &p) == nil &&
+			p.TaskType == "compress" && p.EntryID == putMsg.ID {
+			compressionAssign = &assignMsgs[i]
+			break
+		}
+	}
+	if compressionAssign == nil {
+		t.Fatalf("buy-miss auto-accept: no hot-compression assign emitted for put entry %s (total TagAssign msgs: %d)",
+			putMsg.ID[:8], len(assignMsgs))
+	}
+
+	// Assign must be sent by the operator.
+	if compressionAssign.Sender != h.operator.PublicKeyHex() {
+		t.Errorf("assign sender = %q, want operator %q", compressionAssign.Sender, h.operator.PublicKeyHex())
+	}
+
+	// Decode and verify payload fields.
+	var ap struct {
+		TaskType        string `json:"task_type"`
+		EntryID         string `json:"entry_id"`
+		Reward          int64  `json:"reward"`
+		ExclusiveSender string `json:"exclusive_sender"`
+		Description     string `json:"description"`
+	}
+	if err := json.Unmarshal(compressionAssign.Payload, &ap); err != nil {
+		t.Fatalf("decoding compression assign payload: %v", err)
+	}
+
+	// task_type must be "compress" (hot-compression path).
+	if ap.TaskType != "compress" {
+		t.Errorf("assign task_type = %q, want %q", ap.TaskType, "compress")
+	}
+
+	// entry_id must reference the seller's put message.
+	if ap.EntryID != putMsg.ID {
+		t.Errorf("assign entry_id = %q, want put message ID %q", ap.EntryID, putMsg.ID)
+	}
+
+	// exclusive_sender must be the seller (the original author of the cached result).
+	if ap.ExclusiveSender != h.seller.PublicKeyHex() {
+		t.Errorf("assign exclusive_sender = %q, want seller key %q", ap.ExclusiveSender, h.seller.PublicKeyHex())
+	}
+
+	// Reward (bounty) must be 50% of token_cost (hot compression rate).
+	wantBounty := tokenCost * int64(exchange.HotCompressionBountyPct) / 100
+	if ap.Reward != wantBounty {
+		t.Errorf("assign reward = %d, want %d (%d%% of token_cost %d)",
+			ap.Reward, wantBounty, exchange.HotCompressionBountyPct, tokenCost)
+	}
+
+	// Description must be non-empty.
+	if ap.Description == "" {
+		t.Error("assign description is empty")
+	}
+}
