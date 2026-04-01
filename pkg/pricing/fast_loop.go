@@ -66,6 +66,10 @@ type StateReader interface {
 	EntryPreviewCount(entryID string) int
 	// EntryDemandCount returns the number of distinct completed buyers for an entry.
 	EntryDemandCount(entryID string) int
+	// DebtorScore returns the debtor priority score for a buyer in [0.0, 1.0].
+	// 1.0 = no debt (full priority); 0.0 = maximum debt (lowest priority).
+	// Returns 1.0 for agents with no recorded debt signal.
+	DebtorScore(agentKey string) float64
 }
 
 // StateWriter is the write interface the fast loop needs from exchange state.

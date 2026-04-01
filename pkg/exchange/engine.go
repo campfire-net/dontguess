@@ -489,6 +489,33 @@ func (e *Engine) handleBuy(msg *Message) error {
 		maxResults = 3
 	}
 
+	// Debtor priority weighting (S7).
+	//
+	// Buyers with outstanding debt are deprioritized by receiving fewer match
+	// results. The DebtorScore is a [0.0, 1.0] signal: 1.0 = no debt (full
+	// priority), 0.0 = maximum debt (lowest priority). The score is set
+	// externally via state.SetDebtorScore when scrip signals a loan state change.
+	//
+	// Priority formula (from docs/design §4):
+	//   effective_max_results = max(1, floor(maxResults * debtorScore))
+	//
+	// A buyer at 1.0 (no debt) gets the full result set. A buyer at 0.6 (owes
+	// 40% of limit) gets 60% of results, rounded down but never below 1.
+	// This is behavioral — debtors are always present in the queue, they sort
+	// lower by receiving fewer results. No timer machinery, no blocking.
+	debtorScore := e.state.DebtorScore(msg.Sender)
+	if debtorScore < 1.0 {
+		weighted := int(math.Floor(float64(maxResults) * debtorScore))
+		if weighted < 1 {
+			weighted = 1
+		}
+		if weighted < maxResults {
+			e.opts.log("engine: handleBuy debtor priority applied buyer=%s score=%.3f maxResults %d→%d",
+				shortKey(msg.Sender), debtorScore, maxResults, weighted)
+			maxResults = weighted
+		}
+	}
+
 	// Brokered-match mode: post an assign for workers to perform matching
 	// instead of running inline semantic search. Workers claim the assign,
 	// search inventory, and deliver ranked results via assign-complete.

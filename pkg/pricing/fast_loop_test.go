@@ -35,6 +35,7 @@ func (s *stubState) EntryDemandCount(entryID string) int    { return s.demandCou
 func (s *stubState) SetPriceAdjustment(entryID string, adj exchange.PriceAdjustment) {
 	s.adjustments[entryID] = adj
 }
+func (s *stubState) DebtorScore(_ string) float64 { return 1.0 } // no debt by default
 
 // TestFastLoop_ColdEntryGetsColdDiscount verifies that an entry with zero recent
 // sales and no preview data receives a sub-1.0 price multiplier (cold discount).
