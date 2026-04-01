@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/campfire-net/campfire/pkg/protocol"
 
@@ -22,6 +23,7 @@ const (
 	tagScripSettle        = "dontguess:scrip-settle"
 	tagScripAssignPay     = "dontguess:scrip-assign-pay"
 	tagScripDisputeRefund = "dontguess:scrip-dispute-refund"
+	tagScripLoanMint      = "dontguess:scrip-loan-mint"
 )
 
 // balanceEntry holds the in-memory balance for a single agent.
@@ -76,10 +78,19 @@ type CampfireScripStore struct {
 	// log) or clamp to zero (live mode prevents permanent buyer lockout).
 	replaying atomic.Bool
 
-	// totalSupply tracks total scrip ever minted.
+	// totalSupply tracks total scrip ever minted (circulating + outstanding loan principal).
 	totalSupply atomic.Int64
 	// totalBurned tracks total scrip destroyed.
 	totalBurned atomic.Int64
+	// totalLoanPrincipal tracks the sum of all outstanding loan principals separately
+	// from circulating supply. This allows callers to distinguish base circulating scrip
+	// from loan-expanded supply (important for credit-risk reporting).
+	totalLoanPrincipal atomic.Int64
+
+	// loansMu guards loans and loansByBorrower.
+	loansMu        sync.RWMutex
+	loans          map[string]*LoanRecord // loanID -> record
+	loansByBorrower map[string][]string   // borrowerKey -> []loanID
 }
 
 // NewCampfireScripStore creates a CampfireScripStore and replays the campfire
@@ -91,11 +102,13 @@ type CampfireScripStore struct {
 // operations. Pass an empty string to disable the check (backwards compat for tests).
 func NewCampfireScripStore(campfireID string, client *protocol.Client, operatorKey string) (*CampfireScripStore, error) {
 	s := &CampfireScripStore{
-		campfireID:   campfireID,
-		client:       client,
-		OperatorKey:  operatorKey,
-		balances:     make(map[string]*balanceEntry),
-		reservations: make(map[string]Reservation),
+		campfireID:      campfireID,
+		client:          client,
+		OperatorKey:     operatorKey,
+		balances:        make(map[string]*balanceEntry),
+		reservations:    make(map[string]Reservation),
+		loans:           make(map[string]*LoanRecord),
+		loansByBorrower: make(map[string][]string),
 	}
 	if err := s.Replay(); err != nil {
 		return nil, fmt.Errorf("scrip store: replay: %w", err)
@@ -122,9 +135,15 @@ func (s *CampfireScripStore) Replay() error {
 	s.balances = make(map[string]*balanceEntry)
 	s.balancesMu.Unlock()
 
+	s.loansMu.Lock()
+	s.loans = make(map[string]*LoanRecord)
+	s.loansByBorrower = make(map[string][]string)
+	s.loansMu.Unlock()
+
 	s.seenMsgIDs = sync.Map{}
 	s.totalSupply.Store(0)
 	s.totalBurned.Store(0)
+	s.totalLoanPrincipal.Store(0)
 
 	// Convert at the cf boundary before replaying into internal state.
 	msgs := proto.FromSDKMessages(result.Messages)
@@ -184,6 +203,8 @@ func (s *CampfireScripStore) applyMessage(msg *proto.Message) {
 		s.applyAssignPay(msg)
 	case tagScripDisputeRefund:
 		s.applyDisputeRefund(msg)
+	case tagScripLoanMint:
+		s.applyLoanMint(msg)
 	}
 }
 
@@ -529,9 +550,92 @@ func scripOp(tags []string) string {
 		switch t {
 		case tagScripMint, tagScripBurn, tagScripPutPay,
 			tagScripBuyHold, tagScripSettle, tagScripAssignPay,
-			tagScripDisputeRefund:
+			tagScripDisputeRefund, tagScripLoanMint:
 			return t
 		}
 	}
 	return ""
+}
+
+// applyLoanMint processes a scrip:loan-mint message.
+//
+// State effect: borrower_balance += principal; total_supply += principal;
+// total_loan_principal += principal; loans[loan_id] = LoanRecord{...};
+// loansByBorrower[borrower] appends loan_id.
+//
+// Validation (minimal — engine has already validated before emitting):
+//   - borrower, loan_id must be non-empty
+//   - principal must be > 0
+//   - loan_id must not already exist (idempotency handled by seenMsgIDs above)
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §8.2
+func (s *CampfireScripStore) applyLoanMint(msg *proto.Message) {
+	var p LoanMintPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	if p.Borrower == "" || p.LoanID == "" || p.Principal <= 0 {
+		return
+	}
+
+	// Parse DueAt; treat missing/invalid as zero time (records still stored).
+	var dueAt time.Time
+	if p.DueAt != "" {
+		if t, err := time.Parse(time.RFC3339, p.DueAt); err == nil {
+			dueAt = t
+		}
+	}
+
+	record := &LoanRecord{
+		LoanID:          p.LoanID,
+		BorrowerKey:     p.Borrower,
+		Principal:       p.Principal,
+		VigRateBPS:      p.VigRateBPS,
+		DueAt:           dueAt,
+		SettlementMsgID: p.SettlementMsgID,
+		CommitmentID:    p.CommitmentTokenID,
+		Status:          LoanActive,
+	}
+
+	s.loansMu.Lock()
+	// Duplicate loan_id: silently skip (idempotency guard on seenMsgIDs handles the
+	// common case, but defend against log corruption producing two distinct messages
+	// with the same loan_id).
+	if _, exists := s.loans[p.LoanID]; exists {
+		s.loansMu.Unlock()
+		return
+	}
+	s.loans[p.LoanID] = record
+	s.loansByBorrower[p.Borrower] = append(s.loansByBorrower[p.Borrower], p.LoanID)
+	s.loansMu.Unlock()
+
+	// Credit borrower balance — scrip enters circulation.
+	s.addToBalance(p.Borrower, p.Principal)
+	s.totalSupply.Add(p.Principal)
+	s.totalLoanPrincipal.Add(p.Principal)
+}
+
+// --- Loan accessors ---
+
+// TotalLoanPrincipal returns the sum of all outstanding loan principals minted
+// via scrip:loan-mint. This is tracked separately from TotalSupply to allow
+// callers to distinguish base circulating scrip from loan-expanded supply.
+func (s *CampfireScripStore) TotalLoanPrincipal() int64 {
+	return s.totalLoanPrincipal.Load()
+}
+
+// GetLoan returns the LoanRecord for loanID, and whether it exists.
+func (s *CampfireScripStore) GetLoan(loanID string) (*LoanRecord, bool) {
+	s.loansMu.RLock()
+	defer s.loansMu.RUnlock()
+	r, ok := s.loans[loanID]
+	return r, ok
+}
+
+// LoansByBorrower returns the slice of loan IDs for the given borrower key.
+// The returned slice must not be modified by the caller.
+func (s *CampfireScripStore) LoansByBorrower(borrowerKey string) []string {
+	s.loansMu.RLock()
+	defer s.loansMu.RUnlock()
+	return s.loansByBorrower[borrowerKey]
 }

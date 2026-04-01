@@ -17,6 +17,7 @@ const (
 	TagScripSettle        = "dontguess:scrip-settle"
 	TagScripAssignPay     = "dontguess:scrip-assign-pay"
 	TagScripDisputeRefund = "dontguess:scrip-dispute-refund"
+	TagScripLoanMint      = "dontguess:scrip-loan-mint"
 )
 
 // MintPayload is the JSON payload for a scrip-mint message.
@@ -89,4 +90,19 @@ type DisputeRefundPayload struct {
 	Amount        int64  `json:"amount"`
 	ReservationID string `json:"reservation_id"`
 	DisputeMsg    string `json:"dispute_msg"` // msg ID of the dispute resolution
+}
+
+// LoanMintPayload is the JSON payload for a scrip-loan-mint message.
+// State effect: borrower_balance += principal; total_supply += principal;
+// loans[loan_id] = LoanRecord{...}; loansByBorrower[borrower] appends loan_id.
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §8.2
+type LoanMintPayload struct {
+	Borrower          string `json:"borrower"`            // agent pubkey receiving minted scrip
+	Principal         int64  `json:"principal"`           // loan principal in micro-tokens
+	VigRateBPS        int    `json:"vig_rate_bps"`        // vig rate in basis points per hour
+	DueAt             string `json:"due_at"`              // ISO 8601 repayment deadline
+	LoanID            string `json:"loan_id"`             // unique loan identifier
+	SettlementMsgID   string `json:"settlement_msg_id"`   // settlement this loan backs
+	CommitmentTokenID string `json:"commitment_token_id"` // commitment token being redeemed
 }
