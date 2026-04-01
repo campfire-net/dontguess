@@ -1,0 +1,44 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "assign-auction-close",
+  "description": "Closes a Vickrey auction for an assign task after the auction window (AuctionDeadline) has elapsed. Emitted by the exchange engine as an operator message (not by workers). The engine sweeps for AssignOpen records whose AuctionDeadline has passed and at least one bid exists, then emits this message for each. Payload records the closing timestamp; winner selection and Vickrey price computation happen in state.applyAssignAuctionClose from the bids recorded on the assign record. Vickrey clearing price: second-lowest bid; if only one bidder, the winner pays their own bid. The assign transitions to AssignClaimed with the lowest bidder as claimant. ClaimantKey and VickreyPrice are written to the AssignRecord. DifficultyTier (low/medium/high) is derived from the median-bid-to-base-reward ratio. Antecedent: the assign message ID being closed.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "assign_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "The assign message ID of the auction being finalized. Must match the message antecedent."
+    },
+    {
+      "name": "closed_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when the engine detected the auction deadline had passed. Used as ClaimedAt in the resulting AssignRecord."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:assign-auction-close",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "state_effect": {
+    "on_zero_bids": "No state change. Assign remains AssignOpen (no winner).",
+    "on_winner": "AssignRecord transitions to AssignClaimed. ClaimantKey = lowest bidder's WorkerKey. VickreyPrice = second-lowest bid (or lowest bid if sole bidder). DifficultyTier = 'low' | 'medium' | 'high' from median-bid / base_reward ratio. ClaimExpiresAt = AssignReceivedAt + claim_timeout_minutes."
+  },
+  "security_notes": [
+    "Only the exchange operator key may emit this message. Worker-signed auction-close messages are invalid.",
+    "The engine emits this lazily (on next received message after deadline) and eagerly (on a periodic sweep). Idempotency: once an assign is AssignClaimed or later, a duplicate auction-close is a no-op.",
+    "Workers cannot influence winner selection by submitting bids after AuctionDeadline — applyAssignClaim rejects claim messages received after the auction window."
+  ],
+  "rate_limit": {
+    "max": 500,
+    "per": "campfire",
+    "window": "1h"
+  }
+}

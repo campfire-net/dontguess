@@ -1,0 +1,46 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:loan-vig-accrue",
+  "description": "Operator accrues vig (interest) on an outstanding loan. Vig is computed by the slow loop at its 4-hour cadence: vig = principal * vig_rate_bps / 10000 * hours_elapsed. Vig is tracked in LoanRecord.Outstanding as a running total owed beyond the principal. Vig is NOT burned on accrual — it remains as an obligation. When the borrower repays, repayment covers principal first; any Outstanding vig must also be repaid (via additional loan-repay messages or a combined settlement). If Outstanding > 0 at due_at, the difference contributes to the Defaulted inflationary record. Only the exchange operator may emit this message. State effect: LoanRecord.Outstanding += amount.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "loan_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Loan ID for which vig is accruing. Must reference an Active loan record."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Vig amount accrued in this period, in micro-tokens. Computed as: principal * vig_rate_bps / 10000 * fractional_hours_elapsed."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-loan-vig-accrue",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:loan:*",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "validation": [
+    "loan_id MUST reference a known, Active LoanRecord.",
+    "amount MUST be >= 1 micro-token.",
+    "Antecedent MUST be the scrip:loan-mint message for loan_id or the most recent scrip:loan-vig-accrue for loan_id (chained accrual).",
+    "The slow loop MUST NOT emit vig-accrue for Repaid or Defaulted loans."
+  ],
+  "rate_limit": {
+    "max": 10000,
+    "per": "campfire",
+    "window": "4h"
+  }
+}
