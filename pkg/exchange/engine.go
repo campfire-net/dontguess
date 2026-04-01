@@ -2092,8 +2092,7 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 		rep := float64(e.state.SellerReputation(entry.SellerKey))
 		// Recency: 1.0 for brand-new, decaying over 30 days.
 		ageSec := float64(now-entry.PutTimestamp) / 1e9
-		const thirtyDays = 30 * 24 * 3600.0
-		recency := 1.0 - (ageSec / thirtyDays)
+		recency := 1.0 - (ageSec / rankResultsRecencyDays)
 		if recency < 0 {
 			recency = 0
 		}
@@ -2125,14 +2124,38 @@ func (e *Engine) rankResults(candidates []*InventoryEntry, max int) []*Inventory
 // from receiving l1Efficiency=1.0 (free-item dominance) in the ranker.
 const computePriceMinPrice int64 = 1
 
-// Magic float64 constants used in computePrice and rankResults
+// Named constants used in computePrice and rankResults.
 const (
-	ageDecayFloor    = 0.5    // floor of age decay in computePrice (decays from 1.0 to this over 60 days)
-	repFactorBase    = 0.8    // base reputation multiplier (rep=0 -> 0.8x)
-	repFactorRange   = 0.4    // reputation multiplier range (rep=100 -> 1.2x = base + range)
-	sizeBonusPerKB   = 0.003  // content size multiplier: +0.3% per KB
-	sizeBonusCap     = 0.30   // content size bonus cap: +30% for sizes >= 100KB
-	scoreRepWeight   = 0.6    // reputation weight in rankResults scoring (recency = 1.0 - scoreRepWeight)
+	// Base price coefficients.
+	operatorMargin        = 1.20 // operator takes 20% on top of PutPrice
+	sellerShareFactor     = 0.70 // seller receives 70% of TokenCost as proxy price
+
+	// Overflow guards: largest PutPrice/TokenCost that won't overflow int64 when
+	// multiplied by the corresponding margin (MaxInt64 / guard ≈ safe threshold).
+	operatorMarginOverflowGuard = 120 // PutPrice * 1.20 → guard at MaxInt64/120
+	sellerShareOverflowGuard    = 70  // TokenCost * 0.70 → guard at MaxInt64/70
+
+	// Demand multiplier coefficients.
+	demandCountCap  = 10   // maximum distinct buyers counted toward demand
+	demandStepFactor = 0.10 // +10% per distinct completed buyer
+
+	// Age decay (computePrice): decays linearly from 1.0 to ageDecayFloor over computePriceAgeDays.
+	ageDecayFloor       = 0.5              // floor of age decay
+	computePriceAgeDays = 60 * 24 * 3600.0 // age window in seconds (60 days)
+
+	// Age decay (rankResults): recency score decays from 1.0 to 0.0 over rankResultsRecencyDays.
+	rankResultsRecencyDays = 30 * 24 * 3600.0 // recency window in seconds (30 days)
+
+	// Reputation multiplier: rep=0 -> 0.8x, rep=50 -> 1.0x, rep=100 -> 1.2x.
+	repFactorBase  = 0.8 // base reputation multiplier (rep=0 -> 0.8x)
+	repFactorRange = 0.4 // reputation multiplier range (rep=100 -> 1.2x = base + range)
+
+	// Content size multiplier: +0.3% per KB, capped at +30%.
+	sizeBonusPerKB = 0.003 // +0.3% per KB
+	sizeBonusCap   = 0.30  // cap at +30% for sizes >= 100KB
+
+	// Reputation weight in rankResults scoring (recency = 1.0 - scoreRepWeight).
+	scoreRepWeight = 0.6
 
 	// Compression tier price multipliers (dontguess-cb5).
 	// Hot entries have high cache hit rate and low staleness — price premium reflects
@@ -2165,18 +2188,18 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 	// Step 1: base price
 	var base float64
 	if entry.PutPrice > 0 {
-		if entry.PutPrice > math.MaxInt64/120 {
+		if entry.PutPrice > math.MaxInt64/operatorMarginOverflowGuard {
 			return math.MaxInt64
 		}
-		base = float64(entry.PutPrice) * 1.20
+		base = float64(entry.PutPrice) * operatorMargin
 	} else {
 		if entry.TokenCost <= 0 {
 			return computePriceMinPrice
 		}
-		if entry.TokenCost > math.MaxInt64/70 {
+		if entry.TokenCost > math.MaxInt64/sellerShareOverflowGuard {
 			return math.MaxInt64
 		}
-		base = float64(entry.TokenCost) * 0.70
+		base = float64(entry.TokenCost) * sellerShareFactor
 		if base < float64(computePriceMinPrice) {
 			base = float64(computePriceMinPrice)
 		}
@@ -2184,17 +2207,16 @@ func (e *Engine) computePrice(entry *InventoryEntry) int64 {
 
 	// Step 2: demand multiplier (+10% per buyer, capped at +100%)
 	demandCount := e.state.EntryDemandCount(entry.EntryID)
-	if demandCount > 10 {
-		demandCount = 10
+	if demandCount > demandCountCap {
+		demandCount = demandCountCap
 	}
-	demandFactor := 1.0 + float64(demandCount)*0.10
+	demandFactor := 1.0 + float64(demandCount)*demandStepFactor
 
 	// Step 3: age decay (PutTimestamp=0 means no decay)
 	ageFactor := 1.0
 	if entry.PutTimestamp > 0 {
 		ageSec := float64(time.Now().UnixNano()-entry.PutTimestamp) / 1e9
-		const sixtyDays = 60 * 24 * 3600.0
-		decay := ageSec / sixtyDays
+		decay := ageSec / computePriceAgeDays
 		if decay > 1.0 {
 			decay = 1.0
 		}
