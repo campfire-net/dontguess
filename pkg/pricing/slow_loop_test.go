@@ -1195,3 +1195,107 @@ func TestSlowLoop_ActuarialTable_MultipleTaskTypes(t *testing.T) {
 		t.Errorf("compression SampleCount: want 3, got %d", comp.SampleCount)
 	}
 }
+
+// TestSlowLoop_ActuarialTable_N1_PercentilesEqualSingleValue verifies that when
+// there is exactly one completed sample, P50=P90=P99 all equal that single value.
+//
+// Percentile formula: idx = p*n/100 (integer division). For n=1:
+//
+//	idx = p*1/100 = 0 for any p in [0,99]
+//
+// So all percentiles resolve to index 0 — the single value.
+func TestSlowLoop_ActuarialTable_N1_PercentilesEqualSingleValue(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	const singleLatency = 7 * time.Minute
+
+	st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+		TaskType:  "brokered-match",
+		Latency:   singleLatency,
+		Completed: true,
+	})
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	loop.Tick()
+
+	params := ps.GetMarketParameters()
+	entry, ok := params.ActuarialTable.ByTaskType["brokered-match"]
+	if !ok {
+		t.Fatal("expected 'brokered-match' in actuarial table")
+	}
+	if entry.SampleCount != 1 {
+		t.Errorf("SampleCount: want 1, got %d", entry.SampleCount)
+	}
+	if entry.FillRate != 1.0 {
+		t.Errorf("FillRate: want 1.0 (1 completed of 1 total), got %.4f", entry.FillRate)
+	}
+	// All three percentiles must equal the single latency value.
+	if entry.P50Latency != singleLatency {
+		t.Errorf("P50Latency: want %v (single value), got %v", singleLatency, entry.P50Latency)
+	}
+	if entry.P90Latency != singleLatency {
+		t.Errorf("P90Latency: want %v (single value), got %v", singleLatency, entry.P90Latency)
+	}
+	if entry.P99Latency != singleLatency {
+		t.Errorf("P99Latency: want %v (single value), got %v", singleLatency, entry.P99Latency)
+	}
+}
+
+// TestSlowLoop_ActuarialTable_N0Completed_LatencyPercentilesAreZero verifies that
+// when a task type has samples but none are completed (FillRate < 1.0 because
+// Completed=false for all), the latency percentiles are zero.
+//
+// The slow loop only counts latencies from completed samples (Completed=true).
+// Uncompleted samples count toward SampleCount and reduce FillRate, but contribute
+// no latency data. With zero completed latencies, percentileDuration returns 0.
+func TestSlowLoop_ActuarialTable_N0Completed_LatencyPercentilesAreZero(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 3 samples, none completed.
+	for i := 0; i < 3; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "validation",
+			Completed: false,
+			// Latency is zero for non-completed samples.
+		})
+	}
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	loop.Tick()
+
+	params := ps.GetMarketParameters()
+	entry, ok := params.ActuarialTable.ByTaskType["validation"]
+	if !ok {
+		t.Fatal("expected 'validation' in actuarial table (samples present, even with FillRate=0)")
+	}
+	if entry.SampleCount != 3 {
+		t.Errorf("SampleCount: want 3, got %d", entry.SampleCount)
+	}
+	if entry.FillRate != 0.0 {
+		t.Errorf("FillRate: want 0.0 (no completions), got %.4f", entry.FillRate)
+	}
+	// No completed samples → no latency data → all percentiles zero.
+	if entry.P50Latency != 0 {
+		t.Errorf("P50Latency: want 0 (no completed samples), got %v", entry.P50Latency)
+	}
+	if entry.P90Latency != 0 {
+		t.Errorf("P90Latency: want 0 (no completed samples), got %v", entry.P90Latency)
+	}
+	if entry.P99Latency != 0 {
+		t.Errorf("P99Latency: want 0 (no completed samples), got %v", entry.P99Latency)
+	}
+}

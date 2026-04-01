@@ -183,3 +183,80 @@ func TestGuaranteeForMatch_WithGuarantee(t *testing.T) {
 		t.Errorf("expected deadline≈%v, got %v (diff=%v)", expectedDeadline, deadline, diff)
 	}
 }
+
+// TestGuaranteeForMatch_PersistsAfterOrderRemoval verifies that GuaranteeForMatch
+// still returns the correct deadline and insured amount after the order has been
+// accepted (buyer-accept applied). The guarantee data lives in matchGuarantee, which
+// is set at match time and is not cleared when the order transitions out of activeOrders.
+//
+// This is the regression case: if GuaranteeForMatch only inspected activeOrders it
+// would return not-found after buyer-accept, and the deadline-miss refund path would
+// be silently skipped.
+func TestGuaranteeForMatch_PersistsAfterOrderRemoval(t *testing.T) {
+	t.Parallel()
+	s := exchange.NewState()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// Buy with guarantee: 120-second deadline, 750 insured amount.
+	const buyerKey = "buyer-key-persist"
+	const operatorKey = "operator-key-persist"
+	const insuredAmount int64 = 750
+	const deadlineSecs = 120
+
+	buyMsg := &exchange.Message{
+		ID:      "buy-persist",
+		Tags:    []string{exchange.TagBuy},
+		Sender:  buyerKey,
+		Payload: []byte(`{"task":"cached code search","budget":2000,"guarantee_deadline_seconds":120,"insured_amount":750}`),
+		Timestamp: now.UnixNano(),
+	}
+	s.Apply(buyMsg)
+
+	matchMsg := &exchange.Message{
+		ID:          "match-persist",
+		Tags:        []string{exchange.TagMatch},
+		Sender:      operatorKey,
+		Antecedents: []string{"buy-persist"},
+		Payload:     []byte(`{"results":[{"entry_id":"entry-abc"}]}`),
+		Timestamp:   now.UnixNano(),
+	}
+	s.Apply(matchMsg)
+
+	// Verify guarantee is present before buyer-accept.
+	deadline, gotAmount, ok := s.GuaranteeForMatch("match-persist")
+	if !ok {
+		t.Fatal("GuaranteeForMatch before buyer-accept: expected found")
+	}
+	if gotAmount != insuredAmount {
+		t.Errorf("before buyer-accept: insured_amount = %d, want %d", gotAmount, insuredAmount)
+	}
+	expectedDeadline := now.Add(deadlineSecs * time.Second)
+	if diff := deadline.Sub(expectedDeadline); diff < -time.Second || diff > time.Second {
+		t.Errorf("before buyer-accept: deadline = %v, want ≈%v", deadline, expectedDeadline)
+	}
+
+	// Apply buyer-accept — this transitions the order out of the unmatched-active view
+	// and records it in acceptedOrders. The guarantee in matchGuarantee must survive.
+	buyerAcceptMsg := &exchange.Message{
+		ID:          "buyer-accept-persist",
+		Tags:        []string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept, exchange.TagVerdictPrefix + "accepted"},
+		Sender:      buyerKey, // must match the original buyer
+		Antecedents: []string{"match-persist"},
+		Payload:     []byte(`{"phase":"buyer-accept","entry_id":"entry-abc","accepted":true}`),
+		Timestamp:   now.UnixNano(),
+	}
+	s.Apply(buyerAcceptMsg)
+
+	// Verify guarantee still returns correct values after buyer-accept.
+	deadline2, gotAmount2, ok2 := s.GuaranteeForMatch("match-persist")
+	if !ok2 {
+		t.Fatal("GuaranteeForMatch after buyer-accept: expected found (guarantee must persist)")
+	}
+	if gotAmount2 != insuredAmount {
+		t.Errorf("after buyer-accept: insured_amount = %d, want %d", gotAmount2, insuredAmount)
+	}
+	if !deadline2.Equal(deadline) {
+		t.Errorf("after buyer-accept: deadline changed from %v to %v (must be stable)", deadline, deadline2)
+	}
+}
