@@ -18,6 +18,8 @@ const (
 	TagScripAssignPay     = "dontguess:scrip-assign-pay"
 	TagScripDisputeRefund = "dontguess:scrip-dispute-refund"
 	TagScripLoanMint      = "dontguess:scrip-loan-mint"
+	TagScripLoanRepay     = "dontguess:scrip-loan-repay"
+	TagScripLoanVigAccrue = "dontguess:scrip-loan-vig-accrue"
 )
 
 // MintPayload is the JSON payload for a scrip-mint message.
@@ -105,4 +107,26 @@ type LoanMintPayload struct {
 	LoanID            string `json:"loan_id"`             // unique loan identifier
 	SettlementMsgID   string `json:"settlement_msg_id"`   // settlement this loan backs
 	CommitmentTokenID string `json:"commitment_token_id"` // commitment token being redeemed
+}
+
+// LoanRepayPayload is the JSON payload for a scrip-loan-repay message.
+// State effect: LoanRecord.Repaid += amount; totalSupply -= amount;
+// totalLoanPrincipal -= amount (when fully repaid); LoanRecord.Status = LoanRepaid
+// when Repaid >= Principal.
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §9
+type LoanRepayPayload struct {
+	LoanID string `json:"loan_id"` // loan being repaid
+	Amount int64  `json:"amount"`  // scrip burned (repayment amount in micro-tokens)
+}
+
+// LoanVigAccruePayload is the JSON payload for a scrip-loan-vig-accrue message.
+// State effect: LoanRecord.Outstanding += amount. This is a separate accounting
+// flow from principal repayment — vig accrues on the original principal and is
+// tracked in Outstanding until collected.
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §9
+type LoanVigAccruePayload struct {
+	LoanID string `json:"loan_id"` // loan for which vig is accruing
+	Amount int64  `json:"amount"`  // vig accrued in this period (micro-tokens)
 }

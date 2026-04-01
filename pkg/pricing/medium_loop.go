@@ -150,6 +150,9 @@ type MediumLoopResult struct {
 	// CompressionAssigns is the number of open compression assign tasks posted
 	// this tick for high-demand uncompressed entries.
 	CompressionAssigns int
+	// VigPressure is the total outstanding vig across all active loans at the
+	// time of this tick. Zero when no VigStore is configured or no active loans exist.
+	VigPressure int64
 }
 
 // AssignSpec describes an open compression assign to be posted by the medium loop.
@@ -164,6 +167,14 @@ type AssignSpec struct {
 	TaskType string
 }
 
+// VigReader is the interface MediumLoop uses to read total outstanding vig
+// across all active loans. Implemented by *scrip.CampfireScripStore.
+// If nil, vig_pressure is treated as zero (useful for tests that do not
+// exercise the loan flow).
+type VigReader interface {
+	TotalOutstandingVig() int64
+}
+
 // MediumLoopOptions configures a MediumLoop.
 type MediumLoopOptions struct {
 	// State is the exchange state used to read market signals and write adjustments.
@@ -171,6 +182,9 @@ type MediumLoopOptions struct {
 	// ScripStore is the scrip spending store. If nil, residual settlement is
 	// skipped (useful for tests that do not exercise the scrip flow).
 	ScripStore scrip.SpendingStore
+	// VigStore is the loan store used to read the vig_pressure signal.
+	// If nil, vig_pressure is zero for the tick (loan flow not exercised).
+	VigStore VigReader
 	// Interval is how often the loop runs. Defaults to DefaultMediumLoopInterval.
 	Interval time.Duration
 	// Window is the lookback window for price history analysis.
@@ -309,16 +323,26 @@ func (l *MediumLoop) Tick(ctx context.Context) MediumLoopResult {
 	// 4. Compression assigns.
 	compressionAssigns := l.postCompressionAssigns(inventory)
 
+	// 5. Vig pressure — total outstanding vig across all active loans.
+	// This is a read-only market signal; the medium loop does not act on it
+	// directly (that is the slow loop's domain), but it is surfaced in the
+	// result for diagnostics and higher-level loop consumption.
+	var vigPressure int64
+	if l.opts.VigStore != nil {
+		vigPressure = l.opts.VigStore.TotalOutstandingVig()
+	}
+
 	result := MediumLoopResult{
 		ClusterCorrections: corrections,
 		ResidualsPaid:      residualsPaid,
 		TotalResidualScrip: totalScrip,
 		ReputationUpdates:  repUpdates,
 		CompressionAssigns: compressionAssigns,
+		VigPressure:        vigPressure,
 	}
 
-	l.opts.log("medium loop tick: window=%s, history_records=%d, corrections=%d, residuals=%d (scrip=%d), rep_updates=%d, compression_assigns=%d",
-		window, len(recentHistory), corrections, residualsPaid, totalScrip, repUpdates, compressionAssigns)
+	l.opts.log("medium loop tick: window=%s, history_records=%d, corrections=%d, residuals=%d (scrip=%d), rep_updates=%d, compression_assigns=%d, vig_pressure=%d",
+		window, len(recentHistory), corrections, residualsPaid, totalScrip, repUpdates, compressionAssigns, vigPressure)
 
 	return result
 }

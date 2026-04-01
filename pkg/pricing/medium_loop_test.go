@@ -1069,3 +1069,108 @@ func TestMediumLoop_ZeroBountySkip(t *testing.T) {
 		})
 	}
 }
+
+// =============================================================================
+// Vig pressure signal tests
+// =============================================================================
+
+// stubVigReader is a minimal VigReader stub for medium loop tests.
+type stubVigReader struct {
+	total int64
+}
+
+func (v *stubVigReader) TotalOutstandingVig() int64 { return v.total }
+
+// TestMediumLoop_VigPressure_ReflectsOutstandingVig verifies that when a
+// VigStore is configured, MediumLoopResult.VigPressure equals the value
+// returned by VigStore.TotalOutstandingVig().
+func TestMediumLoop_VigPressure_ReflectsOutstandingVig(t *testing.T) {
+	st := newMediumStubState()
+	now := time.Now()
+
+	vigStore := &stubVigReader{total: 42000}
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State:    st,
+		VigStore: vigStore,
+		Now:      func() time.Time { return now },
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.VigPressure != 42000 {
+		t.Errorf("VigPressure = %d, want 42000", result.VigPressure)
+	}
+}
+
+// TestMediumLoop_VigPressure_ZeroWhenNoVigStore verifies that VigPressure is
+// zero when VigStore is nil (default when loan flow is not exercised).
+func TestMediumLoop_VigPressure_ZeroWhenNoVigStore(t *testing.T) {
+	st := newMediumStubState()
+	now := time.Now()
+
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		// VigStore intentionally nil.
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.VigPressure != 0 {
+		t.Errorf("VigPressure = %d, want 0 when VigStore is nil", result.VigPressure)
+	}
+}
+
+// TestMediumLoop_VigPressure_ZeroWhenNoActiveLoans verifies that VigPressure
+// is zero when TotalOutstandingVig returns zero (no active loans with vig).
+func TestMediumLoop_VigPressure_ZeroWhenNoActiveLoans(t *testing.T) {
+	st := newMediumStubState()
+	now := time.Now()
+
+	vigStore := &stubVigReader{total: 0}
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State:    st,
+		VigStore: vigStore,
+		Now:      func() time.Time { return now },
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.VigPressure != 0 {
+		t.Errorf("VigPressure = %d, want 0", result.VigPressure)
+	}
+}
+
+// TestMediumLoop_VigPressure_OtherOutputsUnaffected verifies that adding a
+// VigStore does not disturb the other MediumLoopResult fields (cluster
+// corrections, residuals, reputation, compression assigns remain zero when
+// the state is empty).
+func TestMediumLoop_VigPressure_OtherOutputsUnaffected(t *testing.T) {
+	st := newMediumStubState()
+	now := time.Now()
+
+	vigStore := &stubVigReader{total: 99}
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State:    st,
+		VigStore: vigStore,
+		Now:      func() time.Time { return now },
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.ClusterCorrections != 0 {
+		t.Errorf("ClusterCorrections = %d, want 0", result.ClusterCorrections)
+	}
+	if result.ResidualsPaid != 0 {
+		t.Errorf("ResidualsPaid = %d, want 0", result.ResidualsPaid)
+	}
+	if result.ReputationUpdates != 0 {
+		t.Errorf("ReputationUpdates = %d, want 0", result.ReputationUpdates)
+	}
+	if result.CompressionAssigns != 0 {
+		t.Errorf("CompressionAssigns = %d, want 0", result.CompressionAssigns)
+	}
+	if result.VigPressure != 99 {
+		t.Errorf("VigPressure = %d, want 99", result.VigPressure)
+	}
+}
