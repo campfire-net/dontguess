@@ -519,6 +519,60 @@ func (m *coOccurrenceMap) topK(k int) []string {
 	return out
 }
 
+// FederationNodeProfile is the trust profile for a counterparty (local agent or
+// federated exchange node). Computed by the slow loop from observed behavioral
+// signals. Local agents and federation nodes use the same model — they differ
+// only in starting trust_score (local: 0.7, new federation node: 0.4).
+//
+// See docs/design/semantic-matching-marketplace.md §4A.
+type FederationNodeProfile struct {
+	// SenderKey is the hex-encoded Ed25519 public key of the counterparty.
+	SenderKey string
+	// TrustScore is the computed trust score in [0.0, 1.0]. New nodes start
+	// at 0.4; local agents start at 0.7. Both converge toward 1.0 via behavioral
+	// history. Written by the slow loop.
+	TrustScore float64
+	// HopDepth is the median observed provenance hop depth for this sender.
+	// Approximated from Antecedents chain length. Advisory input only (F4).
+	HopDepth int
+	// FirstSeenAt is the timestamp of the first message from this sender.
+	FirstSeenAt time.Time
+	// TransactionCount is the number of completed transactions (settle:complete)
+	// traced to this sender. Used for new-node dual guard exit condition.
+	TransactionCount int
+}
+
+// IsNewNode returns true if the sender has not yet exited new-node status.
+// Both conditions must be satisfied to exit new-node status:
+//  1. transaction_count >= NewNodeTransactionThreshold
+//  2. age since FirstSeenAt >= NewNodeAgeDuration
+func (p *FederationNodeProfile) IsNewNode(now time.Time) bool {
+	if p.TransactionCount < NewNodeTransactionThreshold {
+		return true
+	}
+	return now.Sub(p.FirstSeenAt) < NewNodeAgeDuration
+}
+
+const (
+	// NewNodeTransactionThreshold is the minimum completed transaction count
+	// required to exit new-node status. See §4A dual guard.
+	NewNodeTransactionThreshold = 50
+
+	// NewNodeAgeDuration is the minimum age from first observation required
+	// to exit new-node status.
+	NewNodeAgeDuration = 30 * 24 * time.Hour
+
+	// NewNodeTrustScoreStart is the initial trust_score for new federation nodes.
+	NewNodeTrustScoreStart = 0.4
+
+	// LocalAgentTrustScoreStart is the initial trust_score for local agents.
+	LocalAgentTrustScoreStart = 0.7
+
+	// NewNodeTrustThreshold is the trust_score below which a node is routed to
+	// inline matching regardless of BrokeredMatchMode. See §4A dual guard.
+	NewNodeTrustThreshold = 0.6
+)
+
 // State is the in-memory materialized view of the exchange campfire log.
 // It is rebuilt on startup by Replay and updated incrementally by Apply.
 //
@@ -699,6 +753,18 @@ type State struct {
 	// Updated by UpdateCoOccurrence after each settle(complete).
 	// Reset on Replay — derived from the settle log. Reset on Replay.
 	coOccurrence map[string]*coOccurrenceMap
+
+	// senderHopDepth tracks, per sender key, the observed provenance hop depths
+	// across all messages from that sender. Hop depth is approximated from the
+	// Antecedents chain length. Populated by applyLocked for every message.
+	// Reset on Replay (re-derived from the log).
+	// Key: senderKey (hex-encoded Ed25519 public key). Value: slice of hop depths.
+	senderHopDepth map[string][]int
+
+	// federationProfiles holds the computed trust profile for each sender key.
+	// Key: senderKey. Written by UpdateFederationProfile (called by the slow loop
+	// or explicitly). Reset on Replay — re-derived from senderHopDepth.
+	federationProfiles map[string]*FederationNodeProfile
 }
 
 // NewState creates an empty exchange state.
@@ -738,6 +804,8 @@ func NewState() *State {
 		brokerMatchIDs:       make(map[string]struct{}),
 		debtorScores:         make(map[string]float64),
 		coOccurrence:         make(map[string]*coOccurrenceMap),
+		senderHopDepth:       make(map[string][]int),
+		federationProfiles:   make(map[string]*FederationNodeProfile),
 	}
 }
 
@@ -784,6 +852,14 @@ func (s *State) Replay(msgs []Message) {
 	// respectively), not derived from the campfire log.
 	s.brokeredAcceptedOrders = 0
 	s.brokeredCompletions = 0
+	// senderHopDepth is re-derived from the campfire log on Replay.
+	// Reset it so the replay loop rebuilds it cleanly from messages.
+	s.senderHopDepth = make(map[string][]int)
+	// federationProfiles is NOT reset on Replay. The trust_score values written
+	// by the slow loop (via SetFederationTrustScore) are externally managed and
+	// must survive engine restarts. The HopDepth and FirstSeenAt fields will be
+	// updated as messages replay (via trackSenderHopDepth). New senders will get
+	// profiles created during replay; existing profiles keep their trust_scores.
 
 	for i := range msgs {
 		s.applyLocked(&msgs[i])
@@ -800,6 +876,13 @@ func (s *State) Apply(msg *Message) {
 
 // applyLocked applies a message to state. Caller must hold s.mu.
 func (s *State) applyLocked(msg *Message) {
+	// Track provenance hop depth for every message from a known sender.
+	// Hop depth is approximated from the Antecedents chain length.
+	// This populates senderHopDepth for the slow loop's trust_score computation.
+	if msg.Sender != "" {
+		s.trackSenderHopDepth(msg)
+	}
+
 	op := exchangeOp(msg.Tags)
 	switch op {
 	case TagPut:
@@ -1294,6 +1377,11 @@ func (s *State) applySettleComplete(msg *Message) {
 	if _, brokered := s.brokerMatchIDs[matchMsgID]; brokered {
 		s.brokeredCompletions++
 	}
+
+	// Increment federation transaction count for the buyer. Used by the dual
+	// guard to determine when a new node has sufficient history to exit low-trust
+	// status.
+	s.incrementFederationTransactionCount(msg.Sender)
 
 	buyerKey := msg.Sender
 	s.completedEntries[deliverMsgID] = buyerKey
@@ -2690,4 +2778,153 @@ func (s *State) StalePredictionAssigns() []string {
 		}
 	}
 	return stale
+}
+
+// trackSenderHopDepth records the provenance hop depth for a message sender.
+// Hop depth is approximated from len(msg.Antecedents): a message with no
+// antecedents was sent directly (hop depth 0); each additional relay hop adds
+// one antecedent. Caller must hold s.mu.
+func (s *State) trackSenderHopDepth(msg *Message) {
+	hopDepth := len(msg.Antecedents)
+	key := msg.Sender
+	prof, ok := s.federationProfiles[key]
+	if !ok {
+		prof = &FederationNodeProfile{
+			SenderKey:   key,
+			TrustScore:  NewNodeTrustScoreStart,
+			FirstSeenAt: time.Unix(0, msg.Timestamp),
+		}
+		s.federationProfiles[key] = prof
+	}
+	s.senderHopDepth[key] = append(s.senderHopDepth[key], hopDepth)
+	prof.HopDepth = medianInt(s.senderHopDepth[key])
+}
+
+// UpdateFederationProfile updates the trust_score for a sender key based on
+// observed hop depth history and transaction count. Called by the slow loop
+// after computing the trust_score from behavioral signals.
+//
+// senderKey must be non-empty. hopDepth is the latest observed hop depth for
+// this sender (appended to the existing history).
+//
+// Thread-safe.
+func (s *State) UpdateFederationProfile(senderKey string, hopDepth int) {
+	if senderKey == "" {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.senderHopDepth[senderKey] = append(s.senderHopDepth[senderKey], hopDepth)
+	prof, ok := s.federationProfiles[senderKey]
+	if !ok {
+		prof = &FederationNodeProfile{
+			SenderKey:   senderKey,
+			TrustScore:  NewNodeTrustScoreStart,
+			FirstSeenAt: time.Now(),
+		}
+		s.federationProfiles[senderKey] = prof
+	}
+	prof.HopDepth = medianInt(s.senderHopDepth[senderKey])
+}
+
+// SetFederationTrustScore writes the slow-loop-computed trust_score for a sender.
+// Thread-safe.
+func (s *State) SetFederationTrustScore(senderKey string, score float64) {
+	if senderKey == "" {
+		return
+	}
+	if score < 0 {
+		score = 0
+	}
+	if score > 1 {
+		score = 1
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	prof, ok := s.federationProfiles[senderKey]
+	if !ok {
+		prof = &FederationNodeProfile{
+			SenderKey:   senderKey,
+			TrustScore:  NewNodeTrustScoreStart,
+			FirstSeenAt: time.Now(),
+		}
+		s.federationProfiles[senderKey] = prof
+	}
+	prof.TrustScore = score
+}
+
+// FederationProfile returns the trust profile for a sender key, or nil if
+// the sender has not been observed. Thread-safe.
+func (s *State) FederationProfile(senderKey string) *FederationNodeProfile {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	p := s.federationProfiles[senderKey]
+	if p == nil {
+		return nil
+	}
+	cp := *p
+	return &cp
+}
+
+// SenderHopDepths returns a copy of the hop depth history for a sender key.
+// Used by the slow loop to compute the median hop depth for trust_score.
+// Thread-safe.
+func (s *State) SenderHopDepths(senderKey string) []int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	src := s.senderHopDepth[senderKey]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]int, len(src))
+	copy(out, src)
+	return out
+}
+
+// AllFederationProfileKeys returns all sender keys with a federation profile.
+// Used by the slow loop to iterate over all tracked senders.
+// Thread-safe.
+func (s *State) AllFederationProfileKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	keys := make([]string, 0, len(s.federationProfiles))
+	for k := range s.federationProfiles {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// IncrementFederationTransactionCount increments the completed transaction count
+// for a sender. Called from applySettle when a settle:complete is processed.
+// Caller must hold s.mu.
+func (s *State) incrementFederationTransactionCount(senderKey string) {
+	if senderKey == "" {
+		return
+	}
+	prof, ok := s.federationProfiles[senderKey]
+	if !ok {
+		return
+	}
+	prof.TransactionCount++
+}
+
+// medianInt returns the median of a slice of ints. Returns 0 for an empty slice.
+// Does NOT modify the input slice (works on a copy).
+func medianInt(vals []int) int {
+	if len(vals) == 0 {
+		return 0
+	}
+	cp := make([]int, len(vals))
+	copy(cp, vals)
+	// Insertion sort — hop depth slices are small in practice.
+	for i := 1; i < len(cp); i++ {
+		for j := i; j > 0 && cp[j] < cp[j-1]; j-- {
+			cp[j], cp[j-1] = cp[j-1], cp[j]
+		}
+	}
+	mid := len(cp) / 2
+	if len(cp)%2 == 0 {
+		return (cp[mid-1] + cp[mid]) / 2
+	}
+	return cp[mid]
 }
