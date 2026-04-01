@@ -2449,17 +2449,14 @@ func (e *Engine) sendBrokeredMatchAssign(buyMsg *Message, task string, maxResult
 // non-fatal to the caller — the error is logged and the accept proceeds.
 func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 	bounty := entry.TokenCost * HotCompressionBountyPct / 100
-	description := fmt.Sprintf(
-		"Compress cached inference entry %s (content_hash=%s). Run /compress with the entry content to produce a Nyquist-sampled summary. Bounty: %d scrip.",
-		entry.EntryID, entry.ContentHash, bounty,
-	)
+	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
 	payload, err := json.Marshal(map[string]any{
 		"entry_id":         entry.EntryID,
 		"task_type":        "compress",
 		"reward":           bounty,
 		"exclusive_sender": entry.SellerKey,
 		"description":      description,
-		"guide":            "Hot compression: you just sold this content and have it cached. Produce a compressed version (≥30% size reduction) that preserves semantic meaning (≥0.85 similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. Accepted work creates a compressed derivative that earns you additional residuals on future sales.",
+		"guide":            "Hot compression: you just sold this content and have it cached — ideal position to compress. Accepted work creates a compressed derivative listed alongside the original. You earn the bounty now plus residuals (10% of sale price) each time either version sells.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding compression assign payload: %w", err)
@@ -2487,17 +2484,14 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 // the match proceeds.
 func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey string) error {
 	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
-	description := fmt.Sprintf(
-		"Compress cached inference entry %s (content_hash=%s). You just received this content — run /compress to produce a Nyquist-sampled summary. Bounty: %d scrip.",
-		entry.EntryID, entry.ContentHash, bounty,
-	)
+	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
 	payload, err := json.Marshal(map[string]any{
 		"entry_id":         entry.EntryID,
 		"task_type":        "compress",
 		"reward":           bounty,
 		"exclusive_sender": buyerKey,
 		"description":      description,
-		"guide":            "Warm compression: you just purchased and received this content. Produce a compressed version (≥30% size reduction, ≥0.85 semantic similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. The compressed derivative becomes independently purchasable — the original seller earns residuals, and you earn the bounty.",
+		"guide":            "Warm compression: you just purchased this content and have it in context — ideal position to compress. The compressed derivative becomes independently purchasable. Original seller earns residuals on both versions; you earn the bounty.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding warm compression assign payload: %w", err)
@@ -2535,16 +2529,13 @@ func (e *Engine) PostOpenCompressionAssign(entryID string) error {
 // loop for high-demand entries that still lack a compressed derivative.
 func (e *Engine) sendColdCompressionAssign(entry *InventoryEntry) error {
 	bounty := entry.TokenCost * ColdCompressionBountyPct / 100
-	description := fmt.Sprintf(
-		"Compress cached inference entry %s (content_hash=%s). Produce a Nyquist-sampled summary preserving semantic content. Bounty: %d scrip.",
-		entry.EntryID, entry.ContentHash, bounty,
-	)
+	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
 	payload, err := json.Marshal(map[string]any{
 		"entry_id":    entry.EntryID,
 		"task_type":   "compress",
 		"reward":      bounty,
 		"description": description,
-		"guide":       "Cold compression: this entry has buyer demand but no compressed version yet. Any eligible agent can claim this. Produce a compressed version (≥30% size reduction, ≥0.85 semantic similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. Claim timeout: 30 minutes for entries >50k tokens, 15 minutes otherwise.",
+		"guide":       "Cold compression: this entry has active buyer demand but no compressed version. Open to any eligible agent. The compressed derivative becomes independently purchasable at a density premium. Claim timeout: 30 minutes for entries >50k tokens, 15 minutes otherwise.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding cold compression assign payload: %w", err)
