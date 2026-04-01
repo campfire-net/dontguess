@@ -8,6 +8,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version is the build version, injected at build time via ldflags:
+// -X main.Version=v1.2.3
+var Version = "dev"
+
 var rootCmd = &cobra.Command{
 	Use:   "dontguess",
 	Short: "DontGuess — token-work exchange operator CLI",
@@ -19,10 +23,19 @@ orders, matches, settlements) is derived from the message log.
   dontguess convention supersede  publish a new convention version via registry supersede`,
 }
 
+var versionCmd = &cobra.Command{
+	Use:   "version",
+	Short: "Print the version",
+	Run: func(cmd *cobra.Command, args []string) {
+		fmt.Println(Version)
+	},
+}
+
 var jsonOutput bool
 
 func init() {
 	rootCmd.PersistentFlags().BoolVar(&jsonOutput, "json", false, "output as JSON")
+	rootCmd.AddCommand(versionCmd)
 }
 
 func main() {

@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  id-token: write  # required for keyless cosign signing via GitHub OIDC
+
+jobs:
+  release:
+    name: Build and release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      version_bare: ${{ steps.version.outputs.version_bare }}
+      version_minor: ${{ steps.version.outputs.version_minor }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Parse version
+        id: version
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          VERSION_BARE="${VERSION#v}"  # strip leading v
+          VERSION_MINOR="v$(echo "${VERSION_BARE}" | cut -d. -f1-2)"  # e.g., v0.3
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "version_bare=${VERSION_BARE}" >> "$GITHUB_OUTPUT"
+          echo "version_minor=${VERSION_MINOR}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+        env:
+          GOPRIVATE: github.com/campfire-net/campfire
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Build binaries
+        env:
+          GOPRIVATE: github.com/campfire-net/campfire
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          LDFLAGS_DONTGUESS="-s -w -X main.Version=${VERSION}"
+          LDFLAGS_SELLER="-s -w -X main.Version=${VERSION}"
+          OUTDIR="dist"
+          mkdir -p "${OUTDIR}"
+
+          declare -a TARGETS=(
+            "linux/amd64"
+            "linux/arm64"
+            "darwin/amd64"
+            "darwin/arm64"
+            "windows/amd64"
+          )
+
+          for TARGET in "${TARGETS[@]}"; do
+            OS="${TARGET%/*}"
+            ARCH="${TARGET#*/}"
+            LABEL="${OS}_${ARCH}"
+
+            for CMD in dontguess seller; do
+              BIN="${CMD}"
+              if [ "${OS}" = "windows" ]; then
+                BIN="${CMD}.exe"
+              fi
+
+              LDFLAGS="${LDFLAGS_DONTGUESS}"
+              if [ "${CMD}" = "seller" ]; then
+                LDFLAGS="${LDFLAGS_SELLER}"
+              fi
+
+              GOOS="${OS}" GOARCH="${ARCH}" go build \
+                -ldflags "${LDFLAGS}" \
+                -o "${OUTDIR}/${CMD}_${LABEL}/${BIN}" \
+                "./cmd/${CMD}"
+            done
+
+            # Archive: tar.gz for linux/darwin, zip for windows
+            if [ "${OS}" = "windows" ]; then
+              (cd "${OUTDIR}" && zip -r "dontguess_${LABEL}.zip" "dontguess_${LABEL}/" "seller_${LABEL}/")
+            else
+              tar -czf "${OUTDIR}/dontguess_${LABEL}.tar.gz" \
+                -C "${OUTDIR}" \
+                "dontguess_${LABEL}/" "seller_${LABEL}/"
+            fi
+          done
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > checksums.txt
+          cat checksums.txt
+
+      - name: Sign artifacts with cosign
+        run: |
+          cd dist
+          for FILE in *.tar.gz *.zip checksums.txt; do
+            [ -f "${FILE}" ] || continue
+            cosign sign-blob \
+              --yes \
+              --output-signature "${FILE}.sig" \
+              --output-certificate "${FILE}.pem" \
+              "${FILE}"
+          done
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          # Get commits since the previous tag
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          if [ -n "${PREV_TAG}" ]; then
+            COMMITS=$(git log "${PREV_TAG}..HEAD" --pretty=format:"%s" --no-merges)
+          else
+            COMMITS=$(git log --pretty=format:"%s" --no-merges)
+          fi
+
+          # Categorize commits by conventional-commit prefix
+          FEATURES=""
+          FIXES=""
+          REFACTORS=""
+          TESTS=""
+          DOCS=""
+          PERF=""
+          OTHER=""
+
+          while IFS= read -r line; do
+            [ -z "${line}" ] && continue
+            case "${line}" in
+              feat*)    FEATURES="${FEATURES}- ${line}"$'\n' ;;
+              fix*)     FIXES="${FIXES}- ${line}"$'\n' ;;
+              refactor*) REFACTORS="${REFACTORS}- ${line}"$'\n' ;;
+              test*)    TESTS="${TESTS}- ${line}"$'\n' ;;
+              docs*)    DOCS="${DOCS}- ${line}"$'\n' ;;
+              perf*)    PERF="${PERF}- ${line}"$'\n' ;;
+              chore*|beads*|Attest*|Upgrade*|Merge*) ;; # skip noise
+              *)        OTHER="${OTHER}- ${line}"$'\n' ;;
+            esac
+          done <<< "${COMMITS}"
+
+          {
+            if [ -n "${FEATURES}" ]; then
+              echo "### Features"
+              echo ""
+              echo "${FEATURES}"
+            fi
+            if [ -n "${FIXES}" ]; then
+              echo "### Fixes"
+              echo ""
+              echo "${FIXES}"
+            fi
+            if [ -n "${PERF}" ]; then
+              echo "### Performance"
+              echo ""
+              echo "${PERF}"
+            fi
+            if [ -n "${REFACTORS}" ]; then
+              echo "### Refactoring"
+              echo ""
+              echo "${REFACTORS}"
+            fi
+            if [ -n "${TESTS}" ]; then
+              echo "### Tests"
+              echo ""
+              echo "${TESTS}"
+            fi
+            if [ -n "${DOCS}" ]; then
+              echo "### Documentation"
+              echo ""
+              echo "${DOCS}"
+            fi
+            if [ -n "${OTHER}" ]; then
+              echo "### Other"
+              echo ""
+              echo "${OTHER}"
+            fi
+            echo "---"
+            echo ""
+            echo "**Full changelog**: [\`${PREV_TAG}...${{ steps.version.outputs.version }}\`](https://github.com/${GITHUB_REPOSITORY}/compare/${PREV_TAG}...${{ steps.version.outputs.version }})"
+          } > /tmp/release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: /tmp/release_notes.md
+          generate_release_notes: false
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/checksums.txt
+            dist/*.sig
+            dist/*.pem
