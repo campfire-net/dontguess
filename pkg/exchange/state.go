@@ -2868,6 +2868,13 @@ func (s *State) StalePredictionAssigns() []string {
 // Hop depth is approximated from len(msg.Antecedents): a message with no
 // antecedents was sent directly (hop depth 0); each additional relay hop adds
 // one antecedent. Caller must hold s.mu.
+//
+// F4 advisory: Antecedents length is sender-controlled and not cryptographically
+// verified by the campfire protocol. An attacker can set Antecedents=[] to minimize
+// hop depth and maximize the depth term in the trust formula. This is a known
+// design limitation (see §4A F4 permanent constraint): hop depth is weighted at
+// 0.15 and serves as a corroborating signal only. The primary trust signal is
+// behavioral history (0.70 weight). Do not rely on hop depth alone for access control.
 func (s *State) trackSenderHopDepth(msg *Message) {
 	hopDepth := len(msg.Antecedents)
 	key := msg.Sender
@@ -3068,4 +3075,13 @@ func (s *State) GuaranteeForMatch(matchMsgID string) (deadline time.Time, insure
 		return
 	}
 	return time.Unix(0, g[0]).UTC(), g[1], true
+}
+
+// ClearMatchGuarantee removes the guarantee record for matchMsgID so that a
+// duplicate settle(complete) cannot re-enter the refund path. Called by the
+// engine after a successful deadline-miss refund. Thread-safe.
+func (s *State) ClearMatchGuarantee(matchMsgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.matchGuarantee, matchMsgID)
 }
