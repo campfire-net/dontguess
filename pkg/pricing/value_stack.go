@@ -33,8 +33,8 @@ import (
 	"context"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 // CorrectnessRegressionTolerance is the maximum allowed drop in

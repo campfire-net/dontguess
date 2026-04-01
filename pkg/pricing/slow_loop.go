@@ -43,7 +43,7 @@ import (
 	"sort"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // DefaultSlowLoopInterval is the cadence at which the slow loop runs.

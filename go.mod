@@ -1,4 +1,4 @@
-module github.com/3dl-dev/dontguess
+module github.com/campfire-net/dontguess
 
 go 1.25.0
 

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // newMinimalEngineWithOpts returns an engine configured with caller-supplied

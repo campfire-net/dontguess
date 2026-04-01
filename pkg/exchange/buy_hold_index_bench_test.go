@@ -17,8 +17,8 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 // BenchmarkGetBuyHoldReservation_IndexLookup benchmarks the O(1) state-index

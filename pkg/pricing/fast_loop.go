@@ -26,7 +26,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // DefaultFastLoopInterval is the cadence at which the fast loop runs.

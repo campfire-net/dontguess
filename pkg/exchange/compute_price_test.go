@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // newMinimalEngine returns an engine with no transport or store for unit-testing

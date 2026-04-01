@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	dgconv "github.com/3dl-dev/dontguess/pkg/convention"
+	dgconv "github.com/campfire-net/dontguess/pkg/convention"
 )
 
 // buildDecl constructs a minimal convention declaration JSON payload for testing.

@@ -16,8 +16,8 @@ import (
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/matching"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/matching"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 

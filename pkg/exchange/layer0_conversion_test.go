@@ -26,7 +26,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // TestLayer0_Constants verifies the Layer 0 gate constants have the correct values.

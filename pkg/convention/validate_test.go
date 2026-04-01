@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	dgconv "github.com/3dl-dev/dontguess/pkg/convention"
+	dgconv "github.com/campfire-net/dontguess/pkg/convention"
 )
 
 // ---- ValidateTags (denylist) -----------------------------------------------

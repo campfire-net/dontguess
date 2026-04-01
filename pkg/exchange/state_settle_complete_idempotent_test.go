@@ -9,7 +9,7 @@ package exchange_test
 import (
 	"testing"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // TestState_SettleComplete_ReplayIdempotent verifies that replaying all messages

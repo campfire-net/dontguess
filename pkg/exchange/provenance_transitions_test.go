@@ -26,7 +26,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/provenance"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // makeTransitionStore returns a provenance.Store with:

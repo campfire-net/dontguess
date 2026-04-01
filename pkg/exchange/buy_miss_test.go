@@ -18,8 +18,8 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 // TestBuyMiss_EmitsBuyMissWhenNoInventory verifies that a buy with no matching

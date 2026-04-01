@@ -10,7 +10,7 @@ import (
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/store"
-	dgconv "github.com/3dl-dev/dontguess/pkg/convention"
+	dgconv "github.com/campfire-net/dontguess/pkg/convention"
 	"github.com/spf13/cobra"
 )
 

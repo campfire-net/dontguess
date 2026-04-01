@@ -18,8 +18,8 @@ import (
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/campfire-net/campfire/pkg/transport/fs"
 
-	"github.com/3dl-dev/dontguess/pkg/proto"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/proto"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 const (

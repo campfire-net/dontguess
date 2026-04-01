@@ -19,7 +19,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // TestEngine_Prediction_FullPath drives a real engine through the complete settle

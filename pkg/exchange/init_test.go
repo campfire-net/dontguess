@@ -11,7 +11,7 @@ import (
 	"github.com/campfire-net/campfire/pkg/naming"
 	"github.com/campfire-net/campfire/pkg/protocol"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // conventionDir returns the path to the project's convention declarations.

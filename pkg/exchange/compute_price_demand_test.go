@@ -30,7 +30,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 // completeBuyTransactionForBuyer runs the full buy → match → buyer-accept →

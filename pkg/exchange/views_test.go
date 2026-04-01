@@ -6,7 +6,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/protocol"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 func TestInit_CreatesNamedViews(t *testing.T) {

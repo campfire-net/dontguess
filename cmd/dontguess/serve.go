@@ -8,9 +8,9 @@ import (
 	"os/signal"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
-	"github.com/3dl-dev/dontguess/pkg/matching"
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/matching"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 	"github.com/campfire-net/campfire/pkg/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"

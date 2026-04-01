@@ -1,6 +1,6 @@
 package exchange
 
-import "github.com/3dl-dev/dontguess/pkg/matching"
+import "github.com/campfire-net/dontguess/pkg/matching"
 
 // SetMatchIndexForTest replaces the engine's semantic match index.
 // Used in tests that need to control which entries win the semantic match.

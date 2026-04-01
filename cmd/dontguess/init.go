@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/spf13/cobra"
 )
 

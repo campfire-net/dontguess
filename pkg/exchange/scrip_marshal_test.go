@@ -25,7 +25,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/store"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
 var errMarshalInjected = errors.New("injected marshal failure")

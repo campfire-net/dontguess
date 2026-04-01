@@ -10,7 +10,7 @@ import (
 
 	"github.com/campfire-net/campfire/pkg/protocol"
 
-	"github.com/3dl-dev/dontguess/pkg/proto"
+	"github.com/campfire-net/dontguess/pkg/proto"
 )
 
 // scrip operation tag constants. These match the convention spec in

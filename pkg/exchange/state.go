@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 // Tag constants for exchange convention operations.

@@ -21,8 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/exchange"
-	"github.com/3dl-dev/dontguess/pkg/pricing"
+	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/pricing"
 )
 
 // TestComputePrice_FastLoopAdjustment_RealEngine verifies that a fast-loop
