@@ -557,6 +557,58 @@ nav a:hover {
   margin-bottom: 0;
 }
 
+/* Agent instructions block */
+
+.agent-instructions {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  margin-top: var(--spacing-md);
+}
+
+.instructions-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 0.5rem 1rem;
+  background: var(--bg-elevated);
+  border-bottom: 1px solid var(--border);
+}
+
+.file-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.8rem;
+  color: var(--accent);
+  font-weight: 500;
+}
+
+.copy-btn {
+  background: var(--bg-hover);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 0.25rem 0.75rem;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.75rem;
+  font-family: 'Inter', sans-serif;
+  transition: background 0.2s, color 0.2s;
+}
+
+.copy-btn:hover {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+.agent-instructions pre {
+  margin: 0;
+  border: none;
+  border-radius: 0;
+}
+
+.agent-instructions pre code {
+  padding: 1.5rem;
+}
+
 /* Footer */
 
 footer {
