@@ -1074,22 +1074,22 @@ func TestReplay_NegativeBalance_SubsequentDecrementBudgetFails(t *testing.T) {
 	}
 }
 
-// TestLiveMode_SubtractFromBalance_ClampsToZero verifies the underflow guard:
-// a buy-hold message received in live mode (post-Replay, replaying=false) must
-// clamp the balance to zero rather than going negative. This prevents a corrupt
-// or unexpected live message from causing permanent buyer lockout.
+// TestLiveMode_SubtractFromBalance_RejectsUnderflow verifies the underflow guard:
+// a buy-hold message received in live mode (post-Replay, replaying=false) that
+// would drive the balance negative must be hard-rejected — the balance must remain
+// unchanged and not go negative or be clamped to zero.
 //
 // We test this via ApplyMessage, which processes a single message in live mode
 // (replaying=false). Contrast with TestReplay_NegativeBalanceAllowed which shows
 // that replay mode permits negative balances.
-func TestLiveMode_SubtractFromBalance_ClampsToZero(t *testing.T) {
+func TestLiveMode_SubtractFromBalance_RejectsUnderflow(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Mint 200 to Alice so she has a positive balance post-replay.
 	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(200),
-		"x402_tx_ref": "tx-live-clamp",
+		"x402_tx_ref": "tx-live-reject",
 		"rate":        int64(1000),
 	})
 
@@ -1106,12 +1106,35 @@ func TestLiveMode_SubtractFromBalance_ClampsToZero(t *testing.T) {
 	})
 	cs.ApplyMessage(&liveMsg)
 
+	// Balance must be unchanged at 200 — hard-reject, not clamp.
 	bal := cs.Balance(agentAlice)
-	if bal < 0 {
-		t.Errorf("live mode: balance went negative (%d); underflow guard not applied", bal)
+	if bal != 200 {
+		t.Errorf("live mode: expected balance unchanged at 200 after underflow rejection, got %d", bal)
 	}
+}
+
+// TestLiveMode_SubtractFromBalance_ZeroBalance_Rejects verifies that a
+// subtractFromBalance call against a zero balance in live mode is hard-rejected:
+// the message is dropped and the balance remains at zero.
+func TestLiveMode_SubtractFromBalance_ZeroBalance_Rejects(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Alice has no prior mint — balance starts at 0.
+	cs := newStore(t, env)
+	if cs.Balance(agentAlice) != 0 {
+		t.Fatalf("precondition: Alice balance = %d, want 0", cs.Balance(agentAlice))
+	}
+
+	// A buy-hold on a zero balance must be rejected in live mode.
+	liveMsg := buildMsg(t, env.campfireID, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
+		"buyer":  agentAlice,
+		"amount": int64(1),
+	})
+	cs.ApplyMessage(&liveMsg)
+
+	bal := cs.Balance(agentAlice)
 	if bal != 0 {
-		t.Errorf("live mode: expected balance clamped to 0, got %d", bal)
+		t.Errorf("live mode: expected balance unchanged at 0 after underflow rejection, got %d", bal)
 	}
 }
 
