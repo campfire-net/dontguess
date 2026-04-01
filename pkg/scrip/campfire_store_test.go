@@ -1524,3 +1524,399 @@ func TestLoanMint_MultipleBorrowers(t *testing.T) {
 		t.Errorf("TotalLoanPrincipal = %d, want 1200", got)
 	}
 }
+
+// --- scrip:loan-repay tests ---
+
+// TestLoanRepay_PartialRepay verifies that a partial repayment increments
+// LoanRecord.Repaid and burns scrip from totalSupply without transitioning the
+// loan to LoanRepaid.
+func TestLoanRepay_PartialRepay(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 1000,
+		DueAt:     dueAt,
+		LoanID:    "loan-repay-partial",
+	})
+
+	// Partial repayment: 400 of 1000.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-partial",
+		Amount: 400,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-repay-partial")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Repaid != 400 {
+		t.Errorf("Repaid = %d, want 400", rec.Repaid)
+	}
+	if rec.Status != scrip.LoanActive {
+		t.Errorf("Status = %v, want LoanActive (not fully repaid)", rec.Status)
+	}
+	// totalSupply reduced by repayment amount; totalLoanPrincipal unchanged until full repayment.
+	if got := cs.TotalSupply(); got != 600 {
+		t.Errorf("TotalSupply = %d, want 600", got)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 1000 {
+		t.Errorf("TotalLoanPrincipal = %d, want 1000", got)
+	}
+}
+
+// TestLoanRepay_FullRepay verifies that a full repayment sets LoanRecord.Status
+// to LoanRepaid and decrements totalLoanPrincipal by the principal.
+func TestLoanRepay_FullRepay(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 800,
+		DueAt:     dueAt,
+		LoanID:    "loan-repay-full",
+	})
+
+	// Full repayment in one message.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-full",
+		Amount: 800,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-repay-full")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Repaid != 800 {
+		t.Errorf("Repaid = %d, want 800", rec.Repaid)
+	}
+	if rec.Status != scrip.LoanRepaid {
+		t.Errorf("Status = %v, want LoanRepaid", rec.Status)
+	}
+	// Both supply counters reduced.
+	if got := cs.TotalSupply(); got != 0 {
+		t.Errorf("TotalSupply = %d, want 0", got)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 0 {
+		t.Errorf("TotalLoanPrincipal = %d, want 0", got)
+	}
+}
+
+// TestLoanRepay_TwoInstalmentsFullRepay verifies that two partial repayments
+// that sum to the principal transition the loan to LoanRepaid.
+func TestLoanRepay_TwoInstalmentsFullRepay(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 600,
+		DueAt:     dueAt,
+		LoanID:    "loan-repay-two",
+	})
+
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-two",
+		Amount: 300,
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-two",
+		Amount: 300,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-repay-two")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Repaid != 600 {
+		t.Errorf("Repaid = %d, want 600", rec.Repaid)
+	}
+	if rec.Status != scrip.LoanRepaid {
+		t.Errorf("Status = %v, want LoanRepaid", rec.Status)
+	}
+	if got := cs.TotalLoanPrincipal(); got != 0 {
+		t.Errorf("TotalLoanPrincipal = %d, want 0", got)
+	}
+}
+
+// TestLoanRepay_UnknownLoan_Ignored verifies that a repayment for an unknown
+// loan_id is silently ignored without panicking or corrupting state.
+func TestLoanRepay_UnknownLoan_Ignored(t *testing.T) {
+	env := newTestEnv(t)
+
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "does-not-exist",
+		Amount: 500,
+	})
+
+	cs := newStore(t, env)
+
+	if got := cs.TotalSupply(); got != 0 {
+		t.Errorf("TotalSupply = %d, want 0 (no-op for unknown loan)", got)
+	}
+}
+
+// TestLoanRepay_AlreadyRepaid_Ignored verifies that a repayment message for a
+// loan already in LoanRepaid status is silently ignored.
+func TestLoanRepay_AlreadyRepaid_Ignored(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 200,
+		DueAt:     dueAt,
+		LoanID:    "loan-already-repaid",
+	})
+	// Full repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-already-repaid",
+		Amount: 200,
+	})
+	// Attempt second repayment — must be ignored.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-already-repaid",
+		Amount: 100,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-already-repaid")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Repaid != 200 {
+		t.Errorf("Repaid = %d, want 200 (second repay must be ignored)", rec.Repaid)
+	}
+	if rec.Status != scrip.LoanRepaid {
+		t.Errorf("Status = %v, want LoanRepaid", rec.Status)
+	}
+	// totalSupply must only have been decremented by the first repayment.
+	if got := cs.TotalSupply(); got != 0 {
+		t.Errorf("TotalSupply = %d, want 0", got)
+	}
+}
+
+// --- scrip:loan-vig-accrue tests ---
+
+// TestLoanVigAccrue_AccruesToOutstanding verifies that a vig-accrue message
+// increments LoanRecord.Outstanding without affecting Repaid or totalSupply.
+func TestLoanVigAccrue_AccruesToOutstanding(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 1000,
+		DueAt:     dueAt,
+		LoanID:    "loan-vig-accrue",
+	})
+
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "loan-vig-accrue",
+		Amount: 50,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-vig-accrue")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Outstanding != 50 {
+		t.Errorf("Outstanding = %d, want 50", rec.Outstanding)
+	}
+	if rec.Repaid != 0 {
+		t.Errorf("Repaid = %d, want 0 (vig does not touch Repaid)", rec.Repaid)
+	}
+	// totalSupply is not affected by vig accrual.
+	if got := cs.TotalSupply(); got != 1000 {
+		t.Errorf("TotalSupply = %d, want 1000", got)
+	}
+}
+
+// TestLoanVigAccrue_Cumulative verifies that multiple vig-accrue messages
+// accumulate correctly in LoanRecord.Outstanding.
+func TestLoanVigAccrue_Cumulative(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 1000,
+		DueAt:     dueAt,
+		LoanID:    "loan-vig-cumulative",
+	})
+
+	for _, amt := range []int64{20, 30, 15} {
+		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+			LoanID: "loan-vig-cumulative",
+			Amount: amt,
+		})
+	}
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-vig-cumulative")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Outstanding != 65 {
+		t.Errorf("Outstanding = %d, want 65 (20+30+15)", rec.Outstanding)
+	}
+}
+
+// TestLoanVigAccrue_UnknownLoan_Ignored verifies that a vig-accrue for an
+// unknown loan_id is silently ignored.
+func TestLoanVigAccrue_UnknownLoan_Ignored(t *testing.T) {
+	env := newTestEnv(t)
+
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "ghost-loan",
+		Amount: 99,
+	})
+
+	cs := newStore(t, env)
+	// No loan record, no supply change — just silence.
+	if got := cs.TotalSupply(); got != 0 {
+		t.Errorf("TotalSupply = %d, want 0", got)
+	}
+}
+
+// TestLoanVigAccrue_RepaidLoan_Ignored verifies that vig does not accrue on a
+// fully-repaid loan.
+func TestLoanVigAccrue_RepaidLoan_Ignored(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 500,
+		DueAt:     dueAt,
+		LoanID:    "loan-vig-repaid",
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-vig-repaid",
+		Amount: 500,
+	})
+	// Try to accrue vig after repayment — must be ignored.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "loan-vig-repaid",
+		Amount: 25,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-vig-repaid")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Outstanding != 0 {
+		t.Errorf("Outstanding = %d, want 0 (vig must not accrue on repaid loan)", rec.Outstanding)
+	}
+}
+
+// TestTotalOutstandingVig_AcrossLoans verifies that TotalOutstandingVig sums
+// Outstanding across all active loans and excludes repaid loans.
+func TestTotalOutstandingVig_AcrossLoans(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+
+	// Two active loans with vig.
+	for _, args := range []struct {
+		loanID string
+		amt    int64
+	}{
+		{"loan-vig-sum-a", 100},
+		{"loan-vig-sum-b", 200},
+	} {
+		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+			Borrower:  agentAlice,
+			Principal: 1000,
+			DueAt:     dueAt,
+			LoanID:    args.loanID,
+		})
+		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+			LoanID: args.loanID,
+			Amount: args.amt,
+		})
+	}
+
+	// One fully-repaid loan with vig that was accrued before repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentBob,
+		Principal: 300,
+		DueAt:     dueAt,
+		LoanID:    "loan-vig-sum-c",
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "loan-vig-sum-c",
+		Amount: 50,
+	})
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-vig-sum-c",
+		Amount: 300,
+	})
+
+	cs := newStore(t, env)
+
+	// TotalOutstandingVig must only sum active loans (a + b = 300); repaid loan c excluded.
+	if got := cs.TotalOutstandingVig(); got != 300 {
+		t.Errorf("TotalOutstandingVig = %d, want 300", got)
+	}
+}
+
+// TestLoanRepay_ClearsOutstandingVig verifies that a full repayment zeroes
+// LoanRecord.Outstanding even when vig was accrued before repayment.
+//
+// Scenario: mint loan (principal=1000), accrue vig (50), fully repay (1000).
+// After repayment: Outstanding must be 0, Status must be LoanRepaid.
+// TotalOutstandingVig must also be 0.
+func TestLoanRepay_ClearsOutstandingVig(t *testing.T) {
+	env := newTestEnv(t)
+
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: 1000,
+		DueAt:     dueAt,
+		LoanID:    "loan-repay-clears-vig",
+	})
+
+	// Accrue vig before repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		LoanID: "loan-repay-clears-vig",
+		Amount: 50,
+	})
+
+	// Full repayment.
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+		LoanID: "loan-repay-clears-vig",
+		Amount: 1000,
+	})
+
+	cs := newStore(t, env)
+
+	rec, ok := cs.GetLoan("loan-repay-clears-vig")
+	if !ok {
+		t.Fatal("GetLoan: not found")
+	}
+	if rec.Status != scrip.LoanRepaid {
+		t.Errorf("Status = %v, want LoanRepaid", rec.Status)
+	}
+	if rec.Outstanding != 0 {
+		t.Errorf("Outstanding = %d, want 0 after full repayment (accrued vig must be cleared)", rec.Outstanding)
+	}
+	if got := cs.TotalOutstandingVig(); got != 0 {
+		t.Errorf("TotalOutstandingVig = %d, want 0 (repaid loan must not contribute to vig pressure)", got)
+	}
+}
