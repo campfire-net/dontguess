@@ -24,3 +24,5 @@ vendor/
 .env
 *.key
 *.pem
+/seller
+/dist/
