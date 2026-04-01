@@ -75,6 +75,15 @@ var allowedTagPatterns = []tagPattern{
 	{prefix: "scrip:rate:"},
 	// exchange-scrip/settle.json
 	{exact: "dontguess:scrip-settle"},
+	// exchange-core/assign-auction-close.json
+	{exact: "exchange:assign-auction-close"},
+	// exchange-scrip/loan-mint.json
+	{exact: "dontguess:scrip-loan-mint"},
+	{prefix: "scrip:loan:"},
+	// exchange-scrip/loan-repay.json
+	{exact: "dontguess:scrip-loan-repay"},
+	// exchange-scrip/loan-vig-accrue.json
+	{exact: "dontguess:scrip-loan-vig-accrue"},
 }
 
 // tagPattern describes one entry from a produces_tags declaration.
