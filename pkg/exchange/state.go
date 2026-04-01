@@ -2176,6 +2176,8 @@ func (s *State) ClaimAssignPayment(completeMsgID string) *AssignRecord {
 		return nil
 	}
 	r.Status = AssignPaid
+	// Belt-and-suspenders: remove from index in case it wasn't removed at accept.
+	delete(s.completeMsgToAssign, completeMsgID)
 	return r
 }
 
