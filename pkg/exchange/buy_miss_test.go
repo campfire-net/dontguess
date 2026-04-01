@@ -1267,3 +1267,133 @@ func TestBuyMiss_AutoAcceptEmitsHotCompressionAssignToSeller(t *testing.T) {
 		t.Error("assign description is empty")
 	}
 }
+
+// TestBuyMiss_SellerBalanceAfterStandingOfferFulfillment verifies that the
+// seller's scrip balance in the CampfireScripStore increases by exactly the
+// put-pay amount after the engine auto-accepts a put matching a standing offer.
+//
+// Done condition (dontguess-3c3): cs.Balance(sellerKey) == tokenCost *
+// BuyMissOfferRate / 100 after put-accept, asserted via store state —
+// not log parsing.
+//
+// Two assertions:
+//  1. In-memory balance updated immediately by the engine (AddBudget path).
+//  2. Fresh Replay from campfire log reproduces the same balance (scrip-put-pay
+//     message is correctly emitted and replayed via applyPutPay).
+func TestBuyMiss_SellerBalanceAfterStandingOfferFulfillment(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+
+	// Mint operator scrip first so applyPutPay can decrement the operator
+	// balance during Replay without underflowing. The mint must be in the
+	// campfire log before constructing the scrip store so Replay sees it.
+	const tokenCost int64 = 90000
+	expectedPutPay := tokenCost * int64(exchange.BuyMissOfferRate) / 100
+	// Operator needs at least expectedPutPay to cover the put-pay disbursement.
+	addScripMintMsg(t, h, h.operator.PublicKeyHex(), expectedPutPay+10000)
+
+	// Build the scrip store after the mint message is in the log.
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:  h.cfID,
+		Store:       h.st,
+		ReadClient:  h.newOperatorClient(),
+		WriteClient: h.newOperatorClient(),
+		ScripStore:  cs,
+		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	task := "Translate a 3000-line C++ game engine to idiomatic Go"
+	sellerKey := h.buyer.PublicKeyHex() // buyer is also the seller in buy-miss (computed it themselves)
+
+	// Step 1: Buyer sends a buy — no inventory => engine emits buy-miss offer.
+	_ = h.sendMessage(h.buyer,
+		buyPayload(task, 120000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	preBuyMiss, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagBuyMiss}})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	go func() { _ = eng.Start(ctx) }()
+
+	// Wait for the buy-miss offer to appear.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagBuyMiss}})
+		if len(msgs) > len(preBuyMiss) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	buyMissMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagBuyMiss}})
+	if len(buyMissMsgs) <= len(preBuyMiss) {
+		cancel()
+		t.Fatal("step 1: no buy-miss offer emitted")
+	}
+
+	// Step 2: Buyer puts the result — same task description triggers auto-accept.
+	_ = h.sendMessage(h.buyer,
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", tokenCost), "code", tokenCost, tokenCost*2),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+
+	// Step 3: Wait for the put-accept settle message.
+	preSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+		if len(msgs) > len(preSettle) {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	settleMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	if len(settleMsgs) <= len(preSettle) {
+		t.Fatal("step 3: no put-accept settle message emitted")
+	}
+	var putAcceptFound bool
+	for _, sm := range settleMsgs {
+		if hasTag(sm.Tags, "exchange:phase:put-accept") {
+			putAcceptFound = true
+			break
+		}
+	}
+	if !putAcceptFound {
+		t.Fatal("step 3: settle messages exist but none have put-accept phase tag")
+	}
+
+	// --- Assertion 1: in-memory store balance updated by engine (AddBudget path) ---
+	//
+	// The engine calls ScripStore.AddBudget(sellerKey, offeredPrice) directly
+	// before emitting the scrip-put-pay campfire message. The balance must reflect
+	// the payment immediately in the live store instance.
+	inMemoryBalance := cs.Balance(sellerKey)
+	if inMemoryBalance != expectedPutPay {
+		t.Errorf("in-memory seller balance after put-accept: got %d, want %d (tokenCost=%d * offerRate=%d%%)",
+			inMemoryBalance, expectedPutPay, tokenCost, exchange.BuyMissOfferRate)
+	}
+
+	// --- Assertion 2: fresh Replay from campfire log reproduces the same balance ---
+	//
+	// The engine emits a scrip-put-pay campfire message so CampfireScripStore can
+	// reconstruct state from the log. A fresh store constructed from the same log
+	// must show the same seller balance. This verifies the campfire message was
+	// actually emitted and applyPutPay handles it correctly.
+	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	if err != nil {
+		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
+	}
+	replayedBalance := freshCS.Balance(sellerKey)
+	if replayedBalance != expectedPutPay {
+		t.Errorf("replayed seller balance after put-accept: got %d, want %d (tokenCost=%d * offerRate=%d%%)",
+			replayedBalance, expectedPutPay, tokenCost, exchange.BuyMissOfferRate)
+	}
+}
