@@ -1223,3 +1223,80 @@ func TestMediumLoop_VigPressure_OtherOutputsUnaffected(t *testing.T) {
 		t.Errorf("VigPressure = %d, want 99", result.VigPressure)
 	}
 }
+
+// TestMediumLoop_ResidualSettlement_AddBudgetFailureRetries verifies that when
+// AddBudget returns an error for a seller, the entry is NOT added to the
+// paidResiduals dedup map, so it is retried on the next tick once the failure
+// is cleared.
+func TestMediumLoop_ResidualSettlement_AddBudgetFailureRetries(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+	ss := newStubScripStore()
+
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-retry", SellerKey: "seller-retry", ContentType: "code"},
+	}
+
+	// One sale within the window — produces a residual of 100/ResidualRate.
+	ts := now.Add(-20 * time.Minute)
+	st.history = append(st.history, exchange.PriceRecord{
+		EntryID:   "entry-retry",
+		SalePrice: 100,
+		Timestamp: ts.UnixNano(),
+	})
+
+	// Make AddBudget fail for seller-retry.
+	ss.mu.Lock()
+	ss.failKeys["seller-retry"] = true
+	ss.mu.Unlock()
+
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State:      st,
+		ScripStore: ss,
+		Now:        func() time.Time { return now },
+	})
+
+	// Tick 1: AddBudget fails — no residuals paid, no payments recorded.
+	result1 := loop.Tick(context.Background())
+	if result1.ResidualsPaid != 0 {
+		t.Errorf("tick 1: expected 0 residuals paid on AddBudget failure, got %d", result1.ResidualsPaid)
+	}
+	ss.mu.Lock()
+	paymentCount1 := len(ss.payments)
+	ss.mu.Unlock()
+	if paymentCount1 != 0 {
+		t.Errorf("tick 1: expected 0 scrip store payments, got %d", paymentCount1)
+	}
+
+	// Clear the failure — seller-retry can now receive payment.
+	ss.mu.Lock()
+	delete(ss.failKeys, "seller-retry")
+	ss.mu.Unlock()
+
+	// Tick 2: AddBudget succeeds — entry must be retried (dedup map was not
+	// poisoned by the earlier failure), so residual is paid now.
+	result2 := loop.Tick(context.Background())
+	if result2.ResidualsPaid != 1 {
+		t.Errorf("tick 2: expected 1 residual paid after failure cleared, got %d", result2.ResidualsPaid)
+	}
+	ss.mu.Lock()
+	paymentCount2 := len(ss.payments)
+	ss.mu.Unlock()
+	if paymentCount2 != 1 {
+		t.Errorf("tick 2: expected 1 scrip store payment, got %d", paymentCount2)
+	}
+
+	// Tick 3: dedup map now has the entry — must NOT pay again.
+	result3 := loop.Tick(context.Background())
+	if result3.ResidualsPaid != 0 {
+		t.Errorf("tick 3: expected 0 residuals paid (already deduped), got %d", result3.ResidualsPaid)
+	}
+	ss.mu.Lock()
+	paymentCount3 := len(ss.payments)
+	ss.mu.Unlock()
+	if paymentCount3 != 1 {
+		t.Errorf("tick 3: expected still 1 total payment (no double-pay), got %d", paymentCount3)
+	}
+}
