@@ -598,6 +598,12 @@ const (
 	// NewNodeTrustScoreStart is the initial trust_score for new federation nodes.
 	NewNodeTrustScoreStart = 0.4
 
+	// SenderHopDepthWindowSize is the maximum number of hop-depth observations
+	// retained per sender. Older observations are evicted when the window is full.
+	// The slow loop only needs a statistical median, not the full history.
+	// Matches the CoOccurrenceK philosophy of bounding per-sender state.
+	SenderHopDepthWindowSize = 1000
+
 	// LocalAgentTrustScoreStart is the initial trust_score for local agents.
 	LocalAgentTrustScoreStart = 0.7
 
@@ -2888,6 +2894,10 @@ func (s *State) trackSenderHopDepth(msg *Message) {
 		s.federationProfiles[key] = prof
 	}
 	s.senderHopDepth[key] = append(s.senderHopDepth[key], hopDepth)
+	// Cap the window to avoid unbounded growth.
+	if len(s.senderHopDepth[key]) > SenderHopDepthWindowSize {
+		s.senderHopDepth[key] = s.senderHopDepth[key][len(s.senderHopDepth[key])-SenderHopDepthWindowSize:]
+	}
 	prof.HopDepth = medianInt(s.senderHopDepth[key])
 }
 
@@ -2906,6 +2916,10 @@ func (s *State) UpdateFederationProfile(senderKey string, hopDepth int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.senderHopDepth[senderKey] = append(s.senderHopDepth[senderKey], hopDepth)
+	// Cap the window to avoid unbounded growth (UpdateFederationProfile).
+	if len(s.senderHopDepth[senderKey]) > SenderHopDepthWindowSize {
+		s.senderHopDepth[senderKey] = s.senderHopDepth[senderKey][len(s.senderHopDepth[senderKey])-SenderHopDepthWindowSize:]
+	}
 	prof, ok := s.federationProfiles[senderKey]
 	if !ok {
 		prof = &FederationNodeProfile{
