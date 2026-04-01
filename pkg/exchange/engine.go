@@ -47,6 +47,20 @@ const ReservationExpiryDuration = 5 * time.Minute
 // and expected worker demand.
 const BrokeredMatchDefaultReward = 100
 
+// PredictionAssignTTL is the TTL for prediction-derived standing assigns.
+// After this window the assign is stale and workers may not claim it.
+// Default 2 hours per design §7.
+const PredictionAssignTTL = 2 * time.Hour
+
+// MaxPredictionFanout is the maximum number of standing brokered-match assigns
+// the engine will pre-stage per predicted entry. Prevents assignByID blowup
+// from high-frequency settle events (A9 mitigation, design §7).
+const MaxPredictionFanout = 3
+
+// buyerSessionWindow is the lookback window for co-occurrence pairing.
+// Entries settled by the same buyer within this window are considered co-occurring.
+const buyerSessionWindow = time.Hour
+
 // Layer0MinPreviews is the minimum number of previews before conversion-rate
 // exclusion kicks in. Below this, entries have insufficient data for exclusion.
 const Layer0MinPreviews = 10
@@ -205,6 +219,19 @@ type Engine struct {
 	// at buyer-accept time. The settle(complete) handler uses this to locate the
 	// reservation without trusting buyer-supplied payload data.
 	matchToReservation map[string]string
+
+	// buyerRecentEntries tracks the last few entries settled per buyer for
+	// co-occurrence recording. Key: buyerKey -> list of (entryID, time) pairs.
+	// Not persisted — rebuilt from settle events observed since engine start.
+	// Engine-private; no lock needed (engine event loop is single-threaded).
+	buyerRecentEntries map[string][]buyerSessionEntry
+}
+
+// buyerSessionEntry records a single entry settled by a buyer, used for
+// co-occurrence pairing within a session window.
+type buyerSessionEntry struct {
+	entryID   string
+	settledAt time.Time
 }
 
 // engineCtx returns the shutdown context stored at Start time.
@@ -243,6 +270,7 @@ func NewEngine(opts EngineOptions) *Engine {
 		state:              st,
 		matchIndex:         idx,
 		matchToReservation: make(map[string]string),
+		buyerRecentEntries: make(map[string][]buyerSessionEntry),
 	}
 }
 
@@ -953,6 +981,15 @@ func (e *Engine) handleSettle(msg *Message) error {
 	if !ok {
 		e.opts.log("engine: settle: cannot derive match for deliver=%s — antecedent chain broken", shortKey(deliverMsgID))
 		return nil
+	}
+
+	// Derive entryID for co-occurrence recording and next-work prediction.
+	// This is the entry that just completed — use it to update buyer session data
+	// and pre-stage standing assigns for predicted follow-on work.
+	if settledEntry, entryOK := e.state.EntryForDeliver(deliverMsgID); entryOK {
+		buyerKey := msg.Sender
+		e.recordBuyerSettlement(buyerKey, settledEntry.EntryID)
+		e.stagePredictions(settledEntry.EntryID)
 	}
 
 	// Look up the reservation created at buyer-accept time (not from buyer payload).
@@ -2427,4 +2464,88 @@ func hasOverlap(a, b []string) bool {
 		}
 	}
 	return false
+}
+
+// recordBuyerSettlement appends entryID to the buyer's recent-entries list
+// and calls UpdateCoOccurrence for each prior entry in the session window.
+// Entries older than buyerSessionWindow are pruned before pairing.
+// Engine-private: no locking needed (called from the single-threaded event loop).
+func (e *Engine) recordBuyerSettlement(buyerKey, entryID string) {
+	now := time.Now()
+	cutoff := now.Add(-buyerSessionWindow)
+
+	prior := e.buyerRecentEntries[buyerKey]
+	// Prune stale entries.
+	valid := prior[:0]
+	for _, entry := range prior {
+		if entry.settledAt.After(cutoff) {
+			valid = append(valid, entry)
+		}
+	}
+	// Update co-occurrence for all prior entries in the session window.
+	for _, prev := range valid {
+		e.state.UpdateCoOccurrence(prev.entryID, entryID)
+	}
+	// Append current entry (bounded to avoid unlimited growth per buyer key).
+	const maxBuyerSession = 10
+	valid = append(valid, buyerSessionEntry{entryID: entryID, settledAt: now})
+	if len(valid) > maxBuyerSession {
+		valid = valid[len(valid)-maxBuyerSession:]
+	}
+	e.buyerRecentEntries[buyerKey] = valid
+}
+
+// stagePredictions posts standing exchange:assign messages with task_type="brokered-match"
+// for the top predicted next-work entries following settledEntryID. Up to
+// MaxPredictionFanout assigns are posted per call; existing open assigns for the
+// same entry reduce the available slots (A9 mitigation). Each assign has a DeadlineAt
+// of now + PredictionAssignTTL (2h) so expired assigns cannot be claimed.
+//
+// Non-fatal: errors are logged and do not propagate.
+func (e *Engine) stagePredictions(settledEntryID string) {
+	if e.opts.WriteClient == nil {
+		return // read-only engine or test without write client
+	}
+	predicted := e.state.PredictNext(settledEntryID)
+	if len(predicted) == 0 {
+		return
+	}
+	deadline := time.Now().Add(PredictionAssignTTL)
+	deadlineStr := deadline.UTC().Format(time.RFC3339)
+	reward := e.opts.brokeredMatchReward()
+
+	posted := 0
+	for _, predEntryID := range predicted {
+		if posted >= MaxPredictionFanout {
+			break
+		}
+		// Check how many open prediction assigns already exist for this entry.
+		existing := e.state.OpenPredictionAssignsForEntry(predEntryID)
+		if existing >= MaxPredictionFanout {
+			continue
+		}
+		// Build the assign payload for a standing brokered-match offer.
+		payload, err := e.marshal(map[string]any{
+			"entry_id":    predEntryID,
+			"task_type":   "brokered-match",
+			"reward":      reward,
+			"deadline_at": deadlineStr,
+			"description": fmt.Sprintf("Predicted next-work for entry %s — brokered match standing offer", shortKey(settledEntryID)),
+		})
+		if err != nil {
+			e.opts.log("engine: stagePredictions: marshal payload for entry=%s: %v", shortKey(predEntryID), err)
+			continue
+		}
+		msg, err := e.sendOperatorMessage(payload, []string{TagAssign}, nil)
+		if err != nil {
+			e.opts.log("engine: stagePredictions: send assign for entry=%s: %v", shortKey(predEntryID), err)
+			continue
+		}
+		if msg != nil {
+			e.state.Apply(msg)
+		}
+		posted++
+		e.opts.log("engine: stagePredictions: posted standing assign entry=%s deadline=%s",
+			shortKey(predEntryID), deadlineStr)
+	}
 }
