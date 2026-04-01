@@ -647,14 +647,15 @@ func (l *MediumLoop) postCompressionAssigns(inventory []*exchange.InventoryEntry
 			continue
 		}
 
-		// Skip entries with TokenCost < 2: integer division would yield a zero
-		// bounty (TokenCost/2 == 0 for cost 0 or 1), producing a worthless assign.
-		if entry.TokenCost < 2 {
+		// Skip entries with TokenCost < 5: at 20% bounty, anything below 5
+		// produces a zero reward (4*20/100 == 0), yielding a worthless assign.
+		if entry.TokenCost < 5 {
 			continue
 		}
 
-		// Post an open (non-exclusive) compression assign at break-even reward.
-		reward := entry.TokenCost / 2
+		// Post an open (non-exclusive) cold compression assign at 20% of token_cost.
+		// Lower than hot (50%) or warm (30%) — no urgency, stock maintenance.
+		reward := entry.TokenCost * exchange.ColdCompressionBountyPct / 100
 		spec := AssignSpec{
 			EntryID:  entry.EntryID,
 			Reward:   reward,

@@ -37,6 +37,12 @@ const HotCompressionBountyPct = 50
 // warm compression (buyer-initiated, content in cache). 30% = 3/10.
 const WarmCompressionBountyPct = 30
 
+// ColdCompressionBountyPct is the percentage of token_cost paid as bounty for
+// cold compression (demand-driven stock maintenance, medium loop). 20% = 1/5.
+// Lower than warm (30%) because there is no urgency — the entry is aging
+// inventory that the exchange wants compressed proactively.
+const ColdCompressionBountyPct = 20
+
 // ReservationExpiryDuration is the time window during which a buyer-accept
 // reservation is valid. After expiry, the scrip hold is released.
 const ReservationExpiryDuration = 5 * time.Minute
@@ -2499,6 +2505,51 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 	return nil
 }
 
+
+// PostOpenCompressionAssign posts a non-exclusive cold compression assign for the
+// given entry. This is the public entry point used by the medium loop's PostAssign
+// callback. The bounty is ColdCompressionBountyPct (20%) of token_cost.
+//
+// Returns an error if the entry is not found or the assign cannot be sent.
+func (e *Engine) PostOpenCompressionAssign(entryID string) error {
+	entry := e.state.GetInventoryEntry(entryID)
+	if entry == nil {
+		return fmt.Errorf("entry %s not found in inventory", entryID)
+	}
+	return e.sendColdCompressionAssign(entry)
+}
+
+// sendColdCompressionAssign sends an exchange:assign message for a cold compress
+// task with no exclusive sender — any eligible agent can claim it. The bounty is
+// ColdCompressionBountyPct (20%) of the entry's token_cost. Posted by the medium
+// loop for high-demand entries that still lack a compressed derivative.
+func (e *Engine) sendColdCompressionAssign(entry *InventoryEntry) error {
+	bounty := entry.TokenCost * ColdCompressionBountyPct / 100
+	description := fmt.Sprintf(
+		"Compress cached inference entry %s (content_hash=%s). Produce a Nyquist-sampled summary preserving semantic content. Bounty: %d scrip.",
+		entry.EntryID, entry.ContentHash, bounty,
+	)
+	payload, err := json.Marshal(map[string]any{
+		"entry_id":    entry.EntryID,
+		"task_type":   "compress",
+		"reward":      bounty,
+		"description": description,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding cold compression assign payload: %w", err)
+	}
+	tags := []string{TagAssign}
+	msg, err := e.sendOperatorMessage(payload, tags, nil)
+	if err != nil {
+		return fmt.Errorf("sending cold compression assign: %w", err)
+	}
+	if msg != nil {
+		e.state.Apply(msg)
+	}
+	e.opts.log("engine: cold compression assign sent assign_id=%s entry=%s bounty=%d",
+		shortKey(msg.ID), shortKey(entry.PutMsgID), bounty)
+	return nil
+}
 
 // hasActiveBuyerCompressAssign returns true if there is already an active
 // (non-terminal) compression assign for the given entry targeting the buyer.

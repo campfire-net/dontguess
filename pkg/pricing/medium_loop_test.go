@@ -809,9 +809,9 @@ func TestMediumLoop_CompressionAssign_PostedWhenHighDemandNoDerivative(t *testin
 	if spec.TaskType != "compress" {
 		t.Errorf("expected task_type=compress, got %s", spec.TaskType)
 	}
-	wantReward := tokenCost / 2
+	wantReward := tokenCost * int64(exchange.ColdCompressionBountyPct) / 100
 	if spec.Reward != wantReward {
-		t.Errorf("expected reward=%d (token_cost/2), got %d", wantReward, spec.Reward)
+		t.Errorf("expected reward=%d (%d%% of token_cost), got %d", wantReward, exchange.ColdCompressionBountyPct, spec.Reward)
 	}
 }
 
@@ -1030,7 +1030,8 @@ func TestMediumLoop_ZeroBountySkip(t *testing.T) {
 	}{
 		{name: "zero_cost_skipped", tokenCost: 0, wantAssigns: 0, wantPosts: 0},
 		{name: "one_cost_skipped", tokenCost: 1, wantAssigns: 0, wantPosts: 0},
-		{name: "two_cost_proceeds", tokenCost: 2, wantAssigns: 1, wantPosts: 1},
+		{name: "four_cost_skipped", tokenCost: 4, wantAssigns: 0, wantPosts: 0},
+		{name: "five_cost_proceeds", tokenCost: 5, wantAssigns: 1, wantPosts: 1},
 		{name: "large_cost_proceeds", tokenCost: 10000, wantAssigns: 1, wantPosts: 1},
 	}
 
