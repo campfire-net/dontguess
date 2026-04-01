@@ -39,6 +39,11 @@ const (
 	// Sent by the engine as a reply to a buy with no matching inventory.
 	TagBuyMiss = "exchange:buy-miss"
 
+	// TagAssignAuctionClose is emitted by the engine when a Vickrey auction
+	// window closes. The payload carries the winner key and Vickrey clearing
+	// price, allowing state to correctly finalize on replay.
+	TagAssignAuctionClose = "exchange:assign-auction-close"
+
 	SettlePhaseStrPutAccept   = "put-accept"
 	SettlePhaseStrPutReject   = "put-reject"
 	SettlePhaseStrBuyerAccept = "buyer-accept"
@@ -276,6 +281,16 @@ const BuyMissOfferRate = 70 // percent
 // Configurable per-assign via claim_timeout_minutes in the assign payload.
 const DefaultClaimTimeoutMinutes = 15
 
+// DefaultAuctionWindowSeconds is the default duration of a Vickrey auction
+// window. Workers may submit bids during this window; after it closes the
+// engine selects the lowest bidder and pays at the second-lowest price.
+const DefaultAuctionWindowSeconds = 60
+
+// AuctionBidCeilMultiplier is the maximum bid expressed as a multiple of
+// base_reward. Bids exceeding base_reward * AuctionBidCeilMultiplier are
+// rejected as safety measure against runaway pricing.
+const AuctionBidCeilMultiplier = 10
+
 // AssignStatus is the lifecycle state of a single assign task.
 type AssignStatus int
 
@@ -335,6 +350,24 @@ type AssignRecord struct {
 	// AssignReceivedAt is the engine-observed receive time of the assign message,
 	// used as the reference point for computing ClaimExpiresAt. Stored as UTC.
 	AssignReceivedAt time.Time
+	// AuctionDeadline is the time after which no new bids are accepted and the
+	// engine selects the Vickrey winner. Zero means no auction (legacy flow).
+	AuctionDeadline time.Time
+	// AuctionBids holds all bids received during the open auction window.
+	// Each entry corresponds to one assign-claim message with a bid field.
+	AuctionBids []AuctionBid
+	// DifficultyTier is the post-facto difficulty label derived from the bid
+	// distribution after the auction closes ("low", "medium", "high").
+	// Empty until the auction is finalized.
+	DifficultyTier string
+	// VickreyPrice is the clearing price computed at auction close: the
+	// second-lowest bid (or lowest bid if only one bidder). The claimant is
+	// paid this amount instead of the base Reward.
+	VickreyPrice int64
+	// BuyMsgID is the campfire message ID of the originating exchange:buy that
+	// triggered this assign. Non-empty only for task_type="brokered-match" assigns.
+	// Used to correlate the brokered-match assign back to its originating buy order.
+	BuyMsgID string
 }
 
 // SellerStats tracks derived signals for a single seller.
@@ -398,6 +431,16 @@ func (s *SellerStats) Reputation() int {
 		return 100
 	}
 	return score
+}
+
+// AuctionBid records a single bid submitted during a Vickrey auction window.
+type AuctionBid struct {
+	// WorkerKey is the hex-encoded public key of the bidding agent.
+	WorkerKey string
+	// BidAmount is the scrip amount the worker is willing to accept for the task.
+	BidAmount int64
+	// Timestamp is the time the bid was recorded (derived from the assign-claim message).
+	Timestamp time.Time
 }
 
 // State is the in-memory materialized view of the exchange campfire log.
@@ -543,6 +586,12 @@ type State struct {
 	// Key: SHA-256 hex of canonical task description.
 	buyMissOffers map[string]*BuyMissOffer
 
+	// brokerAssigns maps buy message IDs to the assign message IDs of the
+	// brokered-match task posted for that buy. Populated by applyAssign when
+	// task_type="brokered-match" and buy_msg_id is present. Derived from the
+	// campfire log (reset on Replay). Key: buyMsgID -> assignID.
+	brokerAssigns map[string]string
+
 	// brokerMatchIDs is the set of exchange:match message IDs that were produced
 	// by a brokered-match assign (task_type="brokered-match"). Populated externally
 	// by the engine when a brokered-match assign is accepted; NOT reset on Replay
@@ -592,6 +641,7 @@ func NewState() *State {
 		claimedAssigns:       make(map[string]string),
 		pendingAssignResults: make(map[string]*AssignRecord),
 		buyMissOffers:        make(map[string]*BuyMissOffer),
+		brokerAssigns:        make(map[string]string),
 		brokerMatchIDs:       make(map[string]struct{}),
 	}
 }
@@ -632,6 +682,7 @@ func (s *State) Replay(msgs []Message) {
 	s.claimedAssigns = make(map[string]string)
 	s.pendingAssignResults = make(map[string]*AssignRecord)
 	s.buyMissOffers = make(map[string]*BuyMissOffer)
+	s.brokerAssigns = make(map[string]string)
 	// Note: priceAdjustments and brokerMatchIDs are intentionally NOT reset on
 	// Replay. They are externally written (by the fast pricing loop and engine
 	// respectively), not derived from the campfire log.
@@ -675,6 +726,8 @@ func (s *State) applyLocked(msg *Message) {
 		s.applyAssignReject(msg)
 	case TagAssignExpire:
 		s.applyAssignExpire(msg)
+	case TagAssignAuctionClose:
+		s.applyAssignAuctionClose(msg)
 	default:
 		// Handle scrip convention messages that are not exchange operations.
 		for _, tag := range msg.Tags {
@@ -1385,6 +1438,8 @@ func (s *State) applyAssign(msg *Message) {
 		Reward               int64  `json:"reward"`
 		ExclusiveSender      string `json:"exclusive_sender"`
 		ClaimTimeoutMinutes  int    `json:"claim_timeout_minutes"`
+		AuctionWindowSeconds int    `json:"auction_window_seconds"`
+		BuyMsgID             string `json:"buy_msg_id"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
@@ -1408,9 +1463,18 @@ func (s *State) applyAssign(msg *Message) {
 		ExclusiveSender:     payload.ExclusiveSender,
 		ClaimTimeoutMinutes: timeoutMinutes,
 		AssignReceivedAt:    receivedAt,
+		BuyMsgID:            payload.BuyMsgID,
+	}
+	// If the operator requested an auction window, set the deadline.
+	if payload.AuctionWindowSeconds > 0 {
+		rec.AuctionDeadline = receivedAt.Add(time.Duration(payload.AuctionWindowSeconds) * time.Second)
 	}
 	s.assignsByEntry[payload.EntryID] = append(s.assignsByEntry[payload.EntryID], rec)
 	s.assignByID[msg.ID] = rec
+	// For brokered-match tasks, index the buy → assign correlation.
+	if payload.TaskType == "brokered-match" && payload.BuyMsgID != "" {
+		s.brokerAssigns[payload.BuyMsgID] = msg.ID
+	}
 }
 
 // applyAssignClaim processes an exchange:assign-claim message.
@@ -1437,6 +1501,59 @@ func (s *State) applyAssignClaim(msg *Message) {
 	if rec.ExclusiveSender != "" && msg.Sender != rec.ExclusiveSender {
 		return
 	}
+
+	// Parse the claim payload (supports both expires_at and bid fields).
+	var claimPayload struct {
+		ExpiresAt string `json:"expires_at"`
+		Bid       *int64 `json:"bid"`
+	}
+	if len(msg.Payload) > 0 {
+		_ = json.Unmarshal(msg.Payload, &claimPayload) // best-effort; ignore parse errors
+	}
+
+	// Auction path: if this assign has an auction window, collect bids instead
+	// of claiming immediately.
+	if !rec.AuctionDeadline.IsZero() {
+		msgTime := time.Now().UTC()
+		if msg.Timestamp > 0 {
+			msgTime = time.Unix(0, msg.Timestamp).UTC()
+		}
+		if !msgTime.Before(rec.AuctionDeadline) {
+			// Auction window closed; stray claim messages are ignored.
+			// Finalization is handled by applyAssignAuctionClose.
+			return
+		}
+		// Determine bid amount: use the supplied bid, or fall back to base_reward.
+		bidAmount := rec.Reward
+		if claimPayload.Bid != nil {
+			bidAmount = *claimPayload.Bid
+		}
+		// Safety ceiling: reject bids exceeding AuctionBidCeilMultiplier * base_reward.
+		if rec.Reward > 0 && bidAmount > rec.Reward*AuctionBidCeilMultiplier {
+			return
+		}
+		if bidAmount <= 0 {
+			return
+		}
+		// Deduplicate: one bid per worker — keep the lower of old and new bid.
+		for i, existing := range rec.AuctionBids {
+			if existing.WorkerKey == msg.Sender {
+				if bidAmount < existing.BidAmount {
+					rec.AuctionBids[i].BidAmount = bidAmount
+					rec.AuctionBids[i].Timestamp = msgTime
+				}
+				return
+			}
+		}
+		rec.AuctionBids = append(rec.AuctionBids, AuctionBid{
+			WorkerKey: msg.Sender,
+			BidAmount: bidAmount,
+			Timestamp: msgTime,
+		})
+		return // auction window open — do not claim yet
+	}
+
+	// Non-auction path: standard single-claim logic.
 	// Agent may hold only one active claim at a time.
 	if existing, held := s.claimedAssigns[msg.Sender]; held && existing != "" {
 		return
@@ -1445,12 +1562,6 @@ func (s *State) applyAssignClaim(msg *Message) {
 	// If the claimant supplies expires_at, honour it only if within the ceiling.
 	ceiling := rec.AssignReceivedAt.Add(time.Duration(rec.ClaimTimeoutMinutes) * time.Minute)
 	expiresAt := ceiling // default: ceiling
-	var claimPayload struct {
-		ExpiresAt string `json:"expires_at"`
-	}
-	if len(msg.Payload) > 0 {
-		_ = json.Unmarshal(msg.Payload, &claimPayload) // best-effort; ignore parse errors
-	}
 	if claimPayload.ExpiresAt != "" {
 		if parsed, err := time.Parse(time.RFC3339, claimPayload.ExpiresAt); err == nil {
 			parsed = parsed.UTC()
@@ -1464,6 +1575,72 @@ func (s *State) applyAssignClaim(msg *Message) {
 	rec.ClaimMsgID = msg.ID
 	rec.ClaimExpiresAt = expiresAt
 	s.claimedAssigns[msg.Sender] = assignID
+}
+
+// applyAssignAuctionClose finalizes a Vickrey auction for the assign referenced
+// by the message antecedent. It selects the lowest bidder, computes the Vickrey
+// clearing price (second-lowest bid), sets DifficultyTier from the bid
+// distribution, and transitions the assign to AssignClaimed.
+//
+// Antecedent: the assign message ID (the auction being closed).
+//
+// This message is emitted by the engine after AuctionDeadline has passed.
+func (s *State) applyAssignAuctionClose(msg *Message) {
+	if len(msg.Antecedents) == 0 {
+		return
+	}
+	assignID := msg.Antecedents[0]
+	rec, ok := s.assignByID[assignID]
+	if !ok || rec.Status != AssignOpen {
+		return
+	}
+	if len(rec.AuctionBids) == 0 {
+		// No bids — auction closed with no winner. Task remains open.
+		return
+	}
+
+	// Sort bids ascending by amount (lowest first) using insertion sort.
+	bids := make([]AuctionBid, len(rec.AuctionBids))
+	copy(bids, rec.AuctionBids)
+	for i := 1; i < len(bids); i++ {
+		for j := i; j > 0 && bids[j].BidAmount < bids[j-1].BidAmount; j-- {
+			bids[j], bids[j-1] = bids[j-1], bids[j]
+		}
+	}
+
+	winner := bids[0]
+	// Vickrey clearing price: second-lowest bid; if only one bidder, winner's bid.
+	clearingPrice := winner.BidAmount
+	if len(bids) >= 2 {
+		clearingPrice = bids[1].BidAmount
+	}
+
+	// Derive difficulty tier from median bid vs base_reward ratio.
+	medianBid := bids[len(bids)/2].BidAmount
+	var tier string
+	if rec.Reward > 0 {
+		ratio := float64(medianBid) / float64(rec.Reward)
+		switch {
+		case ratio <= 1.5:
+			tier = "low"
+		case ratio <= 5.0:
+			tier = "medium"
+		default:
+			tier = "high"
+		}
+	} else {
+		tier = "low"
+	}
+
+	// Transition to AssignClaimed with the Vickrey winner.
+	ceiling := rec.AssignReceivedAt.Add(time.Duration(rec.ClaimTimeoutMinutes) * time.Minute)
+	rec.Status = AssignClaimed
+	rec.ClaimantKey = winner.WorkerKey
+	rec.ClaimMsgID = msg.ID // auction-close message acts as the canonical claim record
+	rec.ClaimExpiresAt = ceiling
+	rec.VickreyPrice = clearingPrice
+	rec.DifficultyTier = tier
+	s.claimedAssigns[winner.WorkerKey] = assignID
 }
 
 // applyAssignComplete processes an exchange:assign-complete message.
@@ -1627,6 +1804,26 @@ func (s *State) ExpireStaleClaims() []string {
 		}
 	}
 	return expired
+}
+
+// PendingAuctionClose returns the assign IDs of AssignOpen records whose
+// AuctionDeadline has passed and that have at least one bid. These are ready
+// for finalization via exchange:assign-auction-close. It does NOT mutate state —
+// the caller (engine) is responsible for emitting the close message and then
+// calling applyAssignAuctionClose via Apply.
+// Caller must hold s.mu (at least read lock).
+func (s *State) PendingAuctionClose() []string {
+	now := time.Now().UTC()
+	var ready []string
+	for _, rec := range s.assignByID {
+		if rec.Status == AssignOpen &&
+			!rec.AuctionDeadline.IsZero() &&
+			now.After(rec.AuctionDeadline) &&
+			len(rec.AuctionBids) > 0 {
+			ready = append(ready, rec.AssignID)
+		}
+	}
+	return ready
 }
 
 // ClaimAssignPayment atomically checks that the assign record for the given
@@ -2218,6 +2415,16 @@ func (s *State) ClaimBuyMissOffer(taskHash string) *BuyMissOffer {
 	}
 	delete(s.buyMissOffers, taskHash)
 	return offer
+}
+
+// BrokerAssignForBuy returns the assign message ID of the brokered-match assign
+// posted for the given buy message, and whether one exists.
+// Used by the engine to detect duplicate brokered-match posting on restart.
+func (s *State) BrokerAssignForBuy(buyMsgID string) (string, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	id, ok := s.brokerAssigns[buyMsgID]
+	return id, ok
 }
 
 // stripTagPrefix removes a convention tag prefix from a value if present.

@@ -1249,6 +1249,383 @@ func hasTag(tags []string, tag string) bool {
 //     log, now including the match from run 1).
 //  5. Start "run 2" engine (replayAll → dispatchPendingOrders → poll loop).
 //  6. Assert still exactly one match in the store (no double-dispatch).
+// TestEngine_BrokeredMatchMode_PostsAssignNotMatch verifies that when
+// BrokeredMatchMode is enabled, handleBuy posts an exchange:assign with
+// task_type="brokered-match" instead of an exchange:match. No inline match
+// should appear; one assign should appear with the buy message ID in its
+// correlation field.
+func TestEngine_BrokeredMatchMode_PostsAssignNotMatch(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.BrokeredMatchMode = true
+		o.BrokeredMatchReward = 50
+	})
+
+	// Seed one inventory entry.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Docker compose generator", "sha256:"+fmt.Sprintf("%064x", 3001), "code", 6000, 10000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:docker"},
+		nil,
+	)
+	if err := eng.AutoAcceptPut(putMsg.ID, 4200, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Buyer sends buy.
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("Generate docker-compose for a Go web service", 20000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Count pre-existing assigns and matches.
+	preAssigns, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+	preMatches, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	preAssignCount := len(preAssigns)
+	preMatchCount := len(preMatches)
+
+	// Run engine until assign appears.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	var assignMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		assignMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+		if len(assignMsgs) > preAssignCount {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	// Exactly one new assign must have appeared.
+	newAssigns := len(assignMsgs) - preAssignCount
+	if newAssigns != 1 {
+		t.Fatalf("brokered mode: expected 1 new assign, got %d", newAssigns)
+	}
+
+	// No new match messages (matching is async).
+	postMatches, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	if len(postMatches) != preMatchCount {
+		t.Errorf("brokered mode: expected no match messages, got %d new", len(postMatches)-preMatchCount)
+	}
+
+	// The assign message must be from the operator.
+	newAssignMsg := assignMsgs[len(assignMsgs)-1]
+	if newAssignMsg.Sender != h.operator.PublicKeyHex() {
+		t.Errorf("assign sender = %q, want operator %q", newAssignMsg.Sender, h.operator.PublicKeyHex())
+	}
+
+	// The assign payload must contain task_type="brokered-match" and the buy_msg_id.
+	var assignPayload struct {
+		TaskType string `json:"task_type"`
+		BuyMsgID string `json:"buy_msg_id"`
+		Reward   int64  `json:"reward"`
+	}
+	if err := json.Unmarshal(newAssignMsg.Payload, &assignPayload); err != nil {
+		t.Fatalf("parsing assign payload: %v", err)
+	}
+	if assignPayload.TaskType != "brokered-match" {
+		t.Errorf("assign task_type = %q, want %q", assignPayload.TaskType, "brokered-match")
+	}
+	if assignPayload.BuyMsgID != buyMsg.ID {
+		t.Errorf("assign buy_msg_id = %q, want %q", assignPayload.BuyMsgID, buyMsg.ID)
+	}
+	if assignPayload.Reward != 50 {
+		t.Errorf("assign reward = %d, want 50", assignPayload.Reward)
+	}
+}
+
+// TestEngine_BrokeredMatchMode_BuyMsgIDCorrelation verifies that State.applyAssign
+// populates AssignRecord.BuyMsgID and the brokerAssigns correlation map when
+// task_type="brokered-match" and buy_msg_id is present in the payload.
+func TestEngine_BrokeredMatchMode_BuyMsgIDCorrelation(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.BrokeredMatchMode = true
+	})
+
+	// Seed inventory and accept.
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Kubernetes RBAC policy generator", "sha256:"+fmt.Sprintf("%064x", 3002), "code", 9000, 15000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:kubernetes"},
+		nil,
+	)
+	if err := eng.AutoAcceptPut(putMsg.ID, 6300, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	// Buyer sends buy.
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("Generate RBAC policy for cluster admin access", 25000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Run engine until assign appears.
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	var assignMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		assignMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+		if len(assignMsgs) > 0 {
+			// Check if any is a brokered-match assign.
+			for _, a := range assignMsgs {
+				var p struct{ TaskType string `json:"task_type"` }
+				_ = json.Unmarshal(a.Payload, &p)
+				if p.TaskType == "brokered-match" {
+					goto found
+				}
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+found:
+	cancel()
+
+	// Find the brokered-match assign.
+	var brokerAssignID string
+	for _, a := range assignMsgs {
+		var p struct {
+			TaskType string `json:"task_type"`
+			BuyMsgID string `json:"buy_msg_id"`
+		}
+		_ = json.Unmarshal(a.Payload, &p)
+		if p.TaskType == "brokered-match" && p.BuyMsgID == buyMsg.ID {
+			brokerAssignID = a.ID
+			break
+		}
+	}
+	if brokerAssignID == "" {
+		t.Fatal("no brokered-match assign found with correct buy_msg_id")
+	}
+
+	// Verify the correlation map: BrokerAssignForBuy(buyMsgID) == assignID.
+	gotAssignID, ok := eng.State().BrokerAssignForBuy(buyMsg.ID)
+	if !ok {
+		t.Fatal("BrokerAssignForBuy returned not-found for known buy message ID")
+	}
+	if gotAssignID != brokerAssignID {
+		t.Errorf("BrokerAssignForBuy = %q, want %q", gotAssignID, brokerAssignID)
+	}
+
+	// Verify AssignRecord.BuyMsgID is set.
+	recs := eng.State().ActiveAssigns("")
+	var found *exchange.AssignRecord
+	for i := range recs {
+		if recs[i].AssignID == brokerAssignID {
+			found = recs[i]
+			break
+		}
+	}
+	if found == nil {
+		t.Fatal("brokered-match AssignRecord not found in ActiveAssigns")
+	}
+	if found.BuyMsgID != buyMsg.ID {
+		t.Errorf("AssignRecord.BuyMsgID = %q, want %q", found.BuyMsgID, buyMsg.ID)
+	}
+}
+
+// TestEngine_BrokeredMatchMode_IdempotentOnRestart verifies that if an engine
+// restarts after posting a brokered-match assign (the assign is in the log),
+// it does not post a duplicate assign for the same buy.
+func TestEngine_BrokeredMatchMode_IdempotentOnRestart(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+
+	// Step 1: run engine 1 in brokered mode until the assign appears.
+	eng1 := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.BrokeredMatchMode = true
+	})
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Prometheus alert rule generator", "sha256:"+fmt.Sprintf("%064x", 3003), "code", 7000, 12000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:observability"},
+		nil,
+	)
+	if err := eng1.AutoAcceptPut(putMsg.ID, 4900, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	h.sendMessage(h.buyer,
+		buyPayload("Generate Prometheus alert rules for high CPU usage", 20000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	// Count only brokered-match assigns as baseline (compression assigns also exist
+	// after AutoAcceptPut, but we only care about brokered-match here).
+	countBrokeredMatchAssigns := func() int {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+		n := 0
+		for _, m := range msgs {
+			var p struct{ TaskType string `json:"task_type"` }
+			_ = json.Unmarshal(m.Payload, &p)
+			if p.TaskType == "brokered-match" {
+				n++
+			}
+		}
+		return n
+	}
+	preCount := countBrokeredMatchAssigns()
+
+	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng1, ctx1, cancel1)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if countBrokeredMatchAssigns() > preCount {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel1()
+
+	brokerAssignCountRun1 := countBrokeredMatchAssigns()
+	if brokerAssignCountRun1 != preCount+1 {
+		t.Fatalf("run 1: expected %d brokered-match assigns, got %d", preCount+1, brokerAssignCountRun1)
+	}
+
+	// Step 2: restart — new engine, same store. The assign is already in the log.
+	// Replay populates brokerAssigns; handleBuy guard prevents re-posting.
+	eng2 := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.BrokeredMatchMode = true
+	})
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 1*time.Second)
+	h.startEngine(eng2, ctx2, cancel2)
+
+	// Allow enough time for at least one poll cycle.
+	time.Sleep(700 * time.Millisecond)
+	cancel2()
+
+	brokerAssignCountRun2 := countBrokeredMatchAssigns()
+	if brokerAssignCountRun2 != preCount+1 {
+		t.Errorf("restart duplicate assign: expected %d brokered-match assigns after restart, got %d",
+			preCount+1, brokerAssignCountRun2)
+	}
+}
+
+// TestEngine_BrokeredMatchMode_DefaultReward verifies that when BrokeredMatchReward
+// is zero, the assign is posted with the default reward (BrokeredMatchDefaultReward).
+func TestEngine_BrokeredMatchMode_DefaultReward(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.BrokeredMatchMode = true
+		// BrokeredMatchReward left at zero — should default.
+	})
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Nginx config generator", "sha256:"+fmt.Sprintf("%064x", 3004), "code", 5000, 8000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:nginx"},
+		nil,
+	)
+	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	h.sendMessage(h.buyer,
+		buyPayload("Generate Nginx reverse proxy config for Go service", 15000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	var assignMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagAssign}})
+		for _, m := range msgs {
+			var p struct{ TaskType string `json:"task_type"` }
+			_ = json.Unmarshal(m.Payload, &p)
+			if p.TaskType == "brokered-match" {
+				assignMsgs = msgs
+				goto done
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+done:
+	cancel()
+
+	var brokerAssign *store.MessageRecord
+	for i := range assignMsgs {
+		var p struct{ TaskType string `json:"task_type"` }
+		_ = json.Unmarshal(assignMsgs[i].Payload, &p)
+		if p.TaskType == "brokered-match" {
+			brokerAssign = &assignMsgs[i]
+			break
+		}
+	}
+	if brokerAssign == nil {
+		t.Fatal("no brokered-match assign found")
+	}
+
+	var assignPayload struct {
+		Reward int64 `json:"reward"`
+	}
+	if err := json.Unmarshal(brokerAssign.Payload, &assignPayload); err != nil {
+		t.Fatalf("parsing assign payload: %v", err)
+	}
+	if assignPayload.Reward != exchange.BrokeredMatchDefaultReward {
+		t.Errorf("default reward = %d, want %d", assignPayload.Reward, exchange.BrokeredMatchDefaultReward)
+	}
+}
+
+// TestEngine_BrokeredMatchMode_InlineFallbackUnchanged verifies that the default
+// engine (BrokeredMatchMode=false) still performs inline matching correctly —
+// existing behaviour is not regressed by the brokered branch.
+func TestEngine_BrokeredMatchMode_InlineFallbackUnchanged(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	// Default engine: BrokeredMatchMode is false.
+	eng := h.newEngine()
+
+	putMsg := h.sendMessage(h.seller,
+		putPayload("Makefile generator for Go projects", "sha256:"+fmt.Sprintf("%064x", 3005), "code", 4000, 7000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	if err := eng.AutoAcceptPut(putMsg.ID, 2800, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+
+	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	preCount := len(preMsgs)
+
+	h.sendMessage(h.buyer,
+		buyPayload("Generate Makefile for a Go web service with build, test, lint targets", 15000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	h.startEngine(eng, ctx, cancel)
+
+	// Expect inline match to appear (not an assign).
+	var matchMsgs []store.MessageRecord
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+		if len(matchMsgs) > preCount {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	cancel()
+
+	if len(matchMsgs) <= preCount {
+		t.Fatal("inline mode: no match message emitted — inline matching regressed")
+	}
+}
+
 func TestEngine_RestartNoDuplicateMatchForAlreadyMatchedOrder(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
