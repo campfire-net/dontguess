@@ -1023,6 +1023,24 @@ func (e *Engine) handleSettle(msg *Message) error {
 
 	ctx := e.engineCtx()
 
+	// --- Deadline-miss check (insurance guarantee) ---
+	// If the buyer purchased a delivery guarantee and the guarantee_deadline has
+	// passed, issue an automatic full refund (match_price + premium) via
+	// scrip:dispute-refund and skip normal settlement. The exchange absorbs the
+	// loss — the worker is not penalised.
+	if deadline, insuredAmount, hasGuarantee := e.state.GuaranteeForMatch(matchMsgID); hasGuarantee {
+		if time.Now().After(deadline) {
+			if err := e.handleDeadlineMissRefund(ctx, msg, matchMsgID, reservationID, insuredAmount); err != nil {
+				e.opts.log("engine: settle: deadline-miss refund failed for match=%s: %v", shortKey(matchMsgID), err)
+				// Fall through to normal settlement — refund failed, do not double-pay.
+			} else {
+				e.opts.log("engine: settle: deadline-miss refund issued for match=%s deadline=%s",
+					shortKey(matchMsgID), deadline.Format(time.RFC3339))
+				return nil
+			}
+		}
+	}
+
 	// Atomically retrieve and delete reservation (prevents TOCTOU double-spend).
 	res, err := e.opts.ScripStore.ConsumeReservation(ctx, reservationID)
 	if err != nil {
@@ -1616,6 +1634,66 @@ func (e *Engine) handleSettleSmallContentDispute(msg *Message) error {
 
 	e.opts.log("engine: small-content-dispute refund: reservation=%s buyer=%s amount=%d",
 		shortKey(payload.ReservationID), shortKey(res.AgentKey), res.Amount)
+	return nil
+}
+
+// handleDeadlineMissRefund issues an automatic full refund (match_price + premium)
+// to the buyer when a settle(complete) arrives after the guarantee_deadline. The
+// exchange absorbs the loss — the worker is not penalised, and normal payment for
+// the worker was already handled separately via assign-pay.
+//
+// The refund amount is insuredAmount from the buy order. If insuredAmount is zero,
+// the full reservation amount is refunded instead (defensive fallback).
+//
+// Does NOT consume the reservation — the caller is responsible for NOT calling
+// ConsumeReservation before calling this method. This method consumes it internally
+// so that the refund path is atomic (consume → refund).
+func (e *Engine) handleDeadlineMissRefund(ctx context.Context, msg *Message, matchMsgID, reservationID string, insuredAmount int64) error {
+	res, err := e.opts.ScripStore.ConsumeReservation(ctx, reservationID)
+	if err != nil {
+		return fmt.Errorf("scrip: deadline-miss: consume reservation %s: %w", shortKey(reservationID), err)
+	}
+
+	refundAmount := insuredAmount
+	if refundAmount <= 0 {
+		refundAmount = res.Amount
+	}
+
+	refundPayload, marshalErr := e.marshal(scrip.DisputeRefundPayload{
+		Buyer:         res.AgentKey,
+		Amount:        refundAmount,
+		ReservationID: reservationID,
+		DisputeMsg:    msg.ID,
+	})
+	if marshalErr != nil {
+		// Restore reservation so the settle can be retried.
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: deadline-miss: CRITICAL: failed to restore reservation %s after marshal failure: %v",
+				shortKey(reservationID), restoreErr)
+			return fmt.Errorf("scrip: deadline-miss reservation %s: marshal failed AND restore failed: %w",
+				shortKey(reservationID), marshalErr)
+		}
+		return fmt.Errorf("scrip: deadline-miss: marshal refund payload: %w", marshalErr)
+	}
+
+	// Credit the buyer's balance.
+	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, refundAmount, ""); err != nil {
+		// Restore reservation so the settle can be retried.
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: deadline-miss: CRITICAL: failed to restore reservation %s after AddBudget failure: %v",
+				shortKey(reservationID), restoreErr)
+		}
+		return fmt.Errorf("scrip: deadline-miss: AddBudget(buyer %s): %w", shortKey(res.AgentKey), err)
+	}
+
+	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
+	if _, emitErr := e.sendOperatorMessage(refundPayload,
+		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
+		e.opts.log("engine: warning: emit scrip-dispute-refund (deadline-miss): %v", emitErr)
+	}
+
+	e.opts.log("engine: deadline-miss refund: match=%s reservation=%s buyer=%s amount=%d",
+		shortKey(matchMsgID), shortKey(reservationID), shortKey(res.AgentKey), refundAmount)
 	return nil
 }
 

@@ -16,10 +16,11 @@ import (
 
 // slowStubState implements SlowStateReadWriter for slow loop tests.
 type slowStubState struct {
-	mu          sync.Mutex
-	inventory   []*exchange.InventoryEntry
-	history     []exchange.PriceRecord
-	demandCount map[string]int
+	mu                sync.Mutex
+	inventory         []*exchange.InventoryEntry
+	history           []exchange.PriceRecord
+	demandCount       map[string]int
+	completionSamples []exchange.AssignCompletionSample
 }
 
 func newSlowStubState() *slowStubState {
@@ -44,6 +45,12 @@ func (s *slowStubState) EntryDemandCount(entryID string) int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return s.demandCount[entryID]
+}
+
+func (s *slowStubState) AssignCompletionSamples() []exchange.AssignCompletionSample {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.completionSamples
 }
 
 // slowStubParamsStore implements SlowStateWriter for slow loop tests.
@@ -958,5 +965,233 @@ func TestSlowLoop_FederationTrustScore_NilFederationStateSkips(t *testing.T) {
 
 	if len(result.FederationTrustUpdates) != 0 {
 		t.Errorf("expected 0 trust updates when FederationState=nil, got %d", len(result.FederationTrustUpdates))
+	}
+}
+
+// =============================================================================
+// Actuarial table tests
+// =============================================================================
+
+// TestSlowLoop_ActuarialTable_EmptySamplesProducesEmptyTable verifies that when
+// there are no assign completion samples, the actuarial table is empty.
+func TestSlowLoop_ActuarialTable_EmptySamplesProducesEmptyTable(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	result := loop.Tick()
+
+	if result.ActuarialTaskTypesUpdated != 0 {
+		t.Errorf("expected 0 actuarial task types updated, got %d", result.ActuarialTaskTypesUpdated)
+	}
+	params := ps.GetMarketParameters()
+	if len(params.ActuarialTable.ByTaskType) != 0 {
+		t.Errorf("expected empty actuarial table, got %d entries", len(params.ActuarialTable.ByTaskType))
+	}
+}
+
+// TestSlowLoop_ActuarialTable_LatencyPercentilesComputed verifies that P50/P90/P99
+// latency percentiles are computed correctly from completion samples.
+func TestSlowLoop_ActuarialTable_LatencyPercentilesComputed(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 10 completed samples for "brokered-match" with deterministic latencies.
+	// Latencies: 1m, 2m, 3m, 4m, 5m, 6m, 7m, 8m, 9m, 10m.
+	for i := 1; i <= 10; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "brokered-match",
+			Latency:   time.Duration(i) * time.Minute,
+			Completed: true,
+		})
+	}
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	result := loop.Tick()
+
+	if result.ActuarialTaskTypesUpdated != 1 {
+		t.Errorf("expected 1 actuarial task type, got %d", result.ActuarialTaskTypesUpdated)
+	}
+	params := ps.GetMarketParameters()
+	entry, ok := params.ActuarialTable.ByTaskType["brokered-match"]
+	if !ok {
+		t.Fatal("expected 'brokered-match' in actuarial table")
+	}
+	if entry.SampleCount != 10 {
+		t.Errorf("expected SampleCount=10, got %d", entry.SampleCount)
+	}
+	if entry.FillRate != 1.0 {
+		t.Errorf("expected FillRate=1.0 (all completed), got %.2f", entry.FillRate)
+	}
+	// Percentile formula: idx = p*n/100 (integer), values [1m..10m] sorted ascending.
+	// P50: idx = 50*10/100 = 5 → values[5] = 6m (0-indexed, sorted)
+	// P90: idx = 90*10/100 = 9 → values[9] = 10m
+	// P99: idx = 99*10/100 = 9 → values[9] = 10m
+	if entry.P50Latency != 6*time.Minute {
+		t.Errorf("expected P50=6m (index 5 of 10 values), got %v", entry.P50Latency)
+	}
+	if entry.P90Latency != 10*time.Minute {
+		t.Errorf("expected P90=10m (index 9 of 10 values), got %v", entry.P90Latency)
+	}
+	if entry.P99Latency != 10*time.Minute {
+		t.Errorf("expected P99=10m (index 9 of 10 values), got %v", entry.P99Latency)
+	}
+	if entry.UpdatedAt != now {
+		t.Errorf("expected UpdatedAt=%v, got %v", now, entry.UpdatedAt)
+	}
+}
+
+// TestSlowLoop_ActuarialTable_FillRatePartialCompletion verifies fill rate when
+// some assigns are never completed (reducing fill rate below 1.0).
+func TestSlowLoop_ActuarialTable_FillRatePartialCompletion(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 6 total: 4 completed, 2 not completed.
+	for i := 0; i < 4; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "freshness",
+			Latency:   5 * time.Minute,
+			Completed: true,
+		})
+	}
+	for i := 0; i < 2; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "freshness",
+			Completed: false,
+		})
+	}
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	loop.Tick()
+
+	params := ps.GetMarketParameters()
+	entry, ok := params.ActuarialTable.ByTaskType["freshness"]
+	if !ok {
+		t.Fatal("expected 'freshness' in actuarial table")
+	}
+	if entry.SampleCount != 6 {
+		t.Errorf("expected SampleCount=6, got %d", entry.SampleCount)
+	}
+	wantFillRate := 4.0 / 6.0
+	if diff := entry.FillRate - wantFillRate; diff > 0.001 || diff < -0.001 {
+		t.Errorf("expected FillRate≈%.4f, got %.4f", wantFillRate, entry.FillRate)
+	}
+}
+
+// TestSlowLoop_ActuarialTable_ConfidencePenaltyThreshold verifies that the
+// SampleCount field is set correctly and that InsurancePremium applies the
+// 1.5x confidence penalty when SampleCount < 30.
+func TestSlowLoop_ActuarialTable_ConfidencePenaltyThreshold(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	// 10 samples — below ConfidencePenaltyThreshold (30).
+	for i := 0; i < 10; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "validation",
+			Latency:   3 * time.Minute,
+			Completed: true,
+		})
+	}
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	loop.Tick()
+
+	params := ps.GetMarketParameters()
+	entry, ok := params.ActuarialTable.ByTaskType["validation"]
+	if !ok {
+		t.Fatal("expected 'validation' in actuarial table")
+	}
+	if entry.SampleCount != 10 {
+		t.Errorf("expected SampleCount=10, got %d", entry.SampleCount)
+	}
+
+	// Verify InsurancePremium applies the confidence penalty.
+	result, err := pricing.InsurancePremium(entry, 1000, 10*time.Minute)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !result.ConfidencePenaltyApplied {
+		t.Error("expected ConfidencePenaltyApplied=true for SampleCount=10 < 30")
+	}
+	// Without penalty: premium = 1000 * (1.05 - 1.0) / 1.0 = 50
+	// With penalty: 50 * 1.5 = 75
+	if result.Premium < 74 || result.Premium > 76 {
+		t.Errorf("expected premium≈75 with confidence penalty, got %d", result.Premium)
+	}
+}
+
+// TestSlowLoop_ActuarialTable_MultipleTaskTypes verifies that the actuarial table
+// correctly partitions samples by task type.
+func TestSlowLoop_ActuarialTable_MultipleTaskTypes(t *testing.T) {
+	t.Parallel()
+	st := newSlowStubState()
+	ps := newSlowStubParamsStore()
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+
+	for i := 0; i < 5; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "brokered-match",
+			Latency:   2 * time.Minute,
+			Completed: true,
+		})
+	}
+	for i := 0; i < 3; i++ {
+		st.completionSamples = append(st.completionSamples, exchange.AssignCompletionSample{
+			TaskType:  "compression",
+			Latency:   10 * time.Minute,
+			Completed: true,
+		})
+	}
+
+	loop := pricing.NewSlowLoop(pricing.SlowLoopOptions{
+		State:       st,
+		ParamsStore: ps,
+		Now:         func() time.Time { return now },
+	})
+	result := loop.Tick()
+
+	if result.ActuarialTaskTypesUpdated != 2 {
+		t.Errorf("expected 2 task types, got %d", result.ActuarialTaskTypesUpdated)
+	}
+	params := ps.GetMarketParameters()
+	if _, ok := params.ActuarialTable.ByTaskType["brokered-match"]; !ok {
+		t.Error("expected 'brokered-match' in actuarial table")
+	}
+	if _, ok := params.ActuarialTable.ByTaskType["compression"]; !ok {
+		t.Error("expected 'compression' in actuarial table")
+	}
+	bm := params.ActuarialTable.ByTaskType["brokered-match"]
+	comp := params.ActuarialTable.ByTaskType["compression"]
+	if bm.SampleCount != 5 {
+		t.Errorf("brokered-match SampleCount: want 5, got %d", bm.SampleCount)
+	}
+	if comp.SampleCount != 3 {
+		t.Errorf("compression SampleCount: want 3, got %d", comp.SampleCount)
 	}
 }

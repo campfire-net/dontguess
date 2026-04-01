@@ -105,6 +105,39 @@ const (
 	DefaultTrustWeightVolume  = 0.15
 )
 
+// ActuarialEntry holds completion latency statistics and fill rate for a single
+// assign task type. Updated by the slow loop every 4 hours from assign
+// completion history. Used by InsurancePremium to price delivery guarantees.
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §3.2
+type ActuarialEntry struct {
+	// P50Latency is the median time from assign-claim to assign-complete.
+	P50Latency time.Duration
+	// P90Latency is the 90th percentile completion time.
+	P90Latency time.Duration
+	// P99Latency is the 99th percentile completion time.
+	P99Latency time.Duration
+	// FillRate is the fraction of posted assigns that reach assign-complete
+	// (claimed and completed). A fill rate < 1.0 indicates workers are dropping
+	// tasks. Used as the denominator in the insurance premium formula.
+	FillRate float64
+	// SampleCount is the number of assign lifecycles observed for this task type.
+	// When SampleCount < ConfidencePenaltyThreshold (30), a 1.5x confidence
+	// penalty multiplier is applied to the insurance premium.
+	SampleCount int
+	// UpdatedAt is when this entry was last computed.
+	UpdatedAt time.Time
+}
+
+// ActuarialTable maps task types to their actuarial statistics. Stored inside
+// MarketParameters so it follows the same read/write lifecycle as commission
+// and floor parameters (written by slow loop, read by engine).
+type ActuarialTable struct {
+	// ByTaskType maps assign task_type strings to their actuarial entries.
+	// e.g. "brokered-match", "freshness", "validation", "compression".
+	ByTaskType map[string]ActuarialEntry
+}
+
 // MarketParameters holds the current market-level parameters written by the
 // slow loop. The exchange engine reads these to apply structural adjustments
 // above and beyond the fast and medium loop corrections.
@@ -129,6 +162,11 @@ type MarketParameters struct {
 	// uses only TaskCompletionRate (inline matches). Default: 100. Zero means
 	// use the package default (DefaultBrokerMatchBootstrapThreshold).
 	BrokerMatchBootstrapThreshold int
+
+	// ActuarialTable holds completion latency statistics and fill rates per
+	// assign task type. Updated by the slow loop every 4 hours. Used by
+	// InsurancePremium to price delivery guarantees.
+	ActuarialTable ActuarialTable
 
 	// UpdatedAt is when these parameters were last written.
 	UpdatedAt time.Time
@@ -171,6 +209,9 @@ type SlowLoopResult struct {
 	// FederationTrustUpdates contains the trust_score written for each sender
 	// this tick. Empty if FederationState is not configured.
 	FederationTrustUpdates []FederationTrustUpdate
+	// ActuarialTaskTypesUpdated is the number of task types whose actuarial
+	// entry was updated this tick (from assign completion samples).
+	ActuarialTaskTypesUpdated int
 }
 
 // SlowStateReader is the read interface the slow loop needs from exchange state.
@@ -181,6 +222,11 @@ type SlowStateReader interface {
 	PriceHistory() []exchange.PriceRecord
 	// EntryDemandCount returns the number of distinct completed buyers for an entry.
 	EntryDemandCount(entryID string) int
+	// AssignCompletionSamples returns all assign lifecycle samples for actuarial
+	// table computation. Each sample covers one assign lifecycle: its task_type,
+	// whether it was completed (claimed + completed), and the claim-to-complete
+	// latency for completed assigns.
+	AssignCompletionSamples() []exchange.AssignCompletionSample
 }
 
 // FederationStateReader is the read interface for federation trust data.
@@ -443,13 +489,18 @@ func (l *SlowLoop) Tick() SlowLoopResult {
 	// Record the outcome for oscillation detection.
 	l.recordHistory(kept)
 
-	// --- Step 9: Write parameters ---
+	// --- Step 9: Update actuarial table from assign completion history ---
+	// Must run before writing parameters so ActuarialTable is included in the
+	// persisted MarketParameters.
+	proposed.ActuarialTable = l.computeActuarialTable(now)
+
+	// --- Step 10: Write parameters ---
 	proposed.UpdatedAt = now
 	if l.opts.ParamsStore != nil {
 		l.opts.ParamsStore.SetMarketParameters(proposed)
 	}
 
-	// --- Step 10: Update lastNoveltyByType for next tick ---
+	// --- Step 12: Update lastNoveltyByType for next tick ---
 	for _, ns := range noveltyScores {
 		l.lastNoveltyByType[ns.ContentType] = ns.Score
 	}
@@ -474,14 +525,15 @@ func (l *SlowLoop) Tick() SlowLoopResult {
 	}
 
 	result := SlowLoopResult{
-		ContentTypesAnalysed:   len(typeStats),
-		NoveltyScores:          noveltyScores,
-		CommissionAdjustments:  commAdj,
-		FloorAdjustments:       floorAdj,
-		ScalingFactorDelta:     scalingDelta,
-		OscillationDetected:    oscillationDetected,
-		StepSize:               l.currentStep,
-		FederationTrustUpdates: trustUpdates,
+		ContentTypesAnalysed:      len(typeStats),
+		NoveltyScores:             noveltyScores,
+		CommissionAdjustments:     commAdj,
+		FloorAdjustments:          floorAdj,
+		ScalingFactorDelta:        scalingDelta,
+		OscillationDetected:       oscillationDetected,
+		StepSize:                  l.currentStep,
+		FederationTrustUpdates:    trustUpdates,
+		ActuarialTaskTypesUpdated: len(proposed.ActuarialTable.ByTaskType),
 	}
 
 	l.opts.log("slow loop tick: window=%s, history_records=%d, types=%d, novelty=%.4f, step=%.4f, kept=%v, oscillation=%v, federation_updates=%d",
@@ -685,6 +737,9 @@ func (l *SlowLoop) computeParameterUpdates(
 		PriceScalingFactor:    current.PriceScalingFactor,
 		ContentTypeCommission: make(map[string]float64, len(current.ContentTypeCommission)),
 		ContentTypeFloor:      make(map[string]float64, len(current.ContentTypeFloor)),
+		// ActuarialTable is preserved from current; Tick() will overwrite it
+		// after computeParameterUpdates returns (Step 9).
+		ActuarialTable: current.ActuarialTable,
 	}
 
 	// Copy current parameters as base.
@@ -1036,4 +1091,87 @@ func computePriceTrend(prices, timestamps []int64) float64 {
 		return 0
 	}
 	return slope / meanPrice
+}
+
+// computeActuarialTable builds an ActuarialTable from all assign completion
+// samples returned by the state reader. Called once per Tick (4h cadence).
+//
+// For each task type:
+//   - FillRate = completed / total (assigns that reached assign-complete / all assigns)
+//   - Latency percentiles (P50, P90, P99) are computed from completed samples only
+//   - SampleCount = len(all samples for this task type)
+//
+// Task types with zero samples are excluded from the table.
+func (l *SlowLoop) computeActuarialTable(now time.Time) ActuarialTable {
+	samples := l.opts.State.AssignCompletionSamples()
+	if len(samples) == 0 {
+		return ActuarialTable{}
+	}
+
+	// Group by task type.
+	type taskStats struct {
+		total     int
+		completed int
+		latencies []time.Duration // only for completed samples
+	}
+	byType := make(map[string]*taskStats)
+	for _, smpl := range samples {
+		tt := smpl.TaskType
+		if tt == "" {
+			tt = "unknown"
+		}
+		st, ok := byType[tt]
+		if !ok {
+			st = &taskStats{}
+			byType[tt] = st
+		}
+		st.total++
+		if smpl.Completed && smpl.Latency > 0 {
+			st.completed++
+			st.latencies = append(st.latencies, smpl.Latency)
+		}
+	}
+
+	table := ActuarialTable{
+		ByTaskType: make(map[string]ActuarialEntry, len(byType)),
+	}
+	for tt, st := range byType {
+		fillRate := 0.0
+		if st.total > 0 {
+			fillRate = float64(st.completed) / float64(st.total)
+		}
+		entry := ActuarialEntry{
+			FillRate:    fillRate,
+			SampleCount: st.total,
+			UpdatedAt:   now,
+		}
+		if len(st.latencies) > 0 {
+			entry.P50Latency = percentileDuration(st.latencies, 50)
+			entry.P90Latency = percentileDuration(st.latencies, 90)
+			entry.P99Latency = percentileDuration(st.latencies, 99)
+		}
+		table.ByTaskType[tt] = entry
+	}
+	return table
+}
+
+// percentileDuration returns the p-th percentile of a slice of durations.
+// p is in [0, 100]. The slice is sorted in-place; callers must not rely on
+// the original order after this call.
+func percentileDuration(durations []time.Duration, p int) time.Duration {
+	n := len(durations)
+	if n == 0 {
+		return 0
+	}
+	// Insertion sort — samples are small (< 10k per task type).
+	for i := 1; i < n; i++ {
+		for j := i; j > 0 && durations[j] < durations[j-1]; j-- {
+			durations[j], durations[j-1] = durations[j-1], durations[j]
+		}
+	}
+	idx := (p * n) / 100
+	if idx >= n {
+		idx = n - 1
+	}
+	return durations[idx]
 }
