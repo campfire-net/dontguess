@@ -190,3 +190,127 @@ func TestEngine_DeadlineMissRefund(t *testing.T) {
 		t.Error("dispute-refund reservation_id must be non-empty")
 	}
 }
+
+// TestEngine_DeadlineMissRefund_Idempotent verifies that a second
+// settle(complete) for the same match after a deadline-miss refund does NOT
+// produce a second refund. After the first refund, ClearMatchGuarantee removes
+// the entry from matchGuarantee, so GuaranteeForMatch returns ok=false and the
+// engine takes the normal settle path (which will fail due to the consumed
+// reservation, not produce a second credit).
+func TestEngine_DeadlineMissRefund_Idempotent(t *testing.T) {
+	t.Parallel()
+
+	h := newTestHarness(t)
+	cs := newCampfireScripStore(t, h)
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:  h.cfID,
+		Store:       h.st,
+		ReadClient:  h.newOperatorClient(),
+		WriteClient: h.newOperatorClient(),
+		ScripStore:  cs,
+		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+	})
+
+	seedInventoryEntry(t, h, eng, "idempotent deadline test entry", "code", 8000, 5600)
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 inventory entry, got %d", len(inv))
+	}
+	entryID := inv[0].EntryID
+	salePrice := eng.ComputePriceForTest(inv[0])
+	fee := salePrice / exchange.MatchingFeeRate
+	holdAmount := salePrice + fee
+
+	const insuredAmount int64 = 4000
+
+	addScripMintMsg(t, h, h.buyer.PublicKeyHex(), holdAmount+10000)
+	if err := cs.Replay(); err != nil {
+		t.Fatalf("cs.Replay: %v", err)
+	}
+
+	preMatch, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	go func() { _ = eng.Start(ctx) }()
+
+	buyPayloadBytes, _ := json.Marshal(map[string]any{
+		"task":                       "idempotency test",
+		"budget":                     salePrice + 10000,
+		"max_results":                1,
+		"guarantee_deadline_seconds": 1,
+		"insured_amount":             insuredAmount,
+	})
+	h.sendMessage(h.buyer, buyPayloadBytes, []string{exchange.TagBuy}, nil)
+
+	matchMsg := waitForMatchMessage(t, h, preMatch, 3*time.Second)
+	cancel()
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	deadline, _, hasGuarantee := eng.State().GuaranteeForMatch(matchMsg.ID)
+	if !hasGuarantee {
+		t.Fatal("GuaranteeForMatch: expected guarantee for this match, got not-found")
+	}
+
+	buyerAcceptMsg := sendBuyerAcceptAndDispatch(t, h, eng, matchMsg.ID, entryID)
+
+	if d := time.Until(deadline); d > 0 {
+		time.Sleep(d + 200*time.Millisecond)
+	}
+
+	// First settle(complete) after the deadline — triggers the deadline-miss refund.
+	deliverP, _ := json.Marshal(map[string]any{
+		"phase":        "deliver",
+		"entry_id":     entryID,
+		"content_ref":  fmt.Sprintf("sha256:%064x", 2),
+		"content_size": int64(20000),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverP,
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	completeP, _ := json.Marshal(map[string]any{"entry_id": entryID})
+	completeMsg1 := h.sendMessage(h.buyer, completeP,
+		[]string{exchange.TagSettle, exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete},
+		[]string{deliverMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	completeRec1, err := h.st.GetMessage(completeMsg1.ID)
+	if err != nil {
+		t.Fatalf("GetMessage first settle(complete): %v", err)
+	}
+
+	// First dispatch — should produce a refund.
+	preRefund := countMsgsWithTag(t, h, scrip.TagScripDisputeRefund)
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(completeRec1)); err != nil {
+		t.Fatalf("DispatchForTest first settle(complete): %v", err)
+	}
+	afterFirstRefund := countMsgsWithTag(t, h, scrip.TagScripDisputeRefund)
+	if afterFirstRefund <= preRefund {
+		t.Fatal("expected first settle(complete) to produce a dispute-refund")
+	}
+
+	// After the first refund, GuaranteeForMatch must return ok=false (guarantee was cleared).
+	_, _, stillHasGuarantee := eng.State().GuaranteeForMatch(matchMsg.ID)
+	if stillHasGuarantee {
+		t.Error("GuaranteeForMatch returned ok=true after deadline-miss refund; ClearMatchGuarantee did not fire")
+	}
+
+	// Second dispatch of the same settle(complete) — must NOT produce another refund.
+	// (The reservation is already consumed so the engine will error out before emitting anything.)
+	preRefund2 := countMsgsWithTag(t, h, scrip.TagScripDisputeRefund)
+	_ = eng.DispatchForTest(exchange.FromStoreRecord(completeRec1)) // error expected; ignore it
+	afterSecondRefund := countMsgsWithTag(t, h, scrip.TagScripDisputeRefund)
+	if afterSecondRefund > preRefund2 {
+		t.Errorf("second settle(complete) produced %d extra dispute-refund message(s); double-spend not prevented",
+			afterSecondRefund-preRefund2)
+	}
+}

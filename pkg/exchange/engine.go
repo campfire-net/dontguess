@@ -145,12 +145,12 @@ type EngineOptions struct {
 	// If zero, defaults to BrokeredMatchDefaultReward.
 	BrokeredMatchReward int64
 
-	// FederationGuardEnabled enables the new-node dual guard in handleBuy (§4A).
-	// When true, senders whose TrustScore is below NewNodeTrustThreshold (0.6) are
-	// routed to inline matching regardless of BrokeredMatchMode. When false (the
-	// default), all senders with BrokeredMatchMode=true receive brokered routing.
-	// Set true in production deployments where the slow loop populates federation
-	// trust profiles.
+	// FederationGuardEnabled activates the dual trust guard for federation nodes in
+	// handleBuy. When true, new nodes (below NewNodeTrustThreshold or
+	// NewNodeTransactionThreshold) are blocked from brokered routing until they
+	// graduate. REQUIRED in multi-operator/federation deployments. Defaults false
+	// for single-operator deployments. When BrokeredMatchMode=true, a startup
+	// warning is emitted if this is false.
 	FederationGuardEnabled bool
 }
 
@@ -297,6 +297,12 @@ func (e *Engine) MatchIndexLen() int {
 // pending orders from the replay, then runs the event loop until ctx is cancelled.
 func (e *Engine) Start(ctx context.Context) error {
 	e.ctx.Store(ctx)
+	// Warn operators who enable brokered matching without the federation guard.
+	// Without FederationGuardEnabled, new/untrusted federation nodes bypass the
+	// dual trust guard and receive brokered routing unconditionally.
+	if e.opts.BrokeredMatchMode && !e.opts.FederationGuardEnabled {
+		e.opts.log("engine: WARN BrokeredMatchMode enabled but FederationGuardEnabled=false — federation nodes bypass trust guard; set FederationGuardEnabled=true in production")
+	}
 	if err := e.replayAll(); err != nil {
 		return fmt.Errorf("exchange engine replay: %w", err)
 	}
@@ -1676,6 +1682,21 @@ func (e *Engine) handleDeadlineMissRefund(ctx context.Context, msg *Message, mat
 		return fmt.Errorf("scrip: deadline-miss: marshal refund payload: %w", marshalErr)
 	}
 
+	// Emit scrip-dispute-refund convention message BEFORE crediting the buyer so
+	// that Replay is consistent: if the emit fails the reservation was already
+	// consumed and must be restored, but the balance has not been modified yet.
+	if _, emitErr := e.sendOperatorMessage(refundPayload,
+		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
+		// Restore reservation so the settle can be retried.
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: deadline-miss: CRITICAL: failed to restore reservation %s after emit failure: %v",
+				shortKey(reservationID), restoreErr)
+			return fmt.Errorf("scrip: deadline-miss reservation %s: emit failed AND restore failed: %w",
+				shortKey(reservationID), emitErr)
+		}
+		return fmt.Errorf("scrip: deadline-miss: emit scrip-dispute-refund: %w", emitErr)
+	}
+
 	// Credit the buyer's balance.
 	if _, _, err := e.opts.ScripStore.AddBudget(ctx, res.AgentKey, scrip.BalanceKey, refundAmount, ""); err != nil {
 		// Restore reservation so the settle can be retried.
@@ -1686,11 +1707,9 @@ func (e *Engine) handleDeadlineMissRefund(ctx context.Context, msg *Message, mat
 		return fmt.Errorf("scrip: deadline-miss: AddBudget(buyer %s): %w", shortKey(res.AgentKey), err)
 	}
 
-	// Emit scrip-dispute-refund convention message so CampfireScripStore can replay it.
-	if _, emitErr := e.sendOperatorMessage(refundPayload,
-		[]string{scrip.TagScripDisputeRefund}, []string{msg.ID}); emitErr != nil {
-		e.opts.log("engine: warning: emit scrip-dispute-refund (deadline-miss): %v", emitErr)
-	}
+	// Clear the guarantee record so a duplicate settle(complete) cannot re-enter
+	// the refund path (double-spend prevention).
+	e.state.ClearMatchGuarantee(matchMsgID)
 
 	e.opts.log("engine: deadline-miss refund: match=%s reservation=%s buyer=%s amount=%d",
 		shortKey(matchMsgID), shortKey(reservationID), shortKey(res.AgentKey), refundAmount)
