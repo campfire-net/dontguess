@@ -391,6 +391,59 @@ Announces the operator's current x402-to-scrip conversion rate. No scrip movemen
 
 ---
 
+### 9. `scrip:loan-mint` — Issue Commitment Loan
+
+Operator mints scrip as a commitment loan to an agent at settlement time. The loan is backed by a CommitmentToken purchased by the buyer at buy-request time. See `exchange-scrip/loan-mint.json` for the full schema.
+
+**Tags:** `dontguess:scrip-loan-mint`, `scrip:loan:*`, `scrip:to:*`
+
+**Payload:** `{ "loan_id": "<string>", "borrower": "<pubkey>", "principal": <int64>, "vig_rate_bps": <int>, "due_at": "<iso8601>", "settlement_msg_id": "<msg_id>", "commitment_token_id": "<string>" }`
+
+**State effect:** `borrower_balance += principal`; `total_supply += principal`; `loans[loan_id]` created with `Status=Active`.
+
+**Validation:**
+- Signer MUST be the exchange operator.
+- `commitment_token_id` MUST reference a valid `CommitmentIssued` token whose `price_ceiling >= principal`.
+- `settlement_msg_id` MUST reference a valid `exchange:settle(complete)` message.
+- `loan_id` MUST be unique across all loan records.
+
+---
+
+### 10. `scrip:loan-repay` — Repay Loan Principal
+
+Borrower repays part or all of an outstanding loan principal. The amount is burned (not transferred). See `exchange-scrip/loan-repay.json` for the full schema.
+
+**Tags:** `dontguess:scrip-loan-repay`, `scrip:loan:*`
+
+**Payload:** `{ "loan_id": "<string>", "amount": <int64> }`
+
+**State effect:** `borrower_balance -= amount` (burned); `total_supply -= amount`; `LoanRecord.Repaid += amount`; `LoanRecord.Status = LoanRepaid` when `Repaid >= Principal`.
+
+**Validation:**
+- Signer MUST be the exchange operator.
+- `loan_id` MUST reference an Active `LoanRecord`.
+- `amount` MUST NOT exceed `(LoanRecord.Principal - LoanRecord.Repaid)`.
+- Borrower balance MUST be >= `amount` at emission time.
+
+---
+
+### 11. `scrip:loan-vig-accrue` — Accrue Vig (Interest)
+
+Operator accrues vig on an outstanding loan. Emitted by the slow loop at its 4-hour cadence. See `exchange-scrip/loan-vig-accrue.json` for the full schema.
+
+**Tags:** `dontguess:scrip-loan-vig-accrue`, `scrip:loan:*`
+
+**Payload:** `{ "loan_id": "<string>", "amount": <int64> }`
+
+**State effect:** `LoanRecord.Outstanding += amount`. Vig is tracked as an obligation separate from the principal repayment chain.
+
+**Validation:**
+- Signer MUST be the exchange operator.
+- `loan_id` MUST reference an Active `LoanRecord`.
+- The slow loop MUST NOT emit vig-accrue for `LoanRepaid` or `LoanDefaulted` loans.
+
+---
+
 ## Derived State
 
 Scrip balances are not stored as a separate data structure. They are **derived from the campfire message log** by replaying all scrip operations in order.
@@ -428,7 +481,35 @@ for each message in campfire log, ordered by sequence:
         case "scrip:dispute-refund":
             balances[buyer] += amount
             delete escrow[reservation_id]
+
+        case "scrip:loan-mint":
+            balances[borrower] += principal
+            total_supply += principal
+            loans[loan_id] = LoanRecord{ Active, principal, vig_rate_bps, due_at, ... }
+
+        case "scrip:loan-repay":
+            balances[borrower] -= amount   // burned, not transferred
+            total_supply -= amount
+            loans[loan_id].Repaid += amount
+            if loans[loan_id].Repaid >= loans[loan_id].Principal:
+                loans[loan_id].Status = LoanRepaid
+
+        case "scrip:loan-vig-accrue":
+            loans[loan_id].Outstanding += amount
+            // Vig is tracked as an obligation; not burned until repaid.
 ```
+
+### Loan Consistency Invariant
+
+Loans add a separate accounting flow. The full supply invariant becomes:
+
+```
+sum(all_balances) + sum(all_escrow) + total_burned == total_supply
+```
+
+Where `total_supply` includes minted loan principal that has not yet been repaid. Repaid loan scrip is burned and removed from `total_supply`.
+
+Unpaid vig (tracked in `LoanRecord.Outstanding`) is NOT included in `total_supply` until the borrower repays. Defaulted loans leave their minted principal as permanent inflationary scrip.
 
 ### Escrow Timeout
 

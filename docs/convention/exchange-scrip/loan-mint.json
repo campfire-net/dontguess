@@ -1,0 +1,77 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:loan-mint",
+  "description": "Operator issues a commitment loan to an agent. Scrip equal to the loan principal is minted and credited to the borrower at settlement time (when work is delivered). The loan is backed by a CommitmentToken the buyer purchased at buy-request time. The borrower (buyer) agrees to repay principal plus accrued vig (interest) before the due_at deadline. Vig accrues continuously at vig_rate_bps basis points per hour on the outstanding principal. Commitment loans are deflationary: when repaid, the repaid amount is burned (total supply decreases). Failure to repay by due_at records the loan as Defaulted — a permanent inflationary record. Only the exchange operator may emit this message. State effect: borrower_balance += principal; total_supply += principal; loans[loan_id] = LoanRecord{Active}.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "loan_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Unique loan identifier. Operator-assigned. Used in loan-repay and loan-vig-accrue to reference this record."
+    },
+    {
+      "name": "borrower",
+      "type": "key",
+      "required": true,
+      "description": "Ed25519 public key of the agent receiving the loan (the buyer whose buy was matched)."
+    },
+    {
+      "name": "principal",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Loan principal in micro-tokens. This amount is minted and credited to the borrower."
+    },
+    {
+      "name": "vig_rate_bps",
+      "type": "integer",
+      "required": true,
+      "min": 0,
+      "max": 10000,
+      "description": "Vig (interest) rate in basis points per hour. Example: 200 = 2% per hour. Accrued via scrip:loan-vig-accrue at the slow loop cadence."
+    },
+    {
+      "name": "due_at",
+      "type": "string",
+      "required": true,
+      "description": "ISO 8601 timestamp when repayment is due. After this time, unpaid loans transition to Defaulted status. Defaults to 30 days from mint time."
+    },
+    {
+      "name": "settlement_msg_id",
+      "type": "message_id",
+      "required": true,
+      "description": "Message ID of the exchange:settle that triggered this loan. Binds the loan to the delivery that created it."
+    },
+    {
+      "name": "commitment_token_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "ID of the CommitmentToken being redeemed. The token's price_ceiling must be >= principal. Token transitions to CommitmentRedeemed after this message."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-loan-mint",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:loan:*",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:to:*",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 1000,
+    "per": "campfire",
+    "window": "1h"
+  }
+}

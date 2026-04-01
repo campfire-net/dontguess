@@ -1,0 +1,46 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.1",
+  "operation": "scrip:loan-repay",
+  "description": "Borrower makes a partial or full repayment on an outstanding loan. The repaid amount is burned from the borrower's balance (not transferred — burned). State effect: LoanRecord.Repaid += amount; total_supply -= amount; total_loan_principal -= amount when fully repaid; LoanRecord.Status = LoanRepaid when Repaid >= Principal. Vig (accrued interest) is repaid via separate scrip:loan-vig-accrue messages — this operation covers principal only. The borrower initiates this message; the operator signs it after verifying the borrower has sufficient balance. Only the exchange operator may emit this message.",
+  "signing": "campfire_key",
+  "antecedents": "exactly_one(target)",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "loan_id",
+      "type": "string",
+      "required": true,
+      "max_length": 128,
+      "description": "Loan ID being repaid. Must reference an Active loan record."
+    },
+    {
+      "name": "amount",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "description": "Repayment amount in micro-tokens. Must not exceed (principal - already_repaid). Burned from borrower balance on application."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "dontguess:scrip-loan-repay",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "scrip:loan:*",
+      "cardinality": "exactly_one"
+    }
+  ],
+  "validation": [
+    "loan_id MUST reference a known, Active LoanRecord.",
+    "amount MUST NOT exceed (LoanRecord.Principal - LoanRecord.Repaid).",
+    "Borrower balance MUST be >= amount at the time the operator signs (verified before emission).",
+    "Antecedent MUST be the scrip:loan-mint message for loan_id (the root of the loan chain)."
+  ],
+  "rate_limit": {
+    "max": 5000,
+    "per": "campfire",
+    "window": "1h"
+  }
+}

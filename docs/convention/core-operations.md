@@ -69,7 +69,9 @@ All exchange convention tags use the `exchange:` prefix.
 
 **Operation tags** (exactly one per message):
 
-`exchange:put`, `exchange:buy`, `exchange:match`, `exchange:settle`
+Core: `exchange:put`, `exchange:buy`, `exchange:match`, `exchange:settle`
+
+Assign lifecycle: `exchange:assign`, `exchange:assign-claim`, `exchange:assign-complete`, `exchange:assign-accept`, `exchange:assign-reject`, `exchange:assign-expire`, `exchange:assign-auction-close`
 
 **Auxiliary tags** (zero or more, composed from args):
 
