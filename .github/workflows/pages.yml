@@ -6,8 +6,10 @@ on:
       - main
     paths:
       - 'site/**'
+      - '.github/workflows/pages.yml'
 
 permissions:
+  contents: read
   pages: write
   id-token: write
 
