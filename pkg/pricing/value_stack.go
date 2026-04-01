@@ -66,6 +66,10 @@ type ValueStackStateReader interface {
 	// AllPriceAdjustments returns a snapshot of all active price adjustments.
 	// Used to capture pre-tick state for rollback.
 	AllPriceAdjustments() map[string]exchange.PriceAdjustment
+	// DebtorScore returns the debtor priority score for an agent in [0.0, 1.0].
+	// 1.0 = no debt (full priority); 0.0 = maximum debt (lowest priority).
+	// Returns 1.0 for agents with no recorded debt signal.
+	DebtorScore(agentKey string) float64
 }
 
 // ValueStackStateWriter is the write interface for restoring adjustments.
