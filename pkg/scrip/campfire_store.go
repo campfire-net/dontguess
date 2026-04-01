@@ -655,6 +655,13 @@ func (s *CampfireScripStore) applyLoanRepay(msg *proto.Message) {
 	fullyRepaid := record.Repaid >= record.Principal
 	if fullyRepaid {
 		record.Status = LoanRepaid
+		// Zero Outstanding: the borrower has fully repaid (principal + any accrued vig
+		// included in the final payment). Leaving Outstanding stale would cause
+		// TotalOutstandingVig to over-report vig pressure for a closed loan.
+		// Note: the current implementation treats repayment as principal-only
+		// (Repaid tracks principal; Outstanding tracks vig separately). On full
+		// repayment we zero Outstanding regardless — the borrower has settled the debt.
+		record.Outstanding = 0
 	}
 	principal := record.Principal
 	s.loansMu.Unlock()
