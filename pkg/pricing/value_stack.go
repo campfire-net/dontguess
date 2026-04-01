@@ -48,8 +48,21 @@ const CorrectnessRegressionTolerance = 0.02
 // The concrete *exchange.State satisfies this interface.
 type ValueStackStateReader interface {
 	// TaskCompletionRate returns the fraction of buyer-accepted orders that
-	// have reached settle(complete). This is the Layer 0 correctness metric.
+	// have reached settle(complete) via inline (non-brokered) matching.
+	// This is the pre-bootstrap Layer 0 correctness metric.
 	TaskCompletionRate() float64
+	// BrokeredMatchCompletionRate returns the fraction of brokered-match
+	// accepted orders that have reached settle(complete). Used by the Layer 0
+	// bootstrap gate after enough brokered completions have been observed.
+	BrokeredMatchCompletionRate() float64
+	// BrokeredCompletionCount returns the raw count of brokered-match
+	// settle(complete) messages processed. Used by Layer0Metric to check
+	// whether the bootstrap threshold has been crossed.
+	BrokeredCompletionCount() int
+	// CombinedCompletionRate returns a weighted average of TaskCompletionRate
+	// and BrokeredMatchCompletionRate, weighted by each path's share of total
+	// accepted orders. Used by Layer0Metric after the bootstrap threshold.
+	CombinedCompletionRate() float64
 	// AllPriceAdjustments returns a snapshot of all active price adjustments.
 	// Used to capture pre-tick state for rollback.
 	AllPriceAdjustments() map[string]exchange.PriceAdjustment
@@ -211,9 +224,28 @@ func NewValueStackFromState(
 }
 
 // Layer0Metric computes the current Layer 0 correctness metric.
-// This is the task completion rate from exchange state.
+//
+// Before the brokered-match bootstrap threshold is reached, this returns
+// TaskCompletionRate (inline matches only) — brokered matching is too new to
+// include in the correctness gate without generating false rollbacks during the
+// cold-start period.
+//
+// After the threshold (default DefaultBrokerMatchBootstrapThreshold brokered
+// completions, configurable via MarketParameters.BrokerMatchBootstrapThreshold),
+// this returns CombinedCompletionRate — a weighted average that holds both
+// inline and brokered matching to the same correctness standard.
 func (vs *ValueStack) Layer0Metric() float64 {
-	return vs.opts.State.TaskCompletionRate()
+	threshold := DefaultBrokerMatchBootstrapThreshold
+	if vs.opts.ParamsStore != nil {
+		params := vs.opts.ParamsStore.GetMarketParameters()
+		if params.BrokerMatchBootstrapThreshold > 0 {
+			threshold = params.BrokerMatchBootstrapThreshold
+		}
+	}
+	if vs.opts.State.BrokeredCompletionCount() < threshold {
+		return vs.opts.State.TaskCompletionRate()
+	}
+	return vs.opts.State.CombinedCompletionRate()
 }
 
 // RunAll executes the three loops in sequence, enforcing the Layer 0 gate
