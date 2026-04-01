@@ -1253,3 +1253,44 @@ func TestAssignLookupByCompleteMsgIDReject(t *testing.T) {
 		t.Errorf("expected assign back to AssignOpen after reject, got %v", rec)
 	}
 }
+
+// TestCompleteMsgToAssignIndexClearedOnPaid verifies that ClaimAssignPayment
+// removes the completeMsgToAssign index entry to prevent memory leaks.
+// The entry must survive applyAssignAccept (so ClaimAssignPayment can look it up)
+// but must be removed once payment is claimed (AssignAccepted → AssignPaid).
+func TestCompleteMsgToAssignIndexClearedOnPaid(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	// Build full lifecycle up to accept.
+	s.Apply(ptr(makeAssignMsg("assign-idx1", operatorKey, "entry-idx1", "freshness", 100, "")))
+	s.Apply(ptr(makeAssignClaimMsg("claim-idx1", agentKey, "assign-idx1")))
+	s.Apply(ptr(makeAssignCompleteMsg("complete-idx1", agentKey, "claim-idx1", nil)))
+	s.Apply(ptr(makeAssignAcceptMsg("accept-idx1", operatorKey, "complete-idx1")))
+
+	// After accept but before ClaimAssignPayment, the index entry must still be
+	// present so ClaimAssignPayment can perform its O(1) lookup.
+	s.mu.RLock()
+	_, presentAfterAccept := s.completeMsgToAssign["complete-idx1"]
+	s.mu.RUnlock()
+	if !presentAfterAccept {
+		t.Error("completeMsgToAssign entry must remain after accept so ClaimAssignPayment can look it up")
+	}
+
+	// ClaimAssignPayment transitions AssignAccepted → AssignPaid.
+	rec := s.ClaimAssignPayment("complete-idx1")
+	if rec == nil {
+		t.Fatal("ClaimAssignPayment returned nil; expected AssignAccepted record")
+	}
+	if rec.Status != AssignPaid {
+		t.Errorf("expected AssignPaid after ClaimAssignPayment, got %v", rec.Status)
+	}
+
+	// After payment, the index entry must be removed to prevent the memory leak.
+	s.mu.RLock()
+	_, presentAfterPaid := s.completeMsgToAssign["complete-idx1"]
+	s.mu.RUnlock()
+	if presentAfterPaid {
+		t.Error("completeMsgToAssign entry should be removed after ClaimAssignPayment; memory leak detected")
+	}
+}
