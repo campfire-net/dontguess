@@ -438,3 +438,25 @@ func TestFederationProfile_TransactionCountIncrements(t *testing.T) {
 		t.Error("expected IsNewNode=true with TransactionCount=0")
 	}
 }
+
+
+// TestSenderHopDepth_BoundedWindow verifies that senderHopDepth is capped at
+// SenderHopDepthWindowSize even when more than that many messages arrive from
+// the same sender.
+func TestSenderHopDepth_BoundedWindow(t *testing.T) {
+	t.Parallel()
+
+	state := exchange.NewState()
+	senderKey := "test-sender-bounded-window"
+
+	// Inject SenderHopDepthWindowSize+1 observations via UpdateFederationProfile.
+	total := exchange.SenderHopDepthWindowSize + 1
+	for i := 0; i < total; i++ {
+		state.UpdateFederationProfile(senderKey, i%5)
+	}
+
+	depths := state.SenderHopDepths(senderKey)
+	if len(depths) != exchange.SenderHopDepthWindowSize {
+		t.Errorf("SenderHopDepths len: got %d, want %d (SenderHopDepthWindowSize)", len(depths), exchange.SenderHopDepthWindowSize)
+	}
+}
