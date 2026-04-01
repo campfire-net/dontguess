@@ -1920,3 +1920,141 @@ func TestLoanRepay_ClearsOutstandingVig(t *testing.T) {
 		t.Errorf("TotalOutstandingVig = %d, want 0 (repaid loan must not contribute to vig pressure)", got)
 	}
 }
+
+// --- Replay/ApplyMessage race window ---
+
+// TestStore_ReplayRaceWindow verifies that concurrent ApplyMessage calls cannot
+// interleave with Replay() and observe empty balances in live mode.
+//
+// Security fix: dontguess-3da. Before the replayMu fix, the window between
+// map reset and replaying.Store(true) allowed ApplyMessage to run in live mode
+// against empty balances, causing subtractFromBalance to return ErrBudgetExceeded
+// and silently drop valid debit messages.
+//
+// This test exercises the race at runtime: goroutines continuously call
+// ApplyMessage (mint messages) while the main goroutine calls Replay() in a loop.
+// With -race it detects unsynchronized map access. Without -race it verifies that
+// balances remain non-negative after all operations.
+func TestStore_ReplayRaceWindow(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Seed the campfire log with a mint so Replay has data to process.
+	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", struct {
+		Recipient string `json:"recipient"`
+		Amount    int64  `json:"amount"`
+	}{agentAlice, 10_000})
+
+	cs := newStore(t, env)
+
+	const goroutines = 4
+	const iterations = 50
+
+	var wg sync.WaitGroup
+	stop := make(chan struct{})
+
+	// Goroutines call ApplyMessage with fresh mint messages (credit only, no debit).
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				msg := buildMsg(t, env.campfireID, env.operatorKey, "dontguess:scrip-mint",
+					struct {
+						Recipient string `json:"recipient"`
+						Amount    int64  `json:"amount"`
+					}{agentBob, 1},
+				)
+				cs.ApplyMessage(&msg)
+			}
+		}()
+	}
+
+	// Main goroutine calls Replay() repeatedly.
+	for i := 0; i < iterations; i++ {
+		if err := cs.Replay(); err != nil {
+			t.Fatalf("Replay() iteration %d: %v", i, err)
+		}
+	}
+
+	close(stop)
+	wg.Wait()
+
+	// After all concurrent operations, balances must be non-negative.
+	if got := cs.Balance(agentAlice); got < 0 {
+		t.Errorf("Alice balance = %d after concurrent replay, want >= 0", got)
+	}
+	if got := cs.Balance(agentBob); got < 0 {
+		t.Errorf("Bob balance = %d after concurrent replay, want >= 0", got)
+	}
+}
+
+// TestLoanRepay_ConcurrentPartialRepay_NoPrincipalDoubleDecrement verifies that
+// two concurrent partial repayments for the same loan do not double-decrement
+// totalLoanPrincipal. Before the fix, both goroutines could evaluate fullyRepaid=true
+// and each call totalLoanPrincipal.Add(-principal), sending the counter negative.
+func TestLoanRepay_ConcurrentPartialRepay_NoPrincipalDoubleDecrement(t *testing.T) {
+	env := newTestEnv(t)
+
+	// Mint the loan via the campfire message log so the store can replay it.
+	const principal = 1000
+	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
+	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		Borrower:  agentAlice,
+		Principal: principal,
+		DueAt:     dueAt,
+		LoanID:    "loan-concurrent-repay",
+	})
+
+	// Build a store from the replay so the loan record exists in memory.
+	cs := newStore(t, env)
+
+	// Build two partial repayment messages that together exactly cover the principal.
+	// Each goroutine calls ApplyMessage directly (live-mode path) to exercise
+	// concurrent access to the same loan record.
+	makeRepayMsg := func(amount int64, idx int) proto.Message {
+		rawPayload, err := json.Marshal(scrip.LoanRepayPayload{
+			LoanID: "loan-concurrent-repay",
+			Amount: amount,
+		})
+		if err != nil {
+			t.Fatalf("marshal repay payload: %v", err)
+		}
+		return proto.Message{
+			ID:         fmt.Sprintf("repay-concurrent-%d", idx),
+			CampfireID: env.campfireID,
+			Sender:     env.operatorKey,
+			Payload:    rawPayload,
+			Tags:       []string{scrip.TagScripLoanRepay},
+			Timestamp:  time.Now().UnixNano(),
+		}
+	}
+
+	msg1 := makeRepayMsg(500, 1)
+	msg2 := makeRepayMsg(500, 2)
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		cs.ApplyMessage(&msg1)
+	}()
+	go func() {
+		defer wg.Done()
+		cs.ApplyMessage(&msg2)
+	}()
+	wg.Wait()
+
+	// totalLoanPrincipal must be exactly 0: the principal was retired once.
+	// A negative value indicates double-decrement (the race this test guards against).
+	if got := cs.TotalLoanPrincipal(); got != 0 {
+		t.Errorf("TotalLoanPrincipal = %d after concurrent full repayment, want 0 (negative = double-decrement race)", got)
+	}
+	if got := cs.TotalOutstandingVig(); got != 0 {
+		t.Errorf("TotalOutstandingVig = %d, want 0 (repaid loan must not contribute to vig pressure)", got)
+	}
+}
