@@ -140,9 +140,9 @@ func (s *CampfireScripStore) Replay() error {
 // in live mode (replaying == false). It is the public entry point for processing
 // messages received after initial Replay construction. Idempotent for duplicates.
 //
-// In live mode, subtractFromBalance clamps balances to zero (underflow guard).
-// This prevents a corrupt or unexpected message from producing a negative balance
-// that would permanently block the affected buyer from spending scrip.
+// In live mode, subtractFromBalance hard-rejects underflow: a message that would
+// drive any balance negative is dropped without partial writes. This enforces the
+// A12 constraint that no balance may go below zero via any live code path.
 func (s *CampfireScripStore) ApplyMessage(msg *proto.Message) {
 	s.applyMessage(msg)
 }
@@ -228,10 +228,13 @@ func (s *CampfireScripStore) applyPutPay(msg *proto.Message) {
 		return
 	}
 	// Operator (sender) pays seller.
-	s.addToBalance(p.Seller, p.Amount)
+	// Check operator can cover the payment before crediting seller.
 	if msg.Sender != "" {
-		s.subtractFromBalance(msg.Sender, p.Amount)
+		if err := s.subtractFromBalance(msg.Sender, p.Amount); err != nil {
+			return // underflow in live mode: drop entire message, no partial write
+		}
 	}
+	s.addToBalance(p.Seller, p.Amount)
 }
 
 // applyBuyHold processes a scrip:buy-hold message.
@@ -245,7 +248,9 @@ func (s *CampfireScripStore) applyBuyHold(msg *proto.Message) {
 	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.Buyer == "" || p.Amount <= 0 {
 		return
 	}
-	s.subtractFromBalance(p.Buyer, p.Amount)
+	if err := s.subtractFromBalance(p.Buyer, p.Amount); err != nil {
+		return // underflow in live mode: drop message
+	}
 }
 
 // applySettle processes a scrip:settle message.
@@ -289,10 +294,13 @@ func (s *CampfireScripStore) applyAssignPay(msg *proto.Message) {
 	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.Worker == "" || p.Amount <= 0 {
 		return
 	}
-	s.addToBalance(p.Worker, p.Amount)
+	// Check operator can cover the payment before crediting worker.
 	if msg.Sender != "" {
-		s.subtractFromBalance(msg.Sender, p.Amount)
+		if err := s.subtractFromBalance(msg.Sender, p.Amount); err != nil {
+			return // underflow in live mode: drop entire message, no partial write
+		}
 	}
+	s.addToBalance(p.Worker, p.Amount)
 }
 
 // applyDisputeRefund processes a scrip:dispute-refund message.
@@ -491,11 +499,11 @@ func (s *CampfireScripStore) addToBalance(agentKey string, amount int64) {
 // campfire log is the authority, and if the log is consistent the balance
 // should never go negative in practice.
 //
-// In live mode (s.replaying == false) the result is clamped to zero. This
-// prevents a corrupted or inconsistent log from producing a permanent negative
-// balance that would cause every subsequent DecrementBudget to return
-// ErrBudgetExceeded (permanent buyer lockout).
-func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) {
+// In live mode (s.replaying == false) underflow is hard-rejected: if the
+// subtraction would produce a negative balance the function returns an error
+// without writing. This enforces the A12 constraint that a balance cannot go
+// below zero via any live code path.
+func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) error {
 	s.balancesMu.Lock()
 	e, ok := s.balances[agentKey]
 	if !ok {
@@ -505,13 +513,14 @@ func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) 
 	s.balancesMu.Unlock()
 
 	e.mu.Lock()
+	defer e.mu.Unlock()
 	newVal := e.value - amount
 	if !s.replaying.Load() && newVal < 0 {
-		newVal = 0
+		return ErrBudgetExceeded
 	}
 	e.value = newVal
 	e.gen++
-	e.mu.Unlock()
+	return nil
 }
 
 // scripOp returns the scrip operation tag from a message's tag list, or "".
