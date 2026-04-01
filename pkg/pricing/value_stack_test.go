@@ -113,6 +113,9 @@ func (s *valueStackStubState) PurchaseCount(entryID string) int {
 }
 func (s *valueStackStubState) ActiveAssigns(_ string) []*exchange.AssignRecord { return nil }
 func (s *valueStackStubState) DebtorScore(_ string) float64                   { return 1.0 } // no debt by default
+func (s *valueStackStubState) AssignCompletionSamples() []exchange.AssignCompletionSample {
+	return nil // actuarial table not exercised in value stack tests
+}
 
 // ---- value stack interface ----
 func (s *valueStackStubState) TaskCompletionRate() float64 {
