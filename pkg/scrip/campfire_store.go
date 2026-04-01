@@ -24,6 +24,8 @@ const (
 	tagScripAssignPay     = "dontguess:scrip-assign-pay"
 	tagScripDisputeRefund = "dontguess:scrip-dispute-refund"
 	tagScripLoanMint      = "dontguess:scrip-loan-mint"
+	tagScripLoanRepay     = "dontguess:scrip-loan-repay"
+	tagScripLoanVigAccrue = "dontguess:scrip-loan-vig-accrue"
 )
 
 // balanceEntry holds the in-memory balance for a single agent.
@@ -205,6 +207,10 @@ func (s *CampfireScripStore) applyMessage(msg *proto.Message) {
 		s.applyDisputeRefund(msg)
 	case tagScripLoanMint:
 		s.applyLoanMint(msg)
+	case tagScripLoanRepay:
+		s.applyLoanRepay(msg)
+	case tagScripLoanVigAccrue:
+		s.applyLoanVigAccrue(msg)
 	}
 }
 
@@ -550,7 +556,8 @@ func scripOp(tags []string) string {
 		switch t {
 		case tagScripMint, tagScripBurn, tagScripPutPay,
 			tagScripBuyHold, tagScripSettle, tagScripAssignPay,
-			tagScripDisputeRefund, tagScripLoanMint:
+			tagScripDisputeRefund, tagScripLoanMint,
+			tagScripLoanRepay, tagScripLoanVigAccrue:
 			return t
 		}
 	}
@@ -615,6 +622,89 @@ func (s *CampfireScripStore) applyLoanMint(msg *proto.Message) {
 	s.totalLoanPrincipal.Add(p.Principal)
 }
 
+// applyLoanRepay processes a scrip:loan-repay message.
+//
+// State effects:
+//   - LoanRecord.Repaid += amount
+//   - totalSupply -= amount (repaid scrip is burned)
+//   - When Repaid >= Principal: LoanRecord.Status = LoanRepaid;
+//     totalLoanPrincipal -= Principal (principal no longer outstanding)
+//
+// Validation:
+//   - loan_id must exist and be in LoanActive status
+//   - amount must be > 0
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §9
+func (s *CampfireScripStore) applyLoanRepay(msg *proto.Message) {
+	var p LoanRepayPayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	if p.LoanID == "" || p.Amount <= 0 {
+		return
+	}
+
+	s.loansMu.Lock()
+	record, ok := s.loans[p.LoanID]
+	if !ok || record.Status != LoanActive {
+		s.loansMu.Unlock()
+		return
+	}
+
+	record.Repaid += p.Amount
+	fullyRepaid := record.Repaid >= record.Principal
+	if fullyRepaid {
+		record.Status = LoanRepaid
+		// Zero Outstanding: the borrower has fully repaid (principal + any accrued vig
+		// included in the final payment). Leaving Outstanding stale would cause
+		// TotalOutstandingVig to over-report vig pressure for a closed loan.
+		// Note: the current implementation treats repayment as principal-only
+		// (Repaid tracks principal; Outstanding tracks vig separately). On full
+		// repayment we zero Outstanding regardless — the borrower has settled the debt.
+		record.Outstanding = 0
+	}
+	principal := record.Principal
+	s.loansMu.Unlock()
+
+	// Burn the repaid scrip from total supply.
+	s.totalSupply.Add(-p.Amount)
+
+	// When fully repaid, retire the outstanding loan principal.
+	if fullyRepaid {
+		s.totalLoanPrincipal.Add(-principal)
+	}
+}
+
+// applyLoanVigAccrue processes a scrip:loan-vig-accrue message.
+//
+// State effect: LoanRecord.Outstanding += amount. Vig accrual is a separate
+// accounting flow from principal repayment. It accumulates in Outstanding and
+// is tracked as a market signal (vig pressure) by the medium loop.
+//
+// Validation:
+//   - loan_id must exist and be in LoanActive status
+//   - amount must be > 0
+//
+// Design ref: docs/design/semantic-matching-marketplace.md §9
+func (s *CampfireScripStore) applyLoanVigAccrue(msg *proto.Message) {
+	var p LoanVigAccruePayload
+	if err := json.Unmarshal(msg.Payload, &p); err != nil {
+		return
+	}
+	if p.LoanID == "" || p.Amount <= 0 {
+		return
+	}
+
+	s.loansMu.Lock()
+	defer s.loansMu.Unlock()
+
+	record, ok := s.loans[p.LoanID]
+	if !ok || record.Status != LoanActive {
+		return
+	}
+	record.Outstanding += p.Amount
+}
+
 // --- Loan accessors ---
 
 // TotalLoanPrincipal returns the sum of all outstanding loan principals minted
@@ -622,6 +712,21 @@ func (s *CampfireScripStore) applyLoanMint(msg *proto.Message) {
 // callers to distinguish base circulating scrip from loan-expanded supply.
 func (s *CampfireScripStore) TotalLoanPrincipal() int64 {
 	return s.totalLoanPrincipal.Load()
+}
+
+// TotalOutstandingVig returns the sum of accrued vig (LoanRecord.Outstanding)
+// across all active loans. This is the vig_pressure signal consumed by the
+// medium loop.
+func (s *CampfireScripStore) TotalOutstandingVig() int64 {
+	s.loansMu.RLock()
+	defer s.loansMu.RUnlock()
+	var total int64
+	for _, r := range s.loans {
+		if r.Status == LoanActive {
+			total += r.Outstanding
+		}
+	}
+	return total
 }
 
 // GetLoan returns the LoanRecord for loanID, and whether it exists.
