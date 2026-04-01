@@ -1070,6 +1070,55 @@ func TestMediumLoop_ZeroBountySkip(t *testing.T) {
 	}
 }
 
+// TestMediumLoop_CompressionAssign_SkippedWhenActiveAssignExists verifies that
+// the active-assign guard in postCompressionAssigns prevents a duplicate
+// compression assign when one is already in-flight for the entry.
+//
+// The guard lives at medium_loop.go ~line 646:
+//
+//	if len(l.opts.State.ActiveAssigns(entry.EntryID)) > 0 { continue }
+//
+// An entry that would otherwise qualify (high demand, uncompressed, sufficient
+// token cost) must yield CompressionAssigns=0 when activeAssigns is non-empty.
+func TestMediumLoop_CompressionAssign_SkippedWhenActiveAssignExists(t *testing.T) {
+	t.Parallel()
+
+	now := time.Date(2026, 1, 1, 12, 0, 0, 0, time.UTC)
+	st := newMediumStubState()
+
+	const tokenCost int64 = 10000
+	st.inventory = []*exchange.InventoryEntry{
+		{EntryID: "entry-inflight", SellerKey: "seller-1", TokenCost: tokenCost},
+	}
+	// Enough purchases to exceed the compression threshold.
+	st.purchaseCount["entry-inflight"] = 5
+	// No compressed derivative exists — entry qualifies on all other guards.
+	st.compressedVersions["entry-inflight"] = false
+	// Simulate an in-flight compression assign already posted for this entry.
+	st.activeAssigns["entry-inflight"] = []*exchange.AssignRecord{
+		{AssignID: "assign-already-posted", EntryID: "entry-inflight"},
+	}
+
+	postCalls := 0
+	loop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State: st,
+		Now:   func() time.Time { return now },
+		PostAssign: func(spec pricing.AssignSpec) error {
+			postCalls++
+			return nil
+		},
+	})
+
+	result := loop.Tick(context.Background())
+
+	if result.CompressionAssigns != 0 {
+		t.Errorf("expected CompressionAssigns=0 when active assign exists, got %d", result.CompressionAssigns)
+	}
+	if postCalls != 0 {
+		t.Errorf("expected 0 PostAssign calls when active assign exists, got %d", postCalls)
+	}
+}
+
 // =============================================================================
 // Vig pressure signal tests
 // =============================================================================
