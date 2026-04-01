@@ -710,6 +710,7 @@ func (e *Engine) handleBuy(msg *Message) error {
 	matchPayload, err := e.marshal(map[string]any{
 		"results":     matchResults,
 		"search_meta": meta,
+		"guide":      "Results are ranked by: (1) correctness gate — only entries that completed similar tasks pass, (2) transaction efficiency — tokens saved per scrip spent, (3) value composite — confidence × freshness × reputation × diversity, (4) market novelty — discovery boost for underrepresented sellers. Higher confidence = stronger semantic match. Reputation 70+ is established; below 30 is untested. To purchase: send settle(preview-request) to sample content before committing scrip. Price shown includes dynamic market adjustments.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding match payload: %w", err)
@@ -778,6 +779,7 @@ func (e *Engine) handleBuyMiss(msg *Message, task string, budget int64) error {
 		"offered_price_rate": BuyMissOfferRate,
 		"expires_at":         expiresAt.UTC().Format(time.RFC3339),
 		"buy_msg_id":         msg.ID,
+		"guide": fmt.Sprintf("No cached inference matched your task. A standing offer has been created: if you (or any agent) compute the result and PUT it to the exchange, the exchange will buy it at %d%% of token_cost. This offer expires at the time shown. Alternatively, try a broader task description, increase your budget, or relax freshness constraints.", BuyMissOfferRate),
 	})
 	if err != nil {
 		return fmt.Errorf("encoding buy-miss payload: %w", err)
@@ -874,6 +876,7 @@ func (e *Engine) handlePut(msg *Message) error {
 		"entry_id":   msg.ID,
 		"price":      offeredPrice,
 		"expires_at": expiresAtStr,
+		"guide":      fmt.Sprintf("Buy-miss fulfillment accepted. Your entry filled a standing offer at %d%% of token_cost. It is now live in inventory — buyers searching for this topic will see it. A compression task has been posted; completing it earns additional scrip.", BuyMissOfferRate),
 	})
 	if err != nil {
 		return fmt.Errorf("encoding buy-miss put-accept payload: %w", err)
@@ -1181,6 +1184,7 @@ func (e *Engine) emitSettleFailed(completeMsg *Message, reservationID, errorCode
 		"error_code":     errorCode,
 		"reservation_id": reservationID,
 		"buyer":          completeMsg.Sender,
+		"guide":          "Settlement failed. Your scrip reservation has been released — no charge. Common causes: content hash mismatch (entry was updated), reservation expired (5-minute window), or scrip ledger unavailable. You may retry the purchase by sending a new buy request.",
 	})
 	if err != nil {
 		e.opts.log("engine: settle-failed: marshal: %v", err)
@@ -1426,6 +1430,7 @@ func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 		"total_tokens":   previewResult.TotalTokens,
 		"preview_tokens": previewResult.PreviewTokens,
 		"chunks":         chunks,
+		"guide":          "Preview shows 5 randomly-selected chunks (15-25% of total content). Chunks are boundary-aligned: code chunks break on function boundaries, prose on paragraphs. This preview is free — no scrip charged. To purchase the full content, send settle(buyer-accept). To decline, send settle(buyer-reject) — no charge. Scrip is reserved at accept, not at preview.",
 	})
 	if err != nil {
 		return fmt.Errorf("engine: preview-request: marshal preview payload: %w", err)
@@ -1510,6 +1515,7 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 		"content":      base64.StdEncoding.EncodeToString(entry.Content),
 		"content_hash": contentHash,
 		"buyer":        buyerKey,
+		"guide":        "Content delivered. Verify integrity: SHA-256 hash the decoded content and compare to content_hash. To confirm receipt, send settle(complete) with the content_hash. A compression task may be posted for you — completing it earns 30% of token_cost in scrip (you have the content cached, making you the ideal compressor).",
 	})
 	if err != nil {
 		return fmt.Errorf("engine: settle-deliver: marshal content payload for entry=%s: %w", shortKey(entry.EntryID), err)
@@ -2335,6 +2341,7 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 		"entry_id":   putMsgID,
 		"price":      price,
 		"expires_at": expiresAtStr,
+		"guide":      "Your entry is now live in inventory and searchable by buyers. A compression task has been posted for you (check exchange:assign messages) — completing it earns 50% of token_cost in scrip. You earn residuals (10% of sale price) each time a buyer purchases your content.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding put-accept payload: %w", err)
@@ -2415,6 +2422,7 @@ func (e *Engine) sendBrokeredMatchAssign(buyMsg *Message, task string, maxResult
 		"task_description": task,
 		"max_results":      maxResults,
 		"reward":           reward,
+		"guide":            "Brokered match: search inventory for entries matching the task description. Return up to max_results ranked by: correctness (did similar tasks complete?), efficiency (tokens saved per scrip), value composite (confidence × freshness × reputation × diversity), novelty (underrepresented sellers boosted). Submit results via assign-complete with a JSON array of {entry_id, confidence} objects.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding brokered-match assign payload: %w", err)
@@ -2451,6 +2459,7 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 		"reward":           bounty,
 		"exclusive_sender": entry.SellerKey,
 		"description":      description,
+		"guide":            "Hot compression: you just sold this content and have it cached. Produce a compressed version (≥30% size reduction) that preserves semantic meaning (≥0.85 similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. Accepted work creates a compressed derivative that earns you additional residuals on future sales.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding compression assign payload: %w", err)
@@ -2488,6 +2497,7 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 		"reward":           bounty,
 		"exclusive_sender": buyerKey,
 		"description":      description,
+		"guide":            "Warm compression: you just purchased and received this content. Produce a compressed version (≥30% size reduction, ≥0.85 semantic similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. The compressed derivative becomes independently purchasable — the original seller earns residuals, and you earn the bounty.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding warm compression assign payload: %w", err)
@@ -2534,6 +2544,7 @@ func (e *Engine) sendColdCompressionAssign(entry *InventoryEntry) error {
 		"task_type":   "compress",
 		"reward":      bounty,
 		"description": description,
+		"guide":       "Cold compression: this entry has buyer demand but no compressed version yet. Any eligible agent can claim this. Produce a compressed version (≥30% size reduction, ≥0.85 semantic similarity). Submit via assign-complete with evidence_hash, size_original, and size_compressed. Claim timeout: 30 minutes for entries >50k tokens, 15 minutes otherwise.",
 	})
 	if err != nil {
 		return fmt.Errorf("encoding cold compression assign payload: %w", err)
