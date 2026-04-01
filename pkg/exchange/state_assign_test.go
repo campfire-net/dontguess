@@ -2,6 +2,7 @@ package exchange
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 )
@@ -782,3 +783,320 @@ func TestAssignClaimCustomTimeout(t *testing.T) {
 
 // ptr is a helper that takes a value and returns a pointer to it.
 func ptr(m Message) *Message { return &m }
+
+// --- Vickrey Auction Tests ---
+
+const agentKey3 = "445566"
+
+// makeAuctionAssignMsg creates an exchange:assign message with an auction window.
+func makeAuctionAssignMsg(id, sender, taskType string, reward int64, auctionWindowSeconds int, receivedAt time.Time) Message {
+	payload := map[string]any{
+		"task_type":              taskType,
+		"reward":                 reward,
+		"auction_window_seconds": auctionWindowSeconds,
+	}
+	b, _ := json.Marshal(payload)
+	return Message{
+		ID:        id,
+		Sender:    sender,
+		Tags:      []string{TagAssign},
+		Payload:   b,
+		Timestamp: receivedAt.UnixNano(),
+	}
+}
+
+// makeAuctionBidMsg creates an exchange:assign-claim message with a bid field.
+func makeAuctionBidMsg(id, sender, assignID string, bid int64, sentAt time.Time) Message {
+	payload := map[string]any{"bid": bid}
+	b, _ := json.Marshal(payload)
+	return Message{
+		ID:          id,
+		Sender:      sender,
+		Tags:        []string{TagAssignClaim},
+		Antecedents: []string{assignID},
+		Payload:     b,
+		Timestamp:   sentAt.UnixNano(),
+	}
+}
+
+// makeAuctionCloseMsg creates an exchange:assign-auction-close message.
+func makeAuctionCloseMsg(id, sender, assignID string) Message {
+	payload := map[string]any{
+		"assign_id": assignID,
+		"closed_at": time.Now().UTC().Format(time.RFC3339),
+	}
+	b, _ := json.Marshal(payload)
+	return Message{
+		ID:          id,
+		Sender:      sender,
+		Tags:        []string{TagAssignAuctionClose},
+		Antecedents: []string{assignID},
+		Payload:     b,
+	}
+}
+
+// TestAuctionBidAccumulatesDuringWindow verifies that assign-claim messages with
+// bid fields are recorded in AuctionBids and do not claim the task directly.
+func TestAuctionBidAccumulatesDuringWindow(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	s.Apply(ptr(makeAuctionAssignMsg("assign-auc1", operatorKey, "freshness", 100, 60, now)))
+
+	rec := s.assignByID["assign-auc1"]
+	if rec == nil {
+		t.Fatal("assign record not found")
+	}
+
+	// Two bids arrive within the auction window.
+	bid1Time := now.Add(5 * time.Second)
+	bid2Time := now.Add(10 * time.Second)
+	s.Apply(ptr(makeAuctionBidMsg("bid-auc1-a", agentKey, "assign-auc1", 80, bid1Time)))
+	s.Apply(ptr(makeAuctionBidMsg("bid-auc1-b", agentKey2, "assign-auc1", 90, bid2Time)))
+
+	// Task must still be AssignOpen (not yet claimed).
+	if rec.Status != AssignOpen {
+		t.Errorf("expected AssignOpen during auction window, got %v", rec.Status)
+	}
+	if len(rec.AuctionBids) != 2 {
+		t.Fatalf("expected 2 bids, got %d", len(rec.AuctionBids))
+	}
+	// No claimant yet.
+	if rec.ClaimantKey != "" {
+		t.Errorf("ClaimantKey should be empty during auction, got %q", rec.ClaimantKey)
+	}
+}
+
+// TestAuctionVickreyWinnerSelection verifies that the auction-close message
+// selects the lowest bidder and sets the Vickrey clearing price (second-lowest bid).
+func TestAuctionVickreyWinnerSelection(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	// Auction window: 60s. All bids come in during window.
+	s.Apply(ptr(makeAuctionAssignMsg("assign-vic1", operatorKey, "freshness", 100, 60, now)))
+
+	bidTime := now.Add(5 * time.Second)
+	s.Apply(ptr(makeAuctionBidMsg("bid-vic1-low", agentKey, "assign-vic1", 70, bidTime)))   // lowest
+	s.Apply(ptr(makeAuctionBidMsg("bid-vic1-mid", agentKey2, "assign-vic1", 85, bidTime)))  // second-lowest
+	s.Apply(ptr(makeAuctionBidMsg("bid-vic1-high", agentKey3, "assign-vic1", 95, bidTime))) // highest
+
+	// Close the auction (after window).
+	s.Apply(ptr(makeAuctionCloseMsg("close-vic1", operatorKey, "assign-vic1")))
+
+	rec := s.assignByID["assign-vic1"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed after auction close, got %v", rec.Status)
+	}
+	if rec.ClaimantKey != agentKey {
+		t.Errorf("expected winner %s (lowest bid), got %s", agentKey, rec.ClaimantKey)
+	}
+	// Vickrey clearing price = second-lowest bid (85).
+	if rec.VickreyPrice != 85 {
+		t.Errorf("expected VickreyPrice=85 (second-lowest bid), got %d", rec.VickreyPrice)
+	}
+	// ClaimMsgID should be the auction-close message ID.
+	if rec.ClaimMsgID != "close-vic1" {
+		t.Errorf("expected ClaimMsgID=close-vic1, got %s", rec.ClaimMsgID)
+	}
+}
+
+// TestAuctionSingleBidderClearingPrice verifies that with one bidder, the
+// clearing price equals the winner's own bid (no second-price available).
+func TestAuctionSingleBidderClearingPrice(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	s.Apply(ptr(makeAuctionAssignMsg("assign-solo1", operatorKey, "freshness", 100, 60, now)))
+
+	bidTime := now.Add(5 * time.Second)
+	s.Apply(ptr(makeAuctionBidMsg("bid-solo1", agentKey, "assign-solo1", 75, bidTime)))
+
+	s.Apply(ptr(makeAuctionCloseMsg("close-solo1", operatorKey, "assign-solo1")))
+
+	rec := s.assignByID["assign-solo1"]
+	if rec.Status != AssignClaimed {
+		t.Fatalf("expected AssignClaimed, got %v", rec.Status)
+	}
+	if rec.VickreyPrice != 75 {
+		t.Errorf("expected VickreyPrice=75 (solo bid), got %d", rec.VickreyPrice)
+	}
+}
+
+// TestAuctionNoBidsRemainsOpen verifies that an auction-close with no bids
+// leaves the assign in AssignOpen state.
+func TestAuctionNoBidsRemainsOpen(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	s.Apply(ptr(makeAuctionAssignMsg("assign-nobid", operatorKey, "freshness", 100, 60, now)))
+
+	// Close immediately without any bids.
+	s.Apply(ptr(makeAuctionCloseMsg("close-nobid", operatorKey, "assign-nobid")))
+
+	rec := s.assignByID["assign-nobid"]
+	if rec.Status != AssignOpen {
+		t.Errorf("expected AssignOpen (no bids), got %v", rec.Status)
+	}
+}
+
+// TestAuctionBidCeilingRejected verifies that bids exceeding 10x base_reward
+// are silently dropped.
+func TestAuctionBidCeilingRejected(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	s.Apply(ptr(makeAuctionAssignMsg("assign-ceil1", operatorKey, "freshness", 100, 60, now)))
+
+	bidTime := now.Add(5 * time.Second)
+	// 1001 > 100 * 10 — should be rejected (strictly above ceiling).
+	s.Apply(ptr(makeAuctionBidMsg("bid-ceil1-bad", agentKey, "assign-ceil1", 1001, bidTime)))
+	// 1000 == 100 * 10 — exactly at ceiling, accepted (spec: reject bids > 10x).
+	s.Apply(ptr(makeAuctionBidMsg("bid-ceil1-edge", agentKey2, "assign-ceil1", 1000, bidTime)))
+	// 999 < 100 * 10 — valid.
+	s.Apply(ptr(makeAuctionBidMsg("bid-ceil1-ok", agentKey3, "assign-ceil1", 999, bidTime)))
+
+	rec := s.assignByID["assign-ceil1"]
+	if len(rec.AuctionBids) != 2 {
+		t.Errorf("expected 2 valid bids (only strictly-above-ceiling rejected), got %d", len(rec.AuctionBids))
+	}
+	// All surviving bids should not be from agentKey (the rejected one).
+	for _, bid := range rec.AuctionBids {
+		if bid.WorkerKey == agentKey {
+			t.Errorf("bid from agentKey (1001) should have been rejected")
+		}
+	}
+}
+
+// TestAuctionBidDeduplication verifies that a second bid from the same worker
+// replaces the first only if the new bid is lower.
+func TestAuctionBidDeduplication(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	s.Apply(ptr(makeAuctionAssignMsg("assign-dedup", operatorKey, "freshness", 100, 60, now)))
+
+	t1 := now.Add(5 * time.Second)
+	t2 := now.Add(10 * time.Second)
+	t3 := now.Add(15 * time.Second)
+
+	s.Apply(ptr(makeAuctionBidMsg("bid-dedup1", agentKey, "assign-dedup", 80, t1)))
+	// Higher bid from same worker — should be ignored.
+	s.Apply(ptr(makeAuctionBidMsg("bid-dedup2", agentKey, "assign-dedup", 90, t2)))
+	// Lower bid from same worker — should replace.
+	s.Apply(ptr(makeAuctionBidMsg("bid-dedup3", agentKey, "assign-dedup", 60, t3)))
+
+	rec := s.assignByID["assign-dedup"]
+	if len(rec.AuctionBids) != 1 {
+		t.Fatalf("expected 1 bid entry (deduplication), got %d", len(rec.AuctionBids))
+	}
+	if rec.AuctionBids[0].BidAmount != 60 {
+		t.Errorf("expected deduped bid of 60, got %d", rec.AuctionBids[0].BidAmount)
+	}
+}
+
+// TestAuctionDifficultyTier verifies that DifficultyTier is derived correctly
+// from the median bid vs base_reward ratio.
+func TestAuctionDifficultyTier(t *testing.T) {
+	cases := []struct {
+		name     string
+		reward   int64
+		bids     []int64
+		wantTier string
+	}{
+		// median=90, ratio=0.9 → low
+		{"low tier", 100, []int64{80, 90, 95}, "low"},
+		// median=300, ratio=3.0 → medium
+		{"medium tier", 100, []int64{200, 300, 400}, "medium"},
+		// median=700, ratio=7.0 → high
+		{"high tier", 100, []int64{600, 700, 800}, "high"},
+	}
+
+	now := time.Now().UTC()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := NewState()
+			s.OperatorKey = operatorKey
+
+			assignID := "assign-tier-" + tc.name
+			s.Apply(ptr(makeAuctionAssignMsg(assignID, operatorKey, "freshness", tc.reward, 60, now)))
+
+			for i, bid := range tc.bids {
+				workerKey := []string{agentKey, agentKey2, agentKey3}[i%3]
+				bidID := fmt.Sprintf("bid-%s-%d", tc.name, i)
+				bidTime := now.Add(time.Duration(i+1) * time.Second)
+				s.Apply(ptr(makeAuctionBidMsg(bidID, workerKey, assignID, bid, bidTime)))
+			}
+
+			closeID := "close-tier-" + tc.name
+			s.Apply(ptr(makeAuctionCloseMsg(closeID, operatorKey, assignID)))
+
+			rec := s.assignByID[assignID]
+			if rec.DifficultyTier != tc.wantTier {
+				t.Errorf("DifficultyTier = %q, want %q", rec.DifficultyTier, tc.wantTier)
+			}
+		})
+	}
+}
+
+// TestAuctionBidAfterDeadlineIgnored verifies that a bid arriving after the
+// auction window has closed is silently dropped.
+func TestAuctionBidAfterDeadlineIgnored(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	// Auction window of 60s.
+	s.Apply(ptr(makeAuctionAssignMsg("assign-late", operatorKey, "freshness", 100, 60, now)))
+
+	// This bid arrives 90s after assign — past the 60s window.
+	lateBidTime := now.Add(90 * time.Second)
+	s.Apply(ptr(makeAuctionBidMsg("bid-late1", agentKey, "assign-late", 80, lateBidTime)))
+
+	rec := s.assignByID["assign-late"]
+	if len(rec.AuctionBids) != 0 {
+		t.Errorf("expected 0 bids (late bid dropped), got %d", len(rec.AuctionBids))
+	}
+}
+
+// TestPendingAuctionClose verifies that PendingAuctionClose returns assigns
+// whose AuctionDeadline has passed and that have bids, but not others.
+func TestPendingAuctionClose(t *testing.T) {
+	s := NewState()
+	s.OperatorKey = operatorKey
+
+	now := time.Now().UTC()
+	past := now.Add(-10 * time.Minute) // started 10 min ago, 60s window → past deadline
+	future := now.Add(5 * time.Minute) // started 5 min from now → future
+
+	// Expired auction with bids.
+	s.Apply(ptr(makeAuctionAssignMsg("assign-pa1", operatorKey, "freshness", 100, 60, past)))
+	s.Apply(ptr(makeAuctionBidMsg("bid-pa1", agentKey, "assign-pa1", 80, past.Add(5*time.Second))))
+
+	// Non-auction assign (no AuctionDeadline).
+	s.Apply(ptr(makeAssignMsg("assign-pa2", operatorKey, "", "freshness", 100, "")))
+
+	// Auction with future deadline.
+	s.Apply(ptr(makeAuctionAssignMsg("assign-pa3", operatorKey, "freshness", 100, 60*60*6 /*6h*/, future)))
+	s.Apply(ptr(makeAuctionBidMsg("bid-pa3", agentKey2, "assign-pa3", 80, future.Add(5*time.Second))))
+
+	// Expired auction but no bids.
+	s.Apply(ptr(makeAuctionAssignMsg("assign-pa4", operatorKey, "freshness", 100, 60, past)))
+
+	s.mu.RLock()
+	pending := s.PendingAuctionClose()
+	s.mu.RUnlock()
+
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 pending auction close, got %d: %v", len(pending), pending)
+	}
+	if pending[0] != "assign-pa1" {
+		t.Errorf("expected assign-pa1, got %s", pending[0])
+	}
+}
