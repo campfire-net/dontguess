@@ -600,6 +600,25 @@ nav a:hover {
   color: var(--text-dim);
 }
 
+.scale-card.roadmap {
+  opacity: 0.6;
+  border-style: dashed;
+}
+
+.badge-roadmap {
+  font-family: var(--font-mono);
+  font-size: 0.65rem;
+  font-weight: 500;
+  color: var(--text-dim);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.1rem 0.4rem;
+  margin-left: 0.5rem;
+  vertical-align: middle;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
 .scale-footer {
   margin-top: var(--spacing-lg);
   font-family: var(--font-mono);

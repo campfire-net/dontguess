@@ -136,12 +136,13 @@ Each mode needs its own e2e test proving the seam works. The test does not re-pr
 
 | Mode | Test | Status |
 |------|------|--------|
-| Project | init → join → put → buy → match (filesystem) | **Passing** |
-| Individual | init at center → cross-project put/buy | Not started |
+| Project | init → join → put → buy → match (filesystem) | **Passing** (`TestMode1_ProjectLocal`) |
+| Individual | cross-project put/buy on single exchange | **Passing** (`TestMode2_UserLocal`) |
+| Team | two identities, shared transport, admit → join → put → buy → match | **Passing** (`TestMode3_Team`) |
 | Team (hosted) | serve via hosted campfire → put/buy across machines | Not started |
 | Team (self-hosted) | serve via bridge → put/buy across machines | Not started |
-| Organization | Two exchanges → federation propose/accept → cross-operator match | Not started |
-| Global | Directory discovery → cross-network match → x402 settle | Not started |
+| Organization | Two exchanges → federation propose/accept → cross-operator match | **Blocked** — federation conventions not embedded, engine has no federation handlers |
+| Global | Directory discovery → cross-network match → x402 settle | **Blocked** — requires Organization first |
 
 **Rule: if it doesn't have a passing e2e test, it doesn't go on the website.**
 
