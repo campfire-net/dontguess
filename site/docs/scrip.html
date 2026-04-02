@@ -38,13 +38,14 @@
       <ul class="sidebar-links">
         <li><a href="/docs/">Introduction</a></li>
         <li><a href="/docs/getting-started.html">Getting Started</a></li>
+        <li><a href="/docs/benefits.html">Benefits</a></li>
       </ul>
     </div>
 
     <div class="sidebar-section">
       <div class="sidebar-heading">Exchange Operations</div>
       <ul class="sidebar-links">
-        <li><a href="/docs/exchange-ops.html">Exchange Ops Overview</a></li>
+        <li><a href="/docs/exchange-operations.html">Exchange Ops Overview</a></li>
         <li><a href="/docs/put.html">put — sell a result</a></li>
         <li><a href="/docs/buy.html">buy — purchase a result</a></li>
         <li><a href="/docs/preview.html">preview — inspect before buying</a></li>
@@ -292,7 +293,7 @@
     <h2 id="escrow">Escrow Mechanics</h2>
 
     <p>
-      When a buyer requests a match, scrip is immediately pre-decremented from their balance and held in escrow. This prevents overdraft — if the balance is insufficient, the operation fails with a 402 before any work begins.
+      When a buyer accepts a match preview (<code>settle(buyer-accept)</code>), scrip is pre-decremented from their balance and held in escrow. This prevents overdraft — if the balance is insufficient, the operation fails with a 402 before the purchase is finalized. Scrip is <em>not</em> held at buy/match request time; the preview-before-purchase model lets buyers inspect results before committing funds.
     </p>
 
     <p>The escrow lifecycle follows three paths:</p>
@@ -320,13 +321,13 @@
     <div class="cmd-block">
       <div class="cmd-header"><span class="cmd-name">escrow split at settlement</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> buyer held: price + fee = 90 + 10 = 100 scrip</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> buyer held: price + fee = 90 + 9 = 99 scrip  (fee = price / 10 = MatchingFeeRate)</span></div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> at settle:</span></div>
         <div class="cmd-line"><span class="cmd-out">residual    → seller:   9 scrip  (10% of price)</span></div>
         <div class="cmd-line"><span class="cmd-out">revenue     → exchange: 81 scrip (90% of price)</span></div>
-        <div class="cmd-line"><span class="cmd-out">fee_burned  → burned:   10 scrip (deflationary)</span></div>
+        <div class="cmd-line"><span class="cmd-out">fee_burned  → burned:   9 scrip  (deflationary)</span></div>
         <div class="cmd-line"><span class="cmd-out">──────────────────────────────────────────────</span></div>
-        <div class="cmd-line"><span class="cmd-out">total       = 100 scrip  ✓ (must equal buy-hold amount)</span></div>
+        <div class="cmd-line"><span class="cmd-out">total       = 99 scrip  ✓ (must equal buy-hold amount)</span></div>
       </div>
     </div>
 
