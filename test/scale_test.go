@@ -30,12 +30,13 @@ type testEnv struct {
 
 // agent represents an isolated agent environment (one "machine").
 type agent struct {
-	t       *testing.T
-	env     *testEnv
-	home    string // isolated HOME
-	binDir  string // ~/.local/bin equivalent
-	cfHome  string // ~/.campfire
-	name    string // for test output
+	t            *testing.T
+	env          *testEnv
+	home         string // isolated HOME
+	binDir       string // ~/.local/bin equivalent
+	cfHome       string // ~/.campfire
+	transportDir string // CF_TRANSPORT_DIR (empty = default)
+	name         string // for test output
 }
 
 var (
@@ -149,15 +150,24 @@ func (a *agent) resolveBin(name string) string {
 	}
 }
 
-func (a *agent) run(name string, args ...string) (string, error) {
-	a.t.Helper()
-	bin := a.resolveBin(name)
-	cmd := exec.Command(bin, args...)
-	cmd.Env = []string{
+// cmdEnv returns the environment variables for this agent's subprocess.
+func (a *agent) cmdEnv() []string {
+	env := []string{
 		"HOME=" + a.home,
 		"PATH=" + a.binDir + ":" + os.Getenv("PATH"),
 		"CF_HOME=" + a.cfHome,
 	}
+	if a.transportDir != "" {
+		env = append(env, "CF_TRANSPORT_DIR="+a.transportDir)
+	}
+	return env
+}
+
+func (a *agent) run(name string, args ...string) (string, error) {
+	a.t.Helper()
+	bin := a.resolveBin(name)
+	cmd := exec.Command(bin, args...)
+	cmd.Env = a.cmdEnv()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -170,11 +180,7 @@ func (a *agent) runBg(name string, args ...string) (cancel func()) {
 	a.t.Helper()
 	bin := a.resolveBin(name)
 	cmd := exec.Command(bin, args...)
-	cmd.Env = []string{
-		"HOME=" + a.home,
-		"PATH=" + a.binDir + ":" + os.Getenv("PATH"),
-		"CF_HOME=" + a.cfHome,
-	}
+	cmd.Env = a.cmdEnv()
 	var buf bytes.Buffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
@@ -425,4 +431,114 @@ func TestMode2_UserLocal(t *testing.T) {
 		t.Fatal("no match found")
 	}
 	t.Log("Mode 2: cross-project match verified — content from project A discoverable by project C")
+}
+
+// --- Mode 3: Team (two identities, shared filesystem transport) ---
+//
+// Simulates two machines by using two separate CF_HOME directories with
+// different identities. Both access the same exchange campfire via filesystem
+// transport (which on a real multi-machine setup would be P2P HTTP or hosted).
+// The operator admits the second agent, who then joins, puts, and buys.
+
+func TestMode3_Team(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping e2e test in short mode")
+	}
+	env := setup(t)
+
+	// Shared transport directory — simulates shared filesystem / network transport
+	sharedTransport := filepath.Join(t.TempDir(), "shared-transport")
+	os.MkdirAll(sharedTransport, 0755)
+
+	// Alice is the operator — she creates and runs the exchange
+	alice := env.newAgent("alice")
+	alice.transportDir = sharedTransport
+
+	// Bob is a teammate with a separate identity
+	bob := env.newAgent("bob")
+	bob.transportDir = sharedTransport
+
+	// Get Bob's public key
+	bobPubkey := extractPubkey(t, bob)
+
+	// Alice inits exchange
+	out, err := alice.run("dontguess", "init")
+	if err != nil {
+		t.Fatalf("alice init failed: %v\n%s", err, out)
+	}
+	xcfid := alice.exchangeID()
+
+	// Alice admits Bob to the exchange campfire
+	out, err = alice.run("cf", "admit", xcfid, bobPubkey)
+	if err != nil {
+		t.Fatalf("alice admit bob failed: %v\n%s", err, out)
+	}
+	if !strings.Contains(out, "Admitted") && !strings.Contains(out, "admitted") {
+		t.Fatalf("expected admission confirmation, got: %s", out)
+	}
+
+	// Bob joins the exchange
+	out, err = bob.run("cf", "join", xcfid)
+	if err != nil {
+		t.Fatalf("bob join failed: %v\n%s", err, out)
+	}
+
+	// Alice starts the exchange server
+	cancel := alice.runBg("dontguess-operator", "serve")
+	defer cancel()
+	time.Sleep(1 * time.Second)
+
+	// Bob puts content
+	out, err = bob.run("cf", xcfid, "put",
+		"--description", "Kubernetes pod autoscaler with custom metrics from Prometheus",
+		"--content", "HPA config with custom.metrics.k8s.io API, Prometheus adapter, scale target.",
+		"--token_cost", "3500",
+		"--content_type", "code",
+		"--domain", "kubernetes,infrastructure,monitoring")
+	if err != nil {
+		t.Fatalf("bob put failed: %v\n%s", err, out)
+	}
+
+	// Wait for exchange to accept Bob's put
+	waitFor(t, 10*time.Second, "put-accept for bob's content", func() bool {
+		return strings.Contains(alice.cfRead(xcfid), "exchange:phase:put-accept")
+	})
+
+	// Alice buys — should find Bob's content
+	out, err = alice.run("cf", xcfid, "buy",
+		"--task", "Kubernetes autoscaling with Prometheus custom metrics",
+		"--budget", "5000")
+	if err != nil {
+		t.Fatalf("alice buy failed: %v\n%s", err, out)
+	}
+
+	waitFor(t, 10*time.Second, "cross-identity match", func() bool {
+		return strings.Contains(alice.cfRead(xcfid), "exchange:match")
+	})
+
+	t.Log("Mode 3: cross-identity match verified — Bob's put discovered by Alice's buy")
+}
+
+// extractPubkey gets an agent's public key from their cf identity.
+func extractPubkey(t *testing.T, a *agent) string {
+	t.Helper()
+	// cf init was already called in newAgent; read the identity
+	out, err := a.run("cf", "init", "--json")
+	if err != nil {
+		t.Fatalf("cf init --json for %s failed: %v\n%s", a.name, err, out)
+	}
+	// Parse {"public_key": "..."}
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.Contains(line, `"public_key"`) {
+			parts := strings.Split(line, `"`)
+			for i, p := range parts {
+				if p == "public_key" && i+2 < len(parts) {
+					return parts[i+2]
+				}
+			}
+		}
+	}
+	t.Fatalf("could not extract public_key for %s from: %s", a.name, out)
+	return ""
 }
