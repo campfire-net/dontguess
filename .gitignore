@@ -20,6 +20,17 @@ vendor/
 /data/vectors/
 /data/cache/
 
+# Internal tooling state
+.campfire/
+.claude/agents/
+.claude/worktrees/
+.telemetry/
+.ready/
+.rudi/
+charts/
+test/live-fire/
+docs/findings/
+
 # Secrets
 .env
 *.key

@@ -1,7 +1,5 @@
 # CLAUDE.md — DontGuess Project Instructions
 
-> OS-level instructions (session protocol, model routing, blog pipeline, rules) are inherited from `~/.claude/CLAUDE.md`. This file contains only project-specific configuration.
-
 ## Project
 
 **DontGuess**: Token-work exchange — a marketplace where agents buy and sell cached inference results. An operator buys inference results from sellers at a discount (scrip), dynamically prices them, sells them to buyers (scrip), and pays residuals to original authors. Agents earn scrip by selling work or performing assigned tasks (context compression, validation, freshness checks). Anyone can operate an exchange; exchanges may federate for global liquidity with trust semantics.
@@ -9,20 +7,6 @@
 Previously a tool discovery engine (see `docs/heritage/`). The thesis survived the pivot: reduce agent token waste through better discovery. Old: discover the right tool. New: discover pre-computed work someone already paid for.
 
 **Domain:** dontguess.ai. "Don't guess — look it up."
-
-## Work Tracking — rd (not bd)
-
-**This project uses `rd` for all work tracking.** The `bd` CLI is NOT used in dontguess sessions.
-
-```bash
-rd list                    # All items
-rd list --status active    # Active items
-rd ready                   # Ready queue (ETA-sorted)
-rd show <id>               # Item details
-rd create "Title" --type task  # New item
-rd update <id> --status active # Change status
-rd close <id> --reason "..."   # Close with reason
-```
 
 ## Architecture
 
@@ -77,52 +61,12 @@ Layer 4  META                oscillation_frequency     Adapts slow loop step siz
 
 **Behavioral signals over preference signals.** Don't trust ratings. Measure: did the cached inference actually complete the buyer's task? Did they search again? Did they come back to the same seller?
 
-## Agent Roster
-
-| Agent | Spec | Domain | Default Tier |
-|-------|------|--------|-------------|
-| Manager | `.claude/agents/manager.md` | Coordination, decomposition, routing | inherit |
-| Implementer | `.claude/agents/implementer.md` | Code, tests, commits | sonnet |
-| Reviewer | `.claude/agents/reviewer.md` | Code review, spec conformance | sonnet |
-| Designer | `.claude/agents/designer.md` | Convention spec, adversarial design | opus |
-
-**Routing:**
-- Convention design, adversarial review -> Designer (opus)
-- Matching/pricing engine implementation -> Implementer (sonnet)
-- Forge integration, campfire wiring -> Implementer (sonnet)
-- Code review, spec conformance -> Reviewer (sonnet)
-- Decomposition, routing, status -> Manager (inherit)
-- Template-driven edits, config, data migration -> Implementer (haiku)
-
-## Task-Type -> Model Mapping
-
-| Task Type | Model | Rationale |
-|-----------|-------|-----------|
-| Convention design (exchange operations) | **Opus** | Novel protocol design, multi-factor trade-offs |
-| Adversarial design review | **Opus** | Attack surface analysis, trust model |
-| Matching engine (vector search, semantic similarity) | **Sonnet** | Structured implementation, algorithmic |
-| Pricing engine (feedback loops) | **Sonnet** | Multi-signal computation, requires care |
-| Forge integration (scrip ledger, metering) | **Sonnet** | API integration, correctness-critical |
-| Campfire convention wiring | **Sonnet** | Protocol conformance, message schema |
-| Data migration from toolrank | **Haiku** | Mechanical, template-driven |
-| Config, CI/CD, deployment | **Haiku** | Mechanical |
-
 ## Source of Truth Hierarchy
 
 1. **Convention spec** (`docs/convention/`) — what exchange operations mean
 2. **This CLAUDE.md** — project instructions
 3. **Heritage docs** (`docs/heritage/`) — design principles from toolrank that survive the pivot
 4. **Source code** — implementation
-
-## Design Change Cascade
-
-Any change to the exchange convention triggers:
-
-| Step | Agent | Review |
-|------|-------|--------|
-| 1 | Designer | Convention spec consistency, security implications |
-| 2 | Implementer | Implementation feasibility, Forge integration impact |
-| 3 | Reviewer | Test coverage, edge cases |
 
 ## Repo Structure
 
@@ -133,8 +77,6 @@ dontguess/
     convention/                # Exchange convention spec (the authority)
     design/                    # Active design docs
     heritage/                  # Transferred design principles from toolrank
-  .claude/
-    agents/                    # Agent specs
   cmd/                         # CLI entry points (Go)
   pkg/                         # Go packages
     matching/                  # Semantic matching engine
