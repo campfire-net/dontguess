@@ -110,6 +110,7 @@ LOG="${CF_HOME}/dontguess.log"
 
 case "${1:-}" in
   init|serve|convention) exec "$DG_OP" "$@";;
+  join|leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
   version|--version)
     echo "dontguess wrapper"
     "$DG_OP" version 2>/dev/null || true

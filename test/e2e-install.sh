@@ -61,6 +61,7 @@ PID="${CF_HOME}/dontguess.pid"
 LOG="${CF_HOME}/dontguess.log"
 case "${1:-}" in
   init|serve|convention) exec "$DG_OP" "$@";;
+  join|leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
   version|--version) echo "dontguess wrapper"; exit 0;;
   --help|-h|help|"") echo "dontguess — token-work exchange"; exit 0;;
 esac
@@ -102,8 +103,17 @@ else
   fail "Exchange config file missing"
 fi
 
-# --- Test 3: Put (auto-starts server) ---
-printf "\n${BOLD}Test 3: Put cached inference (auto-starts server)${RESET}\n"
+# --- Test 3: Join exchange ---
+printf "\n${BOLD}Test 3: Join exchange via wrapper${RESET}\n"
+XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.campfire/dontguess-exchange.json")
+if dontguess join "$XCFID" 2>&1 | grep -q "already a member\|Joined"; then
+  pass "Join routes correctly through cf"
+else
+  fail "Join did not route to cf correctly"
+fi
+
+# --- Test 4: Put (auto-starts server) ---
+printf "\n${BOLD}Test 4: Put cached inference (auto-starts server)${RESET}\n"
 CONTENT=$(echo "Token bucket rate limiter in Go: per-key limits with burst support, Redis backend for distributed use." | base64 -w0)
 if dontguess put \
   --description "Token bucket rate limiter in Go with Redis backend" \
@@ -126,8 +136,8 @@ fi
 # Give the engine a moment to process the put
 sleep 2
 
-# --- Test 4: Check put was accepted ---
-printf "\n${BOLD}Test 4: Verify put-accept${RESET}\n"
+# --- Test 5: Check put was accepted ---
+printf "\n${BOLD}Test 5: Verify put-accept${RESET}\n"
 XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.campfire/dontguess-exchange.json")
 if cf read "$XCFID" --all 2>&1 | grep -q "exchange:phase:put-accept"; then
   pass "Put was auto-accepted by exchange"
@@ -135,8 +145,8 @@ else
   fail "No put-accept found"
 fi
 
-# --- Test 5: Buy ---
-printf "\n${BOLD}Test 5: Buy (search for cached inference)${RESET}\n"
+# --- Test 6: Buy ---
+printf "\n${BOLD}Test 6: Buy (search for cached inference)${RESET}\n"
 if dontguess buy \
   --task "rate limiter implementation in Go" \
   --budget 5000 2>&1 | grep -q "ok"; then
@@ -147,8 +157,8 @@ fi
 
 sleep 2
 
-# --- Test 6: Check match result ---
-printf "\n${BOLD}Test 6: Verify match result${RESET}\n"
+# --- Test 7: Check match result ---
+printf "\n${BOLD}Test 7: Verify match result${RESET}\n"
 if cf read "$XCFID" --all 2>&1 | grep -q "exchange:match"; then
   pass "Exchange returned a match for the buy"
 else

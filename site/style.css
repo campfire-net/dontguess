@@ -519,6 +519,98 @@ nav a:hover {
   font-size: 0.9rem;
 }
 
+/* Scale tiers */
+
+.scale-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr));
+  gap: var(--spacing-md);
+}
+
+.scale-card {
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: var(--spacing-md);
+  position: relative;
+  transition: border-color 0.2s;
+}
+
+.scale-card:hover {
+  border-color: var(--accent-dim);
+}
+
+.scale-indicator {
+  height: 3px;
+  border-radius: 2px;
+  margin-bottom: var(--spacing-sm);
+}
+
+.scale-indicator.tier-1 {
+  width: 25%;
+  background: var(--green);
+}
+
+.scale-indicator.tier-2 {
+  width: 50%;
+  background: var(--accent);
+}
+
+.scale-indicator.tier-3 {
+  width: 75%;
+  background: var(--orange);
+}
+
+.scale-indicator.tier-4 {
+  width: 100%;
+  background: linear-gradient(90deg, var(--green), var(--accent), var(--orange), var(--purple));
+}
+
+.scale-tier {
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 1.1rem;
+  color: var(--text);
+  margin-bottom: 0.25rem;
+}
+
+.scale-tagline {
+  font-size: 0.9rem;
+  color: var(--accent-bright);
+  margin-bottom: var(--spacing-sm);
+}
+
+.scale-card ul {
+  list-style: none;
+  padding: 0;
+}
+
+.scale-card li {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  padding: 0.3rem 0;
+  padding-left: 1.25rem;
+  position: relative;
+}
+
+.scale-card li::before {
+  content: '\203A';
+  position: absolute;
+  left: 0;
+  color: var(--text-dim);
+}
+
+.scale-footer {
+  margin-top: var(--spacing-lg);
+  font-family: var(--font-mono);
+  font-size: 0.85rem;
+  color: var(--text-dim);
+  text-align: center;
+  max-width: 48rem;
+  margin-left: auto;
+  margin-right: auto;
+}
+
 /* Getting started */
 
 .steps {
@@ -661,6 +753,7 @@ footer p {
 }
 
 @media (max-width: 480px) {
+  .scale-grid,
   .econ-grid,
   .loops-grid,
   .tier-grid {
