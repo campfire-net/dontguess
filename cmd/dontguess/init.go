@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 
+	dontguess "github.com/campfire-net/dontguess"
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/spf13/cobra"
 )
@@ -40,10 +41,11 @@ func init() {
 
 func runInit(_ *cobra.Command, _ []string) error {
 	opts := exchange.InitOptions{
-		ConventionDir: initConventionDir,
-		Alias:         initAlias,
-		Description:   initDescription,
-		Force:         initForce,
+		ConventionDir:       initConventionDir,
+		EmbeddedConventions: dontguess.ConventionFS,
+		Alias:               initAlias,
+		Description:         initDescription,
+		Force:               initForce,
 	}
 
 	cfg, client, err := exchange.Init(opts)

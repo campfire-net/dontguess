@@ -6,6 +6,7 @@ package exchange
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,7 +39,13 @@ type InitOptions struct {
 	BeaconDir string
 	// ConventionDir is the path to the directory containing exchange-core/ and
 	// exchange-scrip/ sub-directories with the .json declaration files.
+	// If empty, EmbeddedConventions is used.
 	ConventionDir string
+	// EmbeddedConventions is an embedded filesystem containing convention
+	// declarations. Used as fallback when ConventionDir is empty. The FS
+	// should contain docs/convention/exchange-core/*.json and
+	// docs/convention/exchange-scrip/*.json.
+	EmbeddedConventions fs.FS
 	// Alias registers this exchange under the given naming alias
 	// (e.g. "home.exchange.dontguess"). Default: "exchange.dontguess".
 	Alias string
@@ -167,7 +174,7 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 	campfireID := createResult.CampfireID
 
 	// Promote convention declarations.
-	if err := promoteDeclarations(opts.ConventionDir, campfireID, client); err != nil {
+	if err := promoteDeclarations(opts.ConventionDir, opts.EmbeddedConventions, campfireID, client); err != nil {
 		// Non-fatal: log but don't fail init — operator can re-promote later.
 		fmt.Fprintf(os.Stderr, "warning: promoting convention declarations: %v\n", err)
 	}
@@ -216,75 +223,56 @@ type declCandidate struct {
 	major, minor, patch int
 }
 
-// promoteDeclarations reads all .json files from conventionDir (searching
-// exchange-core/ and exchange-scrip/ sub-directories), lints each, and posts
+// promoteDeclarations reads all .json convention files, lints each, and posts
 // them as convention:operation messages to the exchange campfire via client.Send.
-// If conventionDir is empty, the embedded declarations are used via the
-// DefaultConventionDir discovery.
+//
+// Source priority: conventionDir (filesystem path) > embeddedFS (go:embed).
+// At least one must provide declarations.
 //
 // When multiple files declare the same convention+operation (e.g. put.json at
 // v0.1 and put-v0.2.json at v0.2), only the highest version is promoted.
-// Promoting an older version alongside a newer one would create ambiguous
-// registry state without a supersedes chain, so the older files are silently
-// skipped.
-func promoteDeclarations(conventionDir, campfireID string, client *protocol.Client) error {
-	dirs := declarationDirs(conventionDir)
-	if len(dirs) == 0 {
-		return fmt.Errorf("no convention declaration directories found (set ConventionDir)")
+func promoteDeclarations(conventionDir string, embeddedFS fs.FS, campfireID string, client *protocol.Client) error {
+	files, err := collectDeclarationFiles(conventionDir, embeddedFS)
+	if err != nil {
+		return err
+	}
+	if len(files) == 0 {
+		return fmt.Errorf("no convention declaration files found (set --convention-dir or embed conventions)")
 	}
 
 	// Collect and parse all candidates, deduplicating by convention+operation.
-	// For each key we keep only the entry with the highest version.
 	winners := make(map[string]*declCandidate)
 	var skipped int
 
-	for _, dir := range dirs {
-		entries, err := os.ReadDir(dir)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "warning: reading declaration dir %s: %v\n", dir, err)
+	for _, f := range files {
+		lintResult := convention.Lint(f.payload)
+		if !lintResult.Valid {
+			fmt.Fprintf(os.Stderr, "warning: skipping %s (lint failed): %v\n", f.name, lintResult.Errors)
+			skipped++
 			continue
 		}
-		for _, e := range entries {
-			if filepath.Ext(e.Name()) != ".json" {
-				continue
+		cand, parseErr := parseVersionedDecl(f.name, f.name, f.payload)
+		if parseErr != nil {
+			fmt.Fprintf(os.Stderr, "warning: skipping %s (version parse): %v\n", f.name, parseErr)
+			skipped++
+			continue
+		}
+		prev, exists := winners[cand.key]
+		if !exists || declGreater(cand, prev) {
+			if exists {
+				fmt.Fprintf(os.Stderr, "info: %s supersedes %s for %s (v%d.%d.%d > v%d.%d.%d)\n",
+					cand.name, prev.name, cand.key,
+					cand.major, cand.minor, cand.patch,
+					prev.major, prev.minor, prev.patch,
+				)
 			}
-			path := filepath.Join(dir, e.Name())
-			payload, err := os.ReadFile(path)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "warning: reading %s: %v\n", path, err)
-				skipped++
-				continue
-			}
-			lintResult := convention.Lint(payload)
-			if !lintResult.Valid {
-				fmt.Fprintf(os.Stderr, "warning: skipping %s (lint failed): %v\n", e.Name(), lintResult.Errors)
-				skipped++
-				continue
-			}
-			cand, parseErr := parseVersionedDecl(path, e.Name(), payload)
-			if parseErr != nil {
-				fmt.Fprintf(os.Stderr, "warning: skipping %s (version parse): %v\n", e.Name(), parseErr)
-				skipped++
-				continue
-			}
-			prev, exists := winners[cand.key]
-			if !exists || declGreater(cand, prev) {
-				if exists {
-					fmt.Fprintf(os.Stderr, "info: %s supersedes %s for %s (v%d.%d.%d > v%d.%d.%d)\n",
-						cand.name, prev.name, cand.key,
-						cand.major, cand.minor, cand.patch,
-						prev.major, prev.minor, prev.patch,
-					)
-				}
-				winners[cand.key] = cand
-			} else {
-				fmt.Fprintf(os.Stderr, "info: skipping %s — %s is a higher version for %s\n",
-					e.Name(), prev.name, cand.key)
-			}
+			winners[cand.key] = cand
+		} else {
+			fmt.Fprintf(os.Stderr, "info: skipping %s — %s is a higher version for %s\n",
+				f.name, prev.name, cand.key)
 		}
 	}
 
-	// Promote the winning declaration for each operation.
 	var promoted int
 	for _, cand := range winners {
 		if err := sendConventionMessage(campfireID, cand.payload, client); err != nil {
@@ -299,6 +287,70 @@ func promoteDeclarations(conventionDir, campfireID string, client *protocol.Clie
 		return fmt.Errorf("all %d declarations failed to promote", skipped)
 	}
 	return nil
+}
+
+// declFile is a name + payload pair from either the filesystem or an embed.FS.
+type declFile struct {
+	name    string
+	payload []byte
+}
+
+// collectDeclarationFiles gathers .json files from either a filesystem dir or
+// an embedded FS. Filesystem takes priority if conventionDir is non-empty.
+func collectDeclarationFiles(conventionDir string, embeddedFS fs.FS) ([]declFile, error) {
+	if conventionDir != "" {
+		return collectFromDisk(conventionDir)
+	}
+	if embeddedFS != nil {
+		return collectFromEmbed(embeddedFS)
+	}
+	return nil, nil
+}
+
+func collectFromDisk(conventionDir string) ([]declFile, error) {
+	var files []declFile
+	for _, sub := range []string{"exchange-core", "exchange-scrip"} {
+		dir := filepath.Join(conventionDir, sub)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "warning: reading declaration dir %s: %v\n", dir, err)
+			continue
+		}
+		for _, e := range entries {
+			if filepath.Ext(e.Name()) != ".json" {
+				continue
+			}
+			payload, err := os.ReadFile(filepath.Join(dir, e.Name()))
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: reading %s: %v\n", e.Name(), err)
+				continue
+			}
+			files = append(files, declFile{name: e.Name(), payload: payload})
+		}
+	}
+	return files, nil
+}
+
+func collectFromEmbed(embedded fs.FS) ([]declFile, error) {
+	var files []declFile
+	for _, sub := range []string{"docs/convention/exchange-core", "docs/convention/exchange-scrip"} {
+		entries, err := fs.ReadDir(embedded, sub)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if filepath.Ext(e.Name()) != ".json" {
+				continue
+			}
+			payload, err := fs.ReadFile(embedded, sub+"/"+e.Name())
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "warning: reading embedded %s: %v\n", e.Name(), err)
+				continue
+			}
+			files = append(files, declFile{name: e.Name(), payload: payload})
+		}
+	}
+	return files, nil
 }
 
 // parseVersionedDecl extracts the convention, operation, and version from a
@@ -368,21 +420,6 @@ func declGreater(a, b *declCandidate) bool {
 	return a.patch > b.patch
 }
 
-// declarationDirs returns the convention declaration sub-directories to scan.
-// If conventionDir is empty, returns nil (caller handles missing dir).
-func declarationDirs(conventionDir string) []string {
-	if conventionDir == "" {
-		return nil
-	}
-	var dirs []string
-	for _, sub := range []string{"exchange-core", "exchange-scrip"} {
-		d := filepath.Join(conventionDir, sub)
-		if info, err := os.Stat(d); err == nil && info.IsDir() {
-			dirs = append(dirs, d)
-		}
-	}
-	return dirs
-}
 
 // sendConventionMessage sends a convention:operation message to the exchange
 // campfire via client.Send.
