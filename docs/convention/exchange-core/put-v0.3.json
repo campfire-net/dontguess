@@ -1,0 +1,98 @@
+{
+  "convention": "dontguess-exchange",
+  "version": "0.3",
+  "supersedes_version": "0.2",
+  "operation": "put",
+  "description": "Offer cached inference to the exchange. Seller submits content (base64-encoded) and metadata. The exchange computes the content hash, buys at a discount, and responds with settle(put-accept) or settle(put-reject). Domain tags are composed as exchange:domain:<value> from the domain arg. v0.3 adds inline content (engine computes hash and size).",
+  "signing": "member_key",
+  "antecedents": "none",
+  "payload_required": true,
+  "args": [
+    {
+      "name": "description",
+      "type": "string",
+      "required": true,
+      "max_length": 4096,
+      "description": "What the cached inference does — task description, inputs, outputs."
+    },
+    {
+      "name": "content",
+      "type": "string",
+      "required": true,
+      "max_length": 2000000,
+      "description": "Base64-encoded cached inference content. The exchange computes SHA-256 hash and byte size from this field."
+    },
+    {
+      "name": "token_cost",
+      "type": "integer",
+      "required": true,
+      "min": 1,
+      "max": 10000000,
+      "description": "Original inference cost in tokens (seller's claim)."
+    },
+    {
+      "name": "content_type",
+      "type": "enum",
+      "required": true,
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ],
+      "description": "Category of cached inference. Composed into exchange:content-type:<value> tag."
+    },
+    {
+      "name": "domain",
+      "type": "tag_set",
+      "max_count": 5,
+      "prefix": "exchange:domain:",
+      "description": "Domain tags for discovery (e.g. 'go', 'terraform', 'security'). Each value composed into exchange:domain:<value> tag."
+    },
+    {
+      "name": "ttl_hours",
+      "type": "integer",
+      "min": 1,
+      "max": 8760,
+      "description": "Seller-requested time-to-live in hours. Exchange may override."
+    },
+    {
+      "name": "priority",
+      "type": "integer",
+      "min": 1,
+      "max": 10,
+      "description": "Optional submission priority (1=highest, 10=lowest). Default: no preference."
+    }
+  ],
+  "produces_tags": [
+    {
+      "tag": "exchange:put",
+      "cardinality": "exactly_one"
+    },
+    {
+      "tag": "exchange:content-type:*",
+      "cardinality": "exactly_one",
+      "values": [
+        "exchange:content-type:code",
+        "exchange:content-type:analysis",
+        "exchange:content-type:summary",
+        "exchange:content-type:plan",
+        "exchange:content-type:data",
+        "exchange:content-type:review",
+        "exchange:content-type:other"
+      ]
+    },
+    {
+      "tag": "exchange:domain:*",
+      "cardinality": "at_most_one"
+    }
+  ],
+  "rate_limit": {
+    "max": 50,
+    "per": "sender",
+    "window": "1h"
+  }
+}
