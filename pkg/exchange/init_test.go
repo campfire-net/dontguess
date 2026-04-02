@@ -186,10 +186,10 @@ func TestInit_ConventionDeclarationsPromoted(t *testing.T) {
 	}
 }
 
-// TestInit_PutNotDoublePromoted verifies that when both put.json (v0.1) and
-// put-v0.2.json (v0.2) are present in the convention directory, only one
-// "put" declaration is promoted — the highest version wins. Double-promotion
-// would create ambiguous registry state without a supersedes chain.
+// TestInit_PutNotDoublePromoted verifies that when multiple put convention
+// files are present in the convention directory, only one "put" declaration
+// is promoted — the highest version wins. Double-promotion would create
+// ambiguous registry state without a supersedes chain.
 func TestInit_PutNotDoublePromoted(t *testing.T) {
 	t.Parallel()
 
@@ -236,9 +236,9 @@ func TestInit_PutNotDoublePromoted(t *testing.T) {
 	if putCount != 1 {
 		t.Errorf("expected exactly 1 promoted 'put' declaration, got %d", putCount)
 	}
-	// The promoted version must be the latest (0.2), not the older 0.1.
-	if putVersion != "0.2" {
-		t.Errorf("expected promoted 'put' version 0.2, got %q", putVersion)
+	// The promoted version must be the latest (0.3), not the older 0.1 or 0.2.
+	if putVersion != "0.3" {
+		t.Errorf("expected promoted 'put' version 0.3, got %q", putVersion)
 	}
 }
 
