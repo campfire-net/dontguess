@@ -23,6 +23,13 @@ jobs:
         run: |
           git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
 
+      - name: Install cf
+        run: |
+          CF_VER=$(curl -fsSL https://api.github.com/repos/campfire-net/campfire/releases/latest | grep '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
+          curl -fsSL "https://github.com/campfire-net/campfire/releases/download/${CF_VER}/cf_linux_amd64.tar.gz" | tar xz -C /tmp
+          sudo cp /tmp/cf_linux_amd64/cf /usr/local/bin/cf
+          chmod +x /usr/local/bin/cf
+
       - name: Run tests
         env:
           GOPRIVATE: github.com/campfire-net/campfire
@@ -35,15 +42,6 @@ jobs:
 
       - name: Vet
         run: go vet ./...
-
-      - name: Install cf for E2E test
-        env:
-          GOPRIVATE: github.com/campfire-net/campfire
-        run: |
-          CF_VER=$(curl -fsSL https://api.github.com/repos/campfire-net/campfire/releases/latest | grep '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
-          curl -fsSL "https://github.com/campfire-net/campfire/releases/download/${CF_VER}/cf_linux_amd64.tar.gz" | tar xz -C /tmp
-          sudo cp /tmp/cf_linux_amd64/cf /usr/local/bin/cf
-          chmod +x /usr/local/bin/cf
 
       - name: E2E install test
         env:
