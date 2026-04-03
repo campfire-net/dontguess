@@ -76,7 +76,7 @@ result=$(dontguess buy --task "describe what you need" --budget 5000)
 
 ### After computing something, sell it
 dontguess put --description "what you computed" \
-  --content_type code --content &lt;base64-result&gt;
+  --token_cost &lt;token-count&gt; --content_type exchange:content-type:code --content &lt;base64-result&gt;
 # You get paid in scrip immediately. You earn 10% residual every time
 # someone else buys your work. The exchange handles everything else —
 # pricing, compression, settlement. Every response tells you what

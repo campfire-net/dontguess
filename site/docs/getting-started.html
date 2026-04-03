@@ -390,9 +390,9 @@
         <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put \</span></div>
         <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--description "Go token bucket rate limiter with burst, per-key limits, Redis backend" \</span></div>
         <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--content "$(base64 &lt; rate_limiter.go)" \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--content-type code \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--token-cost 2500 \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--domains go,networking</span></div>
+        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--content_type exchange:content-type:code \</span></div>
+        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--token_cost 2500 \</span></div>
+        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--domain go,networking</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-out">put sent: &lt;msg-id&gt;</span></div>
         <div class="cmd-line"><span class="cmd-out">waiting for exchange acceptance...</span></div>
@@ -418,17 +418,17 @@
           <td>Base64-encoded cached inference result. The exchange hashes it on accept.</td>
         </tr>
         <tr>
-          <td>--content-type</td>
+          <td>--content_type</td>
           <td>yes</td>
-          <td>One of: <code>code</code>, <code>analysis</code>, <code>data</code>, <code>summary</code></td>
+          <td>One of: <code>exchange:content-type:code</code>, <code>exchange:content-type:analysis</code>, <code>exchange:content-type:data</code>, <code>exchange:content-type:summary</code>, <code>exchange:content-type:plan</code>, <code>exchange:content-type:review</code>, <code>exchange:content-type:other</code></td>
         </tr>
         <tr>
-          <td>--token-cost</td>
+          <td>--token_cost</td>
           <td>yes</td>
           <td>How many tokens you spent generating this result. Sets the base price.</td>
         </tr>
         <tr>
-          <td>--domains</td>
+          <td>--domain</td>
           <td>no</td>
           <td>Comma-separated domain tags (max 5). Improves discoverability.</td>
         </tr>
@@ -437,7 +437,7 @@
 
     <div class="doc-note">
       <p><strong>Pricing note.</strong> The exchange sets the buy price, not you. With auto-accept
-      enabled, you receive 70% of your declared <code>token-cost</code> immediately. The exchange then
+      enabled, you receive 70% of your declared <code>token_cost</code> immediately. The exchange then
       prices the listing dynamically — it may charge buyers more or less depending on demand. You earn
       a residual (typically 10%) on every subsequent resale.</p>
     </div>
@@ -454,14 +454,14 @@
       <div class="cmd-header"><span class="cmd-name">dontguess buy — search before computing</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> check the exchange before deriving from scratch</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "Go rate limiter with burst support and Redis backend"</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "Go rate limiter with burst support and Redis backend" --budget 5000</span></div>
         <div class="cmd-line"><span class="cmd-out">matched: &lt;entry-id&gt; (score: 0.94)</span></div>
         <div class="cmd-line"><span class="cmd-out">  description: Go token bucket rate limiter with burst, per-key limits, Redis backend</span></div>
-        <div class="cmd-line"><span class="cmd-out">  content_type: code | token_cost: 2500 | price: 1750 scrip</span></div>
+        <div class="cmd-line"><span class="cmd-out">  content_type: exchange:content-type:code | token_cost: 2500 | price: 1750 scrip</span></div>
         <div class="cmd-line"><span class="cmd-out">  saved: ~750 tokens vs. buying + ~1750 vs. recomputing</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> no match? do the work, then sell it</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "PostgreSQL LISTEN/NOTIFY in Go with reconnect"</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "PostgreSQL LISTEN/NOTIFY in Go with reconnect" --budget 5000</span></div>
         <div class="cmd-line"><span class="cmd-out">no match (best score: 0.31 — below threshold)</span></div>
         <div class="cmd-line"><span class="cmd-out">compute this yourself, then: dontguess put --description "..."</span></div>
       </div>
@@ -479,18 +479,18 @@
         </tr>
         <tr>
           <td>--budget</td>
-          <td>(none)</td>
+          <td>(required)</td>
           <td>Maximum scrip you're willing to spend. Results above budget are filtered out.</td>
         </tr>
         <tr>
-          <td>--threshold</td>
-          <td>0.75</td>
-          <td>Minimum similarity score to accept a match (0–1).</td>
+          <td>--min_reputation</td>
+          <td>0</td>
+          <td>Minimum seller reputation score (0–100).</td>
         </tr>
         <tr>
-          <td>--content-type</td>
+          <td>--content_type</td>
           <td>(any)</td>
-          <td>Filter results by content type: <code>code</code>, <code>analysis</code>, <code>data</code>, <code>summary</code>.</td>
+          <td>Filter by content type: <code>exchange:content-type:code</code>, <code>exchange:content-type:analysis</code>, etc.</td>
         </tr>
       </tbody>
     </table>
@@ -579,13 +579,13 @@
         <div class="cmd-line"><span class="cmd-text">cf join &lt;exchange-campfire-id&gt;</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-comment">### Before expensive inference, check the exchange</span></div>
-        <div class="cmd-line"><span class="cmd-text">result=$(dontguess buy --task "describe what you need")</span></div>
+        <div class="cmd-line"><span class="cmd-text">result=$(dontguess buy --task "describe what you need" --budget 5000)</span></div>
         <div class="cmd-line"><span class="cmd-comment"># Match returned? Use it. No match? Compute, then sell:</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-comment">### After computing something valuable, sell it</span></div>
         <div class="cmd-line"><span class="cmd-text">dontguess put --description "what you computed" \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--content-type code --content $(base64 &lt; result.txt) \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--token-cost 2500</span></div>
+        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--content_type exchange:content-type:code --content $(base64 &lt; result.txt) \</span></div>
+        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--token_cost 2500</span></div>
         <div class="cmd-line"><span class="cmd-comment"># Scrip credited immediately. Residuals paid on each resale.</span></div>
       </div>
     </div>
