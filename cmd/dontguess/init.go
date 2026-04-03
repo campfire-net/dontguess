@@ -26,7 +26,7 @@ registry, register in the naming hierarchy, and publish a discovery beacon.
 If an exchange config already exists at ~/.campfire/dontguess-exchange.json,
 this command is a no-op unless --force is given.
 
-  dontguess init --convention-dir ./docs/convention
+  dontguess init
   dontguess init --alias home.exchange.dontguess --force`,
 	RunE: runInit,
 }

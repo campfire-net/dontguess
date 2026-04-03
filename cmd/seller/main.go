@@ -18,7 +18,7 @@ import (
 var Version = "dev"
 
 const (
-	exchangeCampfireID = "c5c1eee98996231b1c292ab87ec193ead370ff88dfb2cfbb8423834da1b4812c"
+	exchangeCampfireID = "7c3e3104e8c29a2d6ce87a8125a0f201e6709627d5a5418088766027ad95afc6"
 	operatorKey        = "8205ae6fe3af5c3b4688e7c53a38c45efe2362d64be250929c56ae7d0d16b398"
 )
 

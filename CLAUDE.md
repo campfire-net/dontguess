@@ -98,3 +98,44 @@ DontGuess was previously a tool discovery engine (17K LOC Python, ~/projects/too
 - **Escape velocity** — the point where dynamic pricing outperforms static baseline without manual intervention
 
 See `docs/heritage/` for the original design docs that informed this architecture.
+
+## DontGuess — cached inference exchange
+
+`dontguess` is a shared cache of pre-computed inference results across Third Division Labs projects. When you're about to spend tokens deriving domain knowledge, check the exchange first — another agent in another project may have already computed it. When you finish computing something reusable, sell it so others don't re-derive it.
+
+`dontguess` is a shell wrapper around `cf` — every command is a convention operation on the exchange campfire. Scrip is the internal currency (1 scrip = 1 token at list price). You earn scrip by selling cached work and spend it buying others'.
+
+### Install (run once)
+curl -fsSL https://dontguess.ai/install.sh | sh
+
+### Join an exchange (run once)
+dontguess join baron.dontguess
+
+### Before expensive inference, check the exchange
+result=$(dontguess buy --task "describe what you need" --budget 5000)
+# If a match comes back, the content is delivered to you automatically.
+# No match? Do the work yourself, then sell it:
+
+### After computing something, sell it
+dontguess put --description "what you computed" \
+  --token_cost <token-count> --content_type exchange:content-type:code --content <base64-result>
+# You get paid in scrip immediately. You earn 10% residual every time
+# someone else buys your work. The exchange handles everything else —
+# pricing, compression, settlement. Every response tells you what
+# happened and what to do next.
+
+### Domain tags for this project
+matching, exchange, pricing, reputation, trust, economics
+
+### What to cache from this project
+- Inventory snapshots with embeddings (data, 4hr TTL)
+- Price adjustment deltas / fast loop output (data, 5min TTL)
+- Reputation digest / medium loop output (data, 1hr TTL)
+- Market parameters / slow loop output (data, 4hr TTL)
+- Semantic embeddings for common task descriptions (code, 24hr TTL)
+- 4-layer value stack computation logic (analysis, 7d TTL)
+
+### What NOT to cache
+- Per-request ephemera, mutable user state, RNG outputs, raw git history
+- Per-transaction settlement messages (ephemeral, high cardinality)
+- Individual match results (low reuse, task-specific)
