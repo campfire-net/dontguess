@@ -110,7 +110,11 @@ LOG="${CF_HOME}/dontguess.log"
 
 case "${1:-}" in
   init|serve|convention) exec "$DG_OP" "$@";;
-  join|leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
+  join)
+    # Join uses beacon string for transport-aware discovery.
+    # No exchange config required — user provides target as argument.
+    shift; exec "$CF" join "$@";;
+  leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
   version|--version)
     echo "dontguess wrapper"
     "$DG_OP" version 2>/dev/null || true
@@ -132,7 +136,7 @@ if [ ! -f "$CFG" ]; then
   exit 1
 fi
 
-# Read campfire ID
+# Read campfire ID (used for convention operations — cf requires hex ID for routing)
 XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$CFG")
 [ -z "$XCFID" ] && { echo "error: cannot read exchange_campfire_id from $CFG" >&2; exit 1; }
 
@@ -146,6 +150,7 @@ if ! { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }; then
   echo "  Exchange running (pid $(cat "$PID"))" >&2
 fi
 
+# Convention operations use hex campfire ID for routing.
 exec "$CF" "$XCFID" "$@"
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"

@@ -534,16 +534,15 @@ func TestInit_NamingRootRegistersInRegistry(t *testing.T) {
 		NamingRoot:    registryCampfireID,
 	})
 
-	// Init registers the first segment of the alias ("exchange") in the naming
-	// root. The naming hierarchy is one-level-per-campfire: the root holds
-	// "exchange", which resolves to the exchange campfire.
-	segment := "exchange" // first segment of "exchange.dontguess"
-	resp, err := naming.Resolve(t.Context(), registryClient, registryCampfireID, segment)
+	// Init registers the alias directly in the naming root.
+	// Since the alias "exchange-dontguess" is a valid single segment, it is
+	// registered as-is. Verify that naming.Resolve finds it.
+	resp, err := naming.Resolve(t.Context(), registryClient, registryCampfireID, alias)
 	if err != nil {
-		t.Fatalf("naming.Resolve(%q): %v", segment, err)
+		t.Fatalf("naming.Resolve(%q): %v", alias, err)
 	}
 	if resp.CampfireID != cfg.ExchangeCampfireID {
-		t.Errorf("Resolve(%q) = %q, want %q", segment, resp.CampfireID, cfg.ExchangeCampfireID)
+		t.Errorf("Resolve(%q) = %q, want %q", alias, resp.CampfireID, cfg.ExchangeCampfireID)
 	}
 }
 
