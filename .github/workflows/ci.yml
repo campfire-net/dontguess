@@ -27,8 +27,7 @@ jobs:
         run: |
           CF_VER=$(curl -fsSL https://api.github.com/repos/campfire-net/campfire/releases/latest | grep '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
           curl -fsSL "https://github.com/campfire-net/campfire/releases/download/${CF_VER}/cf_linux_amd64.tar.gz" | tar xz -C /tmp
-          sudo cp /tmp/cf_linux_amd64/cf /usr/local/bin/cf
-          chmod +x /usr/local/bin/cf
+          sudo install -m 755 /tmp/cf_linux_amd64/cf /usr/local/bin/cf
 
       - name: Run tests
         env:
