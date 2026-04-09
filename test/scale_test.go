@@ -34,7 +34,7 @@ type agent struct {
 	env          *testEnv
 	home         string // isolated HOME
 	binDir       string // ~/.local/bin equivalent
-	cfHome       string // ~/.campfire
+	cfHome       string // ~/.cf
 	transportDir string // CF_TRANSPORT_DIR (empty = default)
 	name         string // for test output
 }
@@ -123,7 +123,7 @@ func (e *testEnv) newAgent(name string) *agent {
 		env:    e,
 		home:   home,
 		binDir: binDir,
-		cfHome: filepath.Join(home, ".campfire"),
+		cfHome: filepath.Join(home, ".cf"),
 		name:   name,
 	}
 
@@ -238,7 +238,7 @@ func writeWrapper(t *testing.T, binDir string) {
 set -e
 DG_OP="` + binDir + `/dontguess-operator"
 CF="` + binDir + `/cf"
-CF_HOME="${CF_HOME:-${HOME}/.campfire}"
+CF_HOME="${CF_HOME:-${HOME}/.cf}"
 CFG="${CF_HOME}/dontguess-exchange.json"
 PID="${CF_HOME}/dontguess.pid"
 LOG="${CF_HOME}/dontguess.log"

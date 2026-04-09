@@ -17,7 +17,7 @@ fail() { printf "${RED}FAIL${RESET}: %s\n" "$1"; FAILURES=$((FAILURES + 1)); }
 
 FAILURES=0
 TEST_HOME=$(mktemp -d)
-trap 'kill $(cat "$TEST_HOME/.campfire/dontguess.pid" 2>/dev/null) 2>/dev/null; rm -rf "$TEST_HOME"' EXIT
+trap 'kill $(cat "$TEST_HOME/.cf/dontguess.pid" 2>/dev/null) 2>/dev/null; rm -rf "$TEST_HOME"' EXIT
 
 export HOME="$TEST_HOME"
 export PATH="$TEST_HOME/.local/bin:$PATH"
@@ -55,7 +55,7 @@ cat > "$TEST_HOME/.local/bin/dontguess" <<'ENDWRAPPER'
 set -e
 DG_OP="${HOME}/.local/bin/dontguess-operator"
 CF="${HOME}/.local/bin/cf"
-CF_HOME="${CF_HOME:-${HOME}/.campfire}"
+CF_HOME="${CF_HOME:-${HOME}/.cf}"
 CFG="${CF_HOME}/dontguess-exchange.json"
 PID="${CF_HOME}/dontguess.pid"
 LOG="${CF_HOME}/dontguess.log"
@@ -97,7 +97,7 @@ else
 fi
 
 # Verify config was created
-if [ -f "$TEST_HOME/.campfire/dontguess-exchange.json" ]; then
+if [ -f "$TEST_HOME/.cf/dontguess-exchange.json" ]; then
   pass "Exchange config file created"
 else
   fail "Exchange config file missing"
@@ -105,7 +105,7 @@ fi
 
 # --- Test 3: Join exchange ---
 printf "\n${BOLD}Test 3: Join exchange via wrapper${RESET}\n"
-XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.campfire/dontguess-exchange.json")
+XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.cf/dontguess-exchange.json")
 if dontguess join "$XCFID" 2>&1 | grep -q "already a member\|Joined"; then
   pass "Join routes correctly through cf"
 else
@@ -127,7 +127,7 @@ else
 fi
 
 # Verify server is running
-if [ -f "$TEST_HOME/.campfire/dontguess.pid" ] && kill -0 "$(cat "$TEST_HOME/.campfire/dontguess.pid")" 2>/dev/null; then
+if [ -f "$TEST_HOME/.cf/dontguess.pid" ] && kill -0 "$(cat "$TEST_HOME/.cf/dontguess.pid")" 2>/dev/null; then
   pass "Exchange server auto-started"
 else
   fail "Exchange server not running"
@@ -138,7 +138,7 @@ sleep 2
 
 # --- Test 5: Check put was accepted ---
 printf "\n${BOLD}Test 5: Verify put-accept${RESET}\n"
-XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.campfire/dontguess-exchange.json")
+XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.cf/dontguess-exchange.json")
 if cf read "$XCFID" --all 2>&1 | grep -q "exchange:phase:put-accept"; then
   pass "Put was auto-accepted by exchange"
 else

@@ -273,7 +273,7 @@ func sendSupersede(payload []byte, campfireID string, client *protocol.Client) (
 }
 
 // requireClient initializes a protocol.Client from the campfire home directory.
-// Uses CF_HOME env var or ~/.campfire as the campfire home directory.
+// Uses CF_HOME env var or ~/.cf as the campfire home directory.
 func requireClient() (*protocol.Client, error) {
 	home := cfHome()
 	client, _, err := protocol.Init(home)
@@ -293,7 +293,7 @@ func cfHome() string {
 		fmt.Fprintf(os.Stderr, "error: cannot determine home directory: %v\n", err)
 		os.Exit(1)
 	}
-	return filepath.Join(home, ".campfire")
+	return filepath.Join(home, ".cf")
 }
 
 // shortID returns the first 12 characters of a message or campfire ID.

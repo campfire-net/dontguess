@@ -51,7 +51,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 		if err != nil {
 			return fmt.Errorf("resolving home dir: %w", err)
 		}
-		cfHome = home + "/.campfire"
+		cfHome = home + "/.cf"
 	}
 
 	cfg, err := exchange.LoadConfig(cfHome)

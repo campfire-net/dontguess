@@ -23,7 +23,7 @@ var initCmd = &cobra.Command{
 	Long: `Create an exchange campfire, promote convention declarations to its
 registry, register in the naming hierarchy, and publish a discovery beacon.
 
-If an exchange config already exists at ~/.campfire/dontguess-exchange.json,
+If an exchange config already exists at ~/.cf/dontguess-exchange.json,
 this command is a no-op unless --force is given.
 
   dontguess init

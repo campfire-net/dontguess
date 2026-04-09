@@ -8,7 +8,7 @@
 #   3. dontguess wrapper — turnkey CLI
 #
 # The wrapper auto-starts the exchange server, reads config from
-# ~/.campfire/dontguess-exchange.json, and routes convention operations
+# ~/.cf/dontguess-exchange.json, and routes convention operations
 # (buy, put, settle) through cf.
 
 set -e
@@ -103,7 +103,7 @@ set -e
 
 DG_OP="${HOME}/.local/bin/dontguess-operator"
 CF="${HOME}/.local/bin/cf"
-CF_HOME="${CF_HOME:-${HOME}/.campfire}"
+CF_HOME="${CF_HOME:-${HOME}/.cf}"
 CFG="${CF_HOME}/dontguess-exchange.json"
 PID="${CF_HOME}/dontguess.pid"
 LOG="${CF_HOME}/dontguess.log"

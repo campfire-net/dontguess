@@ -29,7 +29,7 @@ type Config struct {
 
 // InitOptions controls the Init operation.
 type InitOptions struct {
-	// ConfigDir is the campfire config directory (default: ~/.campfire).
+	// ConfigDir is the campfire config directory (default: ~/.cf).
 	// protocol.Init is called with this directory to load/generate identity and open store.
 	ConfigDir string
 	// Transport selects and configures the filesystem transport for the exchange campfire.
@@ -64,9 +64,9 @@ func (o *InitOptions) configDir() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join("/tmp", ".campfire")
+		return filepath.Join("/tmp", ".cf")
 	}
-	return filepath.Join(home, ".campfire")
+	return filepath.Join(home, ".cf")
 }
 
 func (o *InitOptions) transport() protocol.Transport {
@@ -98,9 +98,9 @@ func defaultTransportBaseDir() string {
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return "/tmp/campfire"
+		return "/tmp/cf"
 	}
-	return filepath.Join(home, ".campfire", "transport")
+	return filepath.Join(home, ".cf", "transport")
 }
 
 // ConfigPath returns the path to the exchange operator config file.
