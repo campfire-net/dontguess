@@ -1,0 +1,148 @@
+# Using system dontguess-operator: /home/baron/.local/bin/dontguess-operator
+
+=== SECTION: operator-identity ===
+$ cf init --cf-home $CF_HOME
+Your identity campfire: f6a70a1f3f6ef2874f375bac63330026ab133a5cc3776cd5e411b771eb3f0021. Share it like any beacon.
+
+Next: cf discover    find campfires
+      cf create      start one
+      cf join <id>   join one
+
+=== SECTION: init ===
+$ dontguess init
+warning: skipping assign.json (lint failed): [{error unmappable_tag tag glob "exchange:assign-entry:*" has no arg that can produce values with prefix "exchange:assign-entry:" produces_tags[2]}]
+info: put-v0.3.json supersedes put-v0.2.json for dontguess-exchange:put (v0.3.0 > v0.2.0)
+info: skipping put.json — put-v0.3.json is a higher version for dontguess-exchange:put
+warning: skipping loan-mint.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]} {error unmappable_tag tag glob "scrip:to:*" has no arg that can produce values with prefix "scrip:to:" produces_tags[2]}]
+warning: skipping loan-repay.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
+warning: skipping loan-vig-accrue.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
+created 6 named views
+Exchange initialized
+  campfire: cd2b5243d4138a76ab08733b4925883d931199ee40ef220c75a35c5c2a8954a6
+  operator: 07d84f1c842b63170df38a8c028d666ae91059e90f6f3d0610e6fe6e6c84b74d
+  alias:    exchange.dontguess
+  version:  0.1
+
+Next: cf join cd2b5243d4138a76...
+      cf exchange.dontguess put --help
+# exchange campfire: cd2b5243d4138a76ab08733b4925883d931199ee40ef220c75a35c5c2a8954a6
+
+=== SECTION: worker-identity ===
+$ CF_HOME=$WORKER_CF cf init
+Your identity campfire: a092e956300fcf3eb6df8037cd6d13aa9141132e853f231ae78b97c5980e749d. Share it like any beacon.
+
+Next: cf discover    find campfires
+      cf create      start one
+      cf join <id>   join one
+# Worker identity created at: /tmp/dontguess-demo-07-iEoC/worker/.cf
+
+=== SECTION: worker-admit ===
+# Worker public key: 7a0fa696362101c491632ad43ae9d66b3cd8d6b7259c1018342a28b289f8bb2e
+$ cf --cf-home $CF_HOME admit $XCFID $WORKER_PUBKEY
+Admitted 7a0fa6963621 to campfire cd2b5243d413 (role: full)
+# Worker admitted to exchange campfire
+
+=== SECTION: worker-join ===
+$ CF_HOME=$WORKER_CF cf join $XCFID
+Joined campfire cd2b5243d413
+trust: unknown
+  [unknown] dontguess-exchange:assign-complete
+  [unknown] dontguess-exchange:buy
+  [unknown] dontguess-exchange:match
+  [unknown] dontguess-exchange:put
+  [unknown] dontguess-exchange:assign-auction-close
+  [unknown] dontguess-exchange:assign-expire
+  [unknown] dontguess-exchange:assign-reject
+  [unknown] dontguess-exchange:scrip:mint
+  [unknown] dontguess-exchange:scrip:rate-publish
+  [unknown] dontguess-exchange:scrip:settle
+  [unknown] dontguess-exchange:scrip:assign-pay
+  [unknown] dontguess-exchange:scrip:burn
+  [unknown] dontguess-exchange:settle
+  [unknown] dontguess-exchange:scrip:put-pay
+  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:scrip:dispute-refund
+  [unknown] dontguess-exchange:assign-accept
+  [unknown] dontguess-exchange:assign-claim
+# Worker joined exchange campfire: cd2b5243d4138a76ab08733b4925883d931199ee40ef220c75a35c5c2a8954a6
+
+=== SECTION: put ===
+$ cf send $XCFID <put-payload> --tag exchange:put --tag exchange:content-type:code
+# put message ID: 9639a5d0-63b9-4a32-b1a8-5f1d8c2dc32b
+# content hash: sha256:5047f3f8f72c3ccedae8c41405ce363ab9896ba26ff304bcf2197ae17ce75aa7
+
+=== SECTION: serve ===
+$ dontguess serve --poll-interval 500ms &
+# Waiting for engine to start...
+# Exchange engine is running (PID 674883)
+2026/04/09 18:11:56 [exchange] exchange serving
+2026/04/09 18:11:56 [exchange]   campfire:  cd2b5243d4138a76...
+2026/04/09 18:11:56 [exchange]   operator:  07d84f1c842b6317...
+2026/04/09 18:11:56 [exchange] engine: replayed 26 messages, indexed 0 entries
+
+=== SECTION: verify-accept ===
+# Waiting for put-accept settle (auto-accept, up to 15s)...
+# put-accept received (settle count: 1)
+# Entry ID from settle: 9639a5d0-63b9-4a32-b1a8-5f1d8c2dc32b
+
+=== SECTION: assign ===
+$ cf send $XCFID <assign-payload> --tag exchange:assign --tag exchange:assign-type:validate --future
+# assign message ID: 6b6f06ef-2dd4-4d4f-8d3d-6df4692b86b4
+2026/04/09 18:11:58 [exchange] engine: assign posted assign_id=0bac8d7a
+2026/04/09 18:11:58 [exchange] engine: assign posted assign_id=6b6f06ef
+
+=== SECTION: assign-claim ===
+$ CF_HOME=$WORKER_CF cf send $XCFID <claim-payload> --tag exchange:assign-claim --antecedent $ASSIGN_MSG_ID
+# assign-claim message ID: 3363c11c-1eae-4195-be74-e9c9bee2ab21
+2026/04/09 18:11:59 [exchange] engine: assign-claim received claim_id=3363c11c sender=7a0fa696
+
+=== SECTION: assign-complete ===
+$ CF_HOME=$WORKER_CF cf send $XCFID <complete-payload> --tag exchange:assign-complete --tag exchange:assign-verdict:pass --antecedent $CLAIM_MSG_ID
+# assign-complete message ID: 4def40ed-a1e3-4b4a-9765-3105b2d81ec5
+2026/04/09 18:12:00 [exchange] engine: assign-complete received complete_id=4def40ed sender=7a0fa696
+
+=== SECTION: assign-accept ===
+$ cf send $XCFID <accept-payload> --tag exchange:assign-accept --antecedent $COMPLETE_MSG_ID
+# assign-accept message ID: 1cf2a3c4-d9c7-49c6-8955-affd4237e3ae
+
+=== SECTION: verify-pay ===
+# Waiting for dontguess:scrip-assign-pay message (up to 15s)...
+# scrip-assign-pay received (pay count: 1)
+$ cf read $XCFID --all --tag dontguess:scrip-assign-pay
+Scrip-assign-pay messages: 1
+  id=64598237-54d tags=['dontguess:scrip-assign-pay']
+  worker=7a0fa696362101c4...
+  amount=50000 micro-tokens
+  task_type=exchange:assign-type:validate
+  assign_msg=6b6f06ef-2dd...
+# VERIFIED: scrip-assign-pay references the correct worker
+
+=== SECTION: summary ===
+Exchange campfire:  cd2b5243d4138a76ab08733b4925883d931199ee40ef220c75a35c5c2a8954a6
+Put message ID:     9639a5d0-63b9-4a32-b1a8-5f1d8c2dc32b
+Entry ID:           9639a5d0-63b9-4a32-b1a8-5f1d8c2dc32b
+Assign message ID:  6b6f06ef-2dd4-4d4f-8d3d-6df4692b86b4
+Claim message ID:   3363c11c-1eae-4195-be74-e9c9bee2ab21
+Complete msg ID:    4def40ed-a1e3-4b4a-9765-3105b2d81ec5
+Accept message ID:  1cf2a3c4-d9c7-49c6-8955-affd4237e3ae
+Worker public key:  7a0fa696362101c4...
+
+Total campfire messages: 33
+
+Engine log (assign lifecycle):
+2026/04/09 18:11:56 [exchange] exchange serving
+2026/04/09 18:11:56 [exchange] engine: replayed 26 messages, indexed 0 entries
+2026/04/09 18:11:57 [exchange] engine: replayed 26 messages, indexed 0 entries
+2026/04/09 18:11:57 [exchange] engine: compression assign sent assign_id=0bac8d7a entry=9639a5d0 seller=07d84f1c bounty=1500
+2026/04/09 18:11:58 [exchange] engine: assign posted assign_id=0bac8d7a
+2026/04/09 18:11:58 [exchange] engine: assign posted assign_id=6b6f06ef
+2026/04/09 18:11:59 [exchange] engine: assign-claim received claim_id=3363c11c sender=7a0fa696
+2026/04/09 18:12:00 [exchange] engine: assign-complete received complete_id=4def40ed sender=7a0fa696
+2026/04/09 18:12:01 [exchange] engine: assign-accept: bounty paid assign_id=6b6f06ef worker=7a0fa696 amount=50000
+
+# Demo complete. Transcript written to: /home/baron/projects/dontguess/test/demo/output/07-assign-work.txt
+
+=== SECTION: cleanup ===
+$ kill $SERVE_PID
+$ rm -rf $TMP
+cleanup complete.
