@@ -784,3 +784,119 @@ footer p {
     align-items: center;
   }
 }
+
+/* =========================================================
+   Terminal demo accordion (terminal.js)
+   ========================================================= */
+.demos-section {
+  padding: var(--spacing-xl) 0;
+  background: var(--bg-secondary);
+}
+
+.term-demos {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-sm);
+  margin-top: var(--spacing-md);
+}
+
+.term-accordion {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--bg-primary);
+}
+
+.term-accordion-header {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.875rem 1.25rem;
+  cursor: pointer;
+  user-select: none;
+  transition: background 0.15s;
+}
+.term-accordion-header:hover {
+  background: var(--bg-secondary);
+}
+
+.term-accordion-arrow {
+  font-size: 0.65rem;
+  color: var(--text-muted);
+  flex-shrink: 0;
+  transition: color 0.15s;
+}
+
+.term-accordion-title {
+  font-weight: 600;
+  font-size: 0.95rem;
+  color: var(--text-primary);
+}
+
+.term-accordion-subtitle {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.term-accordion-subtitle:hover {
+  color: var(--accent);
+}
+
+.term-accordion-body {
+  display: none;
+  border-top: 1px solid var(--border);
+}
+.term-accordion-body.open {
+  display: block;
+}
+
+.term-screen {
+  background: #0d1117;
+  color: #c9d1d9;
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  line-height: 1.6;
+  padding: 1.25rem;
+  height: 320px;
+  overflow-y: auto;
+}
+
+.term-cmd {
+  color: #58a6ff;
+}
+.term-cmd::before {
+  content: '';
+}
+
+.term-comment {
+  color: #8b949e;
+}
+
+.term-out {
+  color: #c9d1d9;
+}
+
+.term-blank {
+  height: 0.5rem;
+}
+
+.term-cursor {
+  display: inline-block;
+  animation: blink 1s step-end infinite;
+  color: #58a6ff;
+  font-size: 0.85rem;
+}
+
+@keyframes blink {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0; }
+}
+
+@media (max-width: 768px) {
+  .term-screen {
+    font-size: 0.72rem;
+    height: 260px;
+  }
+}
