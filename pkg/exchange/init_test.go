@@ -670,6 +670,138 @@ func TestInit_BeaconStringPersistedToDisk(t *testing.T) {
 	}
 }
 
+// TestInit_DisplayNameWritesConfigTOML verifies that Init writes a config.toml
+// with identity.display_name when one does not already exist.
+func TestInit_DisplayNameWritesConfigTOML(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		DisplayName:   "My Exchange",
+	})
+
+	// config.toml must have been written.
+	configTOMLPath := filepath.Join(configDir, "config.toml")
+	data, err := os.ReadFile(configTOMLPath)
+	if err != nil {
+		t.Fatalf("config.toml not found: %v", err)
+	}
+	if !strings.Contains(string(data), `"My Exchange"`) {
+		t.Errorf("config.toml does not contain display_name %q:\n%s", "My Exchange", data)
+	}
+}
+
+// TestInit_DisplayNameDefaultIsExchangeName verifies that Init uses
+// "DontGuess Exchange" as the default display name when none is specified.
+func TestInit_DisplayNameDefaultIsExchangeName(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	// Init without specifying DisplayName.
+	initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	configTOMLPath := filepath.Join(configDir, "config.toml")
+	data, err := os.ReadFile(configTOMLPath)
+	if err != nil {
+		t.Fatalf("config.toml not found: %v", err)
+	}
+	if !strings.Contains(string(data), "DontGuess Exchange") {
+		t.Errorf("config.toml does not contain default display_name %q:\n%s", "DontGuess Exchange", data)
+	}
+}
+
+// TestInit_DisplayNamePreservesExistingConfigTOML verifies that Init does not
+// overwrite an existing config.toml — the operator's config takes precedence.
+func TestInit_DisplayNamePreservesExistingConfigTOML(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	// Pre-write a config.toml with a custom display name.
+	existing := "[identity]\ndisplay_name = \"OriginalName\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(existing), 0600); err != nil {
+		t.Fatalf("writing pre-existing config.toml: %v", err)
+	}
+
+	// Init with a different DisplayName — should NOT overwrite the existing file.
+	initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		DisplayName:   "NewName",
+	})
+
+	data, err := os.ReadFile(filepath.Join(configDir, "config.toml"))
+	if err != nil {
+		t.Fatalf("reading config.toml: %v", err)
+	}
+	if !strings.Contains(string(data), "OriginalName") {
+		t.Errorf("existing config.toml was overwritten; want OriginalName, got:\n%s", data)
+	}
+	if strings.Contains(string(data), "NewName") {
+		t.Errorf("existing config.toml was overwritten with NewName:\n%s", data)
+	}
+}
+
+// TestInit_DisplayNameFlowsThroughConfigCascade verifies that the display_name
+// written to config.toml is picked up by InitWithConfig via the config cascade.
+func TestInit_DisplayNameFlowsThroughConfigCascade(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		DisplayName:   "TestOperator",
+	})
+
+	// Use InitWithConfig to load the cascade and verify display_name is present.
+	_, result, err := protocol.InitWithConfig(protocol.WithConfigDir(configDir))
+	if err != nil {
+		t.Fatalf("InitWithConfig: %v", err)
+	}
+
+	// At least one ConfigLayer must have contributed identity.display_name.
+	var foundDisplayName bool
+	for _, layer := range result.ConfigLayers {
+		for _, field := range layer.Fields {
+			if field == "identity.display_name" {
+				foundDisplayName = true
+			}
+		}
+	}
+	if !foundDisplayName {
+		t.Error("identity.display_name not found in any ConfigLayer from InitWithConfig")
+	}
+}
+
 // decodeBeaconString decodes a "beacon:BASE64" string into a *beacon.Beacon.
 // Mirrors the parseBeaconString logic in the cf CLI (share.go).
 func decodeBeaconString(s, tmpDir string) (*beacon.Beacon, error) {

@@ -55,6 +55,10 @@ type InitOptions struct {
 	Alias string
 	// Description is posted as the exchange beacon description.
 	Description string
+	// DisplayName is the human-readable name the operator presents with on
+	// campfire messages. Written as identity.display_name in config.toml on
+	// first init. Default: "DontGuess Exchange".
+	DisplayName string
 	// Force overwrites an existing config if present.
 	Force bool
 	// NamingRoot is the campfire ID of a naming registry. When set, naming.Register
@@ -89,6 +93,13 @@ func (o *InitOptions) description() string {
 		return o.Description
 	}
 	return "DontGuess exchange — token-work marketplace"
+}
+
+func (o *InitOptions) displayName() string {
+	if o.DisplayName != "" {
+		return o.DisplayName
+	}
+	return "DontGuess Exchange"
 }
 
 // defaultTransportBaseDir returns the default filesystem transport base directory.
@@ -149,6 +160,13 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 	if err := os.MkdirAll(configDir, 0700); err != nil {
 		client.Close() //nolint:errcheck
 		return nil, nil, fmt.Errorf("creating config dir: %w", err)
+	}
+
+	// Write config.toml with identity.display_name if it doesn't already exist.
+	// This ensures the operator presents with a human-readable name on campfire.
+	if err := ensureDisplayNameConfig(configDir, opts.displayName()); err != nil {
+		// Non-fatal: warn but don't block exchange init.
+		fmt.Fprintf(os.Stderr, "warning: writing display name config: %v\n", err)
 	}
 
 	// Check for existing config (after opening client so we can return it).
@@ -487,6 +505,23 @@ func shortCampfireID(id string) string {
 		return id
 	}
 	return id[:12]
+}
+
+// ensureDisplayNameConfig writes a config.toml with identity.display_name to
+// configDir if no config.toml already exists there. This lets InitWithConfig
+// pick up the display name from the config cascade so the operator presents
+// with a human-readable name on campfire messages.
+//
+// It is a no-op when config.toml already exists — the operator's existing
+// config is never overwritten.
+func ensureDisplayNameConfig(configDir, displayName string) error {
+	configPath := filepath.Join(configDir, "config.toml")
+	if _, err := os.Stat(configPath); err == nil {
+		// config.toml already exists — leave it alone.
+		return nil
+	}
+	content := fmt.Sprintf("[identity]\ndisplay_name = %q\n", displayName)
+	return os.WriteFile(configPath, []byte(content), 0600)
 }
 
 // writeConfig serializes cfg to configPath (mode 0600).

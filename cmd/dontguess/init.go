@@ -14,6 +14,7 @@ var (
 	initConventionDir string
 	initAlias         string
 	initDescription   string
+	initDisplayName   string
 	initForce         bool
 	initNamingRoot    string
 )
@@ -36,6 +37,7 @@ func init() {
 	initCmd.Flags().StringVar(&initConventionDir, "convention-dir", "", "path to convention declarations directory (must contain exchange-core/ and exchange-scrip/)")
 	initCmd.Flags().StringVar(&initAlias, "alias", "", "naming alias for the exchange (default: exchange.dontguess)")
 	initCmd.Flags().StringVar(&initDescription, "description", "", "exchange description for beacon")
+	initCmd.Flags().StringVar(&initDisplayName, "display-name", "", "operator display name on campfire (default: \"DontGuess Exchange\")")
 	initCmd.Flags().BoolVar(&initForce, "force", false, "reinitialize even if config exists")
 	initCmd.Flags().StringVar(&initNamingRoot, "naming-root", "", "campfire ID of the naming registry for globally discoverable registration")
 	rootCmd.AddCommand(initCmd)
@@ -47,6 +49,7 @@ func runInit(_ *cobra.Command, _ []string) error {
 		EmbeddedConventions: dontguess.ConventionFS,
 		Alias:               initAlias,
 		Description:         initDescription,
+		DisplayName:         initDisplayName,
 		Force:               initForce,
 		NamingRoot:          initNamingRoot,
 	}
