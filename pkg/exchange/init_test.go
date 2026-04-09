@@ -143,7 +143,7 @@ func TestInit_ConventionDeclarationsPromoted(t *testing.T) {
 	})
 
 	// Use protocol.Init to open a second client and read messages via SDK.
-	verifyClient, err := protocol.Init(configDir)
+	verifyClient, _, err := protocol.Init(configDir)
 	if err != nil {
 		t.Fatalf("protocol.Init for verify: %v", err)
 	}
@@ -205,7 +205,7 @@ func TestInit_PutNotDoublePromoted(t *testing.T) {
 		ConventionDir: convDir,
 	})
 
-	verifyClient, err := protocol.Init(configDir)
+	verifyClient, _, err := protocol.Init(configDir)
 	if err != nil {
 		t.Fatalf("protocol.Init for verify: %v", err)
 	}
@@ -323,7 +323,7 @@ func TestInit_MembershipRecorded(t *testing.T) {
 	})
 
 	// Use protocol.Init to verify membership via the SDK.
-	verifyClient, err := protocol.Init(configDir)
+	verifyClient, _, err := protocol.Init(configDir)
 	if err != nil {
 		t.Fatalf("protocol.Init for verify: %v", err)
 	}

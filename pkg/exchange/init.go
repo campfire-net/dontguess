@@ -142,7 +142,7 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 	}
 
 	// Open or create identity and store via SDK.
-	client, err := protocol.Init(configDir)
+	client, _, err := protocol.Init(configDir)
 	if err != nil {
 		return nil, nil, fmt.Errorf("protocol.Init: %w", err)
 	}
