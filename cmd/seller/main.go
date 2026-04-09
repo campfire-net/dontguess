@@ -68,7 +68,7 @@ func main() {
 			cfHome = filepath.Dir(identityPath)
 		} else {
 			home, _ := os.UserHomeDir()
-			cfHome = filepath.Join(home, ".clankeros", "automata", "dontguess-seller")
+			cfHome = filepath.Join(home, ".legion", "automata", "dontguess-seller")
 		}
 	}
 
