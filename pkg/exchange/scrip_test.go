@@ -97,41 +97,7 @@ func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripSto
 	return cs
 }
 
-// countReservations counts the in-flight reservations by iterating over a
-// set of known IDs and checking GetReservation. Since SpendingStore has no
-// ListReservations, we track IDs in a separate slice for tests that need counts.
-//
-// reservationIDs is modified by the caller to accumulate IDs.
-func countReservations(t *testing.T, cs *scrip.CampfireScripStore, ids []string) int {
-	t.Helper()
-	ctx := context.Background()
-	n := 0
-	for _, id := range ids {
-		if _, err := cs.GetReservation(ctx, id); err == nil {
-			n++
-		}
-	}
-	return n
-}
-
 // --- Helpers ---
-
-// newEngineWithScrip builds a testHarness + engine with a SpendingStore wired in.
-func newEngineWithScrip(t *testing.T, scripStore scrip.SpendingStore) (*testHarness, *exchange.Engine) {
-	t.Helper()
-	h := newTestHarness(t)
-	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:       h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       scripStore,
-		Logger: func(format string, args ...any) {
-			t.Logf("[engine] "+format, args...)
-		},
-	})
-	return h, eng
-}
 
 // seedInventoryEntry puts + accepts one entry, returning the put message ID.
 func seedInventoryEntry(t *testing.T, h *testHarness, eng *exchange.Engine, desc, contentType string, tokenCost, putPrice int64) string {
@@ -212,22 +178,6 @@ func sendBuyerAcceptAndDispatch(t *testing.T, h *testHarness, eng *exchange.Engi
 		t.Fatalf("DispatchForTest buyer-accept: %v", err)
 	}
 	return msg
-}
-
-// waitForBuyHoldMessage polls until a new scrip-buy-hold message appears, returns the last one.
-func waitForBuyHoldMessage(t *testing.T, h *testHarness, before []store.MessageRecord, timeout time.Duration) *store.MessageRecord {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{scrip.TagScripBuyHold}})
-		if len(msgs) > len(before) {
-			last := msgs[len(msgs)-1]
-			return &last
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatal("timed out waiting for scrip-buy-hold message")
-	return nil
 }
 
 // --- Tests ---

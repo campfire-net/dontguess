@@ -24,24 +24,6 @@ import (
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
 )
-
-// waitForScripMessage polls the store until a message with the given scrip tag appears.
-// Returns the last matching message or fails the test on timeout.
-func waitForScripMessage(t *testing.T, h *testHarness, tag string, before []store.MessageRecord, timeout time.Duration) *store.MessageRecord {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{tag}})
-		if len(msgs) > len(before) {
-			last := msgs[len(msgs)-1]
-			return &last
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	t.Fatalf("timed out waiting for scrip message with tag %q", tag)
-	return nil
-}
-
 // countMsgsWithTag counts messages in the store with the given tag.
 func countMsgsWithTag(t *testing.T, h *testHarness, tag string) int {
 	t.Helper()

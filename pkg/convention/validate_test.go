@@ -120,7 +120,7 @@ func TestValidateTagPattern_ContentType_Valid(t *testing.T) {
 func TestValidateTagPattern_ContentType_InvalidSuffix(t *testing.T) {
 	err := dgconv.ValidateTagPattern("exchange:content-type:video", "exchange:content-type:*")
 	if err == nil {
-		t.Error("expected error for unknown content-type suffix, got nil")
+		t.Fatal("expected error for unknown content-type suffix, got nil")
 	}
 	if err.Code != "pattern_mismatch" {
 		t.Errorf("expected code pattern_mismatch, got %q", err.Code)
@@ -165,7 +165,7 @@ func TestValidateTagPattern_Domain_OpenWildcard(t *testing.T) {
 func TestValidateTagPattern_UnknownPatternKey(t *testing.T) {
 	err := dgconv.ValidateTagPattern("foo:bar", "foo:*")
 	if err == nil {
-		t.Error("expected error for unknown pattern key, got nil")
+		t.Fatal("expected error for unknown pattern key, got nil")
 	}
 	if err.Code != "pattern_unknown" {
 		t.Errorf("expected code pattern_unknown, got %q", err.Code)
@@ -186,7 +186,7 @@ func TestValidateEnum_ContentType_Valid(t *testing.T) {
 func TestValidateEnum_ContentType_Invalid(t *testing.T) {
 	err := dgconv.ValidateContentType("exchange:content-type:video")
 	if err == nil {
-		t.Error("expected error for invalid content_type, got nil")
+		t.Fatal("expected error for invalid content_type, got nil")
 	}
 	if err.Code != "enum_mismatch" {
 		t.Errorf("expected code enum_mismatch, got %q", err.Code)
@@ -230,7 +230,7 @@ func TestValidateEnum_DisputeType_Valid(t *testing.T) {
 func TestValidateEnum_DisputeType_Invalid(t *testing.T) {
 	err := dgconv.ValidateDisputeType("wrong_reason")
 	if err == nil {
-		t.Error("expected error for invalid dispute_type, got nil")
+		t.Fatal("expected error for invalid dispute_type, got nil")
 	}
 	if err.Code != "enum_mismatch" {
 		t.Errorf("expected code enum_mismatch, got %q", err.Code)
@@ -303,7 +303,7 @@ func TestValidateContentHash_MissingPrefix(t *testing.T) {
 	hash := "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	err := dgconv.ValidateContentHash(hash)
 	if err == nil {
-		t.Error("expected error for content_hash without sha256: prefix, got nil")
+		t.Fatal("expected error for content_hash without sha256: prefix, got nil")
 	}
 	if err.Code != "pattern_mismatch" {
 		t.Errorf("expected code pattern_mismatch, got %q", err.Code)

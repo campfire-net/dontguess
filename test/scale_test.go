@@ -215,15 +215,6 @@ func (a *agent) exchangeID() string {
 	return ""
 }
 
-// centerID reads the center campfire ID.
-func (a *agent) centerID() string {
-	a.t.Helper()
-	data, err := os.ReadFile(filepath.Join(a.cfHome, "center"))
-	if err != nil {
-		a.t.Fatalf("reading center for %s: %v", a.name, err)
-	}
-	return strings.TrimSpace(string(data))
-}
 
 // cfRead reads all messages from a campfire, returns combined output.
 func (a *agent) cfRead(campfireID string) string {

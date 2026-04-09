@@ -1035,13 +1035,6 @@ func medianIntSlice(vals []int) int {
 	return cp[mid]
 }
 
-// min returns the smaller of a and b.
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
 
 // computePriceTrend computes a simple linear regression slope for a price
 // time series. prices and timestamps must have the same length (>= 2).

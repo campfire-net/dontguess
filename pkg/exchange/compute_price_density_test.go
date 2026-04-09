@@ -9,14 +9,6 @@ import (
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
-// newMinimalEngineWithOpts returns an engine configured with caller-supplied
-// EngineOptions overrides. Used to exercise density_markup_factor.
-func newMinimalEngineWithOpts(t *testing.T, overrides func(*exchange.EngineOptions)) *exchange.Engine {
-	t.Helper()
-	h := newTestHarness(t)
-	eng := h.newEngineWithOpts(overrides)
-	return eng
-}
 
 // TestComputePrice_Density_CompressedDerivativeMarkup verifies the core
 // density markup formula:

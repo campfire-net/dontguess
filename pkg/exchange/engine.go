@@ -819,7 +819,7 @@ func (e *Engine) handlePut(msg *Message) error {
 
 	// Reject puts with invalid content_hash format (must start with "sha256:").
 	if !strings.HasPrefix(pending.ContentHash, "sha256:") {
-		return fmt.Errorf("buy-miss put rejected: content_hash %q does not start with sha256:", pending.ContentHash)
+		return fmt.Errorf("buy-miss put rejected: content_hash %q does not have required sha256: prefix", pending.ContentHash)
 	}
 
 	taskHash := TaskDescriptionHash(pending.Description)
@@ -1416,12 +1416,7 @@ func (e *Engine) handleSettlePreviewRequest(msg *Message) error {
 	}
 	chunks := make([]ChunkPayload, len(previewResult.Chunks))
 	for i, c := range previewResult.Chunks {
-		chunks[i] = ChunkPayload{
-			Content:    c.Content,
-			StartByte:  c.StartByte,
-			EndByte:    c.EndByte,
-			ChunkIndex: c.ChunkIndex,
-		}
+		chunks[i] = ChunkPayload(c)
 	}
 
 	previewPayload, err := e.marshal(map[string]any{
@@ -1846,7 +1841,7 @@ func (e *Engine) createCompressionDerivative(rec *AssignRecord, acceptMsgID stri
 		return fmt.Errorf("assign-complete result missing content_hash")
 	}
 	if !strings.HasPrefix(result.ContentHash, "sha256:") {
-		return fmt.Errorf("assign-complete result content_hash %q does not start with sha256:", result.ContentHash)
+		return fmt.Errorf("assign-complete result content_hash %q does not have required sha256: prefix", result.ContentHash)
 	}
 
 	// Derive a stable EntryID from the accept message ID so that replaying
