@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"time"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
@@ -45,38 +46,32 @@ func init() {
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
-	cfHome := os.Getenv("CF_HOME")
-	if cfHome == "" {
-		home, err := os.UserHomeDir()
-		if err != nil {
-			return fmt.Errorf("resolving home dir: %w", err)
-		}
-		cfHome = home + "/.cf"
+	// Build two clients via protocol.InitWithConfig — both share the same identity and store file.
+	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
+	// SDK handles CF_HOME env and ~/.cf default via config cascade.
+	// SDK sync-before-query handles filesystem transport sync automatically.
+	readClient, initResult, err := protocol.InitWithConfig()
+	if err != nil {
+		return fmt.Errorf("protocol.InitWithConfig (read client): %w", err)
 	}
+	defer readClient.Close() //nolint:errcheck
+
+	// Derive config directory and db path from the resolved store path.
+	cfHome := filepath.Dir(initResult.StorePath)
+	dbPath := initResult.StorePath
 
 	cfg, err := exchange.LoadConfig(cfHome)
 	if err != nil {
 		return fmt.Errorf("load config (did you run 'dontguess init'?): %w", err)
 	}
 
-	// Build two clients via protocol.Init — both share the same identity and store file.
-	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
-	// SDK sync-before-query handles filesystem transport sync automatically.
-	readClient, _, err := protocol.Init(cfHome)
+	writeClient, _, err := protocol.InitWithConfig()
 	if err != nil {
-		return fmt.Errorf("protocol.Init (read client): %w", err)
-	}
-	defer readClient.Close() //nolint:errcheck
-
-	writeClient, _, err := protocol.Init(cfHome)
-	if err != nil {
-		return fmt.Errorf("protocol.Init (write client): %w", err)
+		return fmt.Errorf("protocol.InitWithConfig (write client): %w", err)
 	}
 	defer writeClient.Close() //nolint:errcheck
 
 	// Open a shared store for the exchange engine (Store field in EngineOptions).
-	// Uses the same path as protocol.Init.
-	dbPath := store.StorePath(cfHome)
 	st, err := store.Open(dbPath)
 	if err != nil {
 		return fmt.Errorf("opening store %s: %w", dbPath, err)

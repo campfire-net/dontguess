@@ -4,6 +4,8 @@
 package exchange
 
 import (
+	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io/fs"
@@ -13,6 +15,7 @@ import (
 	"time"
 
 	"github.com/campfire-net/campfire/pkg/convention"
+	cfencoding "github.com/campfire-net/campfire/pkg/encoding"
 	"github.com/campfire-net/campfire/pkg/naming"
 	"github.com/campfire-net/campfire/pkg/protocol"
 )
@@ -20,6 +23,7 @@ import (
 // Config is the local operator config written after init.
 type Config struct {
 	ExchangeCampfireID string           `json:"exchange_campfire_id"`
+	ExchangeBeacon     string           `json:"exchange_beacon,omitempty"`
 	OperatorKeyHex     string           `json:"operator_key"`
 	ConventionVersion  string           `json:"convention_version"`
 	Alias              string           `json:"alias"`
@@ -53,20 +57,17 @@ type InitOptions struct {
 	Description string
 	// Force overwrites an existing config if present.
 	Force bool
+	// NamingRoot is the campfire ID of a naming registry. When set, naming.Register
+	// is called after the local alias is set, making the exchange discoverable by
+	// any agent that can read the registry. If empty, only the local alias is set.
+	NamingRoot string
 }
 
-func (o *InitOptions) configDir() string {
+func (o *InitOptions) initClient() (*protocol.Client, *protocol.InitResult, error) {
 	if o.ConfigDir != "" {
-		return o.ConfigDir
+		return protocol.InitWithConfig(protocol.WithConfigDir(o.ConfigDir))
 	}
-	if env := os.Getenv("CF_HOME"); env != "" {
-		return env
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join("/tmp", ".cf")
-	}
-	return filepath.Join(home, ".cf")
+	return protocol.InitWithConfig()
 }
 
 func (o *InitOptions) transport() protocol.Transport {
@@ -134,17 +135,20 @@ func LoadConfig(configDir string) (*Config, error) {
 // and opts.Force is false, returns the existing config without re-initializing
 // (the returned client is still open and must be closed).
 func Init(opts InitOptions) (*Config, *protocol.Client, error) {
-	configDir := opts.configDir()
+	// Open or create identity and store via SDK — uses config cascade.
+	// CF_HOME env and ~/.cf default are handled by InitWithConfig internally.
+	client, initResult, err := opts.initClient()
+	if err != nil {
+		return nil, nil, fmt.Errorf("protocol.InitWithConfig: %w", err)
+	}
+
+	// Derive configDir from the resolved store path (same directory).
+	configDir := filepath.Dir(initResult.StorePath)
 	configPath := ConfigPath(configDir)
 
 	if err := os.MkdirAll(configDir, 0700); err != nil {
+		client.Close() //nolint:errcheck
 		return nil, nil, fmt.Errorf("creating config dir: %w", err)
-	}
-
-	// Open or create identity and store via SDK.
-	client, _, err := protocol.Init(configDir)
-	if err != nil {
-		return nil, nil, fmt.Errorf("protocol.Init: %w", err)
 	}
 
 	// Check for existing config (after opening client so we can return it).
@@ -173,6 +177,13 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 
 	campfireID := createResult.CampfireID
 
+	// Generate portable beacon string (beacon:BASE64) for sharing.
+	// This is the same format produced by `cf share <campfireID>`.
+	var beaconStr string
+	if createResult.Beacon != nil {
+		beaconStr = beaconString(createResult.Beacon)
+	}
+
 	// Promote convention declarations.
 	if err := promoteDeclarations(opts.ConventionDir, opts.EmbeddedConventions, campfireID, client); err != nil {
 		// Non-fatal: log but don't fail init — operator can re-promote later.
@@ -196,9 +207,27 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 		fmt.Fprintf(os.Stderr, "warning: setting alias %q: %v\n", alias, err)
 	}
 
+	// Register in global naming registry if a root is configured.
+	// The naming root is the parent campfire for the alias domain. We register
+	// the first segment of the alias — the leaf name within that parent
+	// (e.g. "exchange" from "exchange.dontguess"). Each naming registry holds
+	// one level of the hierarchy, matching the cf:// name resolution model.
+	if opts.NamingRoot != "" {
+		segment := strings.SplitN(alias, ".", 2)[0]
+		if _, err := naming.Register(context.Background(), client, opts.NamingRoot, segment, campfireID, &naming.RegisterOptions{TTL: naming.MaxTTL}); err != nil {
+			// Non-fatal: naming registry failure doesn't block exchange use.
+			fmt.Fprintf(os.Stderr, "warning: registering name %q in root %s: %v\n", segment, shortCampfireID(opts.NamingRoot), err)
+		} else {
+			fmt.Fprintf(os.Stderr, "registered %q in naming root %s\n", segment, shortCampfireID(opts.NamingRoot))
+		}
+	} else {
+		fmt.Fprintf(os.Stderr, "warning: no naming root configured — exchange is not globally discoverable. Use --naming-root to register in a naming registry.\n")
+	}
+
 	// Write config.
 	cfg := &Config{
 		ExchangeCampfireID: campfireID,
+		ExchangeBeacon:     beaconStr,
 		OperatorKeyHex:     client.PublicKeyHex(),
 		ConventionVersion:  "0.1",
 		Alias:              alias,
@@ -436,6 +465,28 @@ func sendTaggedMessage(campfireID string, payload []byte, tags []string, client 
 		Tags:       tags,
 	})
 	return err
+}
+
+// beaconString encodes a beacon as the portable "beacon:BASE64" string format
+// used by `cf share` and `cf join`. Returns an empty string if b is nil or
+// encoding fails (non-fatal — config is still written without the beacon field).
+func beaconString(b any) string {
+	if b == nil {
+		return ""
+	}
+	data, err := cfencoding.Marshal(b)
+	if err != nil {
+		return ""
+	}
+	return "beacon:" + base64.StdEncoding.EncodeToString(data)
+}
+
+// shortCampfireID safely truncates a campfire ID to at most 12 characters for display.
+func shortCampfireID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12]
 }
 
 // writeConfig serializes cfg to configPath (mode 0600).

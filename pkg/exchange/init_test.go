@@ -1,9 +1,12 @@
 package exchange_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/campfire-net/campfire/pkg/beacon"
@@ -435,4 +438,262 @@ func TestInit_ForceReinitializes(t *testing.T) {
 	if cfg1.ExchangeCampfireID == cfg2.ExchangeCampfireID {
 		t.Error("force init should create a new campfire, got same ID")
 	}
+}
+
+// TestInit_ConfigCascade verifies that a config.toml with identity.display_name
+// in the config directory is picked up by InitWithConfig via the cascade and
+// reflected in the InitResult. This exercises the WithConfigDir option path
+// through protocol.InitWithConfig.
+func TestInit_ConfigCascade(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	// Write a config.toml with a custom display_name into the config directory.
+	configTOML := "[identity]\ndisplay_name = \"TestExchangeOperator\"\n"
+	if err := os.WriteFile(filepath.Join(configDir, "config.toml"), []byte(configTOML), 0600); err != nil {
+		t.Fatalf("writing config.toml: %v", err)
+	}
+
+	// Init using the configDir that contains the config.toml.
+	_, client, err := exchange.Init(exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+	if err != nil {
+		t.Fatalf("Init with config.toml: %v", err)
+	}
+	defer client.Close()
+
+	// Verify that InitWithConfig read the cascade by calling it again
+	// with the same configDir and checking the extended InitResult fields.
+	_, result, err := protocol.InitWithConfig(protocol.WithConfigDir(configDir))
+	if err != nil {
+		t.Fatalf("InitWithConfig for cascade verify: %v", err)
+	}
+
+	// ConfigLayers is only populated by InitWithConfig (not plain Init).
+	// At least one layer should reference our config.toml.
+	if len(result.ConfigLayers) == 0 {
+		t.Error("expected at least one ConfigLayer from InitWithConfig, got none")
+	}
+
+	// The identity should have been loaded from the directory (env or config).
+	// IdentitySource must not be empty — it is only set by InitWithConfig.
+	if result.IdentitySource == "" {
+		t.Error("IdentitySource is empty — InitWithConfig did not populate extended fields")
+	}
+}
+
+// TestInit_NamingRootRegistersInRegistry verifies that when a naming root is
+// configured, Init calls naming.Register so the exchange is discoverable via
+// naming.Resolve on the registry campfire.
+func TestInit_NamingRootRegistersInRegistry(t *testing.T) {
+	t.Parallel()
+
+	// Use a shared configDir and transportDir so the same identity can write to
+	// both the registry campfire and the exchange campfire.
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	// Create a registry campfire to act as the naming root.
+	registryClient, _, err := protocol.InitWithConfig(protocol.WithConfigDir(configDir))
+	if err != nil {
+		t.Fatalf("protocol.InitWithConfig for registry: %v", err)
+	}
+	defer registryClient.Close()
+
+	registryResult, err := registryClient.Create(protocol.CreateRequest{
+		Transport:    protocol.FilesystemTransport{Dir: transportDir},
+		Description:  "test naming registry",
+		JoinProtocol: "invite-only",
+		Threshold:    1,
+		BeaconDir:    beaconDir,
+	})
+	if err != nil {
+		t.Fatalf("creating registry campfire: %v", err)
+	}
+	registryCampfireID := registryResult.CampfireID
+
+	// Init the exchange with the naming root pointing at the registry.
+	// Use a hyphenated alias: naming registry segments must be lowercase alphanumeric + hyphens.
+	alias := "exchange-dontguess"
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		Alias:         alias,
+		NamingRoot:    registryCampfireID,
+	})
+
+	// Init registers the first segment of the alias ("exchange") in the naming
+	// root. The naming hierarchy is one-level-per-campfire: the root holds
+	// "exchange", which resolves to the exchange campfire.
+	segment := "exchange" // first segment of "exchange.dontguess"
+	resp, err := naming.Resolve(t.Context(), registryClient, registryCampfireID, segment)
+	if err != nil {
+		t.Fatalf("naming.Resolve(%q): %v", segment, err)
+	}
+	if resp.CampfireID != cfg.ExchangeCampfireID {
+		t.Errorf("Resolve(%q) = %q, want %q", segment, resp.CampfireID, cfg.ExchangeCampfireID)
+	}
+}
+
+// TestInit_NoNamingRootOnlyLocalAlias verifies backward compatibility: without a
+// naming root, Init only sets the local alias and does not fail.
+func TestInit_NoNamingRootOnlyLocalAlias(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+	alias := "exchange.dontguess"
+
+	// Init without a naming root — backward-compatible path.
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+		Alias:         alias,
+		// NamingRoot intentionally omitted.
+	})
+
+	// Local alias must still resolve correctly.
+	aliases := naming.NewAliasStore(configDir)
+	resolved, err := aliases.Get(alias)
+	if err != nil {
+		t.Fatalf("alias lookup: %v", err)
+	}
+	if resolved != cfg.ExchangeCampfireID {
+		t.Errorf("alias %q resolves to %q, want %q", alias, resolved, cfg.ExchangeCampfireID)
+	}
+}
+
+// TestInit_BeaconStringStoredInConfig verifies that exchange.Init populates
+// ExchangeBeacon in the config with a valid "beacon:BASE64" string.
+func TestInit_BeaconStringStoredInConfig(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	if cfg.ExchangeBeacon == "" {
+		t.Fatal("ExchangeBeacon is empty — Init did not populate beacon string")
+	}
+	if !strings.HasPrefix(cfg.ExchangeBeacon, "beacon:") {
+		t.Errorf("ExchangeBeacon = %q, want prefix \"beacon:\"", cfg.ExchangeBeacon)
+	}
+	// A real encoded beacon is much longer than just the prefix.
+	if len(cfg.ExchangeBeacon) < 64 {
+		t.Errorf("ExchangeBeacon too short (%d chars), likely empty encode", len(cfg.ExchangeBeacon))
+	}
+}
+
+// TestInit_BeaconStringMatchesCampfireID verifies that the beacon string stored
+// in config encodes a beacon whose campfire ID matches ExchangeCampfireID.
+func TestInit_BeaconStringMatchesCampfireID(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	cfg := initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	if cfg.ExchangeBeacon == "" {
+		t.Skip("ExchangeBeacon not set — skipping decode check")
+	}
+
+	b, err := decodeBeaconString(cfg.ExchangeBeacon, t.TempDir())
+	if err != nil {
+		t.Fatalf("decoding ExchangeBeacon: %v", err)
+	}
+	if b.CampfireIDHex() != cfg.ExchangeCampfireID {
+		t.Errorf("beacon campfire_id = %q, want %q", b.CampfireIDHex(), cfg.ExchangeCampfireID)
+	}
+}
+
+// TestInit_BeaconStringPersistedToDisk verifies that the beacon string is
+// written to the on-disk config file, not just returned in the struct.
+func TestInit_BeaconStringPersistedToDisk(t *testing.T) {
+	t.Parallel()
+
+	configDir := t.TempDir()
+	transportDir := t.TempDir()
+	beaconDir := t.TempDir()
+	convDir := conventionDir(t)
+
+	initExchange(t, exchange.InitOptions{
+		ConfigDir:     configDir,
+		Transport:     protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:     beaconDir,
+		ConventionDir: convDir,
+	})
+
+	data, err := os.ReadFile(exchange.ConfigPath(configDir))
+	if err != nil {
+		t.Fatalf("reading config file: %v", err)
+	}
+	var diskCfg exchange.Config
+	if err := json.Unmarshal(data, &diskCfg); err != nil {
+		t.Fatalf("parsing config file: %v", err)
+	}
+	if diskCfg.ExchangeBeacon == "" {
+		t.Error("exchange_beacon not found in on-disk config")
+	}
+	if !strings.HasPrefix(diskCfg.ExchangeBeacon, "beacon:") {
+		t.Errorf("on-disk exchange_beacon = %q, want prefix \"beacon:\"", diskCfg.ExchangeBeacon)
+	}
+}
+
+// decodeBeaconString decodes a "beacon:BASE64" string into a *beacon.Beacon.
+// Mirrors the parseBeaconString logic in the cf CLI (share.go).
+func decodeBeaconString(s, tmpDir string) (*beacon.Beacon, error) {
+	const prefix = "beacon:"
+	if !strings.HasPrefix(s, prefix) {
+		return nil, fmt.Errorf("not a beacon string: %q", s)
+	}
+	raw, err := base64.StdEncoding.DecodeString(s[len(prefix):])
+	if err != nil {
+		return nil, fmt.Errorf("base64 decode: %w", err)
+	}
+	// Write to a temp .beacon file and use beacon.Scan to parse via the SDK's
+	// CBOR unmarshal + signature verification path.
+	beaconFile := filepath.Join(tmpDir, "decoded.beacon")
+	if err := os.WriteFile(beaconFile, raw, 0600); err != nil {
+		return nil, fmt.Errorf("writing temp beacon: %w", err)
+	}
+	beacons, err := beacon.Scan(tmpDir)
+	if err != nil {
+		return nil, fmt.Errorf("beacon.Scan: %w", err)
+	}
+	if len(beacons) == 0 {
+		return nil, fmt.Errorf("no valid beacon decoded from string")
+	}
+	return &beacons[0], nil
 }

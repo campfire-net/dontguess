@@ -15,6 +15,7 @@ var (
 	initAlias         string
 	initDescription   string
 	initForce         bool
+	initNamingRoot    string
 )
 
 var initCmd = &cobra.Command{
@@ -36,6 +37,7 @@ func init() {
 	initCmd.Flags().StringVar(&initAlias, "alias", "", "naming alias for the exchange (default: exchange.dontguess)")
 	initCmd.Flags().StringVar(&initDescription, "description", "", "exchange description for beacon")
 	initCmd.Flags().BoolVar(&initForce, "force", false, "reinitialize even if config exists")
+	initCmd.Flags().StringVar(&initNamingRoot, "naming-root", "", "campfire ID of the naming registry for globally discoverable registration")
 	rootCmd.AddCommand(initCmd)
 }
 
@@ -46,6 +48,7 @@ func runInit(_ *cobra.Command, _ []string) error {
 		Alias:               initAlias,
 		Description:         initDescription,
 		Force:               initForce,
+		NamingRoot:          initNamingRoot,
 	}
 
 	cfg, client, err := exchange.Init(opts)
@@ -65,7 +68,12 @@ func runInit(_ *cobra.Command, _ []string) error {
 	fmt.Printf("  operator: %s\n", cfg.OperatorKeyHex)
 	fmt.Printf("  alias:    %s\n", cfg.Alias)
 	fmt.Printf("  version:  %s\n", cfg.ConventionVersion)
-	fmt.Printf("\nNext: cf join %s...\n", cfg.ExchangeCampfireID[:16])
+	if cfg.ExchangeBeacon != "" {
+		fmt.Printf("  beacon:   %s\n", cfg.ExchangeBeacon)
+		fmt.Printf("\nNext: cf join %s\n", cfg.ExchangeBeacon)
+	} else {
+		fmt.Printf("\nNext: cf join %s...\n", cfg.ExchangeCampfireID[:16])
+	}
 	fmt.Printf("      cf %s put --help\n", cfg.Alias)
 	return nil
 }

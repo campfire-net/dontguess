@@ -77,9 +77,9 @@ func main() {
 	}
 
 	// Load or generate seller identity and open store via SDK.
-	client, _, err := protocol.Init(cfHome)
+	client, _, err := protocol.InitWithConfig(protocol.WithConfigDir(cfHome))
 	if err != nil {
-		log.Fatalf("protocol.Init: %v", err)
+		log.Fatalf("protocol.InitWithConfig: %v", err)
 	}
 	defer client.Close()
 

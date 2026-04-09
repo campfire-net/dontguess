@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 
 	cfconvention "github.com/campfire-net/campfire/pkg/convention"
 	"github.com/campfire-net/campfire/pkg/protocol"
@@ -272,28 +271,14 @@ func sendSupersede(payload []byte, campfireID string, client *protocol.Client) (
 	return msg.ID, nil
 }
 
-// requireClient initializes a protocol.Client from the campfire home directory.
-// Uses CF_HOME env var or ~/.cf as the campfire home directory.
+// requireClient initializes a protocol.Client using the config cascade.
+// Reads CF_HOME env var or ~/.cf via SDK InitWithConfig.
 func requireClient() (*protocol.Client, error) {
-	home := cfHome()
-	client, _, err := protocol.Init(home)
+	client, _, err := protocol.InitWithConfig()
 	if err != nil {
-		return nil, fmt.Errorf("initializing campfire client from %s: %w", home, err)
+		return nil, fmt.Errorf("initializing campfire client: %w", err)
 	}
 	return client, nil
-}
-
-// cfHome returns the campfire home directory.
-func cfHome() string {
-	if env := os.Getenv("CF_HOME"); env != "" {
-		return env
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: cannot determine home directory: %v\n", err)
-		os.Exit(1)
-	}
-	return filepath.Join(home, ".cf")
 }
 
 // shortID returns the first 12 characters of a message or campfire ID.
