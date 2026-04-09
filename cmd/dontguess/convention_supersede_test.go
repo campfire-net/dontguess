@@ -131,7 +131,7 @@ type testAgentResult struct {
 func testAgent(t *testing.T) *testAgentResult {
 	t.Helper()
 	cfHome := t.TempDir()
-	client, err := protocol.Init(cfHome)
+	client, _, err := protocol.Init(cfHome)
 	if err != nil {
 		t.Fatalf("protocol.Init for test agent: %v", err)
 	}

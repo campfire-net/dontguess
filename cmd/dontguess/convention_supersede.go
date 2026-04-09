@@ -276,7 +276,7 @@ func sendSupersede(payload []byte, campfireID string, client *protocol.Client) (
 // Uses CF_HOME env var or ~/.campfire as the campfire home directory.
 func requireClient() (*protocol.Client, error) {
 	home := cfHome()
-	client, err := protocol.Init(home)
+	client, _, err := protocol.Init(home)
 	if err != nil {
 		return nil, fmt.Errorf("initializing campfire client from %s: %w", home, err)
 	}

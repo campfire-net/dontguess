@@ -62,13 +62,13 @@ func runServe(_ *cobra.Command, _ []string) error {
 	// Build two clients via protocol.Init — both share the same identity and store file.
 	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
 	// SDK sync-before-query handles filesystem transport sync automatically.
-	readClient, err := protocol.Init(cfHome)
+	readClient, _, err := protocol.Init(cfHome)
 	if err != nil {
 		return fmt.Errorf("protocol.Init (read client): %w", err)
 	}
 	defer readClient.Close() //nolint:errcheck
 
-	writeClient, err := protocol.Init(cfHome)
+	writeClient, _, err := protocol.Init(cfHome)
 	if err != nil {
 		return fmt.Errorf("protocol.Init (write client): %w", err)
 	}

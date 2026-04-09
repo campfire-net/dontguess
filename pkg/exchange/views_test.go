@@ -25,7 +25,7 @@ func TestInit_CreatesNamedViews(t *testing.T) {
 	})
 
 	// Use protocol.Init to read messages via SDK.
-	verifyClient, err := protocol.Init(cfHome)
+	verifyClient, _, err := protocol.Init(cfHome)
 	if err != nil {
 		t.Fatalf("protocol.Init for verify: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestEnsureViews_Idempotent(t *testing.T) {
 	})
 
 	// Use protocol.Init to get a client; EnsureViews reads via client.Read.
-	client, err := protocol.Init(cfHome)
+	client, _, err := protocol.Init(cfHome)
 	if err != nil {
 		t.Fatalf("protocol.Init: %v", err)
 	}
