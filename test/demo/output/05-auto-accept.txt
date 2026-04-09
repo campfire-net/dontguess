@@ -1,0 +1,178 @@
+# Using system dontguess-operator: /home/baron/.local/bin/dontguess-operator
+
+=== SECTION: operator-identity ===
+$ cf init --cf-home $CF_HOME
+Your identity campfire: a9e6a2228f0baa601f986836962eb221b6557ea197f2727778b6f4e7a94351c1. Share it like any beacon.
+
+Next: cf discover    find campfires
+      cf create      start one
+      cf join <id>   join one
+
+=== SECTION: init ===
+$ dontguess init
+warning: skipping assign.json (lint failed): [{error unmappable_tag tag glob "exchange:assign-entry:*" has no arg that can produce values with prefix "exchange:assign-entry:" produces_tags[2]}]
+info: put-v0.3.json supersedes put-v0.2.json for dontguess-exchange:put (v0.3.0 > v0.2.0)
+info: skipping put.json — put-v0.3.json is a higher version for dontguess-exchange:put
+warning: skipping loan-mint.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]} {error unmappable_tag tag glob "scrip:to:*" has no arg that can produce values with prefix "scrip:to:" produces_tags[2]}]
+warning: skipping loan-repay.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
+warning: skipping loan-vig-accrue.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
+created 6 named views
+Exchange initialized
+  campfire: 261b9725bef9c0e6fdb0d195d18f3313f81638c309cdc0ab2addcc2208f94374
+  operator: e03064a3f6c547ee69afbe8b232aa61f414b11c2945a53c4ec2519c97bd71b2d
+  alias:    exchange.dontguess
+  version:  0.1
+
+Next: cf join 261b9725bef9c0e6...
+      cf exchange.dontguess put --help
+# exchange campfire: 261b9725bef9c0e6fdb0d195d18f3313f81638c309cdc0ab2addcc2208f94374
+
+=== SECTION: seller-identity ===
+$ CF_HOME=$SELLER_CF cf init
+Your identity campfire: 772164ed0333e269b6f29247086789cd4c8a75f8dcba8a7f4065b547da38b5e0. Share it like any beacon.
+
+Next: cf discover    find campfires
+      cf create      start one
+      cf join <id>   join one
+# Seller identity created at: /tmp/dontguess-demo-05-Zuch/seller/.cf
+
+=== SECTION: seller-admit ===
+# Seller public key: 828f74e0889709d21a41e0daa3b18a6d4cff4da2f87583b1043b5a79d872800c
+$ cf --cf-home $CF_HOME admit $XCFID $SELLER_PUBKEY
+Admitted 828f74e08897 to campfire 261b9725bef9 (role: full)
+# Seller admitted to exchange campfire
+
+=== SECTION: seller-join ===
+$ CF_HOME=$SELLER_CF cf join $XCFID
+Joined campfire 261b9725bef9
+trust: unknown
+  [unknown] dontguess-exchange:match
+  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:assign-claim
+  [unknown] dontguess-exchange:settle
+  [unknown] dontguess-exchange:scrip:assign-pay
+  [unknown] dontguess-exchange:scrip:put-pay
+  [unknown] dontguess-exchange:scrip:settle
+  [unknown] dontguess-exchange:assign-reject
+  [unknown] dontguess-exchange:put
+  [unknown] dontguess-exchange:scrip:burn
+  [unknown] dontguess-exchange:scrip:dispute-refund
+  [unknown] dontguess-exchange:assign-accept
+  [unknown] dontguess-exchange:assign-auction-close
+  [unknown] dontguess-exchange:assign-complete
+  [unknown] dontguess-exchange:assign-expire
+  [unknown] dontguess-exchange:buy
+  [unknown] dontguess-exchange:scrip:mint
+  [unknown] dontguess-exchange:scrip:rate-publish
+# Seller joined exchange campfire: 261b9725bef9c0e6fdb0d195d18f3313f81638c309cdc0ab2addcc2208f94374
+
+=== SECTION: put ===
+# Sending put 1: token_cost=1000 (below threshold — will auto-accept)
+# put 1: 7876fddc-0836-438f-8eb7-6586debf5411
+
+# Sending put 2: token_cost=2000 (below threshold — will auto-accept)
+# put 2: e64f0d48-0582-4d9a-97b2-7b497f469b6f
+
+# Sending put 3: token_cost=3000 (below threshold — will auto-accept)
+# put 3: 29e6c9c6-29e1-4570-af8e-c08c5021f92f
+
+# Sending put 4: token_cost=4000 (below threshold — will auto-accept)
+# put 4: 5f4d7afc-86e5-4ba2-89f9-6a8b1a4b94bc
+
+# Sending put 5: token_cost=6000 (ABOVE threshold 5000 — will be skipped)
+# put 5: f68271f4-0503-4851-ab83-26430a4e8ae1
+
+# 5 puts sent. token costs: 1000, 2000, 3000, 4000, 6000
+# max-price threshold: 5000 — puts 1-4 should auto-accept, put 5 should be skipped
+
+=== SECTION: serve ===
+$ dontguess serve --poll-interval 500ms --auto-accept-max-price 5000 &
+# Waiting for engine to start and replay messages...
+# Exchange engine is running (PID 689957)
+2026/04/09 18:26:05 [exchange] exchange serving
+2026/04/09 18:26:05 [exchange]   campfire:  261b9725bef9c0e6...
+2026/04/09 18:26:05 [exchange]   operator:  e03064a3f6c547ee...
+2026/04/09 18:26:05 [exchange]   auto-accept: true (max 5000)
+2026/04/09 18:26:05 [exchange] engine: replayed 30 messages, indexed 0 entries
+
+=== SECTION: verify-accept ===
+# Waiting for 4 put-accept settle messages (up to 30s)...
+# 4 put-accept settlements received (settle count: 4)
+$ cf read $XCFID --all --tag exchange:settle
+Settle messages: 4
+  id=7b4fe9d6-ad8 tags=['exchange:settle', 'exchange:phase:put-accept', 'exchange:verdict:accepted']
+  status=? entry_id=5f4d7afc-86e scrip=?
+  id=b0f481af-664 tags=['exchange:settle', 'exchange:phase:put-accept', 'exchange:verdict:accepted']
+  status=? entry_id=7876fddc-083 scrip=?
+  id=4e1fef96-72e tags=['exchange:settle', 'exchange:phase:put-accept', 'exchange:verdict:accepted']
+  status=? entry_id=e64f0d48-058 scrip=?
+  id=8fdc83bc-765 tags=['exchange:settle', 'exchange:phase:put-accept', 'exchange:verdict:accepted']
+  status=? entry_id=29e6c9c6-29e scrip=?
+
+=== SECTION: verify-skip ===
+# Checking serve log for skip message for the 6000-token put...
+$ grep 'skipping put' $SERVE_LOG
+# SKIP confirmed:
+2026/04/09 18:26:06 [exchange] skipping put f68271f4: token cost 6000 > max 5000
+2026/04/09 18:26:08 [exchange] skipping put f68271f4: token cost 6000 > max 5000
+
+# Checking that put 5 has no settle message...
+# Total settle messages: 4 (expected: 4)
+
+=== SECTION: summary ===
+Exchange campfire:    261b9725bef9c0e6fdb0d195d18f3313f81638c309cdc0ab2addcc2208f94374
+Max-price threshold:  5000 tokens
+
+Puts sent:
+  put 1 (token_cost=1000): 7876fddc-0836-438f-8eb7-6586debf5411  → auto-accepted (scrip = 700)
+  put 2 (token_cost=2000): e64f0d48-0582-4d9a-97b2-7b497f469b6f  → auto-accepted (scrip = 1400)
+  put 3 (token_cost=3000): 29e6c9c6-29e1-4570-af8e-c08c5021f92f  → auto-accepted (scrip = 2100)
+  put 4 (token_cost=4000): 5f4d7afc-86e5-4ba2-89f9-6a8b1a4b94bc  → auto-accepted (scrip = 2800)
+  put 5 (token_cost=6000): f68271f4-0503-4851-ab83-26430a4e8ae1  → skipped (6000 > 5000)
+
+Settlements expected: 4, skipped: 1
+Settlements received: 4
+
+# PASS: 4 puts auto-accepted, 1 skipped
+
+Serve log:
+2026/04/09 18:26:05 [exchange]   embedder:  dense (all-MiniLM-L6-v2) via /home/baron/projects/dontguess/cmd/embed/main.py
+2026/04/09 18:26:05 [exchange] exchange serving
+2026/04/09 18:26:05 [exchange]   campfire:  261b9725bef9c0e6...
+2026/04/09 18:26:05 [exchange]   operator:  e03064a3f6c547ee...
+2026/04/09 18:26:05 [exchange]   poll:      500ms
+2026/04/09 18:26:05 [exchange]   auto-accept: true (max 5000)
+2026/04/09 18:26:05 [exchange]   store:     /tmp/dontguess-demo-05-Zuch/.cf/store.db
+
+--- Agent connection info ---
+EXCHANGE_CAMPFIRE=261b9725bef9c0e6fdb0d195d18f3313f81638c309cdc0ab2addcc2208f94374
+OPERATOR_KEY=e03064a3f6c547ee69afbe8b232aa61f414b11c2945a53c4ec2519c97bd71b2d
+
+Agents join with:
+  cf join 261b9725bef9c0e6
+
+2026/04/09 18:26:05 [exchange] engine: replayed 30 messages, indexed 0 entries
+2026/04/09 18:26:06 [exchange] engine: replayed 30 messages, indexed 0 entries
+2026/04/09 18:26:06 [exchange] engine: compression assign sent assign_id=9855ac8a entry=5f4d7afc seller=828f74e0 bounty=2000
+2026/04/09 18:26:06 [exchange] auto-accepted put 5f4d7afc: price=2800 (token_cost=4000)
+2026/04/09 18:26:06 [exchange] skipping put f68271f4: token cost 6000 > max 5000
+2026/04/09 18:26:06 [exchange] engine: replayed 32 messages, indexed 1 entries
+2026/04/09 18:26:07 [exchange] engine: compression assign sent assign_id=4efa6d37 entry=7876fddc seller=828f74e0 bounty=500
+2026/04/09 18:26:07 [exchange] auto-accepted put 7876fddc: price=700 (token_cost=1000)
+2026/04/09 18:26:07 [exchange] engine: assign posted assign_id=9855ac8a
+2026/04/09 18:26:07 [exchange] engine: assign posted assign_id=4efa6d37
+2026/04/09 18:26:07 [exchange] engine: replayed 34 messages, indexed 2 entries
+2026/04/09 18:26:07 [exchange] engine: compression assign sent assign_id=6b69c3cb entry=e64f0d48 seller=828f74e0 bounty=1000
+2026/04/09 18:26:07 [exchange] auto-accepted put e64f0d48: price=1400 (token_cost=2000)
+2026/04/09 18:26:07 [exchange] engine: assign posted assign_id=6b69c3cb
+2026/04/09 18:26:08 [exchange] engine: replayed 36 messages, indexed 3 entries
+2026/04/09 18:26:08 [exchange] engine: compression assign sent assign_id=f38defe0 entry=29e6c9c6 seller=828f74e0 bounty=1500
+2026/04/09 18:26:08 [exchange] auto-accepted put 29e6c9c6: price=2100 (token_cost=3000)
+2026/04/09 18:26:08 [exchange] skipping put f68271f4: token cost 6000 > max 5000
+
+# Demo complete. Transcript written to: /home/baron/projects/dontguess/test/demo/output/05-auto-accept.txt
+
+=== SECTION: cleanup ===
+$ kill $SERVE_PID
+$ rm -rf $TMP
+cleanup complete.
