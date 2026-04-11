@@ -11,6 +11,79 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// ---- Security regression tests for buildLogDest (dontguess-ba9c) ----
+
+// TestBuildLogDest_RejectsSymlink verifies that buildLogDest returns an error
+// when the log path is a pre-existing symlink, preventing a symlink attack
+// where an attacker redirects operator logs into an arbitrary writable file.
+// Regression test for dontguess-ba9c.
+func TestBuildLogDest_RejectsSymlink(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	targetPath := filepath.Join(dir, "target.txt")
+	if err := os.WriteFile(targetPath, []byte("original content\n"), 0600); err != nil {
+		t.Fatalf("creating target file: %v", err)
+	}
+
+	// Create a symlink at the expected log path pointing to the target.
+	logPath := filepath.Join(dir, "dontguess.log")
+	if err := os.Symlink(targetPath, logPath); err != nil {
+		t.Fatalf("os.Symlink: %v", err)
+	}
+
+	_, err := buildLogDest(dir)
+	if err == nil {
+		t.Fatal("buildLogDest returned nil error for a symlink log path — symlink attack not prevented")
+	}
+	if !strings.Contains(err.Error(), "symlink") {
+		t.Errorf("error message %q does not mention 'symlink'", err.Error())
+	}
+	t.Logf("correctly rejected symlink: %v", err)
+
+	// Verify the target file was NOT written to (no log data appended).
+	data, readErr := os.ReadFile(targetPath)
+	if readErr != nil {
+		t.Fatalf("reading target file: %v", readErr)
+	}
+	if string(data) != "original content\n" {
+		t.Errorf("target file was modified — symlink write occurred: %q", string(data))
+	}
+}
+
+// TestBuildLogDest_AcceptsRegularFile verifies that buildLogDest succeeds and
+// writes to a pre-existing regular log file (not a symlink).
+// Regression test for dontguess-ba9c (normal path must still work).
+func TestBuildLogDest_AcceptsRegularFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "dontguess.log")
+	// Pre-create a regular file (not a symlink).
+	if err := os.WriteFile(logPath, []byte("previous log line\n"), 0600); err != nil {
+		t.Fatalf("creating log file: %v", err)
+	}
+
+	w, err := buildLogDest(dir)
+	if err != nil {
+		t.Fatalf("buildLogDest returned unexpected error: %v", err)
+	}
+
+	const msg = "test line from TestBuildLogDest_AcceptsRegularFile\n"
+	if _, writeErr := io.WriteString(w, msg); writeErr != nil {
+		t.Fatalf("writing to log dest: %v", writeErr)
+	}
+
+	data, readErr := os.ReadFile(logPath)
+	if readErr != nil {
+		t.Fatalf("reading log file: %v", readErr)
+	}
+	if !strings.Contains(string(data), "test line from TestBuildLogDest_AcceptsRegularFile") {
+		t.Errorf("log message not written to file — content: %q", string(data))
+	}
+	t.Logf("regular file accepted and written successfully")
+}
+
 // TestLogRotation_Setup verifies that writing >10MB to the log destination
 // triggers lumberjack rotation, leaving the active log file plus at least one
 // rotated backup in the temp directory.
@@ -110,7 +183,10 @@ func TestLogRotation_DGHomeOverride(t *testing.T) {
 	// Set DG_HOME to the temp dir; buildLogDest should use it.
 	t.Setenv("DG_HOME", dir)
 
-	dest := buildLogDest("/should/not/be/used")
+	dest, err := buildLogDest("/should/not/be/used")
+	if err != nil {
+		t.Fatalf("buildLogDest: %v", err)
+	}
 
 	const msg = "dg_home override test line\n"
 	if _, err := io.WriteString(dest, msg); err != nil {
