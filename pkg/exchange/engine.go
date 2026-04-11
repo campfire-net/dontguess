@@ -2393,6 +2393,49 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 	return nil
 }
 
+// RejectPut sends a settle(put-reject) for a pending put message, rejecting it
+// from inventory. The put must be in the pending state. After rejection the put
+// is no longer actionable and will be pruned from heldForReview on the next
+// RunAutoAccept tick.
+func (e *Engine) RejectPut(putMsgID string, reason string) error {
+	// Replay to ensure state is current before checking.
+	if err := e.replayAll(); err != nil {
+		return fmt.Errorf("replay before put-reject: %w", err)
+	}
+
+	_, pending := e.state.GetPendingPut(putMsgID)
+	if !pending {
+		return fmt.Errorf("put %s is not pending", putMsgID)
+	}
+
+	payload, err := json.Marshal(map[string]any{
+		"phase":    SettlePhaseStrPutReject,
+		"entry_id": putMsgID,
+		"reason":   reason,
+	})
+	if err != nil {
+		return fmt.Errorf("encoding put-reject payload: %w", err)
+	}
+
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrPutReject,
+		TagVerdictPrefix + "rejected",
+	}
+	antecedents := []string{putMsgID}
+
+	rec, err := e.sendOperatorMessage(payload, tags, antecedents)
+	if err != nil {
+		return err
+	}
+
+	// Apply immediately so state is consistent before the next poll.
+	if rec != nil {
+		e.state.Apply(rec)
+	}
+	return nil
+}
+
 // sendBrokeredMatchAssign posts an exchange:assign with task_type="brokered-match"
 // for the given buy message. Workers claim, search inventory, and deliver ranked
 // results. The assign payload carries the buyer's task description, the buy message
