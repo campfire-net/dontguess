@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/signal"
@@ -16,6 +17,7 @@ import (
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/pkg/store"
 	"github.com/spf13/cobra"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
 
 var (
@@ -91,7 +93,8 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating scrip store: %w", err)
 	}
 
-	logger := log.New(os.Stderr, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
+	logDest := buildLogDest(cfHome)
+	logger := log.New(logDest, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
 
 	provCfg := provenance.DefaultConfig()
 	provCfg.AllowSelfAttestation = true
@@ -154,6 +157,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
 	logger.Printf("  store:     %s", dbPath)
+	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(cfHome, "dontguess.log"))
 
 	fmt.Printf("\n--- Agent connection info ---\n")
 	fmt.Printf("EXCHANGE_CAMPFIRE=%s\n", cfg.ExchangeCampfireID)
@@ -185,5 +189,23 @@ func runServe(_ *cobra.Command, _ []string) error {
 
 	logger.Printf("exchange shut down")
 	return nil
+}
+
+// buildLogDest constructs the io.Writer used for the exchange logger.
+// Logs go to both stderr (for foreground operation) and a rotating file
+// at $dgHome/dontguess.log (10 MB max, 5 backups, 28-day retention, gzip).
+// dgHome is resolved from DG_HOME env var, falling back to $HOME/.cf.
+func buildLogDest(dgHome string) io.Writer {
+	if override := os.Getenv("DG_HOME"); override != "" {
+		dgHome = override
+	}
+	roller := &lumberjack.Logger{
+		Filename:   filepath.Join(dgHome, "dontguess.log"),
+		MaxSize:    10, // megabytes
+		MaxBackups: 5,
+		MaxAge:     28, // days
+		Compress:   true,
+	}
+	return io.MultiWriter(os.Stderr, roller)
 }
 
