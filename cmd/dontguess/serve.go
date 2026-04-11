@@ -162,16 +162,18 @@ func runServe(_ *cobra.Command, _ []string) error {
 	fmt.Printf("  cf join %s\n\n", cfg.ExchangeCampfireID[:16])
 
 	// Auto-accept goroutine.
+	// skippedPuts is owned exclusively by this goroutine — no mutex needed.
 	if serveAutoAccept {
 		go func() {
+			skippedPuts := make(map[string]struct{})
 			ticker := time.NewTicker(1 * time.Second)
 			defer ticker.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
-				case <-ticker.C:
-					autoAcceptPuts(eng, logger)
+				case t := <-ticker.C:
+					eng.RunAutoAccept(serveAutoAcceptMax, t, skippedPuts)
 				}
 			}
 		}()
@@ -185,21 +187,3 @@ func runServe(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-func autoAcceptPuts(eng *exchange.Engine, logger *log.Logger) {
-	pending := eng.State().PendingPuts()
-	for _, entry := range pending {
-		if entry.TokenCost > serveAutoAcceptMax {
-			logger.Printf("skipping put %s: token cost %d > max %d",
-				entry.PutMsgID[:8], entry.TokenCost, serveAutoAcceptMax)
-			continue
-		}
-		price := entry.TokenCost * 70 / 100
-		expires := time.Now().Add(72 * time.Hour)
-		if err := eng.AutoAcceptPut(entry.PutMsgID, price, expires); err != nil {
-			logger.Printf("auto-accept put %s failed: %v", entry.PutMsgID[:8], err)
-		} else {
-			logger.Printf("auto-accepted put %s: price=%d (token_cost=%d)",
-				entry.PutMsgID[:8], price, entry.TokenCost)
-		}
-	}
-}

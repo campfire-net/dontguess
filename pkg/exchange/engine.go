@@ -2723,3 +2723,53 @@ func (e *Engine) stagePredictions(settledEntryID string) {
 			shortKey(predEntryID), deadlineStr)
 	}
 }
+
+// RunAutoAccept processes pending puts for one auto-accept tick.
+//
+// For each pending put:
+//   - If TokenCost <= max: call AutoAcceptPut (log success or error as before).
+//   - If TokenCost > max and NOT in skippedPuts: log skip once, insert into map.
+//   - If TokenCost > max and already in skippedPuts: silently skip.
+//
+// Lazy prune: IDs in skippedPuts that are no longer in the pending snapshot are
+// removed so that if a put is later accepted (or removed) and re-submitted, it
+// is logged again.
+//
+// Thread safety: skippedPuts is owned exclusively by the caller goroutine.
+// No mutex is needed here — the goroutine in serve.go is the sole writer.
+func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]struct{}) {
+	pending := e.State().PendingPuts()
+
+	// Build a set of current pending IDs for O(1) prune lookups.
+	pendingIDs := make(map[string]struct{}, len(pending))
+	for _, entry := range pending {
+		pendingIDs[entry.PutMsgID] = struct{}{}
+	}
+
+	// Lazy prune: remove stale entries from skippedPuts.
+	for id := range skippedPuts {
+		if _, ok := pendingIDs[id]; !ok {
+			delete(skippedPuts, id)
+		}
+	}
+
+	// Process each pending put.
+	for _, entry := range pending {
+		if entry.TokenCost > max {
+			if _, alreadyLogged := skippedPuts[entry.PutMsgID]; !alreadyLogged {
+				e.opts.log("skipping put %s: token cost %d > max %d",
+					entry.PutMsgID[:8], entry.TokenCost, max)
+				skippedPuts[entry.PutMsgID] = struct{}{}
+			}
+			continue
+		}
+		price := entry.TokenCost * 70 / 100
+		expires := now.Add(72 * time.Hour)
+		if err := e.AutoAcceptPut(entry.PutMsgID, price, expires); err != nil {
+			e.opts.log("auto-accept put %s failed: %v", entry.PutMsgID[:8], err)
+		} else {
+			e.opts.log("auto-accepted put %s: price=%d (token_cost=%d)",
+				entry.PutMsgID[:8], price, entry.TokenCost)
+		}
+	}
+}
