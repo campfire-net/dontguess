@@ -2728,15 +2728,19 @@ func (e *Engine) stagePredictions(settledEntryID string) {
 //
 // For each pending put:
 //   - If TokenCost <= max: call AutoAcceptPut (log success or error as before).
-//   - If TokenCost > max and NOT in skippedPuts: log skip once, insert into map.
+//   - If TokenCost > max and NOT in skippedPuts: log skip once, insert into
+//     skippedPuts (log-once guard) AND call State.HoldPutForReview (in-memory
+//     classification for the operator CLI via PutsHeldForReview).
 //   - If TokenCost > max and already in skippedPuts: silently skip.
 //
 // Lazy prune: IDs in skippedPuts that are no longer in the pending snapshot are
 // removed so that if a put is later accepted (or removed) and re-submitted, it
-// is logged again.
+// is logged again. State.PruneHeldForReview is called with the same pending set
+// to keep the two maps consistent.
 //
 // Thread safety: skippedPuts is owned exclusively by the caller goroutine.
 // No mutex is needed here — the goroutine in serve.go is the sole writer.
+// heldForReview lives on State and uses its own mutex.
 func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]struct{}) {
 	pending := e.State().PendingPuts()
 
@@ -2746,12 +2750,13 @@ func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]
 		pendingIDs[entry.PutMsgID] = struct{}{}
 	}
 
-	// Lazy prune: remove stale entries from skippedPuts.
+	// Lazy prune: remove stale entries from skippedPuts and heldForReview.
 	for id := range skippedPuts {
 		if _, ok := pendingIDs[id]; !ok {
 			delete(skippedPuts, id)
 		}
 	}
+	e.State().PruneHeldForReview(pendingIDs)
 
 	// Process each pending put.
 	for _, entry := range pending {
@@ -2760,6 +2765,9 @@ func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]
 				e.opts.log("skipping put %s: token cost %d > max %d",
 					entry.PutMsgID[:8], entry.TokenCost, max)
 				skippedPuts[entry.PutMsgID] = struct{}{}
+				// Also classify as held-for-review in State so the operator CLI
+				// can surface it via PutsHeldForReview(). No campfire message.
+				e.State().HoldPutForReview(entry.PutMsgID)
 			}
 			continue
 		}
