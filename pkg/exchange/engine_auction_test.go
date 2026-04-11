@@ -97,14 +97,11 @@ func TestEngine_AuctionSweep_FullPath(t *testing.T) {
 	}
 
 	// State must reflect: assign is AssignClaimed with worker1 as winner (lowest bid).
-	assigns := eng.State().AssignByIDForTest()
-	rec, ok := assigns[assignMsg.ID]
-	if !ok {
-		t.Fatal("assign record not found in state after auction close")
-	}
-	if rec.Status != exchange.AssignClaimed {
-		t.Errorf("assign status = %v, want AssignClaimed", rec.Status)
-	}
+	// The engine's sweep writes the close message to the store before Apply()
+	// transitions the in-memory state — auctionPollForTag can observe the store
+	// record before that Apply lands under parallel suite load. Wait for the
+	// terminal state transition deterministically rather than asserting immediately.
+	rec := waitForAssignStatus(t, eng, assignMsg.ID, exchange.AssignClaimed, 4*time.Second)
 	if rec.ClaimantKey != worker1.PublicKeyHex() {
 		t.Errorf("claimant = %q, want worker1 %q (lowest bidder wins Vickrey)",
 			rec.ClaimantKey, worker1.PublicKeyHex())
@@ -366,6 +363,32 @@ func TestEngine_AuctionVickreyPrice_PaymentCorrectness(t *testing.T) {
 
 // auctionPollForTag polls h.st for messages with the given tag until at least
 // minCount messages appear or the timeout elapses. Returns the messages found.
+// waitForAssignStatus polls eng.State().AssignByIDForTest() until the named
+// assign reaches the desired terminal status, returning the record. The engine
+// sweep writes the auction-close message and applies it to state in sequence,
+// but auctionPollForTag (which reads the store) can observe the write before
+// Apply() finalizes the in-memory transition under parallel suite load. This
+// helper closes that gap deterministically so tests do not race the state
+// transition.
+func waitForAssignStatus(t *testing.T, eng *exchange.Engine, assignID string, want exchange.AssignStatus, timeout time.Duration) *exchange.AssignRecord {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		assigns := eng.State().AssignByIDForTest()
+		if rec, ok := assigns[assignID]; ok && rec.Status == want {
+			return rec
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	assigns := eng.State().AssignByIDForTest()
+	rec, ok := assigns[assignID]
+	if !ok {
+		t.Fatalf("assign record %q not found in state (wanted status %v) after %v", assignID, want, timeout)
+	}
+	t.Fatalf("assign %q: status = %v, want %v after %v", assignID, rec.Status, want, timeout)
+	return rec
+}
+
 func auctionPollForTag(t *testing.T, h *testHarness, tag string, minCount int, timeout time.Duration) []store.MessageRecord {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
