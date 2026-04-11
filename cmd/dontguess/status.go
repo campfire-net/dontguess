@@ -114,14 +114,29 @@ func resolveDGHome() string {
 // --------------------------------------------------------------------------
 
 // attemptLine is a single line from dontguess-attempts.log.
+// Schema matches the wrapper heredoc in site/install.sh — do NOT change the
+// wrapper to match this struct; this struct must match the wrapper.
+//
+// Wrapper writes: {"ts":"<RFC3339>","pid":<int>,"cmd":"<str>","exit":<int>,
+//                  "tag":"<str>","cf_home":"<str>","cwd":"<str>","caller":<null|"str">}
 type attemptLine struct {
-	TS     float64 `json:"ts"` // unix timestamp (float for sub-second)
+	TS     string  `json:"ts"`     // RFC3339 timestamp string (e.g. "2026-04-11T12:00:00Z")
+	PID    int     `json:"pid"`
+	Cmd    string  `json:"cmd"`
+	Exit   int     `json:"exit"`
 	Tag    string  `json:"tag"`
-	Result string  `json:"result"` // "success" | "failed" | ...
+	CFHome string  `json:"cf_home"`
+	CWD    string  `json:"cwd"`
+	Caller *string `json:"caller"` // null when no caller identity is available
 }
 
 // readWrapperLog parses $dgHome/dontguess-attempts.log and aggregates counts
 // for lines within the since window. Malformed lines are silently skipped.
+//
+// Success is determined by exit==0 and tag=="success", matching the wrapper's
+// _classify_tag logic. All tag values are aggregated in ByTag without
+// hard-coding the list — the wrapper emits: success, no_exchange_configured,
+// operator_down, identity_wrapped, not_admitted, other.
 func readWrapperLog(dgHome string, cutoff time.Time) WrapperAttempts {
 	out := WrapperAttempts{ByTag: make(map[string]int)}
 	path := filepath.Join(dgHome, "dontguess-attempts.log")
@@ -143,7 +158,12 @@ func readWrapperLog(dgHome string, cutoff time.Time) WrapperAttempts {
 			// Malformed line — skip.
 			continue
 		}
-		ts := time.Unix(0, int64(entry.TS*1e9))
+		// Parse RFC3339 timestamp.
+		ts, err := time.Parse(time.RFC3339, entry.TS)
+		if err != nil {
+			// Malformed timestamp — skip.
+			continue
+		}
 		if ts.Before(cutoff) {
 			continue
 		}
@@ -151,10 +171,9 @@ func readWrapperLog(dgHome string, cutoff time.Time) WrapperAttempts {
 		if entry.Tag != "" {
 			out.ByTag[entry.Tag]++
 		}
-		switch entry.Result {
-		case "success":
+		if entry.Exit == 0 && entry.Tag == "success" {
 			out.Success++
-		default:
+		} else {
 			out.Failed++
 		}
 	}
