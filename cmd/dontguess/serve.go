@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -183,12 +185,147 @@ func runServe(_ *cobra.Command, _ []string) error {
 		}()
 	}
 
+	// Unix socket IPC for operator CLI commands.
+	sockPath := filepath.Join(cfHome, "dontguess.sock")
+	ln, err := listenOperatorSocket(sockPath)
+	if err != nil {
+		logger.Printf("warning: operator socket unavailable: %v", err)
+	} else {
+		logger.Printf("  operator socket: %s", sockPath)
+		go serveOperatorSocket(ctx, ln, eng)
+		defer func() {
+			ln.Close()
+			os.Remove(sockPath)
+		}()
+	}
+
 	if err := eng.Start(ctx); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("engine error: %w", err)
 	}
 
 	logger.Printf("exchange shut down")
 	return nil
+}
+
+// listenOperatorSocket removes any stale socket file and creates a new unix
+// domain socket listener at path. Permissions are set to 0600 (owner-only).
+func listenOperatorSocket(path string) (net.Listener, error) {
+	// Remove stale socket file if present.
+	_ = os.Remove(path)
+	ln, err := net.Listen("unix", path)
+	if err != nil {
+		return nil, err
+	}
+	if err := os.Chmod(path, 0600); err != nil {
+		ln.Close()
+		return nil, err
+	}
+	return ln, nil
+}
+
+// operatorRequest is the JSON shape received by the socket server.
+type operatorRequest struct {
+	Op       string `json:"op"`
+	PutMsgID string `json:"put_msg_id,omitempty"`
+	Price    int64  `json:"price,omitempty"`
+	Expires  string `json:"expires,omitempty"`
+	Reason   string `json:"reason,omitempty"`
+}
+
+// serveOperatorSocket accepts connections on ln and handles operator IPC
+// requests until ctx is cancelled. One request per connection is handled
+// synchronously; the connection is closed after each request.
+func serveOperatorSocket(ctx context.Context, ln net.Listener, eng *exchange.Engine) {
+	// Close the listener when the context is done so Accept unblocks.
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			// Listener closed — normal shutdown.
+			return
+		}
+		handleOperatorConn(conn, eng)
+	}
+}
+
+// handleOperatorConn reads one JSON request from conn, dispatches it, writes
+// the JSON response, and closes the connection.
+func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
+	defer conn.Close()
+
+	var req operatorRequest
+	dec := json.NewDecoder(conn)
+	if err := dec.Decode(&req); err != nil {
+		writeOperatorResp(conn, map[string]any{"ok": false, "error": "bad request: " + err.Error()})
+		return
+	}
+
+	enc := json.NewEncoder(conn)
+	switch req.Op {
+	case "list-held":
+		held := eng.State().PutsHeldForReview()
+		type entry struct {
+			PutMsgID  string `json:"put_msg_id"`
+			TokenCost int64  `json:"token_cost"`
+			Seller    string `json:"seller"`
+		}
+		entries := make([]entry, 0, len(held))
+		for _, e := range held {
+			entries = append(entries, entry{
+				PutMsgID:  e.PutMsgID,
+				TokenCost: e.TokenCost,
+				Seller:    e.SellerKey,
+			})
+		}
+		enc.Encode(map[string]any{"puts": entries}) //nolint:errcheck
+
+	case "accept-put":
+		var expiresAt time.Time
+		if req.Expires != "" {
+			t, err := time.Parse(time.RFC3339, req.Expires)
+			if err != nil {
+				writeOperatorResp(conn, map[string]any{"ok": false, "error": "invalid expires: " + err.Error()})
+				return
+			}
+			expiresAt = t
+		} else {
+			expiresAt = time.Now().UTC().Add(72 * time.Hour)
+		}
+		price := req.Price
+		if price == 0 {
+			// Auto-price at 70% of token_cost.
+			held := eng.State().PutsHeldForReview()
+			for _, e := range held {
+				if e.PutMsgID == req.PutMsgID {
+					price = e.TokenCost * 70 / 100
+					break
+				}
+			}
+		}
+		if err := eng.AutoAcceptPut(req.PutMsgID, price, expiresAt); err != nil {
+			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeOperatorResp(conn, map[string]any{"ok": true})
+
+	case "reject-put":
+		if err := eng.RejectPut(req.PutMsgID, req.Reason); err != nil {
+			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
+			return
+		}
+		writeOperatorResp(conn, map[string]any{"ok": true})
+
+	default:
+		writeOperatorResp(conn, map[string]any{"ok": false, "error": "unknown op: " + req.Op})
+	}
+}
+
+func writeOperatorResp(conn net.Conn, v any) {
+	json.NewEncoder(conn).Encode(v) //nolint:errcheck
 }
 
 // buildLogDest constructs the io.Writer used for the exchange logger.
