@@ -98,8 +98,9 @@ main() {
   # --- wrapper script ---
   cat > "${INSTALL_DIR}/dontguess" <<'ENDWRAPPER'
 #!/bin/sh
-# dontguess — turnkey wrapper (v0.4.0)
+# dontguess — turnkey wrapper (v0.4.1)
 # Hardened: DG_HOME pin, flock start, cmdline PID verify, health-probe readiness
+# Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL)
 set -e
 
 DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
@@ -116,6 +117,53 @@ CFG="${DG_HOME}/dontguess-exchange.json"
 PID_FILE="${DG_HOME}/dontguess.pid"
 LOG="${DG_HOME}/dontguess.log"
 LOCK="${DG_HOME}/dontguess.start.lock"
+
+# Attempt log paths (set early so all exit paths can log)
+_ATTEMPT_LOG="${DG_HOME}/dontguess-attempts.log"
+_ATTEMPT_LOCK="${DG_HOME}/dontguess-attempts.log.lock"
+_ATTEMPT_CMD="${1:-}"
+
+# Write a JSONL line to the attempt log. Args: <exit_code> <tag>
+# Fail-safe: errors are silently swallowed — observability never breaks main path.
+_attempt_log_write() {
+  local _exit="$1" _tag="$2"
+  local _ts _pid _cf_home _cwd _caller _cmd _line
+  _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
+  _pid=$$
+  _cf_home=$(printf '%s' "${CF_HOME:-}" | sed 's/"/\\"/g')
+  _cwd=$(pwd 2>/dev/null | sed 's/"/\\"/g' || true)
+  _cmd=$(printf '%s' "$_ATTEMPT_CMD" | sed 's/"/\\"/g')
+  _caller=null
+  if command -v jq >/dev/null 2>&1 && [ -n "${CF_HOME:-}" ] && [ -f "${CF_HOME}/identity.json" ]; then
+    _pk=$(jq -r '.public_key // empty' "${CF_HOME}/identity.json" 2>/dev/null | cut -c1-8 2>/dev/null || true)
+    case "$_pk" in
+      [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _caller="\"${_pk}\"";;
+    esac
+  fi
+  _line="{\"ts\":\"${_ts}\",\"pid\":${_pid},\"cmd\":\"${_cmd}\",\"exit\":${_exit},\"tag\":\"${_tag}\",\"cf_home\":\"${_cf_home}\",\"cwd\":\"${_cwd}\",\"caller\":${_caller}}"
+  export _DG_LOG_LINE="$_line"
+  export _DG_LOG_FILE="$_ATTEMPT_LOG"
+  flock "${_ATTEMPT_LOCK}" sh -c 'echo "$_DG_LOG_LINE" >> "$_DG_LOG_FILE"' 2>/dev/null || true
+}
+
+# Classify stderr content into an error tag.
+_classify_tag() {
+  local _exit="$1" _stderr="$2" _tag
+  if [ -z "$_stderr" ] && [ "$_exit" -eq 0 ]; then
+    _tag="success"
+  elif printf '%s' "$_stderr" | grep -q "No exchange configured"; then
+    _tag="no_exchange_configured"
+  elif printf '%s' "$_stderr" | grep -qE "operator not running|server failed"; then
+    _tag="operator_down"
+  elif printf '%s' "$_stderr" | grep -q "identity is wrapped"; then
+    _tag="identity_wrapped"
+  elif printf '%s' "$_stderr" | grep -qE "not admitted|not a member"; then
+    _tag="not_admitted"
+  else
+    _tag="other"
+  fi
+  printf '%s' "$_tag"
+}
 
 case "${1:-}" in
   init|serve|convention) exec "$DG_OP" "$@";;
@@ -140,6 +188,7 @@ esac
 # Exchange config check (always from DG_HOME, not CF_HOME)
 if [ ! -f "$CFG" ]; then
   echo "No exchange configured. Run: dontguess init" >&2
+  _attempt_log_write 1 "no_exchange_configured" 2>/dev/null || true
   exit 1
 fi
 
@@ -222,10 +271,37 @@ done
 
 if [ "$_ready" -eq 0 ]; then
   echo "server failed (not ready in 5s). See $LOG" >&2
+  _attempt_log_write 1 "operator_down" 2>/dev/null || true
   exit 1
 fi
 
-exec "$CF" "$XCFID" "$@"
+# Run cf, tee stderr to both terminal and capture file, classify, log, exit.
+_STDERR_TMP=$(mktemp 2>/dev/null) || _STDERR_TMP=""
+if [ -n "$_STDERR_TMP" ]; then
+  # POSIX-compatible stderr tee via named pipe.
+  _STDERR_FIFO=$(mktemp -u 2>/dev/null || echo "${_STDERR_TMP}.fifo")
+  mkfifo "$_STDERR_FIFO" 2>/dev/null || _STDERR_FIFO=""
+  trap 'rm -f "$_STDERR_TMP" "$_STDERR_FIFO"' EXIT INT TERM
+  if [ -n "$_STDERR_FIFO" ]; then
+    tee "$_STDERR_TMP" >&2 < "$_STDERR_FIFO" &
+    _TEE_PID=$!
+    "$CF" "$XCFID" "$@" 2>"$_STDERR_FIFO"
+    _CF_EXIT=$?
+    wait "$_TEE_PID" 2>/dev/null || true
+  else
+    # Fallback: capture only, replay after
+    "$CF" "$XCFID" "$@" 2>"$_STDERR_TMP"
+    _CF_EXIT=$?
+    cat "$_STDERR_TMP" >&2
+  fi
+  _stderr_content=$(cat "$_STDERR_TMP" 2>/dev/null || true)
+  _tag=$(_classify_tag "$_CF_EXIT" "$_stderr_content")
+  _attempt_log_write "$_CF_EXIT" "$_tag" 2>/dev/null || true
+  exit "$_CF_EXIT"
+else
+  # mktemp failed; run without logging (fail-safe)
+  exec "$CF" "$XCFID" "$@"
+fi
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"
   success "  dontguess (wrapper) → ${INSTALL_DIR}/dontguess"
