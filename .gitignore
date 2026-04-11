@@ -20,6 +20,9 @@ vendor/
 /data/vectors/
 /data/cache/
 
+# Test output (never commit)
+test/reliability/out/
+
 # Internal tooling state
 .campfire/
 .claude/agents/
