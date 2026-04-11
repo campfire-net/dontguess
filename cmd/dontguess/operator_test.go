@@ -320,6 +320,50 @@ func TestOperatorSocket_AcceptPut(t *testing.T) {
 	}
 }
 
+// TestOperatorSocket_AcceptPut_ZeroPriceRejected regression test for
+// dontguess-7d8: a client that sends accept-put with no price AND an
+// unknown put ID must NOT get a free accept. The server must return an
+// error instead of calling AutoAcceptPut with price=0.
+func TestOperatorSocket_AcceptPut_ZeroPriceRejected(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	sockPath, _ := startSocketServer(t, eng)
+
+	// Do NOT create any held put — the lookup will miss, default price stays 0.
+	var resp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	dialAndRequest(t, sockPath, map[string]any{
+		"op":         "accept-put",
+		"put_msg_id": "nonexistent-put-id",
+		// price omitted (stays 0)
+	}, &resp)
+
+	if resp.OK {
+		t.Fatal("accept-put with zero price on unknown ID returned ok=true; want ok=false")
+	}
+	if resp.Error == "" {
+		t.Error("accept-put zero-price error message is empty")
+	}
+
+	// Assert no settle put-accept message was posted to the campfire.
+	msgs, err := h.st.ListMessages(h.cfID, 0)
+	if err != nil {
+		t.Fatalf("ListMessages: %v", err)
+	}
+	for _, m := range msgs {
+		msg := exchange.FromStoreRecord(&m)
+		for _, tag := range msg.Tags {
+			if tag == exchange.TagPhasePrefix+exchange.SettlePhaseStrPutAccept {
+				t.Errorf("unexpected settle put-accept message after zero-price request: %s", msg.ID)
+			}
+		}
+	}
+}
+
 // TestOperatorSocket_RejectPut verifies that reject-put posts a settle put-reject message.
 func TestOperatorSocket_RejectPut(t *testing.T) {
 	t.Parallel()

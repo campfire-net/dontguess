@@ -354,7 +354,8 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 		}
 		price := req.Price
 		if price == 0 {
-			// Auto-price at 70% of token_cost.
+			// Auto-price at 70% of token_cost. Must find the put in
+			// heldForReview to compute the default price.
 			held := eng.State().PutsHeldForReview()
 			for _, e := range held {
 				if e.PutMsgID == req.PutMsgID {
@@ -362,6 +363,20 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 					break
 				}
 			}
+		}
+		// Defense in depth (dontguess-7d8): a client that bypasses the CLI
+		// can call accept-put with price=0 and a stale/unknown put ID; without
+		// this guard the server would list the content for free. The CLI
+		// already returns an error on unknown IDs (dontguess-a70), but the
+		// server must enforce the same invariant — a local process talking
+		// directly to the socket is still in the trust boundary but must not
+		// be able to trick the operator into a free accept.
+		if price <= 0 {
+			writeOperatorResp(conn, map[string]any{
+				"ok":    false,
+				"error": fmt.Sprintf("accept-put: price must be > 0 (put %q not found in held-for-review or no --price supplied)", req.PutMsgID),
+			})
+			return
 		}
 		if err := eng.AutoAcceptPut(req.PutMsgID, price, expiresAt); err != nil {
 			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
