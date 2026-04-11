@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"math"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -220,6 +221,11 @@ type Engine struct {
 	opts       EngineOptions
 	state      *State
 	matchIndex *matching.Index
+	// opMu serializes state-mutating operations across concurrent goroutines:
+	// RunAutoAccept (auto-accept ticker goroutine) and AutoAcceptPut/RejectPut
+	// (operator socket handler goroutine). Lock ordering: acquire opMu FIRST,
+	// then any State-internal locks (acquired via the existing State helpers).
+	opMu sync.Mutex
 	// ctx is the shutdown context passed to Start. Stored atomically so that
 	// handler goroutines can read it without a data race against the Start write.
 	// Handlers use this so that in-flight scrip operations are cancelled on
@@ -2310,7 +2316,19 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 // The put message must exist in the store. This method does not require the put
 // to already be in the engine's in-memory state — it will replay the store to
 // pick up new messages first.
+//
+// This is the public API entrypoint. It acquires opMu and delegates to
+// autoAcceptPutLocked. RunAutoAccept (which holds opMu) calls autoAcceptPutLocked
+// directly to avoid a self-deadlock.
 func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time) error {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	return e.autoAcceptPutLocked(putMsgID, price, expiresAt)
+}
+
+// autoAcceptPutLocked is the internal implementation of AutoAcceptPut.
+// Callers must hold e.opMu before calling. RunAutoAccept calls this directly.
+func (e *Engine) autoAcceptPutLocked(putMsgID string, price int64, expiresAt time.Time) error {
 	// Replay to ensure state is current before checking.
 	if err := e.replayAll(); err != nil {
 		return fmt.Errorf("replay before put-accept: %w", err)
@@ -2398,6 +2416,9 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 // is no longer actionable and will be pruned from heldForReview on the next
 // RunAutoAccept tick.
 func (e *Engine) RejectPut(putMsgID string, reason string) error {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
 	// Replay to ensure state is current before checking.
 	if err := e.replayAll(); err != nil {
 		return fmt.Errorf("replay before put-reject: %w", err)
@@ -2782,9 +2803,13 @@ func (e *Engine) stagePredictions(settledEntryID string) {
 // to keep the two maps consistent.
 //
 // Thread safety: skippedPuts is owned exclusively by the caller goroutine.
-// No mutex is needed here — the goroutine in serve.go is the sole writer.
+// opMu serializes the state-mutating body of this function against concurrent
+// AutoAcceptPut/RejectPut calls from the operator socket handler goroutine.
 // heldForReview lives on State and uses its own mutex.
 func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]struct{}) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+
 	pending := e.State().PendingPuts()
 
 	// Build a set of current pending IDs for O(1) prune lookups.
@@ -2806,7 +2831,7 @@ func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]
 		if entry.TokenCost > max {
 			if _, alreadyLogged := skippedPuts[entry.PutMsgID]; !alreadyLogged {
 				e.opts.log("skipping put %s: token cost %d > max %d",
-					entry.PutMsgID[:8], entry.TokenCost, max)
+					shortKey(entry.PutMsgID), entry.TokenCost, max)
 				skippedPuts[entry.PutMsgID] = struct{}{}
 				// Also classify as held-for-review in State so the operator CLI
 				// can surface it via PutsHeldForReview(). No campfire message.
@@ -2816,11 +2841,12 @@ func (e *Engine) RunAutoAccept(max int64, now time.Time, skippedPuts map[string]
 		}
 		price := entry.TokenCost * 70 / 100
 		expires := now.Add(72 * time.Hour)
-		if err := e.AutoAcceptPut(entry.PutMsgID, price, expires); err != nil {
-			e.opts.log("auto-accept put %s failed: %v", entry.PutMsgID[:8], err)
+		// Call the locked variant — opMu is already held by this function.
+		if err := e.autoAcceptPutLocked(entry.PutMsgID, price, expires); err != nil {
+			e.opts.log("auto-accept put %s failed: %v", shortKey(entry.PutMsgID), err)
 		} else {
 			e.opts.log("auto-accepted put %s: price=%d (token_cost=%d)",
-				entry.PutMsgID[:8], price, entry.TokenCost)
+				shortKey(entry.PutMsgID), price, entry.TokenCost)
 		}
 	}
 }

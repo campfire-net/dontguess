@@ -134,6 +134,7 @@ var acceptPutCmd = &cobra.Command{
 			}
 			conn.Close()
 
+			found := false
 			for _, p := range listResp.Puts {
 				if p.PutMsgID == putMsgID {
 					if price == 0 {
@@ -142,15 +143,14 @@ var acceptPutCmd = &cobra.Command{
 					if expiresStr == "" {
 						expiresStr = time.Now().UTC().Add(72 * time.Hour).Format(time.RFC3339)
 					}
+					found = true
 					break
 				}
 			}
-			// If still not found, fall through with defaults.
-			if price == 0 {
-				price = 0 // caller must supply via --price or operator must know it
-			}
-			if expiresStr == "" {
-				expiresStr = time.Now().UTC().Add(72 * time.Hour).Format(time.RFC3339)
+			// If not found, the put may have already been processed. Do NOT send
+			// accept-put with price=0 — that would list the content at zero cost.
+			if !found {
+				return fmt.Errorf("put %q not found in held-for-review (may have already been processed)", putMsgID)
 			}
 		}
 

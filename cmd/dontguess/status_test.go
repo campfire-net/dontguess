@@ -44,28 +44,35 @@ func writeAttemptLog(t *testing.T, dir string, lines []map[string]any) {
 	}
 }
 
-// tsFloat converts a time.Time to the float unix seconds used in attempt log.
-func tsFloat(t time.Time) float64 {
-	return float64(t.UnixNano()) / 1e9
+// tsRFC3339 converts a time.Time to the RFC3339 string used in attempt log.
+// The wrapper writes: date -u +%Y-%m-%dT%H:%M:%SZ (second precision, UTC, Z suffix).
+func tsRFC3339(t time.Time) string {
+	return t.UTC().Format(time.RFC3339)
 }
 
 // --------------------------------------------------------------------------
 // TestStatus_WrapperLogReader
 // --------------------------------------------------------------------------
 
-// TestStatus_WrapperLogReader creates a tmpdir with known JSONL lines and
-// asserts that readWrapperLog returns the correct aggregate counts.
+// TestStatus_WrapperLogReader creates a tmpdir with JSONL lines in the REAL
+// wrapper format (RFC3339 ts, exit+tag, no "result" field) and asserts correct
+// aggregate counts.
+//
+// This test was updated as part of dontguess-5ce: previously used float ts
+// and a "result" field that the wrapper never emits. The new format matches
+// the wrapper heredoc in site/install.sh.
 func TestStatus_WrapperLogReader(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	now := time.Now()
 
+	// Use the real wrapper format: RFC3339 ts, exit, tag — no "result" field.
 	writeAttemptLog(t, dir, []map[string]any{
-		{"ts": tsFloat(now), "tag": "success", "result": "success"},
-		{"ts": tsFloat(now), "tag": "operator_down", "result": "failed"},
-		{"ts": tsFloat(now), "tag": "identity_wrapped", "result": "failed"},
-		{"ts": tsFloat(now), "tag": "other", "result": "other_failure"},
+		{"ts": tsRFC3339(now), "pid": 100, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "/tmp/cf", "cwd": "/home/user", "caller": nil},
+		{"ts": tsRFC3339(now), "pid": 101, "cmd": "buy", "exit": 1, "tag": "operator_down", "cf_home": "/tmp/cf", "cwd": "/home/user", "caller": nil},
+		{"ts": tsRFC3339(now), "pid": 102, "cmd": "put", "exit": 1, "tag": "identity_wrapped", "cf_home": "/tmp/cf", "cwd": "/home/user", "caller": nil},
+		{"ts": tsRFC3339(now), "pid": 103, "cmd": "buy", "exit": 1, "tag": "other", "cf_home": "/tmp/cf", "cwd": "/home/user", "caller": nil},
 	})
 
 	cutoff := now.Add(-time.Hour)
@@ -78,7 +85,7 @@ func TestStatus_WrapperLogReader(t *testing.T) {
 		t.Errorf("Success = %d, want 1", wa.Success)
 	}
 	if wa.Failed != 3 {
-		t.Errorf("Failed = %d, want 3 (operator_down + identity_wrapped + other_failure)", wa.Failed)
+		t.Errorf("Failed = %d, want 3 (operator_down + identity_wrapped + other)", wa.Failed)
 	}
 	if wa.ByTag["success"] != 1 {
 		t.Errorf("ByTag[success] = %d, want 1", wa.ByTag["success"])
@@ -113,10 +120,10 @@ func TestStatus_SinceFilter(t *testing.T) {
 	outside2 := now.Add(-90 * time.Minute)
 
 	writeAttemptLog(t, dir, []map[string]any{
-		{"ts": tsFloat(inside1), "tag": "success", "result": "success"},
-		{"ts": tsFloat(inside2), "tag": "success", "result": "success"},
-		{"ts": tsFloat(outside1), "tag": "success", "result": "success"},
-		{"ts": tsFloat(outside2), "tag": "success", "result": "success"},
+		{"ts": tsRFC3339(inside1), "pid": 1, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "", "cwd": "", "caller": nil},
+		{"ts": tsRFC3339(inside2), "pid": 2, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "", "cwd": "", "caller": nil},
+		{"ts": tsRFC3339(outside1), "pid": 3, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "", "cwd": "", "caller": nil},
+		{"ts": tsRFC3339(outside2), "pid": 4, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "", "cwd": "", "caller": nil},
 	})
 
 	wa := readWrapperLog(dir, cutoff)
@@ -139,13 +146,13 @@ func TestStatus_WrapperLogMalformedLines(t *testing.T) {
 	now := time.Now()
 	path := filepath.Join(dir, "dontguess-attempts.log")
 
-	// Write a mix of valid and invalid lines.
+	// Write a mix of valid and invalid lines using the real wrapper format.
 	content := fmt.Sprintf(
-		`{"ts":%f,"tag":"success","result":"success"}
+		`{"ts":"%s","pid":1,"cmd":"buy","exit":0,"tag":"success","cf_home":"","cwd":"","caller":null}
 not-json
-{"ts":%f,"tag":"fail","result":"failed"}
+{"ts":"%s","pid":2,"cmd":"buy","exit":1,"tag":"other","cf_home":"","cwd":"","caller":null}
 {"broken":
-`, tsFloat(now), tsFloat(now))
+`, tsRFC3339(now), tsRFC3339(now))
 	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
 		t.Fatalf("write log: %v", err)
 	}
@@ -171,9 +178,9 @@ func TestStatus_JSONOutput(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now()
 
-	// Write a small attempt log so WrapperAttempts is non-empty.
+	// Write a small attempt log so WrapperAttempts is non-empty (real wrapper format).
 	writeAttemptLog(t, dir, []map[string]any{
-		{"ts": tsFloat(now), "tag": "success", "result": "success"},
+		{"ts": tsRFC3339(now), "pid": 1, "cmd": "buy", "exit": 0, "tag": "success", "cf_home": "", "cwd": "", "caller": nil},
 	})
 
 	// Set DG_HOME so status reads from the tmpdir (no exchange config → zero counts).
@@ -413,5 +420,68 @@ func TestStatus_SocketHeldCount(t *testing.T) {
 	}
 	if *held != 3 {
 		t.Errorf("held = %d, want 3", *held)
+	}
+}
+
+// --------------------------------------------------------------------------
+// TestStatus_WrapperLogReader_RealWrapperFormat
+// --------------------------------------------------------------------------
+
+// TestStatus_WrapperLogReader_RealWrapperFormat is the regression test for
+// dontguess-5ce. It uses the EXACT log line format emitted by the wrapper
+// heredoc in site/install.sh to verify the reader correctly parses real output.
+//
+// Real wrapper line: {"ts":"2026-04-11T12:00:00Z","pid":12345,"cmd":"buy",
+//
+//	"exit":0,"tag":"success","cf_home":"/home/user/.cf","cwd":"/home/user",
+//	"caller":null}
+//
+// This test FAILS against the old code (which used float ts and relied on
+// a "result" field that the wrapper never writes).
+func TestStatus_WrapperLogReader_RealWrapperFormat(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "dontguess-attempts.log")
+
+	// Exact format from the wrapper _log_attempt function.
+	// All tags the wrapper can emit: success, no_exchange_configured,
+	// operator_down, identity_wrapped, not_admitted, other.
+	lines := []string{
+		`{"ts":"2026-04-11T10:00:00Z","pid":1000,"cmd":"buy","exit":0,"tag":"success","cf_home":"/home/user/.cf","cwd":"/home/user","caller":null}`,
+		`{"ts":"2026-04-11T10:01:00Z","pid":1001,"cmd":"put","exit":1,"tag":"no_exchange_configured","cf_home":"","cwd":"/home/user","caller":null}`,
+		`{"ts":"2026-04-11T10:02:00Z","pid":1002,"cmd":"buy","exit":1,"tag":"operator_down","cf_home":"/home/user/.cf","cwd":"/home/user","caller":null}`,
+		`{"ts":"2026-04-11T10:03:00Z","pid":1003,"cmd":"buy","exit":1,"tag":"identity_wrapped","cf_home":"/tmp/cf-abc","cwd":"/home/user","caller":null}`,
+		`{"ts":"2026-04-11T10:04:00Z","pid":1004,"cmd":"put","exit":1,"tag":"not_admitted","cf_home":"/home/user/.cf","cwd":"/home/user","caller":null}`,
+		`{"ts":"2026-04-11T10:05:00Z","pid":1005,"cmd":"buy","exit":1,"tag":"other","cf_home":"/home/user/.cf","cwd":"/home/user","caller":null}`,
+	}
+	content := ""
+	for _, l := range lines {
+		content += l + "\n"
+	}
+	if err := os.WriteFile(path, []byte(content), 0600); err != nil {
+		t.Fatalf("write attempt log: %v", err)
+	}
+
+	// Cutoff before all lines (2026-04-11T09:00:00Z) so all 6 lines are in-window.
+	cutoff, _ := time.Parse(time.RFC3339, "2026-04-11T09:00:00Z")
+	wa := readWrapperLog(dir, cutoff)
+
+	if wa.Total != 6 {
+		t.Errorf("Total = %d, want 6", wa.Total)
+	}
+	if wa.Success != 1 {
+		t.Errorf("Success = %d, want 1 (only exit=0 tag=success counts)", wa.Success)
+	}
+	if wa.Failed != 5 {
+		t.Errorf("Failed = %d, want 5", wa.Failed)
+	}
+
+	// All 6 tags must be present in ByTag.
+	expectedTags := []string{"success", "no_exchange_configured", "operator_down", "identity_wrapped", "not_admitted", "other"}
+	for _, tag := range expectedTags {
+		if wa.ByTag[tag] != 1 {
+			t.Errorf("ByTag[%q] = %d, want 1", tag, wa.ByTag[tag])
+		}
 	}
 }
