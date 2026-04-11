@@ -11,7 +11,6 @@ import (
 	"os/signal"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
@@ -190,8 +189,10 @@ func runServe(_ *cobra.Command, _ []string) error {
 		}()
 	}
 
-	// Unix socket IPC for operator CLI commands.
-	sockPath := filepath.Join(cfHome, "dontguess.sock")
+	// Unix socket IPC for operator CLI commands. The socket lives inside a
+	// 0700 subdirectory so the parent-level permissions bound the TOCTOU
+	// window at the dir level (dontguess-33a, post-sec-regression fix).
+	sockPath := filepath.Join(cfHome, "ipc", "dontguess.sock")
 	ln, err := listenOperatorSocket(sockPath)
 	if err != nil {
 		logger.Printf("warning: operator socket unavailable: %v", err)
@@ -213,28 +214,38 @@ func runServe(_ *cobra.Command, _ []string) error {
 }
 
 // listenOperatorSocket removes any stale socket file and creates a new unix
-// domain socket listener at path. Permissions are set to 0600 (owner-only).
+// domain socket listener at path. The socket is placed inside a 0700
+// parent directory so the TOCTOU window between net.Listen and any subsequent
+// chmod is closed at the directory level — a local attacker cannot traverse
+// into the ipc dir regardless of the socket inode's transient permissions.
 //
-// Security (dontguess-33a): we close the TOCTOU window between socket creation
-// and chmod by narrowing the umask to 0177 before net.Listen so the kernel
-// creates the inode with mode 0600 immediately. syscall.Umask is goroutine-
-// global — this is safe here because the operator process is single-threaded
-// during startup and this function is called only once. The subsequent Chmod is
-// belt-and-suspenders in case the platform ignores the umask for UNIX sockets.
+// Security (dontguess-33a): earlier versions used syscall.Umask to narrow the
+// socket's mode at creation time, but syscall.Umask is process-global and
+// races with other goroutines (including the parallel Go test runtime, which
+// calls mkdir under t.TempDir()). Using a restricted parent directory is both
+// race-free and strictly stronger: even a mis-permissioned socket inode would
+// be unreachable through a 0700 parent.
 func listenOperatorSocket(path string) (net.Listener, error) {
+	// Create (or re-use) the restricted parent directory that holds the
+	// socket. Using a dedicated subdirectory (not $DG_HOME itself) means we
+	// can enforce 0700 without touching the user's broader config dir perms.
+	parentDir := filepath.Dir(path)
+	if err := os.MkdirAll(parentDir, 0700); err != nil {
+		return nil, fmt.Errorf("create operator socket dir: %w", err)
+	}
+	// Re-chmod in case the directory pre-existed with looser perms.
+	if err := os.Chmod(parentDir, 0700); err != nil {
+		return nil, fmt.Errorf("chmod operator socket dir: %w", err)
+	}
+
 	// Remove stale socket file if present.
 	_ = os.Remove(path)
 
-	// Narrow umask so net.Listen creates the socket at 0600 immediately,
-	// closing the TOCTOU window between creation and Chmod.
-	oldMask := syscall.Umask(0177) // 0177 → socket lands at 0600
 	ln, err := net.Listen("unix", path)
-	syscall.Umask(oldMask) // restore regardless of Listen outcome
-
 	if err != nil {
 		return nil, err
 	}
-	// Belt-and-suspenders: some platforms don't honour umask for AF_UNIX.
+	// Belt-and-suspenders chmod — the parent 0700 is the primary guarantee.
 	if err := os.Chmod(path, 0600); err != nil {
 		ln.Close()
 		return nil, err

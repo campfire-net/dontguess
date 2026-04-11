@@ -378,7 +378,13 @@ func TestStatus_SocketHeldCount(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
-	sockPath := filepath.Join(dir, "dontguess.sock")
+	// Mirror production: socket lives under dir/ipc/dontguess.sock so that
+	// readHeldCount's path matches what serve.go's listenOperatorSocket creates.
+	sockDir := filepath.Join(dir, "ipc")
+	if err := os.MkdirAll(sockDir, 0700); err != nil {
+		t.Fatalf("mkdir ipc: %v", err)
+	}
+	sockPath := filepath.Join(sockDir, "dontguess.sock")
 
 	// Start a minimal unix socket server.
 	ln, err := net.Listen("unix", sockPath)

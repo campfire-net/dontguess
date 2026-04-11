@@ -181,7 +181,8 @@ func (h *opTestHarness) sendHeldPut(eng *exchange.Engine, desc string, tokenCost
 // startSocketServer starts the operator socket on a temp path, returns the path and a cancel func.
 func startSocketServer(t *testing.T, eng *exchange.Engine) (string, context.CancelFunc) {
 	t.Helper()
-	sockPath := filepath.Join(t.TempDir(), "test-operator.sock")
+	// Mirror production path layout: socket lives in a 0700 "ipc" subdir.
+	sockPath := filepath.Join(t.TempDir(), "ipc", "test-operator.sock")
 	ln, err := listenOperatorSocket(sockPath)
 	if err != nil {
 		t.Fatalf("listenOperatorSocket: %v", err)
@@ -409,13 +410,16 @@ func TestOperatorSocket_ListHeld_Empty(t *testing.T) {
 // ---- Security regression tests (dontguess-33a, 481) ----
 
 // TestOperatorSocket_Permissions verifies that the socket file is created with
-// mode 0600 (owner read/write only) immediately after listenOperatorSocket
-// returns — before any subsequent Chmod could close a TOCTOU window.
-// Regression test for dontguess-33a.
+// mode 0600 (owner read/write only) AND sits inside a 0700 parent directory —
+// the parent directory is the primary TOCTOU guarantee. Regression test for
+// dontguess-33a (and the post-fix regression where syscall.Umask raced with
+// parallel test runtimes).
 func TestOperatorSocket_Permissions(t *testing.T) {
 	t.Parallel()
 
-	sockPath := filepath.Join(t.TempDir(), "sec-test.sock")
+	// Place the socket in an "ipc" subdir so listenOperatorSocket must create
+	// it with 0700 perms — mirroring production behaviour.
+	sockPath := filepath.Join(t.TempDir(), "ipc", "sec-test.sock")
 	ln, err := listenOperatorSocket(sockPath)
 	if err != nil {
 		t.Fatalf("listenOperatorSocket: %v", err)
@@ -429,6 +433,16 @@ func TestOperatorSocket_Permissions(t *testing.T) {
 	perm := info.Mode().Perm()
 	if perm != 0600 {
 		t.Errorf("socket perm = %04o, want 0600", perm)
+	}
+
+	// Parent directory must be 0700 — this is the TOCTOU-proof guarantee.
+	parentInfo, err := os.Stat(filepath.Dir(sockPath))
+	if err != nil {
+		t.Fatalf("os.Stat(parent): %v", err)
+	}
+	parentPerm := parentInfo.Mode().Perm()
+	if parentPerm != 0700 {
+		t.Errorf("parent dir perm = %04o, want 0700", parentPerm)
 	}
 }
 

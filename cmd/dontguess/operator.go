@@ -12,16 +12,18 @@ import (
 )
 
 // socketPath returns the path to the operator unix domain socket.
-// Uses DG_HOME env if set, else falls back to ~/.cf.
+// Uses DG_HOME env if set, else falls back to ~/.cf. The socket lives in a
+// 0700 "ipc" subdirectory (dontguess-33a) to bound the TOCTOU window at the
+// parent-dir level instead of relying on process-global umask tricks.
 func socketPath() string {
 	if dg := os.Getenv("DG_HOME"); dg != "" {
-		return filepath.Join(dg, "dontguess.sock")
+		return filepath.Join(dg, "ipc", "dontguess.sock")
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
-		return filepath.Join(".cf", "dontguess.sock")
+		return filepath.Join(".cf", "ipc", "dontguess.sock")
 	}
-	return filepath.Join(home, ".cf", "dontguess.sock")
+	return filepath.Join(home, ".cf", "ipc", "dontguess.sock")
 }
 
 // dialSocket dials the operator socket and returns the connection.

@@ -426,7 +426,7 @@ func readProcessStartTicks(pid int) (int64, error) {
 // readHeldCount dials the operator socket and sends list-held.
 // On failure, returns nil (means "operator not reachable").
 func readHeldCount(dgHome string) (*int, string) {
-	sockPath := filepath.Join(dgHome, "dontguess.sock")
+	sockPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
 	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
 	if err != nil {
 		return nil, "operator not reachable"
