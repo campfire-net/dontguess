@@ -204,9 +204,24 @@ test_health_probe_timeout() {
     fail "health-probe timeout: took ${elapsed}s (expected <=12s)"
   fi
 
-  # Clean up: restart real operator for subsequent tests
+  # Clean up: kill the fake operator by PID (pkill -f dontguess-operator does
+  # NOT match 'sleep 30'), release the flock, and drop stale pid/lock files so
+  # subsequent tests can acquire the start lock.
+  if [ -f "${DG_HOME_DEFAULT}/dontguess.pid" ]; then
+    fake_pid=$(cat "${DG_HOME_DEFAULT}/dontguess.pid" 2>/dev/null || true)
+    if [ -n "$fake_pid" ]; then
+      kill "$fake_pid" 2>/dev/null || true
+      # wait up to 2s for the fake process to die
+      i=0
+      while kill -0 "$fake_pid" 2>/dev/null && [ "$i" -lt 20 ]; do
+        sleep 0.1; i=$((i+1))
+      done
+      kill -9 "$fake_pid" 2>/dev/null || true
+    fi
+  fi
   kill_operator
-  rm -f "${DG_HOME_DEFAULT}/dontguess.pid"
+  rm -f "${DG_HOME_DEFAULT}/dontguess.pid" "${DG_HOME_DEFAULT}/dontguess.start.lock"
+  rm -f /tmp/fake-dontguess-op
 }
 
 # ----- sanity: one existing demo -----
