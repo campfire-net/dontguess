@@ -191,17 +191,17 @@ test_health_probe_timeout() {
   elapsed=$((end_ts - start_ts))
 
   # Verify bail message
-  if printf '%s' "$output" | grep -q "not ready in 5s"; then
-    pass "health-probe timeout: wrapper bailed with 'not ready in 5s'"
+  if printf '%s' "$output" | grep -q "not ready in 15s"; then
+    pass "health-probe timeout: wrapper bailed with 'not ready in 15s'"
   else
-    fail "health-probe timeout: expected 'not ready in 5s' in output, got: $output"
+    fail "health-probe timeout: expected 'not ready in 15s' in output, got: $output"
   fi
 
-  # Verify it bailed within 12s (5s probe + process start overhead)
-  if [ "$elapsed" -le 12 ]; then
-    pass "health-probe timeout: bailed in ${elapsed}s (within 12s window)"
+  # Verify it bailed within 22s (15s probe + process start overhead)
+  if [ "$elapsed" -le 22 ]; then
+    pass "health-probe timeout: bailed in ${elapsed}s (within 22s window)"
   else
-    fail "health-probe timeout: took ${elapsed}s (expected <=12s)"
+    fail "health-probe timeout: took ${elapsed}s (expected <=22s)"
   fi
 
   # Clean up: kill the fake operator by PID (pkill -f dontguess-operator does
