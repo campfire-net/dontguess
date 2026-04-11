@@ -98,8 +98,10 @@ main() {
   # --- wrapper script ---
   cat > "${INSTALL_DIR}/dontguess" <<'ENDWRAPPER'
 #!/bin/sh
-# dontguess — turnkey wrapper (v0.4.1)
+# dontguess — turnkey wrapper (v0.4.2)
 # Hardened: DG_HOME pin, flock start, cmdline PID verify, health-probe readiness
+# Health-probe skip: only the invocation that starts the operator runs the probe.
+# CF_HOME identity pin: exchange cf calls always use --cf-home $DG_HOME.
 # Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL)
 set -e
 
@@ -214,6 +216,11 @@ pid_is_operator() {
 }
 
 # Auto-start with flock
+#
+# _i_started_operator tracks whether THIS invocation won the flock and launched
+# the operator.  Only the starter runs the full health-probe loop; all other
+# callers trust the starter's work and skip straight to the cf call.
+_i_started_operator=0
 _current_pid=""
 if [ -f "$PID_FILE" ]; then
   _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -240,8 +247,25 @@ if ! pid_is_operator "$_current_pid"; then
     printf "%d\n" "$new_pid" > "'"$PID_FILE"'"
     exit 0
   ' 2>/dev/null; then
-    _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    # We won the flock. Check if WE actually started the operator or found it
+    # already healthy inside the flock body (flock exits 0 either way).
+    _new_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [ "$_new_pid" != "$_current_pid" ] && pid_is_operator "$_new_pid"; then
+      # A new PID was written — we started it (and it's already visible).
+      _i_started_operator=1
+      _current_pid="$_new_pid"
+    elif pid_is_operator "$_new_pid"; then
+      # Flock body found it already healthy (race: another starter just finished).
+      _current_pid="$_new_pid"
+    else
+      # We started it (PID written but process not yet visible as operator).
+      _i_started_operator=1
+      _current_pid="$_new_pid"
+    fi
   else
+    # Lost the flock — another caller is starting the operator.
+    # Poll up to 5s for the PID to appear AND be verified as the operator.
+    # Once it is, trust the starter's probe and proceed without re-probing.
     _deadline=$(( $(date +%s) + 5 ))
     while [ "$(date +%s)" -lt "$_deadline" ]; do
       if [ -f "$PID_FILE" ]; then
@@ -257,25 +281,47 @@ if ! pid_is_operator "$_current_pid"; then
   fi
 fi
 
-# Health-probe readiness: verify operator PID is dontguess-operator AND exchange is readable
-_probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-_ready=0
-_deadline=$(( $(date +%s) + 5 ))
-while [ "$(date +%s)" -lt "$_deadline" ]; do
-  if pid_is_operator "$_probe_pid" && "$CF" "$XCFID" buys --json >/dev/null 2>&1; then
-    _ready=1
-    break
-  fi
-  sleep 0.1 2>/dev/null || sleep 1
-done
+# Health-probe readiness.
+#
+# Only the invocation that won the flock and launched the operator runs the
+# full health-probe loop.  This prevents 49 concurrent callers from each
+# hammering the exchange with network round-trips while the operator is still
+# cold-starting.
+#
+# Callers that found an existing, already-verified operator skip straight to
+# the cf call — the operator was already healthy before they arrived.
+#
+# Callers that waited for another starter trust that the starter's probe
+# succeeded; they only need the PID to be alive (already verified above).
+#
+# Starter probe: poll every 200ms for up to 15s.
+# Always uses --cf-home $DG_HOME so the probe uses the pinned exchange identity,
+# not whatever CF_HOME the caller's environment has set.
 
-if [ "$_ready" -eq 0 ]; then
-  echo "server failed (not ready in 5s). See $LOG" >&2
-  _attempt_log_write 1 "operator_down" 2>/dev/null || true
-  exit 1
+if [ "$_i_started_operator" -eq 1 ]; then
+  _probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  _ready=0
+  _deadline=$(( $(date +%s) + 15 ))
+  while [ "$(date +%s)" -lt "$_deadline" ]; do
+    if pid_is_operator "$_probe_pid" && "$CF" --cf-home "$DG_HOME" "$XCFID" buys --json >/dev/null 2>&1; then
+      _ready=1
+      break
+    fi
+    sleep 0.2 2>/dev/null || sleep 1
+  done
+
+  if [ "$_ready" -eq 0 ]; then
+    echo "server failed (not ready in 15s). See $LOG" >&2
+    _attempt_log_write 1 "operator_down" 2>/dev/null || true
+    exit 1
+  fi
 fi
 
 # Run cf, tee stderr to both terminal and capture file, classify, log, exit.
+# Always pass --cf-home "$DG_HOME" so exchange operations use the pinned exchange
+# identity regardless of how CF_HOME is set in the caller's environment.
+# This is the key that allows subagents with per-session CF_HOME to reach the
+# exchange: their CF_HOME has no identity, but DG_HOME always does.
 _STDERR_TMP=$(mktemp 2>/dev/null) || _STDERR_TMP=""
 if [ -n "$_STDERR_TMP" ]; then
   # POSIX-compatible stderr tee via named pipe.
@@ -285,12 +331,12 @@ if [ -n "$_STDERR_TMP" ]; then
   if [ -n "$_STDERR_FIFO" ]; then
     tee "$_STDERR_TMP" >&2 < "$_STDERR_FIFO" &
     _TEE_PID=$!
-    "$CF" "$XCFID" "$@" 2>"$_STDERR_FIFO"
+    "$CF" --cf-home "$DG_HOME" "$XCFID" "$@" 2>"$_STDERR_FIFO"
     _CF_EXIT=$?
     wait "$_TEE_PID" 2>/dev/null || true
   else
     # Fallback: capture only, replay after
-    "$CF" "$XCFID" "$@" 2>"$_STDERR_TMP"
+    "$CF" --cf-home "$DG_HOME" "$XCFID" "$@" 2>"$_STDERR_TMP"
     _CF_EXIT=$?
     cat "$_STDERR_TMP" >&2
   fi
@@ -300,7 +346,7 @@ if [ -n "$_STDERR_TMP" ]; then
   exit "$_CF_EXIT"
 else
   # mktemp failed; run without logging (fail-safe)
-  exec "$CF" "$XCFID" "$@"
+  exec "$CF" --cf-home "$DG_HOME" "$XCFID" "$@"
 fi
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"
