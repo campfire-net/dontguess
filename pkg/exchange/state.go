@@ -847,6 +847,16 @@ type State struct {
 	// Key: senderKey. Written by UpdateFederationProfile (called by the slow loop
 	// or explicitly). Reset on Replay — re-derived from senderHopDepth.
 	federationProfiles map[string]*FederationNodeProfile
+
+	// heldForReview tracks put message IDs that exceed the auto-accept cap.
+	// These puts remain in pendingPuts (no campfire state change — no new convention
+	// op) but are tagged so the auto-accept loop ignores them and the operator CLI
+	// can surface them via PutsHeldForReview().
+	//
+	// NOT reset on Replay — re-derived by the auto-accept loop on each tick.
+	// On operator restart the loop re-evaluates all pending puts against the cap.
+	// Set by HoldPutForReview; pruned by PruneHeldForReview when a put leaves pending.
+	heldForReview map[string]struct{}
 }
 
 // NewState creates an empty exchange state.
@@ -892,6 +902,7 @@ func NewState() *State {
 		coOccurrence:         make(map[string]*coOccurrenceMap),
 		senderHopDepth:       make(map[string][]int),
 		federationProfiles:   make(map[string]*FederationNodeProfile),
+		heldForReview:        make(map[string]struct{}),
 	}
 }
 
@@ -2274,6 +2285,45 @@ func (s *State) PendingPuts() []*InventoryEntry {
 	out := make([]*InventoryEntry, 0, len(s.pendingPuts))
 	for _, e := range s.pendingPuts {
 		out = append(out, e)
+	}
+	return out
+}
+
+// HoldPutForReview marks a put message ID as held for review.
+// Held puts remain in pendingPuts — no campfire message is emitted.
+// The auto-accept loop calls this when entry.TokenCost > max.
+// Thread-safe.
+func (s *State) HoldPutForReview(putMsgID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.heldForReview[putMsgID] = struct{}{}
+}
+
+// PruneHeldForReview removes IDs from heldForReview that are no longer present
+// in pendingPuts (i.e., they were accepted or rejected by the operator).
+// The auto-accept loop calls this once per tick, passing the current pending ID set.
+// Thread-safe.
+func (s *State) PruneHeldForReview(pendingIDs map[string]struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id := range s.heldForReview {
+		if _, ok := pendingIDs[id]; !ok {
+			delete(s.heldForReview, id)
+		}
+	}
+}
+
+// PutsHeldForReview returns the subset of pendingPuts whose IDs are in heldForReview.
+// The returned slice is a copy; callers may not mutate the entries.
+// Thread-safe (read lock only; no mutation).
+func (s *State) PutsHeldForReview() []*InventoryEntry {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*InventoryEntry, 0, len(s.heldForReview))
+	for id := range s.heldForReview {
+		if entry, ok := s.pendingPuts[id]; ok {
+			out = append(out, entry)
+		}
 	}
 	return out
 }

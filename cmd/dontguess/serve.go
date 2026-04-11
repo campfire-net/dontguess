@@ -41,7 +41,7 @@ The SDK's sync-before-query handles filesystem transport sync automatically.`,
 func init() {
 	serveCmd.Flags().DurationVar(&servePollInterval, "poll-interval", 500*time.Millisecond, "how often to poll for new messages")
 	serveCmd.Flags().BoolVar(&serveAutoAccept, "auto-accept", true, "automatically accept all puts at token cost")
-	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", 100000, "maximum token cost to auto-accept")
+	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", 1000000, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
 	rootCmd.AddCommand(serveCmd)
 }
 
