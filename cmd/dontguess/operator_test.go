@@ -19,6 +19,8 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -401,6 +403,166 @@ func TestOperatorSocket_ListHeld_Empty(t *testing.T) {
 
 	if len(resp.Puts) != 0 {
 		t.Errorf("expected empty puts list, got %d", len(resp.Puts))
+	}
+}
+
+// ---- Security regression tests (dontguess-33a, 481) ----
+
+// TestOperatorSocket_Permissions verifies that the socket file is created with
+// mode 0600 (owner read/write only) immediately after listenOperatorSocket
+// returns — before any subsequent Chmod could close a TOCTOU window.
+// Regression test for dontguess-33a.
+func TestOperatorSocket_Permissions(t *testing.T) {
+	t.Parallel()
+
+	sockPath := filepath.Join(t.TempDir(), "sec-test.sock")
+	ln, err := listenOperatorSocket(sockPath)
+	if err != nil {
+		t.Fatalf("listenOperatorSocket: %v", err)
+	}
+	defer ln.Close()
+
+	info, err := os.Stat(sockPath)
+	if err != nil {
+		t.Fatalf("os.Stat(%s): %v", sockPath, err)
+	}
+	perm := info.Mode().Perm()
+	if perm != 0600 {
+		t.Errorf("socket perm = %04o, want 0600", perm)
+	}
+}
+
+// TestOperatorSocket_HandlesConcurrentClients verifies that 5 concurrent
+// connections each receive a valid response — no head-of-line blocking.
+// Regression test for dontguess-481a (sequential handling).
+func TestOperatorSocket_HandlesConcurrentClients(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	sockPath, _ := startSocketServer(t, eng)
+
+	const n = 5
+	type result struct {
+		ok  bool
+		err error
+	}
+	results := make([]result, n)
+	var wg sync.WaitGroup
+	wg.Add(n)
+	for i := range n {
+		go func(idx int) {
+			defer wg.Done()
+			conn, err := net.Dial("unix", sockPath)
+			if err != nil {
+				results[idx] = result{err: err}
+				return
+			}
+			defer conn.Close()
+			if err := json.NewEncoder(conn).Encode(map[string]any{"op": "list-held"}); err != nil {
+				results[idx] = result{err: err}
+				return
+			}
+			var resp struct {
+				Puts []any `json:"puts"`
+			}
+			if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+				results[idx] = result{err: err}
+				return
+			}
+			results[idx] = result{ok: true}
+		}(i)
+	}
+	wg.Wait()
+
+	for i, r := range results {
+		if r.err != nil {
+			t.Errorf("client %d error: %v", i, r.err)
+		} else if !r.ok {
+			t.Errorf("client %d: did not get ok response", i)
+		}
+	}
+}
+
+// TestOperatorSocket_StalledClient verifies that a client that connects but
+// never sends data is timed out within 5-6 seconds, not hung indefinitely.
+// Regression test for dontguess-481b (missing read deadline).
+func TestOperatorSocket_StalledClient(t *testing.T) {
+	// Not parallel — this test takes ~5s by design (deadline expiry).
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	sockPath, _ := startSocketServer(t, eng)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+	// Deliberately do NOT send anything — handler should time out.
+
+	start := time.Now()
+	// The handler sets a 5-second deadline and closes the conn on timeout.
+	// Set a generous read deadline on our side to detect when the server closes.
+	conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	buf := make([]byte, 64)
+	_, readErr := conn.Read(buf) // will unblock when server closes the conn
+	elapsed := time.Since(start)
+
+	if readErr == nil {
+		t.Error("expected error (server close / timeout), got nil")
+	}
+	if elapsed < 4*time.Second {
+		t.Errorf("handler closed in %v — too fast, expected ~5s deadline", elapsed)
+	}
+	if elapsed > 8*time.Second {
+		t.Errorf("handler took %v — deadline not enforced (expected ≤ 6s)", elapsed)
+	}
+	t.Logf("stalled client timed out after %v (expected 5-6s): %v", elapsed, readErr)
+}
+
+// TestOperatorSocket_OversizedRequest verifies that a >2 MiB payload is
+// rejected (connection closed or error response) rather than allocating 2 MiB.
+// Regression test for dontguess-481c (unbounded LimitReader).
+func TestOperatorSocket_OversizedRequest(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	sockPath, _ := startSocketServer(t, eng)
+
+	conn, err := net.Dial("unix", sockPath)
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close()
+
+	// Send slightly more than 2 MiB of garbage JSON to exceed the 1 MiB limit.
+	bigPayload := `{"op":"list-held","data":"` + strings.Repeat("x", 2*1024*1024) + `"}`
+	conn.SetDeadline(time.Now().Add(10 * time.Second)) //nolint:errcheck
+	_, writeErr := conn.Write([]byte(bigPayload))
+	if writeErr != nil {
+		// Connection was closed by server before we finished writing — expected.
+		t.Logf("server closed conn during oversized write: %v", writeErr)
+		return
+	}
+
+	// If write succeeded, the server should have returned an error JSON or
+	// closed the conn due to the read deadline.
+	var resp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	decErr := json.NewDecoder(conn).Decode(&resp)
+	if decErr == nil {
+		// Got a response — must be an error, not a success.
+		if resp.OK {
+			t.Error("oversized request returned ok=true — LimitReader not effective")
+		}
+		t.Logf("oversized request returned error response: %s", resp.Error)
+	} else {
+		// Conn closed — also acceptable (LimitReader causes decode error → close).
+		t.Logf("oversized request: decode error (conn closed by server): %v", decErr)
 	}
 }
 

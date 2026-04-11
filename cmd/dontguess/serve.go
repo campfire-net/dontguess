@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
@@ -95,7 +97,10 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating scrip store: %w", err)
 	}
 
-	logDest := buildLogDest(cfHome)
+	logDest, err := buildLogDest(cfHome)
+	if err != nil {
+		return fmt.Errorf("log setup: %w", err)
+	}
 	logger := log.New(logDest, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
 
 	provCfg := provenance.DefaultConfig()
@@ -209,13 +214,27 @@ func runServe(_ *cobra.Command, _ []string) error {
 
 // listenOperatorSocket removes any stale socket file and creates a new unix
 // domain socket listener at path. Permissions are set to 0600 (owner-only).
+//
+// Security (dontguess-33a): we close the TOCTOU window between socket creation
+// and chmod by narrowing the umask to 0177 before net.Listen so the kernel
+// creates the inode with mode 0600 immediately. syscall.Umask is goroutine-
+// global — this is safe here because the operator process is single-threaded
+// during startup and this function is called only once. The subsequent Chmod is
+// belt-and-suspenders in case the platform ignores the umask for UNIX sockets.
 func listenOperatorSocket(path string) (net.Listener, error) {
 	// Remove stale socket file if present.
 	_ = os.Remove(path)
+
+	// Narrow umask so net.Listen creates the socket at 0600 immediately,
+	// closing the TOCTOU window between creation and Chmod.
+	oldMask := syscall.Umask(0177) // 0177 → socket lands at 0600
 	ln, err := net.Listen("unix", path)
+	syscall.Umask(oldMask) // restore regardless of Listen outcome
+
 	if err != nil {
 		return nil, err
 	}
+	// Belt-and-suspenders: some platforms don't honour umask for AF_UNIX.
 	if err := os.Chmod(path, 0600); err != nil {
 		ln.Close()
 		return nil, err
@@ -233,8 +252,10 @@ type operatorRequest struct {
 }
 
 // serveOperatorSocket accepts connections on ln and handles operator IPC
-// requests until ctx is cancelled. One request per connection is handled
-// synchronously; the connection is closed after each request.
+// requests until ctx is cancelled. Each connection is dispatched to a goroutine
+// so a hung client cannot block subsequent operator commands (dontguess-481a).
+// A WaitGroup allows clean shutdown — the function returns only after all
+// in-flight handlers finish.
 func serveOperatorSocket(ctx context.Context, ln net.Listener, eng *exchange.Engine) {
 	// Close the listener when the context is done so Accept unblocks.
 	go func() {
@@ -242,23 +263,48 @@ func serveOperatorSocket(ctx context.Context, ln net.Listener, eng *exchange.Eng
 		ln.Close()
 	}()
 
+	var wg sync.WaitGroup
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			// Listener closed — normal shutdown.
+			// Listener closed — wait for in-flight handlers then return.
+			wg.Wait()
 			return
 		}
-		handleOperatorConn(conn, eng)
+		if ctx.Err() != nil {
+			conn.Close()
+			wg.Wait()
+			return
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			handleOperatorConn(conn, eng)
+		}()
 	}
 }
 
 // handleOperatorConn reads one JSON request from conn, dispatches it, writes
 // the JSON response, and closes the connection.
+//
+// Security (dontguess-481):
+//   (b) A 5-second read deadline prevents a stalled client from holding the
+//       goroutine indefinitely.
+//   (c) The connection reader is wrapped in an io.LimitReader (1 MiB) before
+//       being passed to json.NewDecoder, bounding memory allocation from
+//       oversized payloads. All legitimate requests are small JSON objects
+//       well under this ceiling.
 func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 	defer conn.Close()
 
+	// (b) Stall protection: abort if no full request arrives within 5 seconds.
+	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+
+	// (c) OOM protection: cap input to 1 MiB.
+	limited := io.LimitReader(conn, 1<<20)
+
 	var req operatorRequest
-	dec := json.NewDecoder(conn)
+	dec := json.NewDecoder(limited)
 	if err := dec.Decode(&req); err != nil {
 		writeOperatorResp(conn, map[string]any{"ok": false, "error": "bad request: " + err.Error()})
 		return
@@ -332,17 +378,33 @@ func writeOperatorResp(conn net.Conn, v any) {
 // Logs go to both stderr (for foreground operation) and a rotating file
 // at $dgHome/dontguess.log (10 MB max, 5 backups, 28-day retention, gzip).
 // dgHome is resolved from DG_HOME env var, falling back to $HOME/.cf.
-func buildLogDest(dgHome string) io.Writer {
+//
+// Security (dontguess-ba9c): if the target log path is a symlink the function
+// returns an error instead of opening the file. Opening a symlink allows an
+// attacker who pre-creates a symlink at the log path to redirect operator logs
+// into an arbitrary file the process can write (e.g. ~/.ssh/authorized_keys).
+// Startup fails fast on this condition — a dangerous config should not be
+// silently ignored.
+func buildLogDest(dgHome string) (io.Writer, error) {
 	if override := os.Getenv("DG_HOME"); override != "" {
 		dgHome = override
 	}
+	logPath := filepath.Join(dgHome, "dontguess.log")
+
+	// Symlink attack prevention: reject a pre-existing symlink at the log path.
+	if info, err := os.Lstat(logPath); err == nil {
+		if info.Mode()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("log path %q is a symlink — refusing to open (symlink attack prevention)", logPath)
+		}
+	}
+
 	roller := &lumberjack.Logger{
-		Filename:   filepath.Join(dgHome, "dontguess.log"),
+		Filename:   logPath,
 		MaxSize:    10, // megabytes
 		MaxBackups: 5,
 		MaxAge:     28, // days
 		Compress:   true,
 	}
-	return io.MultiWriter(os.Stderr, roller)
+	return io.MultiWriter(os.Stderr, roller), nil
 }
 
