@@ -98,21 +98,28 @@ main() {
   # --- wrapper script ---
   cat > "${INSTALL_DIR}/dontguess" <<'ENDWRAPPER'
 #!/bin/sh
-# dontguess — turnkey wrapper
+# dontguess — turnkey wrapper (v0.4.0)
+# Hardened: DG_HOME pin, flock start, cmdline PID verify, health-probe readiness
 set -e
 
-DG_OP="${HOME}/.local/bin/dontguess-operator"
+DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
 CF="${HOME}/.local/bin/cf"
+
+# CF_HOME controls identity only (unchanged semantics).
 CF_HOME="${CF_HOME:-${HOME}/.cf}"
-CFG="${CF_HOME}/dontguess-exchange.json"
-PID="${CF_HOME}/dontguess.pid"
-LOG="${CF_HOME}/dontguess.log"
+
+# DG_HOME pins all singleton exchange state, independent of CF_HOME.
+# Subagents with per-session CF_HOME still find the real exchange here.
+DG_HOME="${DG_HOME:-${HOME}/.cf}"
+
+CFG="${DG_HOME}/dontguess-exchange.json"
+PID_FILE="${DG_HOME}/dontguess.pid"
+LOG="${DG_HOME}/dontguess.log"
+LOCK="${DG_HOME}/dontguess.start.lock"
 
 case "${1:-}" in
   init|serve|convention) exec "$DG_OP" "$@";;
   join)
-    # Join uses beacon string for transport-aware discovery.
-    # No exchange config required — user provides target as argument.
     shift; exec "$CF" join "$@";;
   leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
   version|--version)
@@ -130,27 +137,94 @@ case "${1:-}" in
     exit 0;;
 esac
 
-# No exchange? Tell them.
+# Exchange config check (always from DG_HOME, not CF_HOME)
 if [ ! -f "$CFG" ]; then
   echo "No exchange configured. Run: dontguess init" >&2
   exit 1
 fi
 
-# Read campfire ID (used for convention operations — cf requires hex ID for routing)
+# Read campfire ID (convention operations require hex ID for routing)
 XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$CFG")
 [ -z "$XCFID" ] && { echo "error: cannot read exchange_campfire_id from $CFG" >&2; exit 1; }
 
-# Auto-start server
-if ! { [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null; }; then
-  echo "Starting exchange server..." >&2
-  nohup "$DG_OP" serve >"$LOG" 2>&1 &
-  echo $! >"$PID"
-  sleep 1
-  kill -0 "$(cat "$PID")" 2>/dev/null || { echo "error: server failed. See $LOG" >&2; exit 1; }
-  echo "  Exchange running (pid $(cat "$PID"))" >&2
+# PID verification helper
+pid_is_operator() {
+  local pid="$1"
+  [ -z "$pid" ] && return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  local comm=""
+  if [ -f "/proc/${pid}/comm" ]; then
+    comm=$(cat "/proc/${pid}/comm" 2>/dev/null || true)
+  else
+    comm=$(ps -p "$pid" -o comm= 2>/dev/null || true)
+  fi
+  case "$comm" in
+    dontguess-oper*) return 0;;
+    *) return 1;;
+  esac
+}
+
+# Auto-start with flock
+_current_pid=""
+if [ -f "$PID_FILE" ]; then
+  _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
 fi
 
-# Convention operations use hex campfire ID for routing.
+if ! pid_is_operator "$_current_pid"; then
+  if flock -n "$LOCK" sh -c '
+    pid=""
+    pid_file="'"$PID_FILE"'"
+    [ -f "$pid_file" ] && pid=$(cat "$pid_file" 2>/dev/null || true)
+    _is_op() {
+      local p="$1"
+      [ -z "$p" ] && return 1
+      kill -0 "$p" 2>/dev/null || return 1
+      local c=""
+      if [ -f "/proc/${p}/comm" ]; then c=$(cat "/proc/${p}/comm" 2>/dev/null || true)
+      else c=$(ps -p "$p" -o comm= 2>/dev/null || true); fi
+      case "$c" in dontguess-oper*) return 0;; *) return 1;; esac
+    }
+    _is_op "$pid" && exit 0
+    echo "Starting exchange server..." >&2
+    nohup "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
+    new_pid=$!
+    printf "%d\n" "$new_pid" > "'"$PID_FILE"'"
+    exit 0
+  ' 2>/dev/null; then
+    _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  else
+    _deadline=$(( $(date +%s) + 5 ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+      if [ -f "$PID_FILE" ]; then
+        _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+        pid_is_operator "$_current_pid" && break
+      fi
+      sleep 0.1 2>/dev/null || sleep 1
+    done
+    _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+  fi
+  if pid_is_operator "$_current_pid"; then
+    echo "  Exchange running (pid ${_current_pid})" >&2
+  fi
+fi
+
+# Health-probe readiness: verify operator PID is dontguess-operator AND exchange is readable
+_probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+_ready=0
+_deadline=$(( $(date +%s) + 5 ))
+while [ "$(date +%s)" -lt "$_deadline" ]; do
+  if pid_is_operator "$_probe_pid" && "$CF" "$XCFID" buys --json >/dev/null 2>&1; then
+    _ready=1
+    break
+  fi
+  sleep 0.1 2>/dev/null || sleep 1
+done
+
+if [ "$_ready" -eq 0 ]; then
+  echo "server failed (not ready in 5s). See $LOG" >&2
+  exit 1
+fi
+
 exec "$CF" "$XCFID" "$@"
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"
