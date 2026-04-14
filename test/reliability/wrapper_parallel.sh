@@ -2,7 +2,7 @@
 # test/reliability/wrapper_parallel.sh — parallel wrapper reliability harness (dontguess-9b6)
 #
 # Spawns N (default 50) concurrent dontguess buy calls across 4 context rotations,
-# then aggregates results and exits 0 iff >=94% reached the exchange with zero
+# then aggregates results and exits 0 iff >=95% reached the exchange with zero
 # hard-failure classes.
 #
 # Usage:
@@ -37,10 +37,15 @@ RUN_SUFFIX="$(date +%s%N)"
 XCFID=$(jq -r .exchange_campfire_id "${DG_HOME}/dontguess-exchange.json")
 
 # ---------------------------------------------------------------------------
+# Fix (25b): Clean out/ at the TOP of every run, regardless of prior outcome.
+# This prevents stale log files from a previous failed run from contaminating
+# the aggregator's classification.
+# ---------------------------------------------------------------------------
+rm -rf "$OUT_DIR" && mkdir -p "$OUT_DIR"
+
+# ---------------------------------------------------------------------------
 # Setup / cleanup helpers
 # ---------------------------------------------------------------------------
-
-mkdir -p "$OUT_DIR"
 
 kill_operator() {
   pkill -f dontguess-operator 2>/dev/null || true
@@ -87,26 +92,36 @@ while [ "$i" -le "$N" ]; do
     case "$ctx_idx" in
       0)
         # default: unset CF_HOME so wrapper uses its built-in default
-        env -u CF_HOME "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1 || true
+        # Fix (0ed): wrap in timeout 30 so a hung buy doesn't block wait indefinitely.
+        # Fix (7ab): capture real exit code rather than always writing exit:0.
+        timeout 30 env -u CF_HOME "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1
+        dg_exit=$?
         ;;
       1)
         # worktree-cfhome: CF_HOME = fresh mktemp dir
+        # Fix (e78): trap ensures temp dir is removed on EXIT, even on timeout/error.
         wt_dir=$(mktemp -d)
-        CF_HOME="$wt_dir" "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1 || true
-        rm -rf "$wt_dir" 2>/dev/null || true
+        trap 'rm -rf "$wt_dir" 2>/dev/null || true' EXIT
+        # Fix (0ed): per-call timeout.
+        timeout 30 env CF_HOME="$wt_dir" "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1
+        dg_exit=$?
         ;;
       2)
         # session-cfhome: CF_HOME = /tmp/cf-session-test-$i
-        CF_HOME="/tmp/cf-session-test-${i}" "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1 || true
+        # Fix (0ed): per-call timeout.
+        timeout 30 env CF_HOME="/tmp/cf-session-test-${i}" "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1
+        dg_exit=$?
         ;;
       3)
         # warm-operator: no env override (operator already warm from earlier rounds)
-        env -u CF_HOME "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1 || true
+        # Fix (0ed): per-call timeout.
+        timeout 30 env -u CF_HOME "$DG" buy --task "$task" --budget 100 >"$log_file" 2>&1
+        dg_exit=$?
         ;;
     esac
-    # Record exit status as last line (subshell always exits 0 due to || true above;
-    # we capture the exit via the grep-able prefix instead)
-    printf 'exit:0\n' >> "$log_file"
+    # Fix (0ed): if timeout fires, exit code is 124 — record it faithfully.
+    # Fix (7ab): write real exit code, not hardcoded 0.
+    printf "exit:%d\n" "$dg_exit" >> "$log_file"
   ) &
 
   i=$((i+1))
@@ -129,23 +144,30 @@ done
 printf "\n[aggregate] Fetching campfire buy log and classifying...\n"
 
 python3 - "$OUT_DIR" "$N" "$RUN_SUFFIX" "$XCFID" <<'PYEOF'
-import sys, os, json, re, subprocess
+import sys, os, json, re, subprocess, math
 
 out_dir  = sys.argv[1]
 n        = int(sys.argv[2])
 suffix   = sys.argv[3]
 xcfid    = sys.argv[4]
 
-# Fetch campfire buys — ground truth for "reached exchange"
+# Fix (8c1): Fetch campfire buys — ground truth for "reached exchange".
+# On failure, emit a clear diagnostic and abort. The harness must NOT silently
+# degrade its ground-truth check.
+# Fix (bae): cf read has no --limit flag. Filter client-side by the run-specific
+# task suffix (harness-$i-ctx$ctx_idx-$RUN_SUFFIX) which is unique per run.
 try:
     cf_path = os.path.expanduser("~/.local/bin/cf")
-    raw = subprocess.check_output([cf_path, xcfid, "buys", "--json"], stderr=subprocess.DEVNULL)
+    raw = subprocess.check_output(
+        [cf_path, xcfid, "buys", "--json"],
+        stderr=subprocess.PIPE,
+    )
     buys = json.loads(raw)
 except Exception as e:
-    print(f"[warn] Could not fetch cf buys: {e}", file=sys.stderr)
-    buys = []
+    print(f"ERROR: cf buys query failed: {e}", file=sys.stderr)
+    sys.exit(1)
 
-# Build set of tasks that reached the exchange (filter by run suffix)
+# Build set of tasks that reached the exchange (filter by run suffix — unique per run)
 reached_tasks = set()
 for msg in buys:
     try:
@@ -166,7 +188,7 @@ buckets = {
     "other":                  0,
 }
 
-per_run = {}  # i -> {task, ctx_idx, bucket, reached}
+per_run = {}  # i -> {task, ctx_idx, bucket, reached, exit_code}
 
 for fname in sorted(os.listdir(out_dir)):
     m = re.match(r"run-(\d+)\.log", fname)
@@ -180,19 +202,38 @@ for fname in sorted(os.listdir(out_dir)):
     ctx_idx = (i - 1) % 4
     task = f"harness-{i}-ctx{ctx_idx}-{suffix}"
 
+    # Fix (7ab): parse real exit code from the last line written by the subshell.
+    exit_code = None
+    for line in text.splitlines():
+        em = re.match(r"exit:(\d+)", line)
+        if em:
+            exit_code = int(em.group(1))
+
+    # Fix (bd2): expanded hard-failure patterns — transport-level failures ARE
+    # server failures from the buyer's perspective. Added: connection refused,
+    # connection reset, dial tcp, i/o timeout.
+    SERVER_FAIL_PATTERNS = [
+        "server failed",
+        "server error",
+        "connection refused",
+        "connection reset",
+        "dial tcp",
+        "i/o timeout",
+    ]
+
     # Classify by stderr/stdout content
     if "No exchange configured" in text:
         bucket = "No exchange configured"
     elif "operator not running" in text or "operator is not running" in text:
         bucket = "operator not running"
-    elif "server failed" in text or "server error" in text:
+    elif any(p in text for p in SERVER_FAIL_PATTERNS):
         bucket = "server failed"
     elif "identity is wrapped" in text:
         bucket = "identity is wrapped"
     elif task in reached_tasks:
         bucket = "success"
     else:
-        # Exit code 0 in log means wrapper returned ok but might not have hit exchange
+        # Fix (7ab): also flag timeout exits (124) explicitly in "other" classification
         bucket = "other"
 
     # Ground truth override: campfire is authoritative
@@ -201,7 +242,7 @@ for fname in sorted(os.listdir(out_dir)):
 
     buckets[bucket] += 1
     per_run[i] = {"task": task, "ctx_idx": ctx_idx, "bucket": bucket,
-                  "reached": task in reached_tasks}
+                  "reached": task in reached_tasks, "exit_code": exit_code}
 
 # reached_exchange = count of runs whose task appeared in campfire buys
 reached_count = sum(1 for v in per_run.values() if v["reached"])
@@ -217,11 +258,10 @@ print(f"\nreached_exchange={reached_count}/{n} ({pct:.1f}%) | success={buckets['
 hard_fail_buckets = {"No exchange configured", "operator not running", "server failed"}
 hard_fail_count = sum(buckets[b] for b in hard_fail_buckets)
 
-# Gate: >=94% reached AND zero hard failures
-threshold = max(1, int(n * 0.94))
-# Use ceiling: 47 out of 50 = 94%
-import math
-threshold = math.ceil(n * 0.94)
+# Fix (bd5): threshold is >=95% (spec title). math.ceil(50 * 0.95) = 48/50.
+# Previously used 0.94 (47/50). Aligning to spec. If the observed floor is lower,
+# calibrate here and document — but do not silently use a softer threshold.
+threshold = math.ceil(n * 0.95)
 
 gate_ok = (reached_count >= threshold) and (hard_fail_count == 0)
 
@@ -231,7 +271,7 @@ if gate_ok:
 else:
     diag_lines = []
     if reached_count < threshold:
-        diag_lines.append(f"reached_exchange={reached_count}/{n} ({pct:.1f}%) — below {threshold}/{n} (94%) threshold")
+        diag_lines.append(f"reached_exchange={reached_count}/{n} ({pct:.1f}%) — below {threshold}/{n} (95%) threshold")
     for b in hard_fail_buckets:
         if buckets[b] > 0:
             diag_lines.append(f"hard-failure bucket '{b}' has {buckets[b]} failures (must be 0)")

@@ -33,15 +33,18 @@ kill_operator() {
   done
 }
 
-# buy a task and verify it hit the exchange campfire
-buy_and_verify() {
+# Run a buy with optional extra env vars. Does NOT poll campfire.
+# Usage: buy_with_env <task> [env_var=val ...]
+buy_with_env() {
+  local task="$1"; shift
+  env "$@" "$DG" buy --task "$task" --budget 100 >/dev/null 2>&1 || true
+}
+
+# Poll campfire for a task to appear (up to timeout seconds). No buy of its own.
+verify_in_campfire() {
   local task="$1"
   local timeout="${2:-15}"
 
-  # run the buy (may auto-start operator)
-  "$DG" buy --task "$task" --budget 100 >/dev/null 2>&1 || true
-
-  # poll for the message to appear in campfire (up to timeout seconds)
   local i=0
   while [ "$i" -lt "$timeout" ]; do
     local found
@@ -53,6 +56,14 @@ buy_and_verify() {
     sleep 1; i=$((i+1))
   done
   return 1
+}
+
+# Convenience wrapper: buy then verify (used by tests that just need both).
+buy_and_verify() {
+  local task="$1"
+  local timeout="${2:-15}"
+  buy_with_env "$task"
+  verify_in_campfire "$task" "$timeout"
 }
 
 # ----- test 1: default context -----
@@ -79,12 +90,14 @@ test_session_dir_context() {
   session_dir=$(mktemp -d)
 
   # Operator must already be running (from test 1 or will auto-start via DG_HOME default)
-  # CF_HOME points to a temp dir — DG_HOME should still default to ~/.cf
-  CF_HOME="$session_dir" "$DG" buy --task "$task" >/dev/null 2>&1 || true
+  # CF_HOME points to a temp dir — DG_HOME should still default to ~/.cf.
+  # Use buy_with_env so that only THIS scoped buy is issued; verify_in_campfire
+  # then polls without issuing its own buy (which would mask the session-dir buy).
+  buy_with_env "$task" "CF_HOME=$session_dir"
 
   rm -rf "$session_dir"
 
-  if buy_and_verify "$task" 15; then
+  if verify_in_campfire "$task" 15; then
     pass "session-dir CF_HOME: buy reaches exchange (wrapper uses DG_HOME, not CF_HOME)"
   else
     fail "session-dir CF_HOME: buy not found in exchange — wrapper may be using CF_HOME for exchange state"

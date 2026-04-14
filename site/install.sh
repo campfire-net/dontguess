@@ -106,6 +106,11 @@ main() {
 set -e
 
 DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
+# Security note (dontguess-791): DG_OP can be overridden by the calling user.
+# This is a user-level CLI tool — not setuid — so any user who can set DG_OP
+# can already exec arbitrary binaries through other means (PATH, aliases, etc.).
+# The override is intentional and is restricted to test use only; production
+# callers should never set DG_OP.  Accepting risk as documented.
 CF="${HOME}/.local/bin/cf"
 
 # CF_HOME controls identity only (unchanged semantics).

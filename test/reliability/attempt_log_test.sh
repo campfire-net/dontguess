@@ -145,9 +145,9 @@ fi
 rm -rf "$TEST3_HOME"
 
 # ---------------------------------------------------------------------------
-# Test 4: Parallel atomicity — 20 concurrent buys produce valid JSONL lines
+# Test 4: Parallel atomicity — 50 concurrent buys produce valid JSONL lines
 # ---------------------------------------------------------------------------
-printf "\n[TEST 4] Parallel atomicity (20 concurrent buys)\n"
+printf "\n[TEST 4] Parallel atomicity (50 concurrent buys)\n"
 TEST4_HOME=$(mktemp -d)
 cp "${DG_HOME_DEFAULT}/dontguess-exchange.json" "${TEST4_HOME}/"
 ATTEMPTS4="${TEST4_HOME}/dontguess-attempts.log"
@@ -156,9 +156,9 @@ rm -f "$ATTEMPTS4"
 # Wait for operator startup on first call, then parallelize
 DG_HOME="$TEST4_HOME" "$DG" buy --task "parallel-warmup-$$" --budget 10 >/dev/null 2>&1 || true
 
-# 20 concurrent buys
+# 50 concurrent buys
 i=1
-while [ "$i" -le 20 ]; do
+while [ "$i" -le 50 ]; do
   DG_HOME="$TEST4_HOME" "$DG" buy --task "parallel-${i}-$$" --budget 10 >/dev/null 2>&1 &
   i=$((i+1))
 done
@@ -166,7 +166,7 @@ wait
 
 # Count lines and validate each
 TOTAL_LINES=$(wc -l < "$ATTEMPTS4" 2>/dev/null || echo 0)
-# We expect at least 21 lines (warmup + 20 parallel)
+# We expect at least 51 lines (warmup + 50 parallel)
 BAD_LINES=0
 if [ -f "$ATTEMPTS4" ]; then
   while IFS= read -r line; do
@@ -177,10 +177,10 @@ if [ -f "$ATTEMPTS4" ]; then
 fi
 
 ACTUAL_LINES=$(grep -c '"cmd"' "$ATTEMPTS4" 2>/dev/null || echo 0)
-if [ "$ACTUAL_LINES" -ge 20 ] && [ "$BAD_LINES" -eq 0 ]; then
+if [ "$ACTUAL_LINES" -ge 50 ] && [ "$BAD_LINES" -eq 0 ]; then
   pass "Test 4: parallel atomicity — ${ACTUAL_LINES} lines, all valid JSON, 0 corrupt"
 else
-  fail "Test 4" "lines=${ACTUAL_LINES} (want >=20), bad_lines=${BAD_LINES}"
+  fail "Test 4" "lines=${ACTUAL_LINES} (want >=50), bad_lines=${BAD_LINES}"
 fi
 rm -rf "$TEST4_HOME"
 
@@ -239,6 +239,43 @@ else
   fi
 fi
 rm -rf "$TEST6_HOME"
+
+# ---------------------------------------------------------------------------
+# Test 6b: Caller prefix — hex public_key identity produces 8-char hex caller
+# (dontguess-493: explicit coverage for the hex code path)
+# ---------------------------------------------------------------------------
+printf "\n[TEST 6b] Caller prefix — hex identity path\n"
+TEST6B_HOME=$(mktemp -d)
+cp "${DG_HOME_DEFAULT}/dontguess-exchange.json" "${TEST6B_HOME}/"
+ATTEMPTS6B="${TEST6B_HOME}/dontguess-attempts.log"
+rm -f "$ATTEMPTS6B"
+
+# Synthetic identity.json with a lowercase hex public_key (64 hex chars)
+HEX_KEY="deadbeef01234567abcdef890123456789abcdef01234567deadbeef01234567"
+mkdir -p "${TEST6B_HOME}"
+printf '{"public_key":"%s","display_name":"test-hex-identity"}\n' "$HEX_KEY" \
+  > "${TEST6B_HOME}/identity.json"
+
+# Run a buy using this hex identity for CF_HOME (so _attempt_log_write finds it)
+DG_HOME="$TEST6B_HOME" CF_HOME="$TEST6B_HOME" "$DG" buy \
+  --task "caller-hex-test-$$" --budget 100 >/dev/null 2>&1 || true
+
+if [ ! -f "$ATTEMPTS6B" ]; then
+  fail "Test 6b" "log not created"
+else
+  LINE=$(tail -1 "$ATTEMPTS6B")
+  TAG6B=$(printf '%s' "$LINE" | jq -r '.tag // "null"')
+  CALLER=$(printf '%s' "$LINE" | jq -r '.caller // "null"')
+  EXPECTED="${HEX_KEY%"${HEX_KEY#????????}"}"  # first 8 chars
+  if [ "$TAG6B" = "no_exchange_configured" ]; then
+    fail "Test 6b" "exchange not reached (tag=${TAG6B}) — hex identity test inconclusive"
+  elif [ "$CALLER" = "$EXPECTED" ]; then
+    pass "Test 6b: caller=${CALLER} tag=${TAG6B} — matches first 8 hex chars of public_key"
+  else
+    fail "Test 6b" "caller '${CALLER}' expected '${EXPECTED}' (first 8 hex chars of public_key)"
+  fi
+fi
+rm -rf "$TEST6B_HOME"
 
 # ---------------------------------------------------------------------------
 # Test 7: Sensitive data absence — task description not in log
