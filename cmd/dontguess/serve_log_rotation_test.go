@@ -175,40 +175,47 @@ func TestLogRotation_MultiWriter(t *testing.T) {
 	}
 }
 
-// TestLogRotation_DGHomeOverride verifies that buildLogDest respects the
-// DG_HOME environment variable when constructing the log file path.
-func TestLogRotation_DGHomeOverride(t *testing.T) {
-	dir := t.TempDir()
+// TestBuildLogDest_UsesPassedPath verifies that buildLogDest writes to the
+// explicitly passed dgHome path and does NOT re-derive the path from the
+// DG_HOME environment variable (regression for dontguess-34e).
+//
+// Before the fix, buildLogDest re-read DG_HOME from the environment even
+// though the caller had already resolved it and passed it as an argument.
+// This caused the log file to appear at the env-derived path instead of the
+// caller-controlled path, breaking callers that pass a different directory.
+func TestBuildLogDest_UsesPassedPath(t *testing.T) {
+	// Cannot use t.Parallel() here — t.Setenv is not allowed with t.Parallel.
+	passedDir := t.TempDir()
+	envDir := t.TempDir()
 
-	// Set DG_HOME to the temp dir; buildLogDest should use it.
-	t.Setenv("DG_HOME", dir)
+	// Point DG_HOME at a *different* directory than what we pass.
+	// After the fix, buildLogDest must honour the passed path, not the env var.
+	t.Setenv("DG_HOME", envDir)
 
-	dest, err := buildLogDest("/should/not/be/used")
+	dest, err := buildLogDest(passedDir)
 	if err != nil {
 		t.Fatalf("buildLogDest: %v", err)
 	}
 
-	const msg = "dg_home override test line\n"
+	const msg = "log to passed path\n"
 	if _, err := io.WriteString(dest, msg); err != nil {
 		t.Fatalf("write: %v", err)
 	}
 
-	// Close lumberjack so the file is flushed (extract roller from MultiWriter
-	// via type assertion — we know the structure from buildLogDest).
-	type multiWriterCloser interface {
-		io.Writer
-	}
-	// We can't easily reach the lumberjack logger through io.MultiWriter, so
-	// read the file directly after a sync via an explicit small write.
-	// The file should exist at $DG_HOME/dontguess.log.
-	logPath := filepath.Join(dir, "dontguess.log")
-
+	// Log file must appear in passedDir, not envDir.
+	logPath := filepath.Join(passedDir, "dontguess.log")
 	data, err := os.ReadFile(logPath)
 	if err != nil {
-		t.Fatalf("ReadFile %s: %v — DG_HOME override not respected", logPath, err)
+		t.Fatalf("ReadFile %s: %v — log not written to passed path", logPath, err)
 	}
-	if !strings.Contains(string(data), "dg_home override test line") {
-		t.Errorf("expected message not in file: %q", string(data))
+	if !strings.Contains(string(data), "log to passed path") {
+		t.Errorf("expected message not in passed-path file: %q", string(data))
+	}
+
+	// Confirm nothing was written to the env-override directory.
+	envLogPath := filepath.Join(envDir, "dontguess.log")
+	if _, statErr := os.Stat(envLogPath); statErr == nil {
+		t.Errorf("log file unexpectedly created at env-dir path %s — env override was applied", envLogPath)
 	}
 	_ = dest
 }

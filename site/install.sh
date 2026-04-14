@@ -247,7 +247,12 @@ if ! pid_is_operator "$_current_pid"; then
     }
     _is_op "$pid" && exit 0
     echo "Starting exchange server..." >&2
-    nohup "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
+    # Pin CF_HOME to DG_HOME so the operator always uses the stable exchange
+    # identity, even when this wrapper was called by a subagent whose CF_HOME
+    # points at a per-session directory (e.g. /tmp/cf-session-XXX).
+    # Without this pin the operator inherits the caller's CF_HOME and
+    # protocol.InitWithConfig() may fail or load the wrong identity (dontguess-b6e).
+    nohup env CF_HOME="'"$DG_HOME"'" "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
     new_pid=$!
     printf "%d\n" "$new_pid" > "'"$PID_FILE"'"
     exit 0
