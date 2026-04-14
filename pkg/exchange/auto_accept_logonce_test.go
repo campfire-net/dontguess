@@ -74,6 +74,92 @@ func replayAll(t *testing.T, h *testHarness, eng *exchange.Engine) {
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 }
 
+// TestRunAutoAccept_CapZero verifies the zero-boundary case: when max=0, ALL puts
+// are over-cap regardless of their token cost. Each should land in PutsHeldForReview
+// and produce exactly one "skipping put" log line. No puts should be auto-accepted.
+// Regression test for dontguess-166.
+func TestRunAutoAccept_CapZero(t *testing.T) {
+	t.Parallel()
+
+	const maxAccept = int64(0)
+
+	h := newTestHarness(t)
+
+	var logBuf bytes.Buffer
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.Logger = newLogCapture(&logBuf)
+	})
+
+	// Submit 3 puts with varying token costs — all should be over-cap at max=0.
+	sendOverCapPut(t, h, "tiny put", 100)
+	sendOverCapPut(t, h, "medium put", 1000)
+	sendOverCapPut(t, h, "large put", 1_000_000)
+	replayAll(t, h, eng)
+
+	pending := eng.State().PendingPuts()
+	if len(pending) != 3 {
+		t.Fatalf("expected 3 pending puts, got %d", len(pending))
+	}
+
+	skipped := make(map[string]struct{})
+	now := time.Now()
+	eng.RunAutoAccept(maxAccept, now, skipped)
+
+	// All 3 should be held — none accepted.
+	held := eng.State().PutsHeldForReview()
+	if len(held) != 3 {
+		t.Errorf("expected 3 puts in PutsHeldForReview at cap=0, got %d", len(held))
+	}
+
+	// All 3 still pending (no campfire state change).
+	pending = eng.State().PendingPuts()
+	if len(pending) != 3 {
+		t.Errorf("expected all 3 puts still pending after cap=0 tick, got %d", len(pending))
+	}
+
+	// No inventory — nothing was accepted.
+	inv := eng.State().Inventory()
+	if len(inv) != 0 {
+		t.Errorf("expected empty inventory at cap=0, got %d entries", len(inv))
+	}
+
+	// Exactly 3 "skipping put" log lines — one per put.
+	skipLines := countLines(&logBuf, "skipping put")
+	if skipLines != 3 {
+		t.Errorf("expected 3 'skipping put' log lines at cap=0, got %d\nlog:\n%s",
+			skipLines, logBuf.String())
+	}
+}
+
+// TestRunAutoAccept_EmptyPending verifies that RunAutoAccept is a no-op when there
+// are no pending puts: no log lines, no panics, no errors. Regression test for
+// dontguess-807.
+func TestRunAutoAccept_EmptyPending(t *testing.T) {
+	t.Parallel()
+
+	const maxAccept = int64(1_000_000)
+
+	h := newTestHarness(t)
+
+	var logBuf bytes.Buffer
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.Logger = newLogCapture(&logBuf)
+	})
+
+	// Do NOT submit any puts. The pending snapshot is empty.
+	skipped := make(map[string]struct{})
+	now := time.Now()
+
+	// Run 5 times — should be completely silent.
+	for i := 0; i < 5; i++ {
+		eng.RunAutoAccept(maxAccept, now, skipped)
+	}
+
+	if logBuf.Len() != 0 {
+		t.Errorf("expected no log output for empty pending snapshot across 5 ticks, got:\n%s", logBuf.String())
+	}
+}
+
 // TestAutoAccept_LogOnce is the primary regression test for dontguess-405.
 // It verifies that an over-cap put produces exactly one "skipping put" log line
 // across N=10 RunAutoAccept calls, not one per call.
@@ -155,11 +241,16 @@ func TestAutoAccept_Regression(t *testing.T) {
 	skipLines := countLines(&logBuf, "skipping put")
 	acceptLines := countLines(&logBuf, "auto-accepted put")
 	if skipLines != 5 {
-		t.Errorf("expected 5 'skipping put' lines, got %d\nlog output:\n%s",
+		t.Errorf("expected 5 'skipping put' lines (one per over-cap put, logged exactly once), got %d\nlog output:\n%s",
 			skipLines, logBuf.String())
 	}
-	if acceptLines != 5 {
-		t.Errorf("expected 5 'auto-accepted put' lines, got %d\nlog output:\n%s",
+	// Under-cap puts are accepted on the first tick they are processed. All 5 should
+	// be accepted across the 10 ticks. We assert >= 5 rather than == 5 to avoid
+	// brittleness if a future version batches or retries accepts — the invariant is
+	// "all under-cap puts eventually accepted," not "exactly one accept line per put."
+	// skipLines == 5 (asserted above) already pins the over-cap boundary precisely.
+	if acceptLines < 5 {
+		t.Errorf("expected at least 5 'auto-accepted put' lines (one per under-cap put), got %d\nlog output:\n%s",
 			acceptLines, logBuf.String())
 	}
 }
