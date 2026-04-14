@@ -264,10 +264,13 @@ if [ ! -f "$ATTEMPTS6B" ]; then
   fail "Test 6b" "log not created"
 else
   LINE=$(tail -1 "$ATTEMPTS6B")
+  TAG6B=$(printf '%s' "$LINE" | jq -r '.tag // "null"')
   CALLER=$(printf '%s' "$LINE" | jq -r '.caller // "null"')
   EXPECTED="${HEX_KEY%"${HEX_KEY#????????}"}"  # first 8 chars
-  if [ "$CALLER" = "$EXPECTED" ]; then
-    pass "Test 6b: caller=${CALLER} — matches first 8 hex chars of public_key"
+  if [ "$TAG6B" = "no_exchange_configured" ]; then
+    fail "Test 6b" "exchange not reached (tag=${TAG6B}) — hex identity test inconclusive"
+  elif [ "$CALLER" = "$EXPECTED" ]; then
+    pass "Test 6b: caller=${CALLER} tag=${TAG6B} — matches first 8 hex chars of public_key"
   else
     fail "Test 6b" "caller '${CALLER}' expected '${EXPECTED}' (first 8 hex chars of public_key)"
   fi
