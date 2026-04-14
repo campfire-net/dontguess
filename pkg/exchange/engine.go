@@ -2802,7 +2802,29 @@ func (e *Engine) stagePredictions(settledEntryID string) {
 // is logged again. State.PruneHeldForReview is called with the same pending set
 // to keep the two maps consistent.
 //
-// Thread safety: skippedPuts is owned exclusively by the caller goroutine.
+// # Dual-map ownership split
+//
+// Two maps track over-cap puts, each serving a different consumer:
+//
+//   skippedPuts (caller-owned, not exported):
+//     Log-once guard. Lives in the ticker goroutine (serve.go). No mutex needed
+//     — it is never accessed from another goroutine. Its sole purpose is
+//     suppressing repeated "skipping put" log lines (one per tick → ~86,400/day
+//     without it). Pruned lazily when a put leaves the pending snapshot.
+//
+//   heldForReview (State-owned, mutex-protected, exported):
+//     State-level classification. Protected by State's internal mutex. Consumed
+//     by the operator socket handler goroutine so "dontguess operator status"
+//     can surface held puts for human review via PutsHeldForReview(). Pruned
+//     by State.PruneHeldForReview() on the same pending snapshot, keeping both
+//     maps in sync.
+//
+// Both maps record the same over-cap put IDs; they differ in ownership,
+// synchronization, and the consumer they serve.
+//
+// # Thread safety
+//
+// skippedPuts is owned exclusively by the caller goroutine.
 // opMu serializes the state-mutating body of this function against concurrent
 // AutoAcceptPut/RejectPut calls from the operator socket handler goroutine.
 // heldForReview lives on State and uses its own mutex.
