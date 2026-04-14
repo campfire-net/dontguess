@@ -23,6 +23,11 @@ import (
 	"gopkg.in/natefinch/lumberjack.v2"
 )
 
+// DefaultAutoAcceptMax is the default value for --auto-accept-max-price.
+// It is exported so tests can assert against it without hardcoding the magic number.
+// If this constant is changed, TestServeAutoAcceptMaxDefault will fail — update both together.
+const DefaultAutoAcceptMax = int64(1_000_000)
+
 var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
@@ -46,7 +51,7 @@ The SDK's sync-before-query handles filesystem transport sync automatically.`,
 func init() {
 	serveCmd.Flags().DurationVar(&servePollInterval, "poll-interval", 500*time.Millisecond, "how often to poll for new messages")
 	serveCmd.Flags().BoolVar(&serveAutoAccept, "auto-accept", true, "automatically accept all puts at token cost")
-	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", 1000000, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
+	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", DefaultAutoAcceptMax, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -64,6 +69,10 @@ func runServe(_ *cobra.Command, _ []string) error {
 	// Derive config directory and db path from the resolved store path.
 	cfHome := filepath.Dir(initResult.StorePath)
 	dbPath := initResult.StorePath
+	// DG_HOME is the dontguess state directory — resolved once here via the
+	// shared resolveDGHome() from dgpath.go, then passed to helpers that need
+	// it (e.g. buildLogDest) so they don't re-derive it from the environment.
+	dgHome := resolveDGHome()
 
 	cfg, err := exchange.LoadConfig(cfHome)
 	if err != nil {
@@ -96,7 +105,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("creating scrip store: %w", err)
 	}
 
-	logDest, err := buildLogDest(cfHome)
+	logDest, err := buildLogDest(dgHome)
 	if err != nil {
 		return fmt.Errorf("log setup: %w", err)
 	}
@@ -172,7 +181,25 @@ func runServe(_ *cobra.Command, _ []string) error {
 	fmt.Printf("  cf join %s\n\n", cfg.ExchangeCampfireID[:16])
 
 	// Auto-accept goroutine.
-	// skippedPuts is owned exclusively by this goroutine — no mutex needed.
+	//
+	// Dual-map design — two separate maps track over-cap puts, serving different consumers:
+	//
+	//   skippedPuts (this goroutine, local, not exported):
+	//     Log-suppression guard. Keyed by put message ID. Owned exclusively by this
+	//     goroutine — no mutex needed. Ensures each over-cap put produces exactly one
+	//     "skipping put" log line across the lifetime of the operator process, rather
+	//     than one line per tick (~86,400/day at 1s poll). Pruned lazily on each tick
+	//     when a put leaves the pending snapshot (accepted, rejected, or removed).
+	//
+	//   heldForReview (State, synchronized, exported via PutsHeldForReview()):
+	//     State-level classification. Keyed by put message ID inside State, protected
+	//     by State's mutex. Consumed by the operator socket handler goroutine so the
+	//     operator CLI ("dontguess operator status") can surface held puts for human
+	//     review. Pruned by State.PruneHeldForReview() on the same tick cadence as
+	//     skippedPuts, keeping both maps consistent.
+	//
+	// Both maps record the same over-cap put IDs, but serve different consumers with
+	// different ownership and lifetime semantics.
 	if serveAutoAccept {
 		go func() {
 			skippedPuts := make(map[string]struct{})
@@ -411,8 +438,9 @@ func writeOperatorResp(conn net.Conn, v any) {
 
 // buildLogDest constructs the io.Writer used for the exchange logger.
 // Logs go to both stderr (for foreground operation) and a rotating file
-// at $dgHome/dontguess.log (10 MB max, 5 backups, 28-day retention, gzip).
-// dgHome is resolved from DG_HOME env var, falling back to $HOME/.cf.
+// at dgHome/dontguess.log (10 MB max, 5 backups, 28-day retention, gzip).
+// dgHome must be the already-resolved DG_HOME path — callers should resolve
+// it once via resolveDGHome() (dgpath.go) and pass the result here.
 //
 // Security (dontguess-ba9c): if the target log path is a symlink the function
 // returns an error instead of opening the file. Opening a symlink allows an
@@ -421,9 +449,6 @@ func writeOperatorResp(conn net.Conn, v any) {
 // Startup fails fast on this condition — a dangerous config should not be
 // silently ignored.
 func buildLogDest(dgHome string) (io.Writer, error) {
-	if override := os.Getenv("DG_HOME"); override != "" {
-		dgHome = override
-	}
 	logPath := filepath.Join(dgHome, "dontguess.log")
 
 	// Symlink attack prevention: reject a pre-existing symlink at the log path.
