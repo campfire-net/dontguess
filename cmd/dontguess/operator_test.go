@@ -848,6 +848,117 @@ func TestOperatorSocket_RejectPutNotPending(t *testing.T) {
 	t.Logf("got expected error: %s", resp.Error)
 }
 
+// deadlineTrackingConn wraps a net.Conn and records every SetDeadline call.
+// Used by TestOperatorSocket_AcceptPutDeadlineReset to assert that
+// handleOperatorConn calls SetDeadline twice on the accept-put path: once
+// initially (stall protection) and once after AutoAcceptPut returns (the
+// dontguess-777 reset). If the reset line is removed, only one call is
+// recorded and the test fails.
+type deadlineTrackingConn struct {
+	net.Conn
+	mu    sync.Mutex
+	calls []time.Time // the deadline argument of each SetDeadline call
+}
+
+func (c *deadlineTrackingConn) SetDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.calls = append(c.calls, t)
+	c.mu.Unlock()
+	return c.Conn.SetDeadline(t)
+}
+
+func (c *deadlineTrackingConn) deadlineCallCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls)
+}
+
+// TestOperatorSocket_AcceptPutDeadlineReset is a regression test for
+// dontguess-777: handleOperatorConn must call SetDeadline a second time after
+// AutoAcceptPut returns to reset the connection deadline. Without the reset,
+// opMu contention that consumes the initial 5 s deadline causes the response
+// write to hit a stale deadline and the client sees EOF instead of JSON.
+//
+// This test verifies the structural invariant — that SetDeadline is called
+// exactly twice on the accept-put code path (initial + post-AutoAcceptPut
+// reset) — by wrapping the connection in a deadlineTrackingConn and counting
+// the calls. Removing serve.go line 416 reduces the count to 1 and the test
+// fails, catching the dontguess-777 regression.
+//
+// The test also verifies the second deadline is later than the first (i.e., it
+// extends the window, not shorten it).
+func TestOperatorSocket_AcceptPutDeadlineReset(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+
+	const tokenCost = int64(2_000_000) // > 1M cap → held
+	putID := h.sendHeldPut(eng, "deadline-reset test", tokenCost)
+
+	// Build a server-side net.Pipe wrapped in deadlineTrackingConn so we can
+	// observe every SetDeadline call made by handleOperatorConn.
+	serverConn, clientConn := net.Pipe()
+	tracker := &deadlineTrackingConn{Conn: serverConn}
+
+	// Run handleOperatorConn in a goroutine — it closes the connection when done.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		handleOperatorConn(tracker, eng)
+	}()
+
+	// Send accept-put from the client side.
+	price := tokenCost * 70 / 100
+	expiresStr := time.Now().UTC().Add(72 * time.Hour).Format(time.RFC3339)
+	if err := json.NewEncoder(clientConn).Encode(map[string]any{
+		"op":         "accept-put",
+		"put_msg_id": putID,
+		"price":      price,
+		"expires":    expiresStr,
+	}); err != nil {
+		t.Fatalf("encode accept-put request: %v", err)
+	}
+
+	// Read the response with a generous timeout — the real AutoAcceptPut does
+	// I/O (replayAll + campfire write), so give it up to 120s.
+	clientConn.SetDeadline(time.Now().Add(120 * time.Second)) //nolint:errcheck
+	var resp struct {
+		OK    bool   `json:"ok"`
+		Error string `json:"error,omitempty"`
+	}
+	if err := json.NewDecoder(clientConn).Decode(&resp); err != nil {
+		t.Fatalf("decode accept-put response: %v", err)
+	}
+	clientConn.Close()
+	<-done
+
+	// Primary assertion: accept-put succeeded.
+	if !resp.OK {
+		t.Fatalf("accept-put: ok=false error=%q", resp.Error)
+	}
+
+	// Structural assertion: SetDeadline must have been called at least twice —
+	// once initially (stall protection) and once after AutoAcceptPut (dontguess-777 reset).
+	// A regression that removes the reset reduces this count to 1.
+	n := tracker.deadlineCallCount()
+	if n < 2 {
+		t.Errorf("SetDeadline called %d time(s) on accept-put path, want ≥2 (initial + post-AutoAcceptPut reset)", n)
+		t.Log("This means the dontguess-777 deadline reset (serve.go ~line 416) is missing.")
+	}
+
+	// Secondary assertion: the second deadline must be later than the first,
+	// confirming it extends the window (not an accidental zero or past time).
+	tracker.mu.Lock()
+	calls := tracker.calls
+	tracker.mu.Unlock()
+	if len(calls) >= 2 && !calls[1].After(calls[0]) {
+		t.Errorf("second SetDeadline (%v) is not after first (%v) — reset not extending window", calls[1], calls[0])
+	}
+
+	t.Logf("SetDeadline called %d time(s): %v — deadline reset present (dontguess-777 OK)", n, calls)
+}
+
 // TestOperatorCLI_SocketPath verifies that socketPath() returns the correct
 // path under both DG_HOME override and default resolution (dontguess-409).
 // Not parallel: subtests use t.Setenv which cannot be used in parallel tests.

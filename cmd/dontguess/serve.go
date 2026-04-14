@@ -32,6 +32,12 @@ var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
 	serveAutoAcceptMax int64
+
+	// operatorConnDeadline is the per-connection deadline applied both initially
+	// (stall protection) and again after AutoAcceptPut (dontguess-777 reset).
+	// Exposed as a package-level variable so tests can shorten it without changing
+	// production behaviour. Default is 5 seconds.
+	operatorConnDeadline = 5 * time.Second
 )
 
 var serveCmd = &cobra.Command{
@@ -335,8 +341,8 @@ func serveOperatorSocket(ctx context.Context, ln net.Listener, eng *exchange.Eng
 func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 	defer conn.Close()
 
-	// (b) Stall protection: abort if no full request arrives within 5 seconds.
-	conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+	// (b) Stall protection: abort if no full request arrives within operatorConnDeadline.
+	conn.SetDeadline(time.Now().Add(operatorConnDeadline)) //nolint:errcheck
 
 	// (c) OOM protection: cap input to 1 MiB.
 	limited := io.LimitReader(conn, 1<<20)
@@ -413,7 +419,7 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 		// the 5s deadline and the client would see an EOF instead of a response
 		// (dontguess-777).
 		err := eng.AutoAcceptPut(req.PutMsgID, price, expiresAt)
-		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		conn.SetDeadline(time.Now().Add(operatorConnDeadline)) //nolint:errcheck
 		if err != nil {
 			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
 			return
