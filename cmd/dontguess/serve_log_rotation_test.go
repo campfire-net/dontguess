@@ -175,6 +175,63 @@ func TestLogRotation_MultiWriter(t *testing.T) {
 	}
 }
 
+// TestLogRotation_BackupCap verifies that lumberjack honours MaxBackups=5.
+// We write enough data to trigger 7 rotations (7 × 10MB+ chunks) and then
+// assert that at most 5 compressed backup files exist in the temp directory.
+// The active dontguess.log is not counted as a backup.
+// Regression coverage for dontguess-ffa.
+func TestLogRotation_BackupCap(t *testing.T) {
+	dir := t.TempDir()
+
+	roller := &lumberjack.Logger{
+		Filename:   filepath.Join(dir, "dontguess.log"),
+		MaxSize:    10, // MB — same as buildLogDest config
+		MaxBackups: 5,
+		MaxAge:     0,    // no age-based pruning
+		Compress:   true, // backups are .gz
+	}
+	defer roller.Close()
+
+	// Write 7 × ~11 MB = ~77 MB total. Each chunk exceeds the 10 MB threshold,
+	// so each flush forces a rotation before the next chunk begins.
+	//
+	// 11264 lines × 1 KB = ~11 MB per chunk.
+	line := strings.Repeat("x", 1023) + "\n"
+	for rotation := 0; rotation < 7; rotation++ {
+		for i := 0; i < 11264; i++ {
+			if _, err := io.WriteString(roller, line); err != nil {
+				t.Fatalf("rotation %d line %d: write error: %v", rotation, i, err)
+			}
+		}
+		// Explicitly rotate to flush the current segment before the next chunk.
+		if err := roller.Rotate(); err != nil {
+			t.Fatalf("rotation %d: Rotate() error: %v", rotation, err)
+		}
+	}
+	roller.Close()
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("ReadDir: %v", err)
+	}
+
+	// Count .gz backup files (lumberjack names them dontguess-<timestamp>.log.gz).
+	var gzCount int
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".gz") {
+			gzCount++
+		}
+	}
+
+	if gzCount > 5 {
+		t.Errorf("MaxBackups=5 not enforced: found %d .gz backup files (want ≤ 5)", gzCount)
+	}
+	if gzCount == 0 {
+		t.Errorf("expected compressed backup files but found none (rotation did not occur)")
+	}
+	t.Logf("backup cap enforced: %d .gz file(s) present (limit 5)", gzCount)
+}
+
 // TestBuildLogDest_UsesPassedPath verifies that buildLogDest writes to the
 // explicitly passed dgHome path and does NOT re-derive the path from the
 // DG_HOME environment variable (regression for dontguess-34e).
