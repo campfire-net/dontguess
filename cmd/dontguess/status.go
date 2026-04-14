@@ -97,17 +97,8 @@ type StatusSnapshot struct {
 // dgHome resolver
 // --------------------------------------------------------------------------
 
-// resolveDGHome returns the DG_HOME directory: DG_HOME env if set, else ~/.cf.
-func resolveDGHome() string {
-	if dg := os.Getenv("DG_HOME"); dg != "" {
-		return dg
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ".cf"
-	}
-	return filepath.Join(home, ".cf")
-}
+// resolveDGHome is defined in dgpath.go — single canonical implementation
+// shared across operator.go, serve.go, and status.go (dontguess-435).
 
 // --------------------------------------------------------------------------
 // Wrapper attempt log reader

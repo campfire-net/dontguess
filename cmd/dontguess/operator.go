@@ -12,18 +12,12 @@ import (
 )
 
 // socketPath returns the path to the operator unix domain socket.
-// Uses DG_HOME env if set, else falls back to ~/.cf. The socket lives in a
-// 0700 "ipc" subdirectory (dontguess-33a) to bound the TOCTOU window at the
+// Delegates to resolveDGHome (dgpath.go) — single source of truth for
+// DG_HOME resolution (dontguess-435). The socket lives in a 0700 "ipc"
+// subdirectory (dontguess-33a) to bound the TOCTOU window at the
 // parent-dir level instead of relying on process-global umask tricks.
 func socketPath() string {
-	if dg := os.Getenv("DG_HOME"); dg != "" {
-		return filepath.Join(dg, "ipc", "dontguess.sock")
-	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return filepath.Join(".cf", "ipc", "dontguess.sock")
-	}
-	return filepath.Join(home, ".cf", "ipc", "dontguess.sock")
+	return filepath.Join(resolveDGHome(), "ipc", "dontguess.sock")
 }
 
 // dialSocket dials the operator socket and returns the connection.
@@ -86,7 +80,7 @@ var listHeldCmd = &cobra.Command{
 		defer conn.Close()
 
 		var resp listHeldResponse
-		if err := sendRequest(conn, map[string]any{"op": "list-held"}, &resp); err != nil {
+		if err := sendRequest(conn, map[string]any{"op": OpListHeld}, &resp); err != nil {
 			return err
 		}
 
@@ -130,7 +124,7 @@ var acceptPutCmd = &cobra.Command{
 		if price == 0 || expiresStr == "" {
 			conn := dialSocket()
 			var listResp listHeldResponse
-			if err := sendRequest(conn, map[string]any{"op": "list-held"}, &listResp); err != nil {
+			if err := sendRequest(conn, map[string]any{"op": OpListHeld}, &listResp); err != nil {
 				conn.Close()
 				return err
 			}
@@ -161,7 +155,7 @@ var acceptPutCmd = &cobra.Command{
 
 		var resp okResponse
 		if err := sendRequest(conn, map[string]any{
-			"op":         "accept-put",
+			"op":         OpAcceptPut,
 			"put_msg_id": putMsgID,
 			"price":      price,
 			"expires":    expiresStr,
@@ -197,7 +191,7 @@ var rejectPutCmd = &cobra.Command{
 
 		var resp okResponse
 		if err := sendRequest(conn, map[string]any{
-			"op":         "reject-put",
+			"op":         OpRejectPut,
 			"put_msg_id": putMsgID,
 			"reason":     rejectPutReason,
 		}, &resp); err != nil {

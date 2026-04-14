@@ -323,7 +323,7 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 
 	enc := json.NewEncoder(conn)
 	switch req.Op {
-	case "list-held":
+	case OpListHeld:
 		held := eng.State().PutsHeldForReview()
 		type entry struct {
 			PutMsgID  string `json:"put_msg_id"`
@@ -340,7 +340,7 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 		}
 		enc.Encode(map[string]any{"puts": entries}) //nolint:errcheck
 
-	case "accept-put":
+	case OpAcceptPut:
 		var expiresAt time.Time
 		if req.Expires != "" {
 			t, err := time.Parse(time.RFC3339, req.Expires)
@@ -378,13 +378,22 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 			})
 			return
 		}
-		if err := eng.AutoAcceptPut(req.PutMsgID, price, expiresAt); err != nil {
+		// AutoAcceptPut acquires opMu, which is also held by the auto-accept
+		// ticker goroutine during RunAutoAccept. If the ticker holds opMu when
+		// this call arrives, we block until the tick finishes. Reset the
+		// deadline after the potentially-blocking call so the response write
+		// has a fresh window — without this, a slow tick could consume most of
+		// the 5s deadline and the client would see an EOF instead of a response
+		// (dontguess-777).
+		err := eng.AutoAcceptPut(req.PutMsgID, price, expiresAt)
+		conn.SetDeadline(time.Now().Add(5 * time.Second)) //nolint:errcheck
+		if err != nil {
 			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
 			return
 		}
 		writeOperatorResp(conn, map[string]any{"ok": true})
 
-	case "reject-put":
+	case OpRejectPut:
 		if err := eng.RejectPut(req.PutMsgID, req.Reason); err != nil {
 			writeOperatorResp(conn, map[string]any{"ok": false, "error": err.Error()})
 			return
