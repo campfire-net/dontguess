@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strconv"
@@ -65,32 +66,32 @@ type WrapperAttempts struct {
 
 // ExchangeCounts holds the exchange view counts.
 type ExchangeCounts struct {
-	Buys          int  `json:"buys"`
-	Matches       int  `json:"matches"`
-	Settlements   int  `json:"settlements"`
-	PutsSubmitted int  `json:"puts_submitted"`
-	PutsAccepted  int  `json:"puts_accepted"`
-	PutsRejected  int  `json:"puts_rejected"`
-	PutsHeld      *int `json:"puts_held"`
+	Buys          int    `json:"buys"`
+	Matches       int    `json:"matches"`
+	Settlements   int    `json:"settlements"`
+	PutsSubmitted int    `json:"puts_submitted"`
+	PutsAccepted  int    `json:"puts_accepted"`
+	PutsRejected  int    `json:"puts_rejected"`
+	PutsHeld      *int   `json:"puts_held"`
 	PutsHeldNote  string `json:"puts_held_note,omitempty"`
 }
 
 // OperatorHealth holds operator process health info.
 type OperatorHealth struct {
-	PID                  int   `json:"pid"`
-	Alive                bool  `json:"alive"`
-	UptimeSeconds        int64 `json:"uptime_seconds"`
-	StoreSizeBytes       int64 `json:"store_size_bytes"`
+	PID                    int    `json:"pid"`
+	Alive                  bool   `json:"alive"`
+	UptimeSeconds          int64  `json:"uptime_seconds"`
+	StoreSizeBytes         int64  `json:"store_size_bytes"`
 	LastActivitySecondsAgo *int64 `json:"last_activity_seconds_ago"`
 }
 
 // StatusSnapshot is the full status snapshot returned by collectStatus.
 type StatusSnapshot struct {
-	SchemaVersion  int            `json:"schema_version"`
-	Since          string         `json:"since"`
+	SchemaVersion   int            `json:"schema_version"`
+	Since           string         `json:"since"`
 	WrapperAttempts WrapperAttempts `json:"wrapper_attempts"`
-	Exchange       ExchangeCounts `json:"exchange"`
-	Operator       OperatorHealth `json:"operator"`
+	Exchange        ExchangeCounts `json:"exchange"`
+	Operator        OperatorHealth `json:"operator"`
 }
 
 // --------------------------------------------------------------------------
@@ -177,53 +178,51 @@ func readWrapperLog(dgHome string, cutoff time.Time) WrapperAttempts {
 
 // readExchangeViews reads counts from the exchange campfire views for messages
 // within the since window. Returns zero counts on any error (not fatal for
-// the overall status command).
-func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, error) {
+// the overall status command). Also returns the max timestamp (nanos) seen
+// across all messages, used by the caller for last_activity tracking.
+func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, error) {
 	cfg, err := exchange.LoadConfig(dgHome)
 	if err != nil {
-		return ExchangeCounts{}, fmt.Errorf("load exchange config: %w", err)
+		return ExchangeCounts{}, 0, fmt.Errorf("load exchange config: %w", err)
 	}
 
 	client, _, err := protocol.Init(dgHome)
 	if err != nil {
-		return ExchangeCounts{}, fmt.Errorf("protocol.Init: %w", err)
+		return ExchangeCounts{}, 0, fmt.Errorf("protocol.Init: %w", err)
 	}
 	defer client.Close()
 
 	cutoffNano := cutoff.UnixNano()
 	cfID := cfg.ExchangeCampfireID
 
-	readTag := func(tag string) (int, int64) {
+	var globalMaxTS int64
+	readTag := func(tag string) int {
 		req := protocol.ReadRequest{
 			CampfireID: cfID,
 			Tags:       []string{tag},
 		}
 		result, err := client.Read(req)
 		if err != nil {
-			return 0, 0
+			return 0
 		}
 		count := 0
-		var maxTS int64
 		for _, m := range result.Messages {
+			if m.Timestamp > globalMaxTS {
+				globalMaxTS = m.Timestamp
+			}
 			if m.Timestamp >= cutoffNano {
 				count++
 			}
-			if m.Timestamp > maxTS {
-				maxTS = m.Timestamp
-			}
 		}
-		return count, maxTS
+		return count
 	}
 
-	buys, _ := readTag(exchange.TagBuy)
-	matches, _ := readTag(exchange.TagMatch)
-	settlements, _ := readTag(exchange.TagSettle)
-	puts, _ := readTag(exchange.TagPut)
-	putAccepts, maxPATS := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept)
-	putRejects, maxPRTS := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutReject)
-
-	_ = maxPATS
-	_ = maxPRTS
+	buys := readTag(exchange.TagBuy)
+	matches := readTag(exchange.TagMatch)
+	settlements := readTag(exchange.TagSettle)
+	puts := readTag(exchange.TagPut)
+	putAccepts := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept)
+	putRejects := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutReject)
 
 	return ExchangeCounts{
 		Buys:          buys,
@@ -232,7 +231,7 @@ func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, error) 
 		PutsSubmitted: puts,
 		PutsAccepted:  putAccepts,
 		PutsRejected:  putRejects,
-	}, nil
+	}, globalMaxTS, nil
 }
 
 // readExchangeViewsWithClient is used in tests to pass in a pre-built client
@@ -352,7 +351,7 @@ func processUptime(pid int, pidPath string) int64 {
 	if err == nil {
 		startTicks, err := readProcessStartTicks(pid)
 		if err == nil {
-			clkTck := int64(100) // sysconf(_SC_CLK_TCK) on Linux — almost always 100
+			clkTck := readClkTck()
 			startTime := time.Unix(bootTime+startTicks/clkTck, 0)
 			return int64(time.Since(startTime).Seconds())
 		}
@@ -410,6 +409,21 @@ func readProcessStartTicks(pid int) (int64, error) {
 	return strconv.ParseInt(fields[19], 10, 64)
 }
 
+// readClkTck returns sysconf(_SC_CLK_TCK) by running `getconf CLK_TCK`.
+// Falls back to 100 (correct on almost all Linux kernels) if getconf is
+// unavailable or returns a non-positive value.
+func readClkTck() int64 {
+	out, err := exec.Command("getconf", "CLK_TCK").Output()
+	if err != nil {
+		return 100
+	}
+	v, err := strconv.ParseInt(strings.TrimSpace(string(out)), 10, 64)
+	if err != nil || v <= 0 {
+		return 100
+	}
+	return v
+}
+
 // --------------------------------------------------------------------------
 // Held-for-review via socket
 // --------------------------------------------------------------------------
@@ -427,7 +441,7 @@ func readHeldCount(dgHome string) (*int, string) {
 	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
 
 	enc := json.NewEncoder(conn)
-	if err := enc.Encode(map[string]any{"op": "list-held"}); err != nil {
+	if err := enc.Encode(map[string]any{"op": OpListHeld}); err != nil {
 		return nil, "operator not reachable"
 	}
 
@@ -453,10 +467,11 @@ func collectStatus(dgHome string, since time.Duration) (*StatusSnapshot, error) 
 
 	wa := readWrapperLog(dgHome, cutoff)
 
-	excCounts, excErr := readExchangeViews(dgHome, cutoff)
+	excCounts, lastActivityNano, excErr := readExchangeViews(dgHome, cutoff)
 	if excErr != nil {
 		// Non-fatal: zero counts.
 		excCounts = ExchangeCounts{}
+		lastActivityNano = 0
 	}
 
 	// Held-for-review via socket.
@@ -464,15 +479,6 @@ func collectStatus(dgHome string, since time.Duration) (*StatusSnapshot, error) 
 	excCounts.PutsHeld = held
 	if heldNote != "" {
 		excCounts.PutsHeldNote = heldNote
-	}
-
-	// lastActivity from exchange messages — collect max timestamp from all views.
-	var lastActivityNano int64
-	if excErr == nil {
-		// Re-read to get raw timestamps for last_activity (the view reader
-		// above discards the per-tag maxTS; we take the last_activity from the
-		// operator health perspective as the max over all view messages).
-		lastActivityNano = collectLastActivity(dgHome, cutoff)
 	}
 
 	op := readOperatorHealth(dgHome, cutoff, lastActivityNano)
@@ -485,41 +491,6 @@ func collectStatus(dgHome string, since time.Duration) (*StatusSnapshot, error) 
 		Operator:        op,
 	}
 	return snap, nil
-}
-
-// collectLastActivity returns the max timestamp (nanos) of any exchange message
-// seen in the since window. Used for operator.last_activity_seconds_ago.
-func collectLastActivity(dgHome string, cutoff time.Time) int64 {
-	cfg, err := exchange.LoadConfig(dgHome)
-	if err != nil {
-		return 0
-	}
-	client, _, err := protocol.Init(dgHome)
-	if err != nil {
-		return 0
-	}
-	defer client.Close()
-
-	cutoffNano := cutoff.UnixNano()
-	allTags := []string{
-		exchange.TagPut, exchange.TagBuy, exchange.TagMatch, exchange.TagSettle,
-	}
-	var maxTS int64
-	for _, tag := range allTags {
-		result, err := client.Read(protocol.ReadRequest{
-			CampfireID: cfg.ExchangeCampfireID,
-			Tags:       []string{tag},
-		})
-		if err != nil {
-			continue
-		}
-		for _, m := range result.Messages {
-			if m.Timestamp >= cutoffNano && m.Timestamp > maxTS {
-				maxTS = m.Timestamp
-			}
-		}
-	}
-	return maxTS
 }
 
 // --------------------------------------------------------------------------
