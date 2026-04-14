@@ -708,6 +708,62 @@ func TestOperator_AcceptPut_UnknownID(t *testing.T) {
 	t.Logf("accept-put unknown ID returned ok=%v error=%q (expected ok=false)", acceptResp.OK, acceptResp.Error)
 }
 
+// ---- Regression test: dontguess-e30 / dontguess-649 ----
+
+// TestOperatorSocket_DGHomeOverride verifies that listenOperatorSocket creates
+// the socket under DG_HOME when DG_HOME differs from CF_HOME. Before this fix
+// serve.go used cfHome (from campfire SDK initResult.StorePath) for the socket
+// path while operator.go used resolveDGHome() (DG_HOME env), causing the
+// server and client to miss each other when CF_HOME != DG_HOME.
+//
+// The test sets DG_HOME to a dedicated temp directory, derives the expected
+// socket path from resolveDGHome(), starts the socket server, and confirms
+// the socket file appears at the DG_HOME-based path — not under a separate
+// "cfHome" path. Not parallel: uses t.Setenv.
+func TestOperatorSocket_DGHomeOverride(t *testing.T) {
+	dgHomeDir := t.TempDir()
+	t.Setenv("DG_HOME", dgHomeDir)
+
+	// Resolve what the server should use — must match the client (operator.go).
+	expectedSockPath := filepath.Join(resolveDGHome(), "ipc", "dontguess.sock")
+	if expectedSockPath != filepath.Join(dgHomeDir, "ipc", "dontguess.sock") {
+		t.Fatalf("resolveDGHome() = %q, expected to honour DG_HOME=%q", resolveDGHome(), dgHomeDir)
+	}
+
+	ln, err := listenOperatorSocket(expectedSockPath)
+	if err != nil {
+		t.Fatalf("listenOperatorSocket at DG_HOME path: %v", err)
+	}
+	defer ln.Close()
+
+	// Confirm socket exists at DG_HOME/ipc/dontguess.sock.
+	if _, err := os.Stat(expectedSockPath); err != nil {
+		t.Errorf("socket not found at DG_HOME path %q: %v", expectedSockPath, err)
+	}
+
+	// Confirm a client using the same resolveDGHome() path can dial and gets a response.
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		serveOperatorSocket(ctx, ln, eng)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+
+	var resp struct {
+		Puts []any `json:"puts"`
+	}
+	dialAndRequest(t, expectedSockPath, map[string]any{"op": "list-held"}, &resp)
+	// A successful decode (even of an empty list) proves client and server
+	// are using the same path — the DG_HOME-based socket.
+	t.Logf("DG_HOME socket round-trip OK: %d held puts", len(resp.Puts))
+}
+
 // ---- New tests: dontguess-075, c8c, d11, 409 ----
 
 // TestOperatorSocket_InvalidExpires verifies that accept-put with a malformed

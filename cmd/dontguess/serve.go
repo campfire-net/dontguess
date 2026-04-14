@@ -172,7 +172,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
 	logger.Printf("  store:     %s", dbPath)
-	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(cfHome, "dontguess.log"))
+	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(dgHome, "dontguess.log"))
 
 	fmt.Printf("\n--- Agent connection info ---\n")
 	fmt.Printf("EXCHANGE_CAMPFIRE=%s\n", cfg.ExchangeCampfireID)
@@ -219,7 +219,7 @@ func runServe(_ *cobra.Command, _ []string) error {
 	// Unix socket IPC for operator CLI commands. The socket lives inside a
 	// 0700 subdirectory so the parent-level permissions bound the TOCTOU
 	// window at the dir level (dontguess-33a, post-sec-regression fix).
-	sockPath := filepath.Join(cfHome, "ipc", "dontguess.sock")
+	sockPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
 	ln, err := listenOperatorSocket(sockPath)
 	if err != nil {
 		logger.Printf("warning: operator socket unavailable: %v", err)
