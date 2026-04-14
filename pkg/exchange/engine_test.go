@@ -58,11 +58,14 @@ func newTestHarness(t *testing.T) *testHarness {
 	convDir := conventionDir(t)
 
 	// Create exchange via Init to get a properly bootstrapped campfire.
+	// SkipConfigCascade avoids ancestor .cf/config.toml auto_join beacons
+	// that would sync real campfires during test setup (~15s per harness).
 	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:     cfHome,
-		Transport:     protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:     t.TempDir(),
-		ConventionDir: convDir,
+		ConfigDir:         cfHome,
+		Transport:         protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:         t.TempDir(),
+		ConventionDir:     convDir,
+		SkipConfigCascade: true,
 	})
 	if err != nil {
 		t.Fatalf("Init: %v", err)

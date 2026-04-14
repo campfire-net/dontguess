@@ -47,10 +47,11 @@ func newOpTestHarness(t *testing.T) *opTestHarness {
 	convDir := conventionDirForOpTest(t)
 
 	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:     cfHome,
-		Transport:     protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:     t.TempDir(),
-		ConventionDir: convDir,
+		ConfigDir:         cfHome,
+		Transport:         protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:         t.TempDir(),
+		ConventionDir:     convDir,
+		SkipConfigCascade: true,
 	})
 	if err != nil {
 		t.Fatalf("exchange.Init: %v", err)

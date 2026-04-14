@@ -41,8 +41,14 @@ func conventionDir(t *testing.T) string {
 }
 
 // initExchange calls exchange.Init with temp dirs, closes the client, and returns the config.
+// SkipConfigCascade defaults to true to avoid ancestor .cf/config.toml auto_join
+// beacons that add ~15s per call. Tests that explicitly need config cascade must
+// set SkipConfigCascade=false.
 func initExchange(t *testing.T, opts exchange.InitOptions) *exchange.Config {
 	t.Helper()
+	if !opts.SkipConfigCascade {
+		opts.SkipConfigCascade = true
+	}
 	cfg, client, err := exchange.Init(opts)
 	if err != nil {
 		t.Fatalf("Init: %v", err)
@@ -354,10 +360,11 @@ func TestInit_Idempotent(t *testing.T) {
 	convDir := conventionDir(t)
 
 	opts := exchange.InitOptions{
-		ConfigDir:     configDir,
-		Transport:     protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:     beaconDir,
-		ConventionDir: convDir,
+		ConfigDir:         configDir,
+		Transport:         protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:         beaconDir,
+		ConventionDir:     convDir,
+		SkipConfigCascade: true,
 	}
 
 	cfg1, client1, err := exchange.Init(opts)
@@ -415,10 +422,11 @@ func TestInit_ForceReinitializes(t *testing.T) {
 	convDir := conventionDir(t)
 
 	opts := exchange.InitOptions{
-		ConfigDir:     configDir,
-		Transport:     protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:     beaconDir,
-		ConventionDir: convDir,
+		ConfigDir:         configDir,
+		Transport:         protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:         beaconDir,
+		ConventionDir:     convDir,
+		SkipConfigCascade: true,
 	}
 
 	cfg1, client1, err := exchange.Init(opts)
@@ -445,12 +453,13 @@ func TestInit_ForceReinitializes(t *testing.T) {
 // reflected in the InitResult. This exercises the WithConfigDir option path
 // through protocol.InitWithConfig.
 func TestInit_ConfigCascade(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: t.Chdir isolates from ancestor .cf/config.toml auto_join
+	// beacons that cause InitWithConfig to sync real campfires (~15s).
+	convDir := conventionDir(t) // resolve before chdir
 	configDir := t.TempDir()
+	t.Chdir(configDir)
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
-	convDir := conventionDir(t)
 
 	// Write a config.toml with a custom display_name into the config directory.
 	configTOML := "[identity]\ndisplay_name = \"TestExchangeOperator\"\n"
@@ -460,10 +469,11 @@ func TestInit_ConfigCascade(t *testing.T) {
 
 	// Init using the configDir that contains the config.toml.
 	_, client, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:     configDir,
-		Transport:     protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:     beaconDir,
-		ConventionDir: convDir,
+		ConfigDir:         configDir,
+		Transport:         protocol.FilesystemTransport{Dir: transportDir},
+		BeaconDir:         beaconDir,
+		ConventionDir:     convDir,
+		SkipConfigCascade: true,
 	})
 	if err != nil {
 		t.Fatalf("Init with config.toml: %v", err)
@@ -494,14 +504,16 @@ func TestInit_ConfigCascade(t *testing.T) {
 // configured, Init calls naming.Register so the exchange is discoverable via
 // naming.Resolve on the registry campfire.
 func TestInit_NamingRootRegistersInRegistry(t *testing.T) {
-	t.Parallel()
+	// Not parallel: t.Chdir isolates from ancestor .cf/config.toml auto_join
+	// beacons that cause InitWithConfig to sync real campfires (~15s).
+	convDir := conventionDir(t) // resolve before chdir
 
 	// Use a shared configDir and transportDir so the same identity can write to
 	// both the registry campfire and the exchange campfire.
 	configDir := t.TempDir()
+	t.Chdir(configDir)
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
-	convDir := conventionDir(t)
 
 	// Create a registry campfire to act as the naming root.
 	registryClient, _, err := protocol.InitWithConfig(protocol.WithConfigDir(configDir))
@@ -767,12 +779,13 @@ func TestInit_DisplayNamePreservesExistingConfigTOML(t *testing.T) {
 // TestInit_DisplayNameFlowsThroughConfigCascade verifies that the display_name
 // written to config.toml is picked up by InitWithConfig via the config cascade.
 func TestInit_DisplayNameFlowsThroughConfigCascade(t *testing.T) {
-	t.Parallel()
-
+	// Not parallel: t.Chdir isolates from ancestor .cf/config.toml auto_join
+	// beacons that cause InitWithConfig to sync real campfires (~15s).
+	convDir := conventionDir(t) // resolve before chdir
 	configDir := t.TempDir()
+	t.Chdir(configDir)
 	transportDir := t.TempDir()
 	beaconDir := t.TempDir()
-	convDir := conventionDir(t)
 
 	initExchange(t, exchange.InitOptions{
 		ConfigDir:     configDir,

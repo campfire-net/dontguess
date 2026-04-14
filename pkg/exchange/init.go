@@ -65,9 +65,17 @@ type InitOptions struct {
 	// is called after the local alias is set, making the exchange discoverable by
 	// any agent that can read the registry. If empty, only the local alias is set.
 	NamingRoot string
+	// SkipConfigCascade bypasses the config cascade walk (ancestor .cf/config.toml
+	// files, auto_join beacons). Uses protocol.Init directly instead of
+	// protocol.InitWithConfig. Intended for tests where ancestor configs with
+	// auto_join beacons cause expensive campfire syncs during setup.
+	SkipConfigCascade bool
 }
 
 func (o *InitOptions) initClient() (*protocol.Client, *protocol.InitResult, error) {
+	if o.SkipConfigCascade && o.ConfigDir != "" {
+		return protocol.Init(o.ConfigDir)
+	}
 	if o.ConfigDir != "" {
 		return protocol.InitWithConfig(protocol.WithConfigDir(o.ConfigDir))
 	}

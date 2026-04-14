@@ -294,6 +294,7 @@ func TestMode1_ProjectLocal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+	t.Parallel()
 	env := setup(t)
 	alice := env.newAgent("alice")
 
@@ -360,6 +361,7 @@ func TestMode2_UserLocal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+	t.Parallel()
 	env := setup(t)
 
 	// Single user with one identity, one center campfire
@@ -435,6 +437,7 @@ func TestMode3_Team(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping e2e test in short mode")
 	}
+	t.Parallel()
 	env := setup(t)
 
 	// Shared transport directory — simulates shared filesystem / network transport
