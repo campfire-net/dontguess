@@ -708,3 +708,117 @@ func TestOperator_AcceptPut_UnknownID(t *testing.T) {
 	t.Logf("accept-put unknown ID returned ok=%v error=%q (expected ok=false)", acceptResp.OK, acceptResp.Error)
 }
 
+// ---- New tests: dontguess-075, c8c, d11, 409 ----
+
+// TestOperatorSocket_InvalidExpires verifies that accept-put with a malformed
+// expires value returns an error response rather than accepting the put (dontguess-075).
+func TestOperatorSocket_InvalidExpires(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+
+	const tokenCost = int64(2_000_000)
+	putID := h.sendHeldPut(eng, "invalid-expires test", tokenCost)
+
+	sockPath, _ := startSocketServer(t, eng)
+
+	var resp okResponse
+	dialAndRequest(t, sockPath, map[string]any{
+		"op":         OpAcceptPut,
+		"put_msg_id": putID,
+		"price":      tokenCost * 70 / 100,
+		"expires":    "not-a-date",
+	}, &resp)
+
+	if resp.OK {
+		t.Fatal("accept-put with invalid expires returned ok=true; want ok=false")
+	}
+	if resp.Error == "" {
+		t.Error("accept-put invalid expires error message is empty")
+	}
+	if !strings.Contains(resp.Error, "invalid expires") {
+		t.Errorf("expected error to contain %q, got %q", "invalid expires", resp.Error)
+	}
+	t.Logf("got expected error: %s", resp.Error)
+}
+
+// TestOperatorSocket_UnknownOp verifies that an unrecognised op returns an
+// error response containing "unknown op" (dontguess-c8c).
+func TestOperatorSocket_UnknownOp(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+	sockPath, _ := startSocketServer(t, eng)
+
+	var resp okResponse
+	dialAndRequest(t, sockPath, map[string]any{"op": "foobar"}, &resp)
+
+	if resp.OK {
+		t.Fatal("unknown op returned ok=true; want ok=false")
+	}
+	if !strings.Contains(resp.Error, "unknown op") {
+		t.Errorf("expected error to contain %q, got %q", "unknown op", resp.Error)
+	}
+	t.Logf("got expected error: %s", resp.Error)
+}
+
+// TestOperatorSocket_RejectPutNotPending verifies that reject-put for a
+// non-existent put ID returns an error rather than succeeding (dontguess-d11).
+func TestOperatorSocket_RejectPutNotPending(t *testing.T) {
+	t.Parallel()
+
+	h := newOpTestHarness(t)
+	eng := h.newEngine()
+
+	// No held puts — the engine has an empty held-for-review list.
+	sockPath, _ := startSocketServer(t, eng)
+
+	nonExistentID := "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+	var resp okResponse
+	dialAndRequest(t, sockPath, map[string]any{
+		"op":         OpRejectPut,
+		"put_msg_id": nonExistentID,
+		"reason":     "test rejection of non-existent put",
+	}, &resp)
+
+	if resp.OK {
+		t.Fatal("reject-put for non-existent put ID returned ok=true; want ok=false")
+	}
+	if resp.Error == "" {
+		t.Error("reject-put non-existent ID error message is empty")
+	}
+	t.Logf("got expected error: %s", resp.Error)
+}
+
+// TestOperatorCLI_SocketPath verifies that socketPath() returns the correct
+// path under both DG_HOME override and default resolution (dontguess-409).
+// Not parallel: subtests use t.Setenv which cannot be used in parallel tests.
+func TestOperatorCLI_SocketPath(t *testing.T) {
+	// Case 1: DG_HOME override.
+	t.Run("DG_HOME override", func(t *testing.T) {
+		t.Setenv("DG_HOME", "/tmp/test-dg-home")
+		got := socketPath()
+		want := "/tmp/test-dg-home/ipc/dontguess.sock"
+		if got != want {
+			t.Errorf("socketPath() = %q, want %q", got, want)
+		}
+	})
+
+	// Case 2: Default (no DG_HOME). Verify it contains ~/.cf/ipc/dontguess.sock.
+	t.Run("default (no DG_HOME)", func(t *testing.T) {
+		t.Setenv("DG_HOME", "")
+		home, err := os.UserHomeDir()
+		if err != nil {
+			t.Skip("no UserHomeDir — skip default path test")
+		}
+		got := socketPath()
+		wantSuffix := "/.cf/ipc/dontguess.sock"
+		wantFull := home + wantSuffix
+		if got != wantFull {
+			t.Errorf("socketPath() = %q, want %q", got, wantFull)
+		}
+	})
+}
+
