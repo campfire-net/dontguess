@@ -166,22 +166,14 @@ func (l *Limiter) Allow(ctx context.Context, key string) (bool, error) {
 }'
 CONTENT_CODE_B64=$(printf '%s' "$CONTENT_CODE" | base64 -w0)
 
-PUT_PAYLOAD_1=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops',
-    'content': '$CONTENT_CODE_B64',
-    'token_cost': 2500,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ cf send \$XCFID <put-code-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG_1=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD_1" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
-    --json)
-PUT_MSG_ID_1=$(echo "$PUT_MSG_1" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description \"...\" --content \"\$CONTENT_CODE_B64\" --token_cost 2500 --content_type code"
+CF_HOME="$SELLER_CF" cf "$XCFID" put \
+    --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
+    --content "$CONTENT_CODE_B64" \
+    --token_cost 2500 \
+    --content_type code
+PUT_MSG_ID_1=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# put 1 (code) message ID: $PUT_MSG_ID_1"
 
 # --- Item 2: analysis — Terraform module analysis for AWS VPC ---
@@ -205,44 +197,28 @@ so adding AZs requires re-index. This is a known Terraform footgun.
 - Enable VPC Flow Logs retention policy (30d default is fine)'
 CONTENT_ANALYSIS_B64=$(printf '%s' "$CONTENT_ANALYSIS" | base64 -w0)
 
-PUT_PAYLOAD_2=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Terraform module analysis for AWS VPC — 3-tier HA, footgun findings, cost recommendations',
-    'content': '$CONTENT_ANALYSIS_B64',
-    'token_cost': 4000,
-    'content_type': 'exchange:content-type:analysis',
-}))
-")
-
-echo "$ cf send \$XCFID <put-analysis-payload> --tag exchange:put --tag exchange:content-type:analysis"
-PUT_MSG_2=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD_2" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:analysis" \
-    --json)
-PUT_MSG_ID_2=$(echo "$PUT_MSG_2" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description \"...\" --content \"\$CONTENT_ANALYSIS_B64\" --token_cost 4000 --content_type analysis"
+CF_HOME="$SELLER_CF" cf "$XCFID" put \
+    --description "Terraform module analysis for AWS VPC — 3-tier HA, footgun findings, cost recommendations" \
+    --content "$CONTENT_ANALYSIS_B64" \
+    --token_cost 4000 \
+    --content_type analysis
+PUT_MSG_ID_2=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# put 2 (analysis) message ID: $PUT_MSG_ID_2"
 
 # --- Item 3: data — API latency benchmark dataset ---
 CONTENT_DATA='{"benchmark":"api-latency","version":"1.0","collected":"2026-04-01","sample_count":10000,"percentiles":{"p50":12,"p75":18,"p90":31,"p95":52,"p99":147,"p999":423},"endpoints":[{"path":"/api/v1/items","method":"GET","p50":9,"p95":41},{"path":"/api/v1/items","method":"POST","p50":18,"p95":89},{"path":"/api/v1/search","method":"GET","p50":31,"p95":142}],"infra":{"region":"us-east-1","instance":"c6i.xlarge","concurrency":50}}'
 CONTENT_DATA_B64=$(printf '%s' "$CONTENT_DATA" | base64 -w0)
 
-PUT_PAYLOAD_3=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'API latency benchmark dataset — p50/p95/p99 by endpoint, 10k samples, c6i.xlarge',
-    'content': '$CONTENT_DATA_B64',
-    'token_cost': 1500,
-    'content_type': 'exchange:content-type:data',
-}))
-")
-
-echo "$ cf send \$XCFID <put-data-payload> --tag exchange:put --tag exchange:content-type:data"
-PUT_MSG_3=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD_3" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:data" \
-    --json)
-PUT_MSG_ID_3=$(echo "$PUT_MSG_3" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description \"...\" --content \"\$CONTENT_DATA_B64\" --token_cost 1500 --content_type data"
+CF_HOME="$SELLER_CF" cf "$XCFID" put \
+    --description "API latency benchmark dataset — p50/p95/p99 by endpoint, 10k samples, c6i.xlarge" \
+    --content "$CONTENT_DATA_B64" \
+    --token_cost 1500 \
+    --content_type data
+PUT_MSG_ID_3=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# put 3 (data) message ID: $PUT_MSG_ID_3"
 
 # ---------------------------------------------------------------------------
@@ -286,7 +262,7 @@ echo "# Waiting for 3 put-accept settle messages (up to 20s)..."
 ACCEPT_COUNT=0
 for i in $(seq 1 40); do
     sleep 0.5
-    ACCEPT_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    ACCEPT_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$ACCEPT_COUNT" -ge 3 ]; then
         echo "# 3 put-accept settlements received (settle count: $ACCEPT_COUNT)"
@@ -300,8 +276,8 @@ if [ "$ACCEPT_COUNT" -lt 3 ]; then
     grep "auto-accepted\|auto-accept\|pending\|put" "$TMP/serve.log" 2>/dev/null || echo "# (no relevant log lines)"
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:settle"
-SETTLE_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null)
+echo "$ dontguess settlements"
+SETTLE_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null)
 echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -337,10 +313,10 @@ echo "Put 2 (analysis):  $PUT_MSG_ID_2"
 echo "Put 3 (data):      $PUT_MSG_ID_3"
 echo ""
 
-# Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | \
+# Final message count (puts view — exchange puts submitted)
+FINAL_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
-echo "Total campfire messages: $FINAL_COUNT"
+echo "Total puts submitted: $FINAL_COUNT"
 echo ""
 echo "Serve log:"
 cat "$TMP/serve.log"
