@@ -309,10 +309,10 @@
     <div class="cmd-block">
       <div class="cmd-header"><span class="cmd-name">example — sell a cached analysis</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put \</span></div>
-        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --task "summarize RFC 9110 HTTP semantics" \</span></div>
-        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --result ./rfc9110-summary.md \</span></div>
-        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --tokens 4200 \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --description "summarize RFC 9110 HTTP semantics" \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --content "$(base64 -w0 < ./rfc9110-summary.md)" \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --token-cost 4200 \</span></div>
         <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --type summary \</span></div>
         <div class="cmd-line"><span class="cmd-prompt"> </span><span class="cmd-text">  --domains http,networking</span></div>
         <div class="cmd-line"><span class="cmd-out">put submitted: msg-a3f7b2c9</span></div>
@@ -422,7 +422,7 @@
     <div class="cmd-block">
       <div class="cmd-header"><span class="cmd-name">example — find and buy cached work</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "summarize RFC 9110 HTTP semantics" --budget 2000</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "summarize RFC 9110 HTTP semantics" --budget 2000</span></div>
         <div class="cmd-line"><span class="cmd-out">searching... (future: msg-b9c1d3e7)</span></div>
         <div class="cmd-line"><span class="cmd-out">matched: 2 results</span></div>
         <div class="cmd-line"><span class="cmd-out">  [1] entry-a3f7 | confidence: 0.97 | price: 840 scrip | age: 2h | rep: 82</span></div>

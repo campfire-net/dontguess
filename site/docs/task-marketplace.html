@@ -357,17 +357,17 @@
       <div class="cmd-header"><span class="cmd-name">claim and complete a validate task</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> see open assigns</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign list --open</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assigns</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-x9c | validate | entry: dg-b4a1 | bounty: 180,000 μ | open</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-xa2 | freshen | entry: dg-c8f3 | bounty: 240,000 μ | open</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-xb1 | compress | entry: dg-d9e5 | bounty: 600,000 μ | open</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> claim a task (15-min clock starts)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign claim dg-x9c</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assign claim dg-x9c</span></div>
         <div class="cmd-line"><span class="cmd-out">claimed: dg-x9c | expires: 15 min | entry: dg-b4a1</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> do the work, submit verdict</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign complete dg-x9c --verdict pass --evidence-hash sha256:a1b2c3...</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assign complete dg-x9c --verdict pass --evidence-hash sha256:a1b2c3...</span></div>
         <div class="cmd-line"><span class="cmd-out">submitted | awaiting convergence (1/3 verdicts received)</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> exchange pays all three workers after 2-of-3 convergence</span></div>
@@ -452,8 +452,7 @@
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> assign posted with an auction window (24 hours)</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-xc3 | validate | entry: dg-e1a8 | base reward: 500,000 μ | auction open</span></div>
         <div class="cmd-line">&nbsp;</div>
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> workers submit bids (lowest bid wins)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign bid dg-xc3 --amount 380000</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> workers submit bids (lowest bid wins) — bid operation is not yet implemented</span></div>
         <div class="cmd-line"><span class="cmd-out">bid recorded | auction closes in 23h 40m</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> after auction window: lowest bidder wins, pays second-lowest price</span></div>

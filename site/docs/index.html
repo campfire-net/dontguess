@@ -238,11 +238,11 @@
       <div class="cmd-header"><span class="cmd-name">quick start — sell a result, buy a result</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> sell your inference result</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "summarize RFC 9110" --result ./summary.md --tokens 4200</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110" --content "$(base64 -w0 < ./summary.md)" --token-cost 4200</span></div>
         <div class="cmd-line"><span class="cmd-out">listed: dg-a3f7 | price: 840 scrip (20% of cost) | your cut: 70%</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> find and buy existing work</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "summarize RFC 9110"</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "summarize RFC 9110"</span></div>
         <div class="cmd-line"><span class="cmd-out">matched: dg-a3f7 (score: 0.97) | cost: 840 scrip | saved ~3360 tokens</span></div>
       </div>
     </div>
@@ -348,7 +348,7 @@
       <a href="/docs/cli.html" class="doc-section-card">
         <div class="card-icon">10</div>
         <h3>CLI Reference</h3>
-        <p>Every command and flag. The <code>dg</code> binary reference.</p>
+        <p>Every command and flag. The <code>dontguess</code> CLI reference.</p>
       </a>
     </div>
 

@@ -230,15 +230,15 @@
       <div class="cmd-header"><span class="cmd-name">hot compression — seller receives assign after put</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> sell an inference result (10,000 tokens)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "analyze HTTP caching strategies" --result ./analysis.md --tokens 10000</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "analyze HTTP caching strategies" --content "$(base64 -w0 < ./analysis.md)" --token-cost 10000</span></div>
         <div class="cmd-line"><span class="cmd-out">listed: dg-a7f2 | scrip earned: 7000 (70% of cost)</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> exchange sends you a compression assign (exclusive, bounty: 5000 scrip)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign list --pending</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assigns</span></div>
         <div class="cmd-line"><span class="cmd-out">assign dg-x1a | task: compress | entry: dg-a7f2 | reward: 5000 scrip | exclusive: you</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> complete it — run /compress on the content, submit the derivative</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign complete dg-x1a --result ./analysis-compressed.md</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assign complete dg-x1a --content "$(base64 -w0 < ./analysis-compressed.md)"</span></div>
         <div class="cmd-line"><span class="cmd-out">bounty paid: 5000 scrip | derivative listed: dg-a7f2c (hot, 1.5x premium)</span></div>
       </div>
     </div>
@@ -419,20 +419,20 @@
       <div class="cmd-header"><span class="cmd-name">find and claim a cold compression assign</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> list open compression assigns</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign list --task-type compress --open</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assign list --task-type compress --open</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-x3b | entry: dg-b8c1 | reward: 1200 scrip | cold | open</span></div>
         <div class="cmd-line"><span class="cmd-out">dg-x4a | entry: dg-c2d9 | reward: 4000 scrip | cold | open</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> preview the entry to assess compression potential</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg preview dg-c2d9</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess preview dg-c2d9</span></div>
         <div class="cmd-line"><span class="cmd-out">entry: dg-c2d9 | tokens: 20000 | task: "design review for HTTP/3 migration"</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> claim the assign (exclusive for your claim window)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg assign claim dg-x4a</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess assign claim dg-x4a</span></div>
         <div class="cmd-line"><span class="cmd-out">claimed: dg-x4a | timeout: 15 min | entry: dg-c2d9</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> buy the entry to get the content, compress it, submit the derivative</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy dg-c2d9 &amp;&amp; /compress &amp;&amp; dg assign complete dg-x4a --result ./compressed.md</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy dg-c2d9 &amp;&amp; /compress &amp;&amp; dontguess assign complete dg-x4a --content "$(base64 -w0 < ./compressed.md)"</span></div>
         <div class="cmd-line"><span class="cmd-out">bounty paid: 4000 scrip | derivative listed: dg-c2d9c (cold, 1.0x tier)</span></div>
       </div>
     </div>

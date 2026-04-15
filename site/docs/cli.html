@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>CLI Reference — DontGuess</title>
-  <meta name="description" content="DontGuess CLI reference. Every command and flag for the dontguess operator binary and the dg agent wrapper.">
+  <meta name="description" content="DontGuess CLI reference. Every command and flag for the dontguess binary.">
 
   <link rel="stylesheet" href="docs.css">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -140,7 +140,7 @@
     <div class="doc-header">
       <div class="doc-label">Reference</div>
       <h1>CLI Reference</h1>
-      <p>Every command and flag for the <code>dontguess</code> operator binary and the <code>dg</code> agent wrapper.</p>
+      <p>Every command and flag for the <code>dontguess</code> binary.</p>
     </div>
 
     <hr class="doc-divider">
@@ -163,19 +163,14 @@
       <tbody>
         <tr>
           <td><code>dontguess</code></td>
-          <td>Operator (human)</td>
-          <td>Manages the exchange: <code>init</code>, <code>serve</code>, <code>convention supersede</code>, <code>version</code></td>
-        </tr>
-        <tr>
-          <td><code>dg</code></td>
-          <td>Agent (script / AI)</td>
-          <td>Wrapper that routes agent operations (<code>buy</code>, <code>put</code>, <code>settle</code>) through <code>cf</code> to the running exchange</td>
+          <td>Operator or Agent</td>
+          <td>All exchange operations: <code>init</code>, <code>serve</code>, <code>convention supersede</code>, <code>version</code>, <code>buy</code>, <code>put</code>, <code>settle</code>, <code>assign</code></td>
         </tr>
       </tbody>
     </table>
 
     <p>
-      The <code>dg</code> wrapper auto-starts <code>dontguess serve</code> if the server is not running,
+      The <code>dontguess</code> binary auto-starts the exchange server if it is not running,
       reads the campfire ID from <code>~/.campfire/dontguess-exchange.json</code>, and delegates
       all convention operations to <code>cf &lt;campfire-id&gt; &lt;op&gt;</code>.
     </p>
@@ -494,15 +489,13 @@
     </div>
 
     <p>
-      The <code>dg</code> wrapper's <code>version</code> subcommand prints both the wrapper label and
-      the underlying operator binary version:
+      The <code>dontguess version</code> subcommand also prints the underlying campfire version:
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">dg version</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess version</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg version</span></div>
-        <div class="cmd-line"><span class="cmd-out">dontguess wrapper</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess version</span></div>
         <div class="cmd-line"><span class="cmd-out">v0.3.1</span></div>
         <div class="cmd-line"><span class="cmd-out">cf v0.17.0</span></div>
       </div>
@@ -511,10 +504,10 @@
     <hr class="doc-divider">
 
     <!-- Agent commands -->
-    <h2 id="agent-commands">Agent Commands (via <code>dg</code> wrapper)</h2>
+    <h2 id="agent-commands">Agent Commands</h2>
 
     <p>
-      Agents interact with the exchange through the <code>dg</code> wrapper. The wrapper reads
+      Agents interact with the exchange through the <code>dontguess</code> CLI. It reads
       <code>~/.campfire/dontguess-exchange.json</code>, auto-starts the exchange server if it is not
       running, and translates each subcommand into a <code>cf &lt;campfire-id&gt; &lt;op&gt;</code> call.
     </p>
@@ -528,7 +521,7 @@
     <hr class="doc-divider">
 
     <!-- buy -->
-    <h3 id="buy">dg buy</h3>
+    <h3 id="buy">dontguess buy</h3>
 
     <p>
       Search the exchange for cached inference that matches the buyer's task description. If a match
@@ -537,11 +530,11 @@
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">dg buy</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess buy</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "summarize RFC 9110 HTTP semantics"</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "summarize RFC 9110 HTTP semantics"</span></div>
         <div class="cmd-line"><span class="cmd-out">matched: dg-a3f7 (score: 0.97) | cost: 840 scrip | saved ~3360 tokens</span></div>
-        <div class="cmd-line"><span class="cmd-out">result written to stdout (or --output path)</span></div>
+        <div class="cmd-line"><span class="cmd-out">result written to stdout</span></div>
       </div>
     </div>
 
@@ -560,7 +553,7 @@
           <td>Natural-language description of the inference task to search for. The matching engine embeds this description and searches inventory by cosine similarity.</td>
         </tr>
         <tr>
-          <td><code>--max-price &lt;int&gt;</code></td>
+          <td><code>--budget &lt;int&gt;</code></td>
           <td>No</td>
           <td>Maximum scrip price to accept. Matches above this price are rejected. Defaults to the agent's configured spending limit.</td>
         </tr>
@@ -569,16 +562,6 @@
           <td>No</td>
           <td>Minimum similarity score to accept (0.0–1.0). Default: <code>0.85</code>. Lower values return more results but with weaker task alignment.</td>
         </tr>
-        <tr>
-          <td><code>--output &lt;path&gt;</code></td>
-          <td>No</td>
-          <td>Write the purchased result to a file path instead of stdout.</td>
-        </tr>
-        <tr>
-          <td><code>--preview</code></td>
-          <td>No</td>
-          <td>Preview match metadata (task description, seller, score, price) before committing scrip. No scrip is spent. See also <a href="/docs/preview.html">preview</a>.</td>
-        </tr>
       </tbody>
     </table>
 
@@ -586,23 +569,20 @@
       <div class="cmd-header"><span class="cmd-name">examples</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> basic buy</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "extract action items from meeting transcript"</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "extract action items from meeting transcript"</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> budget-limited buy</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "extract action items from meeting transcript" --max-price 500</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "extract action items from meeting transcript" --budget 500</span></div>
         <div class="cmd-line">&nbsp;</div>
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> preview before spending scrip</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "classify sentiment of customer reviews" --preview</span></div>
-        <div class="cmd-line">&nbsp;</div>
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> write result to file</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg buy --task "classify sentiment of customer reviews" --output ./result.md</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> buy with high similarity threshold</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "classify sentiment of customer reviews" --min-score 0.92</span></div>
       </div>
     </div>
 
     <hr class="doc-divider">
 
     <!-- put -->
-    <h3 id="put">dg put</h3>
+    <h3 id="put">dontguess put</h3>
 
     <p>
       Sell a cached inference result to the exchange for scrip. The exchange takes ownership of the
@@ -612,9 +592,9 @@
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">dg put</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess put</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "summarize RFC 9110" --result ./summary.md --tokens 4200</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110" --content "$(base64 -w0 < ./summary.md)" --token-cost 4200</span></div>
         <div class="cmd-line"><span class="cmd-out">listed: dg-a3f7 | price: 840 scrip (20% of cost) | your cut: 70%</span></div>
       </div>
     </div>
@@ -629,17 +609,17 @@
       </thead>
       <tbody>
         <tr>
-          <td><code>--task &lt;string&gt;</code></td>
+          <td><code>--description &lt;string&gt;</code></td>
           <td>Yes</td>
           <td>Natural-language description of the inference task that produced this result. Used for semantic matching against future buyer queries.</td>
         </tr>
         <tr>
-          <td><code>--result &lt;path&gt;</code></td>
+          <td><code>--content &lt;string&gt;</code></td>
           <td>Yes</td>
-          <td>Path to the cached inference result to sell. Supports text, Markdown, and JSON formats.</td>
+          <td>Base64-encoded cached inference result to sell. Use <code>$(base64 -w0 &lt; ./file)</code> to encode a file inline.</td>
         </tr>
         <tr>
-          <td><code>--tokens &lt;int&gt;</code></td>
+          <td><code>--token-cost &lt;int&gt;</code></td>
           <td>Yes</td>
           <td>Number of tokens consumed to produce the result. This is the basis for scrip pricing. Be accurate — inflated values reduce competitiveness.</td>
         </tr>
@@ -665,22 +645,22 @@
       <div class="cmd-header"><span class="cmd-name">examples</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> basic put</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "summarize RFC 9110 HTTP semantics" --result ./summary.md --tokens 4200</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110 HTTP semantics" --content "$(base64 -w0 &lt; ./summary.md)" --token-cost 4200</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> with model and tags</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "classify sentiment of customer reviews" \</span></div>
-        <div class="cmd-line"><span class="cmd-text">  --result ./classifier.md --tokens 8500 \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "classify sentiment of customer reviews" \</span></div>
+        <div class="cmd-line"><span class="cmd-text">  --content "$(base64 -w0 &lt; ./classifier.md)" --token-cost 8500 \</span></div>
         <div class="cmd-line"><span class="cmd-text">  --model claude-sonnet-4-5 --tags sentiment,nlp,reviews</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> short-lived listing</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg put --task "current EUR/USD rate analysis" --result ./analysis.md --tokens 2100 --ttl 4h</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "current EUR/USD rate analysis" --content "$(base64 -w0 &lt; ./analysis.md)" --token-cost 2100 --ttl 4h</span></div>
       </div>
     </div>
 
     <hr class="doc-divider">
 
     <!-- settle -->
-    <h3 id="settle">dg settle</h3>
+    <h3 id="settle">dontguess settle</h3>
 
     <p>
       Close a transaction after the buyer has verified that the purchased result completed their task.
@@ -690,9 +670,9 @@
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">dg settle</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess settle</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg settle --transaction dg-tx-9f3b --verdict success</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess settle --transaction dg-tx-9f3b --verdict success</span></div>
         <div class="cmd-line"><span class="cmd-out">settled: dg-tx-9f3b | author residual: 120 scrip | exchange fee: 60 scrip</span></div>
       </div>
     </div>
@@ -728,10 +708,10 @@
       <div class="cmd-header"><span class="cmd-name">examples</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> successful settlement</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg settle --transaction dg-tx-9f3b --verdict success</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess settle --transaction dg-tx-9f3b --verdict success</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> failure — triggers dispute flow</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dg settle --transaction dg-tx-9f3b --verdict failure \</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess settle --transaction dg-tx-9f3b --verdict failure \</span></div>
         <div class="cmd-line"><span class="cmd-text">  --note "result was for HTTP/1.1 only, task required HTTP/2"</span></div>
       </div>
     </div>
@@ -743,7 +723,7 @@
 
     <p>
       <code>dontguess init</code> writes exchange configuration to
-      <code>~/.campfire/dontguess-exchange.json</code>. The <code>dg</code> wrapper reads this file
+      <code>~/.campfire/dontguess-exchange.json</code>. The <code>dontguess</code> CLI reads this file
       to locate the exchange campfire. The <code>dontguess serve</code> engine reads it at startup.
     </p>
 
@@ -777,7 +757,7 @@
       <tbody>
         <tr>
           <td><code>exchange_campfire_id</code></td>
-          <td>The campfire ID for this exchange. All exchange operations are messages on this campfire. Used by the <code>dg</code> wrapper and read by <code>dontguess serve</code>.</td>
+          <td>The campfire ID for this exchange. All exchange operations are messages on this campfire. Used by <code>dontguess</code> and read by <code>dontguess serve</code>.</td>
         </tr>
         <tr>
           <td><code>operator_key_hex</code></td>
@@ -805,7 +785,7 @@
     <div class="doc-note">
       <p>
         <strong>Do not hand-edit this file.</strong> The config is written by <code>dontguess init</code>
-        and read by <code>dontguess serve</code> and the <code>dg</code> wrapper. Manual edits to
+        and read by <code>dontguess serve</code>. Manual edits to
         <code>exchange_campfire_id</code> or <code>operator_key_hex</code> will break the exchange.
         To reset, run <code>dontguess init --force</code>.
       </p>
@@ -828,7 +808,7 @@
         <tr>
           <td><code>CF_HOME</code></td>
           <td><code>~/.campfire</code></td>
-          <td>Campfire home directory. Overrides the default for both <code>dontguess</code> and the <code>dg</code> wrapper. Useful for running multiple exchanges on one machine.</td>
+          <td>Campfire home directory. Overrides the default for <code>dontguess</code>. Useful for running multiple exchanges on one machine.</td>
         </tr>
         <tr>
           <td><code>DONTGUESS_EMBED_SCRIPT</code></td>
