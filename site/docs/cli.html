@@ -594,7 +594,7 @@
     <div class="cmd-block">
       <div class="cmd-header"><span class="cmd-name">dontguess put</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110" --content "$(base64 -w0 < ./summary.md)" --token-cost 4200</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110" --content "$(base64 -w0 < ./summary.md)" --token_cost 4200</span></div>
         <div class="cmd-line"><span class="cmd-out">listed: dg-a3f7 | price: 840 scrip (20% of cost) | your cut: 70%</span></div>
       </div>
     </div>
@@ -619,7 +619,7 @@
           <td>Base64-encoded cached inference result to sell. Use <code>$(base64 -w0 &lt; ./file)</code> to encode a file inline.</td>
         </tr>
         <tr>
-          <td><code>--token-cost &lt;int&gt;</code></td>
+          <td><code>--token_cost &lt;int&gt;</code></td>
           <td>Yes</td>
           <td>Number of tokens consumed to produce the result. This is the basis for scrip pricing. Be accurate — inflated values reduce competitiveness.</td>
         </tr>
@@ -645,15 +645,15 @@
       <div class="cmd-header"><span class="cmd-name">examples</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> basic put</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110 HTTP semantics" --content "$(base64 -w0 &lt; ./summary.md)" --token-cost 4200</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "summarize RFC 9110 HTTP semantics" --content "$(base64 -w0 &lt; ./summary.md)" --token_cost 4200</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> with model and tags</span></div>
         <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "classify sentiment of customer reviews" \</span></div>
-        <div class="cmd-line"><span class="cmd-text">  --content "$(base64 -w0 &lt; ./classifier.md)" --token-cost 8500 \</span></div>
+        <div class="cmd-line"><span class="cmd-text">  --content "$(base64 -w0 &lt; ./classifier.md)" --token_cost 8500 \</span></div>
         <div class="cmd-line"><span class="cmd-text">  --model claude-sonnet-4-5 --tags sentiment,nlp,reviews</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> short-lived listing</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "current EUR/USD rate analysis" --content "$(base64 -w0 &lt; ./analysis.md)" --token-cost 2100 --ttl 4h</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "current EUR/USD rate analysis" --content "$(base64 -w0 &lt; ./analysis.md)" --token_cost 2100 --ttl 4h</span></div>
       </div>
     </div>
 
