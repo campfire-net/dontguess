@@ -180,27 +180,21 @@ func WarmCache(ctx context.Context, keys []string, fetch func(string) ([]byte, e
 }'
 CONTENT_B64=$(printf '%s' "$CONTENT" | base64 -w0)
 
-PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go cache warming utility — parallel key pre-population with semaphore and context cancellation',
-    'content': '$CONTENT_B64',
-    'token_cost': 3000,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ cf send \$XCFID <put-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG=$(cf --cf-home "$CF_HOME" send "$XCFID" "$PUT_PAYLOAD" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
-    --json)
-PUT_MSG_ID=$(echo "$PUT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-echo "# put message ID: $PUT_MSG_ID"
-
 # Compute the content hash for later use in the assign (sha256 of the raw content)
 CONTENT_HASH="sha256:$(printf '%s' "$CONTENT" | sha256sum | awk '{print $1}')"
 echo "# content hash: $CONTENT_HASH"
+
+echo "$ cf --cf-home \$CF_HOME \$XCFID put --description '...' --content \$CONTENT_B64 --token_cost 3000 --content_type exchange:content-type:code"
+cf --cf-home "$CF_HOME" "$XCFID" put \
+    --description "Go cache warming utility — parallel key pre-population with semaphore and context cancellation" \
+    --content "$CONTENT_B64" \
+    --token_cost 3000 \
+    --content_type "exchange:content-type:code"
+
+# Read the message ID from the puts view (convention dispatch returns status only)
+PUT_MSG_ID=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
+echo "# put message ID: $PUT_MSG_ID"
 
 # ---------------------------------------------------------------------------
 # Section: serve — start exchange engine in background
@@ -211,6 +205,7 @@ tee_section "serve"
 echo "$ dontguess serve --poll-interval 500ms &"
 "$BINARY" serve --poll-interval 500ms > "$TMP/serve.log" 2>&1 &
 SERVE_PID=$!
+echo "$SERVE_PID" > "$CF_HOME/dontguess.pid"
 
 # Wait for serve to replay messages (up to 10s)
 echo "# Waiting for engine to start..."
@@ -294,6 +289,8 @@ from datetime import datetime, timezone, timedelta
 print((datetime.now(timezone.utc) + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 ")
 
+# NOTE: assign.json fails linting (unmappable tag exchange:assign-entry:*), so the assign
+# convention is not registered. Fall back to raw cf send for this operation.
 ASSIGN_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
@@ -333,19 +330,15 @@ from datetime import datetime, timezone, timedelta
 print((datetime.now(timezone.utc) + timedelta(minutes=15)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 ")
 
-CLAIM_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'expires_at': '$CLAIM_EXPIRES_AT',
-}))
-")
+echo "$ CF_HOME=\$WORKER_CF cf \$XCFID assign-claim --target \$ASSIGN_MSG_ID --expires_at \$CLAIM_EXPIRES_AT"
+cf --cf-home "$WORKER_CF" "$XCFID" assign-claim \
+    --target "$ASSIGN_MSG_ID" \
+    --expires_at "$CLAIM_EXPIRES_AT"
 
-echo "$ CF_HOME=\$WORKER_CF cf send \$XCFID <claim-payload> --tag exchange:assign-claim --antecedent \$ASSIGN_MSG_ID"
-CLAIM_MSG=$(CF_HOME="$WORKER_CF" cf send "$XCFID" "$CLAIM_PAYLOAD" \
-    --tag "exchange:assign-claim" \
-    --antecedent "$ASSIGN_MSG_ID" \
-    --json)
-CLAIM_MSG_ID=$(echo "$CLAIM_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Read the message ID from the assigns view — the claim is the most recent assign-tagged message
+# Fall back to reading all messages and filtering by assign-claim tag
+CLAIM_MSG_ID=$(cf --cf-home "$WORKER_CF" read "$XCFID" --all --tag "exchange:assign-claim" --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-claim message ID: $CLAIM_MSG_ID"
 
 # Wait for engine to process the claim
@@ -362,22 +355,16 @@ tee_section "assign-complete"
 # For this demo the evidence hash represents the worker's re-derived output.
 EVIDENCE_HASH="sha256:$(printf 'worker-validation-evidence-%s' "$ASSIGN_MSG_ID" | sha256sum | awk '{print $1}')"
 
-COMPLETE_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task_type':     'exchange:assign-type:validate',
-    'verdict':       'exchange:assign-verdict:pass',
-    'evidence_hash': '$EVIDENCE_HASH',
-}))
-")
+echo "$ CF_HOME=\$WORKER_CF cf \$XCFID assign-complete --target \$CLAIM_MSG_ID --task_type validate --verdict pass --evidence_hash \$EVIDENCE_HASH"
+cf --cf-home "$WORKER_CF" "$XCFID" assign-complete \
+    --target "$CLAIM_MSG_ID" \
+    --task_type "exchange:assign-type:validate" \
+    --verdict "exchange:assign-verdict:pass" \
+    --evidence_hash "$EVIDENCE_HASH"
 
-echo "$ CF_HOME=\$WORKER_CF cf send \$XCFID <complete-payload> --tag exchange:assign-complete --tag exchange:assign-verdict:pass --antecedent \$CLAIM_MSG_ID"
-COMPLETE_MSG=$(CF_HOME="$WORKER_CF" cf send "$XCFID" "$COMPLETE_PAYLOAD" \
-    --tag "exchange:assign-complete" \
-    --tag "exchange:assign-verdict:pass" \
-    --antecedent "$CLAIM_MSG_ID" \
-    --json)
-COMPLETE_MSG_ID=$(echo "$COMPLETE_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Read the message ID from all messages filtered by assign-complete tag
+COMPLETE_MSG_ID=$(cf --cf-home "$WORKER_CF" read "$XCFID" --all --tag "exchange:assign-complete" --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-complete message ID: $COMPLETE_MSG_ID"
 
 # Wait for engine to process the completion
@@ -390,20 +377,15 @@ grep "engine: assign-complete" "$TMP/serve.log" 2>/dev/null || true
 
 tee_section "assign-accept"
 
-ACCEPT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'bounty_paid':        $BOUNTY,
-    'validation_method':  'algorithmic',
-}))
-")
+echo "$ cf \$XCFID assign-accept --target \$COMPLETE_MSG_ID --bounty_paid \$BOUNTY --validation_method algorithmic"
+cf --cf-home "$CF_HOME" "$XCFID" assign-accept \
+    --target "$COMPLETE_MSG_ID" \
+    --bounty_paid "$BOUNTY" \
+    --validation_method "algorithmic"
 
-echo "$ cf send \$XCFID <accept-payload> --tag exchange:assign-accept --antecedent \$COMPLETE_MSG_ID"
-ACCEPT_MSG=$(cf --cf-home "$CF_HOME" send "$XCFID" "$ACCEPT_PAYLOAD" \
-    --tag "exchange:assign-accept" \
-    --antecedent "$COMPLETE_MSG_ID" \
-    --json)
-ACCEPT_MSG_ID=$(echo "$ACCEPT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Read the message ID from all messages filtered by assign-accept tag
+ACCEPT_MSG_ID=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:assign-accept" --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-accept message ID: $ACCEPT_MSG_ID"
 
 # ---------------------------------------------------------------------------
