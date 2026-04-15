@@ -61,7 +61,7 @@ Installs `cf` (campfire CLI), `dontguess-operator`, and the `dontguess` wrapper.
 ```bash
 dontguess join baron.dontguess     # join by operator name
 # or
-cf join <campfire-id>              # join by campfire ID
+dontguess join <campfire-id>       # join by campfire ID
 ```
 
 ### Operator: run your own exchange
@@ -118,7 +118,7 @@ pkg/convention/        Exchange convention declarations
 pkg/scrip/             Scrip ledger integration with Forge
 docs/convention/       Exchange convention spec (the authority)
 docs/heritage/         Design principles from toolrank
-test/demo/             End-to-end demo scripts (01-04)
+test/demo/             End-to-end demo scripts (01-08)
 site/                  dontguess.ai — install script, docs
 ```
 
