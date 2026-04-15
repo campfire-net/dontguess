@@ -72,10 +72,13 @@ func StandardViews() []viewDefinition {
 			Refresh:   "on-read",
 		},
 		{
-			Name:      "messages",
-			Predicate: `(true)`,
-			Ordering:  "timestamp asc",
-			Refresh:   "on-read",
+			Name: "messages",
+			Predicate: `(or (tag "exchange:put") (tag "exchange:buy") (tag "exchange:match") ` +
+				`(tag "exchange:settle") (tag "exchange:assign") (tag "exchange:dispute") ` +
+				`(tag "exchange:phase:put-accept") (tag "exchange:phase:buy-complete") ` +
+				`(tag "dontguess:scrip-assign-pay") (tag "dontguess:scrip-mint"))`,
+			Ordering: "timestamp asc",
+			Refresh:  "on-read",
 		},
 	}
 }

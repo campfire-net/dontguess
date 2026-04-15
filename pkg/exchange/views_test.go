@@ -87,8 +87,12 @@ func TestViews_StandardViewsContainsAllExpected(t *testing.T) {
 	if !ok {
 		t.Fatal("StandardViews() missing view \"messages\"")
 	}
-	if predicate != `(true)` {
-		t.Errorf("messages predicate = %q, want %q", predicate, `(true)`)
+	wantPredicate := `(or (tag "exchange:put") (tag "exchange:buy") (tag "exchange:match") ` +
+		`(tag "exchange:settle") (tag "exchange:assign") (tag "exchange:dispute") ` +
+		`(tag "exchange:phase:put-accept") (tag "exchange:phase:buy-complete") ` +
+		`(tag "dontguess:scrip-assign-pay") (tag "dontguess:scrip-mint"))`
+	if predicate != wantPredicate {
+		t.Errorf("messages predicate = %q, want %q", predicate, wantPredicate)
 	}
 
 	// Verify total count: 6 original + 2 new + 1 scrip-assign-pay = 9.
