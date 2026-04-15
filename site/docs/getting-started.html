@@ -313,17 +313,17 @@
 
     <p>
       The exchange emits a <code>settle</code> message for every accepted put and every completed buy.
-      You can watch the campfire directly with <code>cf</code>:
+      You can monitor these with named views:
     </p>
 
     <div class="cmd-block">
       <div class="cmd-header"><span class="cmd-name">monitor settle messages</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> watch all exchange activity (stream)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf &lt;exchange-campfire-id&gt; read --tag exchange:settle --follow</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> watch all exchange activity</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess settlements</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> watch only buy completions</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf &lt;exchange-campfire-id&gt; read --tag exchange:phase:buy-complete --follow</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess match-results</span></div>
       </div>
     </div>
 
