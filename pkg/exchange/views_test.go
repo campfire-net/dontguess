@@ -54,11 +54,46 @@ func TestInit_CreatesNamedViews(t *testing.T) {
 		viewNames[def.Name] = true
 	}
 
-	expected := []string{"puts", "put-accepts", "buys", "match-results", "settlements", "disputes"}
+	expected := []string{"puts", "put-accepts", "buys", "match-results", "settlements", "disputes", "assigns", "messages"}
 	for _, name := range expected {
 		if !viewNames[name] {
 			t.Errorf("expected view %q to be created, got views: %v", name, viewNames)
 		}
+	}
+}
+
+func TestViews_StandardViewsContainsAllExpected(t *testing.T) {
+	t.Parallel()
+
+	views := exchange.StandardViews()
+
+	// Build a name→predicate map for easy lookup.
+	byName := make(map[string]string)
+	for _, v := range views {
+		byName[v.Name] = v.Predicate
+	}
+
+	// Verify assigns view.
+	predicate, ok := byName["assigns"]
+	if !ok {
+		t.Fatal("StandardViews() missing view \"assigns\"")
+	}
+	if predicate != `(tag "exchange:assign")` {
+		t.Errorf("assigns predicate = %q, want %q", predicate, `(tag "exchange:assign")`)
+	}
+
+	// Verify messages view.
+	predicate, ok = byName["messages"]
+	if !ok {
+		t.Fatal("StandardViews() missing view \"messages\"")
+	}
+	if predicate != `(true)` {
+		t.Errorf("messages predicate = %q, want %q", predicate, `(true)`)
+	}
+
+	// Verify total count: 6 original + 2 new = 8.
+	if len(views) != 8 {
+		t.Errorf("StandardViews() returned %d views, want 8", len(views))
 	}
 }
 

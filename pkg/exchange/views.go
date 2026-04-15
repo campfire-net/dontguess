@@ -59,6 +59,18 @@ func StandardViews() []viewDefinition {
 			Ordering:  "timestamp asc",
 			Refresh:   "on-read",
 		},
+		{
+			Name:      "assigns",
+			Predicate: `(tag "exchange:assign")`,
+			Ordering:  "timestamp desc",
+			Refresh:   "on-read",
+		},
+		{
+			Name:      "messages",
+			Predicate: `(true)`,
+			Ordering:  "timestamp asc",
+			Refresh:   "on-read",
+		},
 	}
 }
 
