@@ -54,7 +54,7 @@ func TestInit_CreatesNamedViews(t *testing.T) {
 		viewNames[def.Name] = true
 	}
 
-	expected := []string{"puts", "put-accepts", "buys", "match-results", "settlements", "disputes", "assigns", "messages"}
+	expected := []string{"puts", "put-accepts", "buys", "match-results", "settlements", "disputes", "assigns", "scrip-assign-pay", "messages"}
 	for _, name := range expected {
 		if !viewNames[name] {
 			t.Errorf("expected view %q to be created, got views: %v", name, viewNames)
@@ -91,9 +91,9 @@ func TestViews_StandardViewsContainsAllExpected(t *testing.T) {
 		t.Errorf("messages predicate = %q, want %q", predicate, `(true)`)
 	}
 
-	// Verify total count: 6 original + 2 new = 8.
-	if len(views) != 8 {
-		t.Errorf("StandardViews() returned %d views, want 8", len(views))
+	// Verify total count: 6 original + 2 new + 1 scrip-assign-pay = 9.
+	if len(views) != 9 {
+		t.Errorf("StandardViews() returned %d views, want 9", len(views))
 	}
 }
 

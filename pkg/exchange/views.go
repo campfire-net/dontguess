@@ -66,6 +66,12 @@ func StandardViews() []viewDefinition {
 			Refresh:   "on-read",
 		},
 		{
+			Name:      "scrip-assign-pay",
+			Predicate: `(tag "dontguess:scrip-assign-pay")`,
+			Ordering:  "timestamp desc",
+			Refresh:   "on-read",
+		},
+		{
 			Name:      "messages",
 			Predicate: `(true)`,
 			Ordering:  "timestamp asc",
