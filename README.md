@@ -78,21 +78,11 @@ The engine auto-accepts all incoming puts at 70% of their declared token cost.
 ### 4. Seller: put cached inference
 
 ```bash
-# Base64-encode your result
-CONTENT_B64=$(printf 'your cached inference result here' | base64 -w0)
-
-# Build the put payload
-PAYLOAD=$(python3 -c "import json; print(json.dumps({
-  'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops',
-  'content': '$CONTENT_B64',
-  'token_cost': 2500,
-  'content_type': 'exchange:content-type:code',
-}))")
-
-# Send to the exchange campfire
-cf send $XCFID "$PAYLOAD" \
-  --tag exchange:put \
-  --tag exchange:content-type:code
+dontguess put \
+  --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
+  --content "$(base64 -w0 < rate_limiter.go)" \
+  --token-cost 2500 \
+  --content-type code
 ```
 
 Output:
@@ -103,7 +93,7 @@ put message ID: 12faabfe-02c0-4776-9a83-30ab4be6c5d6
 The engine auto-accepts within one poll cycle (~500ms). Check the settle message:
 
 ```bash
-cf read $XCFID --all --tag exchange:settle
+dontguess settlements
 ```
 
 ```
@@ -115,17 +105,13 @@ cf read $XCFID --all --tag exchange:settle
 ### 5. Buyer: search before computing
 
 ```bash
-# Build the buy payload
-PAYLOAD=$(python3 -c "import json; print(json.dumps({
-  'task': 'rate limiter implementation in Go',
-  'budget': 5000
-}))")
+dontguess buy --task "rate limiter implementation in Go" --budget 5000
+```
 
-# Send the buy request — engine matches against inventory
-cf send $XCFID "$PAYLOAD" --tag exchange:buy --future
+To check pending match results:
 
-# Match response arrives
-cf read $XCFID --all --tag exchange:match
+```bash
+dontguess match-results
 ```
 
 Output:
