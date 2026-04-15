@@ -228,20 +228,12 @@ func (l *Limiter) Allow(ctx context.Context, key string) (bool, error) {
 }'
 CONTENT_CODE_B64=$(printf '%s' "$CONTENT_CODE" | base64 -w0)
 
-PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops',
-    'content': '$CONTENT_CODE_B64',
-    'token_cost': 2500,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ cf --cf-home \$SELLER_CF send \$XCFID <put-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG=$(cf --cf-home "$SELLER_CF" send "$XCFID" "$PUT_PAYLOAD" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description '...' --content \$B64 --token-cost 2500 --content-type code"
+PUT_MSG=$(CF_HOME="$SELLER_CF" dontguess put \
+    --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
+    --content "$CONTENT_CODE_B64" \
+    --token-cost 2500 \
+    --content-type code \
     --json)
 PUT_MSG_ID=$(echo "$PUT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 echo "# put message ID: $PUT_MSG_ID"
@@ -288,7 +280,7 @@ echo "# Waiting for put-accept settle message (up to 20s)..."
 ACCEPT_COUNT=0
 for i in $(seq 1 40); do
     sleep 0.5
-    ACCEPT_COUNT=$(cf --cf-home "$OP_CF" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    ACCEPT_COUNT=$(CF_HOME="$OP_CF" dontguess settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$ACCEPT_COUNT" -ge 1 ]; then
         echo "# put-accept settlement received (settle count: $ACCEPT_COUNT)"
@@ -302,8 +294,8 @@ if [ "$ACCEPT_COUNT" -lt 1 ]; then
     grep "auto-accepted\|auto-accept\|pending\|put" "$TMP/serve.log" 2>/dev/null || echo "# (no relevant log lines)"
 fi
 
-echo "$ cf --cf-home \$OP_CF read \$XCFID --all --tag exchange:settle"
-SETTLE_MSGS=$(cf --cf-home "$OP_CF" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null)
+echo "$ CF_HOME=\$OP_CF dontguess settlements"
+SETTLE_MSGS=$(CF_HOME="$OP_CF" dontguess settlements --json 2>/dev/null)
 echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -332,18 +324,10 @@ fi
 
 tee_section "buy (remote buyer → hosted exchange)"
 
-BUY_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'rate limiter implementation in Go',
-    'budget': 5000
-}))
-")
-
-echo "$ cf --cf-home \$BUYER_CF send \$XCFID <buy-payload> --tag exchange:buy --future"
-BUY_MSG=$(cf --cf-home "$BUYER_CF" send "$XCFID" "$BUY_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
+echo "$ CF_HOME=\$BUYER_CF dontguess buy --task '...' --budget 5000"
+BUY_MSG=$(CF_HOME="$BUYER_CF" dontguess buy \
+    --task "rate limiter implementation in Go" \
+    --budget 5000 \
     --json)
 BUY_MSG_ID=$(echo "$BUY_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
 echo "# buy message ID: $BUY_MSG_ID"
@@ -358,7 +342,7 @@ echo "# Waiting for exchange:match response (up to 15s)..."
 MATCH_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    MATCH_COUNT=$(cf --cf-home "$OP_CF" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(CF_HOME="$OP_CF" dontguess match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -gt 0 ]; then
         MATCH_FOUND=true
@@ -374,8 +358,8 @@ if [ "$MATCH_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf --cf-home \$OP_CF read \$XCFID --all --tag exchange:match"
-MATCH_MSGS=$(cf --cf-home "$OP_CF" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ CF_HOME=\$OP_CF dontguess match-results"
+MATCH_MSGS=$(CF_HOME="$OP_CF" dontguess match-results --json 2>/dev/null)
 echo "$MATCH_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -437,8 +421,8 @@ fi
 tee_section "campfire-log"
 
 echo "# Full campfire message log (all 3 hosted identities' activity):"
-echo "$ cf --cf-home \$OP_CF read \$XCFID --all"
-cf --cf-home "$OP_CF" read "$XCFID" --all --json 2>/dev/null | python3 -c "
+echo "$ CF_HOME=\$OP_CF dontguess messages"
+CF_HOME="$OP_CF" dontguess messages --json 2>/dev/null | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
 print(f'Total messages: {len(msgs)}')
@@ -485,7 +469,7 @@ echo "Put message ID:       $PUT_MSG_ID"
 echo "Buy message ID:       $BUY_MSG_ID"
 echo ""
 
-FINAL_COUNT=$(cf --cf-home "$OP_CF" read "$XCFID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(CF_HOME="$OP_CF" dontguess messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""
