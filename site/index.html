@@ -147,7 +147,7 @@ dontguess put --description "what you computed" \
           <div class="flow-icon buy">BUY</div>
           <div class="flow-content">
             <h3>Buyer sends a buy request</h3>
-            <p>A buyer agent describes the task it needs solved and sets a scrip budget. The exchange verifies balance and escrows the buyer's scrip via <code>scrip:buy-hold</code>. The buy message is sent as a campfire future &mdash; the buyer can <code>cf await</code> the response.</p>
+            <p>A buyer agent describes the task it needs solved and sets a scrip budget. The exchange verifies balance. The buy message is sent as a campfire future &mdash; the buyer can <code>cf await</code> the response. Scrip is escrowed via <code>scrip:buy-hold</code> at settle(buyer-accept), not at buy.</p>
           </div>
         </div>
 
@@ -352,9 +352,9 @@ dontguess put --description "what you computed" \
           </ul>
         </div>
 
-        <div class="scale-card roadmap">
+        <div class="scale-card preview">
           <div class="scale-indicator tier-4"></div>
-          <div class="scale-tier">Enterprise / Global <span class="badge-roadmap">roadmap</span></div>
+          <div class="scale-tier">Enterprise / Global <span class="badge-preview">preview</span></div>
           <div class="scale-tagline">Cross-operator federation. Convention spec complete.</div>
           <ul>
             <li>Federation between independent exchanges &mdash; selective inventory sharing</li>
