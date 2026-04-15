@@ -197,22 +197,14 @@ func (l *Limiter) Allow(ctx context.Context, key string) (bool, error) {
 }'
 CONTENT_CODE_B64=$(printf '%s' "$CONTENT_CODE" | base64 -w0)
 
-PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops',
-    'content': '$CONTENT_CODE_B64',
-    'token_cost': 2500,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ CF_HOME=\$SELLER_CF cf send \$XCFID <put-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
-    --json)
-PUT_MSG_ID=$(echo "$PUT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description \"...\" --content \"\$CONTENT_CODE_B64\" --token_cost 2500 --content_type code"
+CF_HOME="$SELLER_CF" cf "$XCFID" put \
+    --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
+    --content "$CONTENT_CODE_B64" \
+    --token_cost 2500 \
+    --content_type code
+PUT_MSG_ID=$(CF_HOME="$SELLER_CF" cf "$XCFID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else '')" 2>/dev/null || echo "")
 echo "# put message ID: $PUT_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -256,7 +248,7 @@ echo "# Waiting for put-accept settle message (up to 20s)..."
 ACCEPT_FOUND=false
 for i in $(seq 1 40); do
     sleep 0.5
-    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$SETTLE_COUNT" -gt 0 ]; then
         ACCEPT_FOUND=true
@@ -271,8 +263,8 @@ if [ "$ACCEPT_FOUND" != "true" ]; then
     grep "auto-accepted\|auto-accept\|pending" "$TMP/serve.log" 2>/dev/null || echo "# (no auto-accept log lines)"
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:settle"
-cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
+echo "$ dontguess settlements"
+cf --cf-home "$CF_HOME" "$XCFID" settlements 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
 
 # ---------------------------------------------------------------------------
 # Section: buy — buyer requests cached inference matching the seller's item
@@ -280,20 +272,12 @@ cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" 2>/dev/null 
 
 tee_section "buy"
 
-BUY_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'rate limiter implementation in Go',
-    'budget': 5000
-}))
-")
-
-echo "$ CF_HOME=\$BUYER_CF cf send \$XCFID <buy-payload> --tag exchange:buy --future"
-BUY_MSG=$(CF_HOME="$BUYER_CF" cf send "$XCFID" "$BUY_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
-    --json)
-BUY_MSG_ID=$(echo "$BUY_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$BUYER_CF dontguess buy --task \"rate limiter implementation in Go\" --budget 5000"
+CF_HOME="$BUYER_CF" cf "$XCFID" buy \
+    --task "rate limiter implementation in Go" \
+    --budget 5000
+BUY_MSG_ID=$(CF_HOME="$BUYER_CF" cf "$XCFID" buys --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else '')" 2>/dev/null || echo "")
 echo "# buy message ID: $BUY_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -306,7 +290,7 @@ echo "# Waiting for exchange:match response (up to 15s)..."
 MATCH_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -gt 0 ]; then
         MATCH_FOUND=true
@@ -322,8 +306,8 @@ if [ "$MATCH_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:match"
-MATCH_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ dontguess match-results"
+MATCH_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" match-results --json 2>/dev/null)
 echo "$MATCH_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
