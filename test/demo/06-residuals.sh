@@ -198,22 +198,13 @@ GSI1: PK=STATUS#<status>  SK=ORDER#<timestamp>
 - WCU burst: set on-demand for launch, switch to provisioned after traffic stabilizes'
 CONTENT_B64=$(printf '%s' "$CONTENT" | base64 -w0)
 
-PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'DynamoDB single-table design analysis — access patterns, GSI recommendations, capacity planning',
-    'content': '$CONTENT_B64',
-    'token_cost': 5000,
-    'content_type': 'exchange:content-type:analysis',
-}))
-")
-
-echo "$ CF_HOME=\$SELLER_CF cf send \$XCFID <put-payload> --tag exchange:put --tag exchange:content-type:analysis"
-PUT_MSG=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:analysis" \
-    --json)
-PUT_MSG_ID=$(echo "$PUT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$SELLER_CF dontguess put --description \"...\" --content \"\$CONTENT_B64\" --token_cost 5000 --content_type analysis"
+CF_HOME="$SELLER_CF" cf "$XCFID" put \
+    --description "DynamoDB single-table design analysis — access patterns, GSI recommendations, capacity planning" \
+    --content "$CONTENT_B64" \
+    --token_cost 5000 \
+    --content_type analysis
+PUT_MSG_ID=$(cf --cf-home "$CF_HOME" view read "$XCFID" puts --json 2>/dev/null | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# put message ID: $PUT_MSG_ID"
 echo "# token_cost: 5000 → seller will earn put-pay scrip = 3500 (70%)"
 
@@ -229,39 +220,23 @@ tee_section "seed-scrip"
 SEED_AMOUNT=10000
 
 echo "# Operator mints $SEED_AMOUNT scrip for buyer 1 (pubkey: ${BUYER1_PUBKEY:0:16}...)"
-MINT1_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'recipient': '$BUYER1_PUBKEY',
-    'amount': $SEED_AMOUNT,
-    'x402_tx_ref': 'demo-06-mint-buyer1',
-    'rate': 1000
-}))
-")
-echo "$ cf --cf-home \$CF_HOME send \$XCFID <mint-payload> --tag dontguess:scrip-mint"
-MINT1_MSG=$(cf --cf-home "$CF_HOME" send "$XCFID" "$MINT1_PAYLOAD" \
-    --tag "dontguess:scrip-mint" \
-    --json)
-MINT1_MSG_ID=$(echo "$MINT1_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-echo "# scrip-mint for buyer1: $MINT1_MSG_ID"
+echo "$ dontguess mint --recipient \$BUYER1_PUBKEY --amount $SEED_AMOUNT --x402_tx_ref demo-06-mint-buyer1 --rate 1000"
+cf --cf-home "$CF_HOME" "$XCFID" scrip:mint \
+    --recipient "$BUYER1_PUBKEY" \
+    --amount "$SEED_AMOUNT" \
+    --x402_tx_ref "demo-06-mint-buyer1" \
+    --rate 1000
+echo "# scrip-mint for buyer1: dispatched"
 
 echo ""
 echo "# Operator mints $SEED_AMOUNT scrip for buyer 2 (pubkey: ${BUYER2_PUBKEY:0:16}...)"
-MINT2_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'recipient': '$BUYER2_PUBKEY',
-    'amount': $SEED_AMOUNT,
-    'x402_tx_ref': 'demo-06-mint-buyer2',
-    'rate': 1000
-}))
-")
-echo "$ cf --cf-home \$CF_HOME send \$XCFID <mint-payload> --tag dontguess:scrip-mint"
-MINT2_MSG=$(cf --cf-home "$CF_HOME" send "$XCFID" "$MINT2_PAYLOAD" \
-    --tag "dontguess:scrip-mint" \
-    --json)
-MINT2_MSG_ID=$(echo "$MINT2_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-echo "# scrip-mint for buyer2: $MINT2_MSG_ID"
+echo "$ dontguess mint --recipient \$BUYER2_PUBKEY --amount $SEED_AMOUNT --x402_tx_ref demo-06-mint-buyer2 --rate 1000"
+cf --cf-home "$CF_HOME" "$XCFID" scrip:mint \
+    --recipient "$BUYER2_PUBKEY" \
+    --amount "$SEED_AMOUNT" \
+    --x402_tx_ref "demo-06-mint-buyer2" \
+    --rate 1000
+echo "# scrip-mint for buyer2: dispatched"
 
 echo ""
 echo "# Both buyers seeded with $SEED_AMOUNT scrip. Ready for serve."
@@ -307,7 +282,7 @@ echo "# Waiting for put-accept settle message (up to 20s)..."
 ACCEPT_FOUND=false
 for i in $(seq 1 40); do
     sleep 0.5
-    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" view read "$XCFID" settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$SETTLE_COUNT" -gt 0 ]; then
         ACCEPT_FOUND=true
@@ -321,13 +296,13 @@ if [ "$ACCEPT_FOUND" != "true" ]; then
     grep "auto-accepted\|auto-accept\|pending" "$TMP/serve.log" 2>/dev/null || echo "# (no auto-accept log lines)"
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:settle"
-cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
+echo "$ dontguess settlements"
+cf --cf-home "$CF_HOME" view read "$XCFID" settlements 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
 
 # Read seller's scrip balance after put-accept (from scrip-put-pay messages)
 echo ""
 echo "# Checking exchange scrip ledger for seller put-pay..."
-SCRIP_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "dontguess:scrip-put-pay" --json 2>/dev/null || echo "[]")
+SCRIP_MSGS=$(cf --cf-home "$CF_HOME" view read "$XCFID" put-accepts --json 2>/dev/null || echo "[]")
 echo "$SCRIP_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -352,20 +327,11 @@ for m in msgs:
 
 tee_section "buy1"
 
-BUY1_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'DynamoDB single-table design access pattern analysis',
-    'budget': 8000
-}))
-")
-
-echo "$ CF_HOME=\$BUYER1_CF cf send \$XCFID <buy-payload> --tag exchange:buy --future"
-BUY1_MSG=$(CF_HOME="$BUYER1_CF" cf send "$XCFID" "$BUY1_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
-    --json)
-BUY1_MSG_ID=$(echo "$BUY1_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$BUYER1_CF dontguess buy --task \"DynamoDB single-table design access pattern analysis\" --budget 8000"
+CF_HOME="$BUYER1_CF" cf "$XCFID" buy \
+    --task "DynamoDB single-table design access pattern analysis" \
+    --budget 8000
+BUY1_MSG_ID=$(cf --cf-home "$CF_HOME" view read "$XCFID" buys --json 2>/dev/null | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# buy1 message ID: $BUY1_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -378,7 +344,7 @@ echo "# Waiting for exchange:match response for buyer 1 (up to 15s)..."
 MATCH1_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(cf --cf-home "$CF_HOME" view read "$XCFID" match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -gt 0 ]; then
         MATCH1_FOUND=true
@@ -394,8 +360,8 @@ if [ "$MATCH1_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:match"
-MATCH1_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ dontguess match-results"
+MATCH1_MSGS=$(cf --cf-home "$CF_HOME" view read "$XCFID" match-results --json 2>/dev/null)
 echo "$MATCH1_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -422,20 +388,11 @@ for m in msgs[-3:]:
 
 tee_section "buy2"
 
-BUY2_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'DynamoDB table design with single-table pattern and GSI access patterns',
-    'budget': 8000
-}))
-")
-
-echo "$ CF_HOME=\$BUYER2_CF cf send \$XCFID <buy-payload> --tag exchange:buy --future"
-BUY2_MSG=$(CF_HOME="$BUYER2_CF" cf send "$XCFID" "$BUY2_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
-    --json)
-BUY2_MSG_ID=$(echo "$BUY2_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ CF_HOME=\$BUYER2_CF dontguess buy --task \"DynamoDB table design with single-table pattern and GSI access patterns\" --budget 8000"
+CF_HOME="$BUYER2_CF" cf "$XCFID" buy \
+    --task "DynamoDB table design with single-table pattern and GSI access patterns" \
+    --budget 8000
+BUY2_MSG_ID=$(cf --cf-home "$CF_HOME" view read "$XCFID" buys --json 2>/dev/null | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# buy2 message ID: $BUY2_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -448,7 +405,7 @@ echo "# Waiting for exchange:match response for buyer 2 (up to 15s)..."
 MATCH2_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(cf --cf-home "$CF_HOME" view read "$XCFID" match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -ge 2 ]; then
         MATCH2_FOUND=true
@@ -460,13 +417,13 @@ done
 if [ "$MATCH2_FOUND" != "true" ]; then
     echo "# NOTE: Buyer 2 match not seen within 15s (may be buy-miss or pending)"
     echo "# Checking current match count..."
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(cf --cf-home "$CF_HOME" view read "$XCFID" match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     echo "# Current match count: $MATCH_COUNT"
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:match"
-MATCH_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ dontguess match-results"
+MATCH_MSGS=$(cf --cf-home "$CF_HOME" view read "$XCFID" match-results --json 2>/dev/null)
 echo "$MATCH_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -498,7 +455,7 @@ echo ""
 
 # scrip-put-pay: initial seller payment when put is accepted
 echo "--- dontguess:scrip-put-pay (seller initial payment) ---"
-PUTPAY_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "dontguess:scrip-put-pay" --json 2>/dev/null || echo "[]")
+PUTPAY_MSGS=$(cf --cf-home "$CF_HOME" view read "$XCFID" put-accepts --json 2>/dev/null || echo "[]")
 echo "$PUTPAY_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -520,7 +477,7 @@ echo ""
 
 # scrip-settle: buyer pay → seller residual + operator revenue + fee burn
 echo "--- dontguess:scrip-settle (buyer sale → seller residual) ---"
-SETTLE_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "dontguess:scrip-settle" --json 2>/dev/null || echo "[]")
+SETTLE_MSGS=$(cf --cf-home "$CF_HOME" view read "$XCFID" settlements --json 2>/dev/null || echo "[]")
 echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -563,7 +520,7 @@ echo "Buy 2 message ID:     $BUY2_MSG_ID"
 echo ""
 
 # Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(cf --cf-home "$CF_HOME" view read "$XCFID" messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""
