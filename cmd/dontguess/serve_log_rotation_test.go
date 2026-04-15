@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/natefinch/lumberjack.v2"
 )
@@ -210,17 +211,28 @@ func TestLogRotation_BackupCap(t *testing.T) {
 	}
 	roller.Close()
 
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		t.Fatalf("ReadDir: %v", err)
-	}
-
-	// Count .gz backup files (lumberjack names them dontguess-<timestamp>.log.gz).
+	// Lumberjack compresses old segments asynchronously. Close() does not
+	// wait for compression goroutines to finish, so .gz files may still be
+	// in flight. Poll until the gz count stabilises or we time out.
 	var gzCount int
-	for _, e := range entries {
-		if strings.HasSuffix(e.Name(), ".gz") {
-			gzCount++
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatalf("ReadDir: %v", err)
 		}
+		gzCount = 0
+		for _, e := range entries {
+			if strings.HasSuffix(e.Name(), ".gz") {
+				gzCount++
+			}
+		}
+		// After 7 rotations with MaxBackups=5, we expect exactly 5 .gz
+		// files once compression finishes. Stop polling once we see them.
+		if gzCount >= 5 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	if gzCount > 5 {
