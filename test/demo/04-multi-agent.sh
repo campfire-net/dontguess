@@ -285,7 +285,7 @@ echo "# Waiting for 2 put-accept settle messages (up to 20s)..."
 ACCEPT_COUNT=0
 for i in $(seq 1 40); do
     sleep 0.5
-    ACCEPT_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    ACCEPT_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$ACCEPT_COUNT" -ge 2 ]; then
         echo "# 2 put-accept settlements received (settle count: $ACCEPT_COUNT)"
@@ -299,8 +299,8 @@ if [ "$ACCEPT_COUNT" -lt 2 ]; then
     grep "auto-accepted\|auto-accept\|pending\|put" "$TMP/serve.log" 2>/dev/null || echo "# (no relevant log lines)"
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:settle"
-SETTLE_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null)
+echo "$ cf \$XCFID settlements"
+SETTLE_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null)
 echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -351,7 +351,7 @@ echo "# Waiting for exchange:match response (up to 15s)..."
 MATCH_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -gt 0 ]; then
         MATCH_FOUND=true
@@ -367,8 +367,8 @@ if [ "$MATCH_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf read \$XCFID --all --tag exchange:match"
-MATCH_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ cf \$XCFID match-results"
+MATCH_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" match-results --json 2>/dev/null)
 echo "$MATCH_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)

@@ -238,7 +238,7 @@ echo "# Waiting for put-accept settle (auto-accept, up to 15s)..."
 ACCEPT_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
-    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$SETTLE_COUNT" -gt 0 ]; then
         ACCEPT_FOUND=true
@@ -255,7 +255,7 @@ if [ "$ACCEPT_FOUND" != "true" ]; then
 fi
 
 # Retrieve the entry_id from the settle message so we can reference it in assign
-SETTLE_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null)
+SETTLE_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" settlements --json 2>/dev/null)
 ENTRY_ID=$(echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
