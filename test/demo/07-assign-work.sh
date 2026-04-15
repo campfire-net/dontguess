@@ -325,9 +325,8 @@ cf --cf-home "$WORKER_CF" "$XCFID" assign-claim \
     --target "$ASSIGN_MSG_ID" \
     --expires_at "$CLAIM_EXPIRES_AT"
 
-# Read the message ID from the assigns view — the claim is the most recent assign-tagged message
-# Fall back to reading all messages and filtering by assign-claim tag
-CLAIM_MSG_ID=$(cf --cf-home "$WORKER_CF" read "$XCFID" --all --tag "exchange:assign-claim" --json 2>/dev/null | \
+# Read the message ID from the assign-claims named view
+CLAIM_MSG_ID=$(cf --cf-home "$WORKER_CF" "$XCFID" assign-claims --json 2>/dev/null | \
     python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-claim message ID: $CLAIM_MSG_ID"
 
@@ -352,8 +351,8 @@ cf --cf-home "$WORKER_CF" "$XCFID" assign-complete \
     --verdict "exchange:assign-verdict:pass" \
     --evidence_hash "$EVIDENCE_HASH"
 
-# Read the message ID from all messages filtered by assign-complete tag
-COMPLETE_MSG_ID=$(cf --cf-home "$WORKER_CF" read "$XCFID" --all --tag "exchange:assign-complete" --json 2>/dev/null | \
+# Read the message ID from the assign-completes named view
+COMPLETE_MSG_ID=$(cf --cf-home "$WORKER_CF" "$XCFID" assign-completes --json 2>/dev/null | \
     python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-complete message ID: $COMPLETE_MSG_ID"
 
@@ -373,8 +372,8 @@ cf --cf-home "$CF_HOME" "$XCFID" assign-accept \
     --bounty_paid "$BOUNTY" \
     --validation_method "algorithmic"
 
-# Read the message ID from all messages filtered by assign-accept tag
-ACCEPT_MSG_ID=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:assign-accept" --json 2>/dev/null | \
+# Read the message ID from the assign-accepts named view
+ACCEPT_MSG_ID=$(cf --cf-home "$CF_HOME" "$XCFID" assign-accepts --json 2>/dev/null | \
     python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign-accept message ID: $ACCEPT_MSG_ID"
 
@@ -425,7 +424,7 @@ for m in msgs:
 "
 
 # Verify worker key appears in the pay message
-WORKER_IN_PAY=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "dontguess:scrip-assign-pay" --json 2>/dev/null | \
+WORKER_IN_PAY=$(cf --cf-home "$CF_HOME" "$XCFID" scrip-assign-pay --json 2>/dev/null | \
     python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -460,7 +459,7 @@ echo "Worker public key:  ${WORKER_PUBKEY:0:16}..."
 echo ""
 
 # Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""

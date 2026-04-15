@@ -371,7 +371,7 @@ echo "Buy message ID:    $BUY_MSG_ID"
 echo ""
 
 # Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""

@@ -237,7 +237,7 @@ cf --cf-home "$SELLER_CF" "$XCFID" put \
 echo "# put 2 (analysis) dispatched"
 
 # Read put message IDs from named view after both puts
-PUTS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null || cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:put" --json 2>/dev/null)
+PUTS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null)
 PUT_MSG_ID_1=$(echo "$PUTS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id']) if msgs else print('')" 2>/dev/null || echo "")
 PUT_MSG_ID_2=$(echo "$PUTS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[1]['id']) if len(msgs)>1 else print('')" 2>/dev/null || echo "")
 echo "# put 1 (code) message ID: $PUT_MSG_ID_1"
@@ -337,7 +337,7 @@ cf --cf-home "$BUYER_CF" "$XCFID" buy \
 echo "# buy dispatched"
 
 # Read buy message ID from named view
-BUYS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" buys --json 2>/dev/null || cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:buy" --json 2>/dev/null)
+BUYS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" buys --json 2>/dev/null)
 BUY_MSG_ID=$(echo "$BUYS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id']) if msgs else print('')" 2>/dev/null || echo "")
 echo "# buy message ID: $BUY_MSG_ID"
 
@@ -479,7 +479,7 @@ echo "Buy message ID:     $BUY_MSG_ID"
 echo ""
 
 # Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(cf --cf-home "$CF_HOME" "$XCFID" messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""
