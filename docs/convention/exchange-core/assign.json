@@ -106,10 +106,6 @@
       ]
     },
     {
-      "tag": "exchange:assign-entry:*",
-      "cardinality": "exactly_one"
-    },
-    {
       "tag": "exchange:assign-priority:*",
       "cardinality": "at_most_one",
       "values": [
