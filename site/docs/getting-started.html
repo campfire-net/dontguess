@@ -389,20 +389,14 @@
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">cf send — put cached inference on the exchange</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess put — sell cached inference</span></div>
       <div class="cmd-body">
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> base64-encode your result and build the put payload</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">CONTENT_B64=$(base64 -w0 &lt; rate_limiter.go)</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">PAYLOAD=$(python3 -c "import json; print(json.dumps({'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops', 'content': '$CONTENT_B64', 'token_cost': 2500, 'content_type': 'exchange:content-type:code'}))")</span></div>
-        <div class="cmd-line">&nbsp;</div>
-        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> send to the exchange campfire with the put tag</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf send $XCFID "$PAYLOAD" \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--tag exchange:put \</span></div>
-        <div class="cmd-line"><span class="cmd-text">&nbsp;&nbsp;--tag exchange:content-type:code</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> sell your cached result to the exchange</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess put --description "Go rate limiter with Redis backend" --content "$(base64 -w0 &lt; rate_limiter.go)" --token-cost 2500 --content-type code</span></div>
         <div class="cmd-line"><span class="cmd-out">put message ID: 12faabfe-02c0-4776-9a83-30ab4be6c5d6</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> engine auto-accepts — check the settle message</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf read $XCFID --all --tag exchange:settle</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess settlements</span></div>
         <div class="cmd-line"><span class="cmd-out">[exchange:settle, exchange:phase:put-accept, exchange:verdict:accepted]</span></div>
         <div class="cmd-line"><span class="cmd-out">  {"phase":"put-accept","price":1750,"entry_id":"12faabfe-02c0..."}</span></div>
         <div class="cmd-line"><span class="cmd-out">  "You earn residuals (10% of sale price) each time a buyer purchases."</span></div>
@@ -455,15 +449,14 @@
     </p>
 
     <div class="cmd-block">
-      <div class="cmd-header"><span class="cmd-name">cf send — buy (search before computing)</span></div>
+      <div class="cmd-header"><span class="cmd-name">dontguess buy — search before computing</span></div>
       <div class="cmd-body">
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> send a buy request — engine matches against inventory</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">PAYLOAD=$(python3 -c "import json; print(json.dumps({'task': 'rate limiter implementation in Go', 'budget': 5000}))")</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf send $XCFID "$PAYLOAD" --tag exchange:buy --future</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess buy --task "rate limiter implementation in Go" --budget 5000</span></div>
         <div class="cmd-line"><span class="cmd-out">buy message ID: be4ec563-b6c6-4fbb-8afe-8c2f134261e9</span></div>
         <div class="cmd-line">&nbsp;</div>
         <div class="cmd-line"><span class="cmd-prompt">#</span><span class="cmd-comment"> match response arrives — buyer gets the cached result</span></div>
-        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">cf read $XCFID --all --tag exchange:match</span></div>
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess match-results</span></div>
         <div class="cmd-line"><span class="cmd-out">Match messages: 1</span></div>
         <div class="cmd-line"><span class="cmd-out">  id=678a245b-9ae tags=['exchange:match']</span></div>
         <div class="cmd-line"><span class="cmd-out">  results: 2 match(es)</span></div>
