@@ -65,6 +65,9 @@ func StandardViews() []viewDefinition {
 			Ordering:  "timestamp desc",
 			Refresh:   "on-read",
 		},
+		{Name: "assign-claims", Predicate: `(tag "exchange:assign-claim")`, Ordering: "timestamp desc", Refresh: "on-read"},
+		{Name: "assign-completes", Predicate: `(tag "exchange:assign-complete")`, Ordering: "timestamp desc", Refresh: "on-read"},
+		{Name: "assign-accepts", Predicate: `(tag "exchange:assign-accept")`, Ordering: "timestamp desc", Refresh: "on-read"},
 		{
 			Name:      "scrip-assign-pay",
 			Predicate: `(tag "dontguess:scrip-assign-pay")`,
