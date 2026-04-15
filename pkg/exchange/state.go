@@ -1742,6 +1742,7 @@ func (s *State) applyAssign(msg *Message) {
 		EntryID              string `json:"entry_id"`
 		TaskType             string `json:"task_type"`
 		Reward               int64  `json:"reward"`
+		Bounty               int64  `json:"bounty"` // convention-dispatched assigns use "bounty"; engine-generated use "reward"
 		ExclusiveSender      string `json:"exclusive_sender"`
 		ClaimTimeoutMinutes  int    `json:"claim_timeout_minutes"`
 		AuctionWindowSeconds int    `json:"auction_window_seconds"`
@@ -1750,6 +1751,11 @@ func (s *State) applyAssign(msg *Message) {
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
+	}
+	// Convention-dispatched assigns use "bounty" (from assign.json spec);
+	// engine-generated assigns use "reward". Merge: bounty takes precedence.
+	if payload.Bounty > 0 && payload.Reward == 0 {
+		payload.Reward = payload.Bounty
 	}
 	timeoutMinutes := payload.ClaimTimeoutMinutes
 	if timeoutMinutes <= 0 || timeoutMinutes > 30 {

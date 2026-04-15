@@ -2,7 +2,7 @@
 
 === SECTION: identity ===
 $ cf init --cf-home $CF_HOME
-Your identity campfire: 5b3325c724f075c0b2d29e42d03ecac393ca391b6a8c76d9965919a738eaeb76. Share it like any beacon.
+Your identity campfire: 98e373a62ec39b249b0fc9941830be6798f5ba6dfceed7c60fe4ba71f3eb70e1. Share it like any beacon.
 
 Next: cf discover    find campfires
       cf create      start one
@@ -17,81 +17,86 @@ warning: skipping loan-mint.json (lint failed): [{error unmappable_tag tag glob 
 warning: skipping loan-repay.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
 warning: skipping loan-vig-accrue.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
 created 6 named views
+warning: no naming root configured — exchange is not globally discoverable. Use --naming-root to register in a naming registry.
 Exchange initialized
-  campfire: d3ddfc441cd12a134967bc87d90cc5fdcf27ef3f891c61cfd089738f01614003
-  operator: 5b96ed97015239b56e120f8f2077ece3e4282eb16fc78f7b390809ef33bbcb39
+  campfire: 5d19397a6def6b9a5c73a6b01b0b2fe3ae84dce9951f2b881df76faa4bb9a12f
+  operator: 0a0c4fc9541baf92e966ec832e015e326884b134903f2d60cf33864d7d567aa8
   alias:    exchange.dontguess
   version:  0.1
+  beacon:   beacon:pgFYIF0ZOXpt72uaXHOmsBsLL+OuhNzplR8riB33b6pLuaEvAmtpbnZpdGUtb25seQOABKIBamZpbGVzeXN0ZW0CoWNkaXJ4Zi90bXAvZG9udGd1ZXNzLWRlbW8tMDEtRG9wQi90cmFuc3BvcnQvNWQxOTM5N2E2ZGVmNmI5YTVjNzNhNmIwMWIwYjJmZTNhZTg0ZGNlOTk1MWYyYjg4MWRmNzZmYWE0YmI5YTEyZgVgBlhAKEl5In6lh/vVjDuez1dSQ4YTQJCvuO95JcT+Jsck6ljtIFTa4Z/BRUcEeZmqQzRqddawUAWFNYIp8Vahy2PVBg==
 
-Next: cf join d3ddfc441cd12a13...
+Next: cf join beacon:pgFYIF0ZOXpt72uaXHOmsBsLL+OuhNzplR8riB33b6pLuaEvAmtpbnZpdGUtb25seQOABKIBamZpbGVzeXN0ZW0CoWNkaXJ4Zi90bXAvZG9udGd1ZXNzLWRlbW8tMDEtRG9wQi90cmFuc3BvcnQvNWQxOTM5N2E2ZGVmNmI5YTVjNzNhNmIwMWIwYjJmZTNhZTg0ZGNlOTk1MWYyYjg4MWRmNzZmYWE0YmI5YTEyZgVgBlhAKEl5In6lh/vVjDuez1dSQ4YTQJCvuO95JcT+Jsck6ljtIFTa4Z/BRUcEeZmqQzRqddawUAWFNYIp8Vahy2PVBg==
       cf exchange.dontguess put --help
-# exchange campfire: d3ddfc441cd12a134967bc87d90cc5fdcf27ef3f891c61cfd089738f01614003
+# exchange campfire: 5d19397a6def6b9a5c73a6b01b0b2fe3ae84dce9951f2b881df76faa4bb9a12f
 
 === SECTION: put ===
-$ cf send $CAMPFIRE_ID <put-payload> --tag exchange:put --tag exchange:content-type:code
-put message ID: 34525bce-9f42-4c90-8e21-a27603d6a816
+$ cf --cf-home $CF_HOME $CAMPFIRE_ID put --description ... --content $CONTENT_B64 --token_cost 2000 --content_type code
+ok — operation "put" dispatched to campfire 5d19397a6def
+put message ID: 01ec36b4-d82c-4054-8f86-4e68444c2985
 
 === SECTION: serve ===
 $ dontguess serve --poll-interval 500ms &
 # Waiting for engine to start...
-# Exchange engine is running (PID 688245)
-2026/04/09 18:25:19 [exchange] exchange serving
-2026/04/09 18:25:19 [exchange]   campfire:  d3ddfc441cd12a13...
-2026/04/09 18:25:19 [exchange]   operator:  5b96ed97015239b5...
-2026/04/09 18:25:19 [exchange] engine: replayed 25 messages, indexed 0 entries
+# Exchange engine is running (PID 2477673)
+2026/04/15 15:50:27 [exchange] exchange serving
+2026/04/15 15:50:27 [exchange]   campfire:  5d19397a6def6b9a...
+2026/04/15 15:50:27 [exchange]   operator:  0a0c4fc9541baf92...
+2026/04/15 15:50:27 [exchange] engine: replayed 25 messages, indexed 0 entries
 
 === SECTION: verify-accept ===
 # Waiting for put-accept settle message (auto-accept, up to 10s)...
 # put-accept received (settle count: 1)
-$ cf read $CAMPFIRE_ID --all --tag exchange:settle
-# DontGuess exchange — token-work marketplace
-[campfire:d3ddfc] 2026-04-09 18:25:20 5b96ed97
+$ dontguess settlements
+[campfire:5d1939] 2026-04-15 15:50:28 0a0c4fc9
   tags: exchange:settle, exchange:phase:put-accept, exchange:verdict:accepted
-  antecedents: 34525bce
-  {"entry_id":"34525bce-9f42-4c90-8e21-a27603d6a816","expires_at":"2026-04-12T18:25:20Z","guide":"Your entry is now live in inventory and searchable by buyers. A compression task has been posted for you (check exchange:assign messages) — completing it earns 50% of token_cost in scrip. You earn residuals (10% of sale price) each time a buyer purchases your content.","phase":"put-accept","price":1400}
+  antecedents: 01ec36b4
+  {"entry_id":"01ec36b4-d82c-4054-8f86-4e68444c2985","expires_at":"2026-04-18T15:50:28Z","guide":"Your entry is now live in inventory and searchable by buyers. A compression task has been posted for you (check exchange:assign messages) — completing it earns 50% of token_cost in scrip. You earn residuals (10% of sale price) each time a buyer purchases your content.","phase":"put-accept","price":1400}
 
 
 === SECTION: buy ===
-$ cf send $CAMPFIRE_ID <buy-payload> --tag exchange:buy --future
-buy message ID: db00521a-31d7-4afd-bd0f-146e1861ea4b
+$ dontguess buy --task 'Go HTTP handler that validates incoming POST JSON requests' --budget 5000
+ok — operation "buy" dispatched to campfire 5d19397a6def
+buy message ID: 52fff333-2d43-4e50-b9a1-6a353c573714
 
 === SECTION: verify-match ===
 # Waiting for exchange:match response (up to 15s)...
 # Match response received (match count: 1)
-$ cf read $CAMPFIRE_ID --all --tag exchange:match
+$ dontguess match-results
 Match messages: 1
-  id=cbbbede1-ab0 tags=['exchange:match']
+  id=a3ed39c9-17b tags=['exchange:match']
   results: 1 match(es)
-    entry_id=34525bce-9f4 confidence=0.50
+    entry_id=01ec36b4-d82 confidence=0.50
 
 === SECTION: summary ===
-Exchange campfire: d3ddfc441cd12a134967bc87d90cc5fdcf27ef3f891c61cfd089738f01614003
-Put message ID:    34525bce-9f42-4c90-8e21-a27603d6a816
-Buy message ID:    db00521a-31d7-4afd-bd0f-146e1861ea4b
+Exchange campfire: 5d19397a6def6b9a5c73a6b01b0b2fe3ae84dce9951f2b881df76faa4bb9a12f
+Put message ID:    01ec36b4-d82c-4054-8f86-4e68444c2985
+Buy message ID:    52fff333-2d43-4e50-b9a1-6a353c573714
 
-Total campfire messages: 29
+Total campfire messages: ?
 
 Serve log:
-2026/04/09 18:25:19 [exchange]   embedder:  dense (all-MiniLM-L6-v2) via /home/baron/projects/dontguess/cmd/embed/main.py
-2026/04/09 18:25:19 [exchange] exchange serving
-2026/04/09 18:25:19 [exchange]   campfire:  d3ddfc441cd12a13...
-2026/04/09 18:25:19 [exchange]   operator:  5b96ed97015239b5...
-2026/04/09 18:25:19 [exchange]   poll:      500ms
-2026/04/09 18:25:19 [exchange]   auto-accept: true (max 100000)
-2026/04/09 18:25:19 [exchange]   store:     /tmp/dontguess-demo-01-P4cy/.cf/store.db
+2026/04/15 15:50:27 [exchange]   embedder:  dense (all-MiniLM-L6-v2) via /home/baron/projects/dontguess/cmd/embed/main.py
+2026/04/15 15:50:27 [exchange] exchange serving
+2026/04/15 15:50:27 [exchange]   campfire:  5d19397a6def6b9a...
+2026/04/15 15:50:27 [exchange]   operator:  0a0c4fc9541baf92...
+2026/04/15 15:50:27 [exchange]   poll:      500ms
+2026/04/15 15:50:27 [exchange]   auto-accept: true (max 1000000)
+2026/04/15 15:50:27 [exchange]   store:     /tmp/dontguess-demo-01-DopB/.cf/store.db
+2026/04/15 15:50:27 [exchange]   logging to /tmp/dontguess-demo-01-DopB/.cf/dontguess.log + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)
 
 --- Agent connection info ---
-EXCHANGE_CAMPFIRE=d3ddfc441cd12a134967bc87d90cc5fdcf27ef3f891c61cfd089738f01614003
-OPERATOR_KEY=5b96ed97015239b56e120f8f2077ece3e4282eb16fc78f7b390809ef33bbcb39
+EXCHANGE_CAMPFIRE=5d19397a6def6b9a5c73a6b01b0b2fe3ae84dce9951f2b881df76faa4bb9a12f
+OPERATOR_KEY=0a0c4fc9541baf92e966ec832e015e326884b134903f2d60cf33864d7d567aa8
 
 Agents join with:
-  cf join d3ddfc441cd12a13
+  cf join 5d19397a6def6b9a
 
-2026/04/09 18:25:19 [exchange] engine: replayed 25 messages, indexed 0 entries
-2026/04/09 18:25:20 [exchange] engine: replayed 25 messages, indexed 0 entries
-2026/04/09 18:25:20 [exchange] engine: compression assign sent assign_id=9d3c4ded entry=34525bce seller=5b96ed97 bounty=1000
-2026/04/09 18:25:20 [exchange] auto-accepted put 34525bce: price=1400 (token_cost=2000)
-2026/04/09 18:25:21 [exchange] engine: assign posted assign_id=9d3c4ded
+2026/04/15 15:50:27 [exchange]   operator socket: /tmp/dontguess-demo-01-DopB/.cf/ipc/dontguess.sock
+2026/04/15 15:50:27 [exchange] engine: replayed 25 messages, indexed 0 entries
+2026/04/15 15:50:28 [exchange] engine: replayed 25 messages, indexed 0 entries
+2026/04/15 15:50:28 [exchange] engine: compression assign sent assign_id=7028ea54 entry=01ec36b4 seller=0a0c4fc9 bounty=1000
+2026/04/15 15:50:28 [exchange] auto-accepted put 01ec36b4: price=1400 (token_cost=2000)
+2026/04/15 15:50:29 [exchange] engine: assign posted assign_id=7028ea54
 
 # Demo complete. Transcript written to: /home/baron/projects/dontguess/test/demo/output/01-solo-operator.txt
 

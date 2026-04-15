@@ -2,7 +2,7 @@
 
 === SECTION: operator-identity ===
 $ cf init --cf-home $CF_HOME
-Your identity campfire: 30b098c15e2f27e5a2586e60df4f67797f80a902515a43b3a1da6e85286ce90e. Share it like any beacon.
+Your identity campfire: 01a989c330351131dbc2ebf6fa6030ad5d0a65765c9544ccfd3c77f362a32d01. Share it like any beacon.
 
 Next: cf discover    find campfires
       cf create      start one
@@ -17,166 +17,171 @@ warning: skipping loan-mint.json (lint failed): [{error unmappable_tag tag glob 
 warning: skipping loan-repay.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
 warning: skipping loan-vig-accrue.json (lint failed): [{error unmappable_tag tag glob "scrip:loan:*" has no arg that can produce values with prefix "scrip:loan:" produces_tags[1]}]
 created 6 named views
+warning: no naming root configured — exchange is not globally discoverable. Use --naming-root to register in a naming registry.
 Exchange initialized
-  campfire: e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
-  operator: 79e4394984ce39489bd12722690cca12838e5e1e227610a277764efdac9bb628
+  campfire: 772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
+  operator: 175fc090f2432c370016cdd9896b81d645b65c7096797074826844e025a71145
   alias:    exchange.dontguess
   version:  0.1
+  beacon:   beacon:pgFYIHcmkjM2EKTlJ1LHW90g3EWRZzBumwoYZMuK1vJL03XXAmtpbnZpdGUtb25seQOABKIBamZpbGVzeXN0ZW0CoWNkaXJ4Zi90bXAvZG9udGd1ZXNzLWRlbW8tMDMtb3ZDTi90cmFuc3BvcnQvNzcyNjkyMzMzNjEwYTRlNTI3NTJjNzViZGQyMGRjNDU5MTY3MzA2ZTliMGExODY0Y2I4YWQ2ZjI0YmQzNzVkNwVgBlhAxmjJn6CvtG38jCr5cgbjlqS2mFrAuw/0EIgSnbltjrHji0DCMKtS3ihzQ5pzPIKMjGWKcRvkbeKDT1fnxD3wDQ==
 
-Next: cf join e4efc93bde6cb19d...
+Next: cf join beacon:pgFYIHcmkjM2EKTlJ1LHW90g3EWRZzBumwoYZMuK1vJL03XXAmtpbnZpdGUtb25seQOABKIBamZpbGVzeXN0ZW0CoWNkaXJ4Zi90bXAvZG9udGd1ZXNzLWRlbW8tMDMtb3ZDTi90cmFuc3BvcnQvNzcyNjkyMzMzNjEwYTRlNTI3NTJjNzViZGQyMGRjNDU5MTY3MzA2ZTliMGExODY0Y2I4YWQ2ZjI0YmQzNzVkNwVgBlhAxmjJn6CvtG38jCr5cgbjlqS2mFrAuw/0EIgSnbltjrHji0DCMKtS3ihzQ5pzPIKMjGWKcRvkbeKDT1fnxD3wDQ==
       cf exchange.dontguess put --help
-# exchange campfire: e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
+# exchange campfire: 772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
 
 === SECTION: seller-identity ===
 $ CF_HOME=$SELLER_CF cf init
-Your identity campfire: 64363e5e7bb232317e60a52adaab8a1a664e8fdd901f686c2ff63637cf46de5c. Share it like any beacon.
+Your identity campfire: b96b4f97f4bf05ed1358ddc4cb50d1738244748dd390c561a876fa522b4d3667. Share it like any beacon.
 
 Next: cf discover    find campfires
       cf create      start one
       cf join <id>   join one
-# Seller identity created at: /tmp/dontguess-demo-03-a7mI/seller/.cf
+# Seller identity created at: /tmp/dontguess-demo-03-ovCN/seller/.cf
 
 === SECTION: seller-admit ===
-# Seller public key: 66948d3aeef537678514db8bc307786ce12e0ee67150cbe858e880ae5f8bd11c
+# Seller public key: 91212e6d43b8724318ea0583ca8579f2cd53a3b2fa5c2a4c8f5e9c84bcee7067
 $ cf --cf-home $CF_HOME admit $XCFID $SELLER_PUBKEY
-Admitted 66948d3aeef5 to campfire e4efc93bde6c (role: full)
+Admitted 91212e6d43b8 to campfire 772692333610 (role: full)
 # Seller admitted to exchange campfire
 
 === SECTION: seller-join ===
 $ CF_HOME=$SELLER_CF cf join $XCFID
-Joined campfire e4efc93bde6c
+Joined campfire 772692333610
 trust: unknown
-  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:scrip:burn
   [unknown] dontguess-exchange:scrip:mint
-  [unknown] dontguess-exchange:scrip:rate-publish
+  [unknown] dontguess-exchange:buy
+  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:scrip:settle
+  [unknown] dontguess-exchange:scrip:dispute-refund
   [unknown] dontguess-exchange:assign-accept
+  [unknown] dontguess-exchange:assign-claim
+  [unknown] dontguess-exchange:assign-complete
+  [unknown] dontguess-exchange:assign-reject
+  [unknown] dontguess-exchange:scrip:rate-publish
+  [unknown] dontguess-exchange:assign-auction-close
   [unknown] dontguess-exchange:match
   [unknown] dontguess-exchange:settle
-  [unknown] dontguess-exchange:scrip:burn
-  [unknown] dontguess-exchange:assign-reject
-  [unknown] dontguess-exchange:buy
-  [unknown] dontguess-exchange:scrip:settle
-  [unknown] dontguess-exchange:assign-claim
+  [unknown] dontguess-exchange:scrip:put-pay
   [unknown] dontguess-exchange:assign-expire
   [unknown] dontguess-exchange:put
-  [unknown] dontguess-exchange:scrip:dispute-refund
-  [unknown] dontguess-exchange:scrip:put-pay
-  [unknown] dontguess-exchange:assign-auction-close
-  [unknown] dontguess-exchange:assign-complete
   [unknown] dontguess-exchange:scrip:assign-pay
-# Seller joined exchange campfire: e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
+# Seller joined exchange campfire: 772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
 
 === SECTION: buyer-identity ===
 $ CF_HOME=$BUYER_CF cf init
-Your identity campfire: aa1b295cbf4f958a18b15e3aed484c77c9a523a3114e5a162302984a537ba85a. Share it like any beacon.
+Your identity campfire: e7587c6c7d640d2298f3cfb3fd6ea1f729b3126446407af6213279fb4c0c7801. Share it like any beacon.
 
 Next: cf discover    find campfires
       cf create      start one
       cf join <id>   join one
-# Buyer identity created at: /tmp/dontguess-demo-03-a7mI/buyer/.cf
+# Buyer identity created at: /tmp/dontguess-demo-03-ovCN/buyer/.cf
 
 === SECTION: buyer-admit ===
-# Buyer public key: 58003b3182eddb1dcf9777852a3a187e302d026aff3a433eaa90a618fa9238f0
+# Buyer public key: 01b68c24178db4843a257222d20a9af23ae614823dd01a71e3daa7d752d3dac5
 $ cf --cf-home $CF_HOME admit $XCFID $BUYER_PUBKEY
-Admitted 58003b3182ed to campfire e4efc93bde6c (role: full)
+Admitted 01b68c24178d to campfire 772692333610 (role: full)
 # Buyer admitted to exchange campfire
 
 === SECTION: buyer-join ===
 $ CF_HOME=$BUYER_CF cf join $XCFID
-Joined campfire e4efc93bde6c
+Joined campfire 772692333610
 trust: unknown
-  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:scrip:burn
   [unknown] dontguess-exchange:scrip:mint
-  [unknown] dontguess-exchange:scrip:rate-publish
+  [unknown] dontguess-exchange:buy
+  [unknown] dontguess-exchange:scrip:buy-hold
+  [unknown] dontguess-exchange:scrip:settle
+  [unknown] dontguess-exchange:scrip:dispute-refund
   [unknown] dontguess-exchange:assign-accept
+  [unknown] dontguess-exchange:assign-claim
+  [unknown] dontguess-exchange:assign-complete
+  [unknown] dontguess-exchange:assign-reject
+  [unknown] dontguess-exchange:scrip:rate-publish
+  [unknown] dontguess-exchange:assign-auction-close
   [unknown] dontguess-exchange:match
   [unknown] dontguess-exchange:settle
-  [unknown] dontguess-exchange:scrip:burn
-  [unknown] dontguess-exchange:assign-reject
-  [unknown] dontguess-exchange:buy
-  [unknown] dontguess-exchange:scrip:settle
-  [unknown] dontguess-exchange:assign-claim
+  [unknown] dontguess-exchange:scrip:put-pay
   [unknown] dontguess-exchange:assign-expire
   [unknown] dontguess-exchange:put
-  [unknown] dontguess-exchange:scrip:dispute-refund
-  [unknown] dontguess-exchange:scrip:put-pay
-  [unknown] dontguess-exchange:assign-auction-close
-  [unknown] dontguess-exchange:assign-complete
   [unknown] dontguess-exchange:scrip:assign-pay
-# Buyer joined exchange campfire: e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
+# Buyer joined exchange campfire: 772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
 
 === SECTION: put ===
-$ CF_HOME=$SELLER_CF cf send $XCFID <put-payload> --tag exchange:put --tag exchange:content-type:code
-# put message ID: 20042a34-eda3-4ef6-bfec-3e202071f92c
+$ CF_HOME=$SELLER_CF dontguess put --description "..." --content "$CONTENT_CODE_B64" --token_cost 2500 --content_type code
+ok — operation "put" dispatched to campfire 772692333610
+# put message ID: 41f053e1-5a07-48b8-b37b-24d90a6c93e1
 
 === SECTION: serve ===
 $ dontguess serve --poll-interval 500ms &
 # Waiting for engine to start...
-# Exchange engine is running (PID 689000)
-2026/04/09 18:25:49 [exchange] exchange serving
-2026/04/09 18:25:49 [exchange]   campfire:  e4efc93bde6cb19d...
-2026/04/09 18:25:49 [exchange]   operator:  79e4394984ce3948...
-2026/04/09 18:25:49 [exchange] engine: replayed 27 messages, indexed 0 entries
+# Exchange engine is running (PID 2480714)
+2026/04/15 15:51:43 [exchange] exchange serving
+2026/04/15 15:51:43 [exchange]   campfire:  772692333610a4e5...
+2026/04/15 15:51:43 [exchange]   operator:  175fc090f2432c37...
+2026/04/15 15:51:43 [exchange] engine: replayed 25 messages, indexed 0 entries
 
 === SECTION: verify-accept ===
 # Waiting for put-accept settle message (up to 20s)...
 # put-accept received (settle count: 1)
-$ cf read $XCFID --all --tag exchange:settle
-# DontGuess exchange — token-work marketplace
-[campfire:e4efc9] 2026-04-09 18:25:50 79e43949
+$ dontguess settlements
+[campfire:772692] 2026-04-15 15:51:44 175fc090
   tags: exchange:settle, exchange:phase:put-accept, exchange:verdict:accepted
-  antecedents: 20042a34
-  {"entry_id":"20042a34-eda3-4ef6-bfec-3e202071f92c","expires_at":"2026-04-12T18:25:50Z","guide":"Your entry is now live in inventory and searchable by buyers. A compression task has been posted for you (check exchange:assign messages) — completing it earns 50% of token_cost in scrip. You earn residuals (10% of sale price) each time a buyer purchases your content.","phase":"put-accept","price":1750}
+  antecedents: 41f053e1
+  {"entry_id":"41f053e1-5a07-48b8-b37b-24d90a6c93e1","expires_at":"2026-04-18T15:51:44Z","guide":"Your entry is now live in inventory and searchable by buyers. A compression task has been posted for you (check exchange:assign messages) — completing it earns 50% of token_cost in scrip. You earn residuals (10% of sale price) each time a buyer purchases your content.","phase":"put-accept","price":1750}
 
 
 === SECTION: buy ===
-$ CF_HOME=$BUYER_CF cf send $XCFID <buy-payload> --tag exchange:buy --future
-# buy message ID: 4683692e-15ac-4ec2-a105-bb4906fdfbfc
+$ CF_HOME=$BUYER_CF dontguess buy --task "rate limiter implementation in Go" --budget 5000
+ok — operation "buy" dispatched to campfire 772692333610
+# buy message ID: 3e3d1870-757b-4919-8b76-cf8d3a6c72d4
 
 === SECTION: verify-match ===
 # Waiting for exchange:match response (up to 15s)...
 # Match response received (match count: 1)
-$ cf read $XCFID --all --tag exchange:match
+$ dontguess match-results
 Match messages: 1
-  id=55265fdb-ddf tags=['exchange:match']
+  id=e4d22605-24e tags=['exchange:match']
   results: 1 match(es)
-    entry_id=20042a34-eda confidence=0.50
+    entry_id=41f053e1-5a0 confidence=0.50
 
 # Verifying match references seller's put...
-# Put message ID:   20042a34-eda3-4ef6-bfec-3e202071f92c
-# Match entry_id:   20042a34-eda3-4ef6-bfec-3e202071f92c
+# Put message ID:   41f053e1-5a07-48b8-b37b-24d90a6c93e1
+# Match entry_id:   41f053e1-5a07-48b8-b37b-24d90a6c93e1
 # Match entry_id present — buy → match lifecycle verified
 
 === SECTION: summary ===
-Exchange campfire: e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
-Put message ID:    20042a34-eda3-4ef6-bfec-3e202071f92c
-Buy message ID:    4683692e-15ac-4ec2-a105-bb4906fdfbfc
+Exchange campfire: 772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
+Put message ID:    41f053e1-5a07-48b8-b37b-24d90a6c93e1
+Buy message ID:    3e3d1870-757b-4919-8b76-cf8d3a6c72d4
 
-Total campfire messages: 32
+Total campfire messages: 30
 
 Serve log:
-2026/04/09 18:25:49 [exchange]   embedder:  dense (all-MiniLM-L6-v2) via /home/baron/projects/dontguess/cmd/embed/main.py
-2026/04/09 18:25:49 [exchange] exchange serving
-2026/04/09 18:25:49 [exchange]   campfire:  e4efc93bde6cb19d...
-2026/04/09 18:25:49 [exchange]   operator:  79e4394984ce3948...
-2026/04/09 18:25:49 [exchange]   poll:      500ms
-2026/04/09 18:25:49 [exchange]   auto-accept: true (max 100000)
-2026/04/09 18:25:49 [exchange]   store:     /tmp/dontguess-demo-03-a7mI/.cf/store.db
+2026/04/15 15:51:43 [exchange]   embedder:  dense (all-MiniLM-L6-v2) via /home/baron/projects/dontguess/cmd/embed/main.py
+2026/04/15 15:51:43 [exchange] exchange serving
+2026/04/15 15:51:43 [exchange]   campfire:  772692333610a4e5...
+2026/04/15 15:51:43 [exchange]   operator:  175fc090f2432c37...
+2026/04/15 15:51:43 [exchange]   poll:      500ms
+2026/04/15 15:51:43 [exchange]   auto-accept: true (max 1000000)
+2026/04/15 15:51:43 [exchange]   store:     /tmp/dontguess-demo-03-ovCN/.cf/store.db
+2026/04/15 15:51:43 [exchange]   logging to /tmp/dontguess-demo-03-ovCN/.cf/dontguess.log + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)
 
 --- Agent connection info ---
-EXCHANGE_CAMPFIRE=e4efc93bde6cb19d1d63d3dc93dabe839201cee55b65aba13a37db8d6e587165
-OPERATOR_KEY=79e4394984ce39489bd12722690cca12838e5e1e227610a277764efdac9bb628
+EXCHANGE_CAMPFIRE=772692333610a4e52752c75bdd20dc459167306e9b0a1864cb8ad6f24bd375d7
+OPERATOR_KEY=175fc090f2432c370016cdd9896b81d645b65c7096797074826844e025a71145
 
 Agents join with:
-  cf join e4efc93bde6cb19d
+  cf join 772692333610a4e5
 
-2026/04/09 18:25:49 [exchange] engine: replayed 27 messages, indexed 0 entries
-2026/04/09 18:25:50 [exchange] engine: replayed 27 messages, indexed 0 entries
-2026/04/09 18:25:50 [exchange] engine: compression assign sent assign_id=049ebf5b entry=20042a34 seller=66948d3a bounty=1250
-2026/04/09 18:25:50 [exchange] auto-accepted put 20042a34: price=1750 (token_cost=2500)
-2026/04/09 18:25:51 [exchange] engine: assign posted assign_id=049ebf5b
-2026/04/09 18:25:52 [exchange] engine: warm compression assign sent assign_id=f0b2b305 entry=20042a34 buyer=58003b31 bounty=750
-2026/04/09 18:25:52 [exchange] engine: assign posted assign_id=f0b2b305
+2026/04/15 15:51:43 [exchange]   operator socket: /tmp/dontguess-demo-03-ovCN/.cf/ipc/dontguess.sock
+2026/04/15 15:51:43 [exchange] engine: replayed 25 messages, indexed 0 entries
+2026/04/15 15:51:44 [exchange] engine: replayed 25 messages, indexed 0 entries
+2026/04/15 15:51:44 [exchange] engine: compression assign sent assign_id=f62b17e9 entry=41f053e1 seller=91212e6d bounty=1250
+2026/04/15 15:51:44 [exchange] auto-accepted put 41f053e1: price=1750 (token_cost=2500)
+2026/04/15 15:51:44 [exchange] engine: assign posted assign_id=f62b17e9
+2026/04/15 15:51:45 [exchange] engine: warm compression assign sent assign_id=65f72e96 entry=41f053e1 buyer=01b68c24 bounty=750
+2026/04/15 15:51:45 [exchange] engine: assign posted assign_id=65f72e96
 
 # Demo complete. Transcript written to: /home/baron/projects/dontguess/test/demo/output/03-agent-buyer.txt
 

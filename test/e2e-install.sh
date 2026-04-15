@@ -139,7 +139,7 @@ sleep 2
 # --- Test 5: Check put was accepted ---
 printf "\n${BOLD}Test 5: Verify put-accept${RESET}\n"
 XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$TEST_HOME/.cf/dontguess-exchange.json")
-if cf read "$XCFID" --all 2>&1 | grep -q "exchange:phase:put-accept"; then
+if cf "$XCFID" put-accepts --json 2>&1 | grep -q "exchange:phase:put-accept"; then
   pass "Put was auto-accepted by exchange"
 else
   fail "No put-accept found"
@@ -159,7 +159,7 @@ sleep 2
 
 # --- Test 7: Check match result ---
 printf "\n${BOLD}Test 7: Verify match result${RESET}\n"
-if cf read "$XCFID" --all 2>&1 | grep -q "exchange:match"; then
+if cf "$XCFID" match-results --json 2>&1 | grep -q "exchange:match"; then
   pass "Exchange returned a match for the buy"
 else
   fail "No match found — buy-miss or engine did not process"

@@ -289,30 +289,20 @@ from datetime import datetime, timezone, timedelta
 print((datetime.now(timezone.utc) + timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ'))
 ")
 
-# NOTE: assign.json fails linting (unmappable tag exchange:assign-entry:*), so the assign
-# convention is not registered. Fall back to raw cf send for this operation.
-ASSIGN_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'entry_id':     '$ENTRY_ID',
-    'task_type':    'exchange:assign-type:validate',
-    'bounty':       $BOUNTY,
-    'reward':       $BOUNTY,
-    'entry_value':  $ENTRY_VALUE,
-    'content_hash': '$CONTENT_HASH',
-    'description':  'Validate cache entry freshness: Go cache warming utility. Re-derive the output independently and verify the content matches the stored hash.',
-    'slots':        1,
-    'expires_at':   '$EXPIRES_AT',
-}))
-")
+echo "$ cf \$XCFID assign --entry_id \$ENTRY_ID --task_type exchange:assign-type:validate --bounty \$BOUNTY --entry_value \$ENTRY_VALUE --content_hash \$CONTENT_HASH --description ... --slots 1 --expires_at \$EXPIRES_AT --priority exchange:assign-priority:p2"
+cf --cf-home "$CF_HOME" "$XCFID" assign \
+    --entry_id "$ENTRY_ID" \
+    --task_type "exchange:assign-type:validate" \
+    --bounty "$BOUNTY" \
+    --entry_value "$ENTRY_VALUE" \
+    --content_hash "$CONTENT_HASH" \
+    --description "Validate cache entry freshness: Go cache warming utility. Re-derive the output independently and verify the content matches the stored hash." \
+    --slots 1 \
+    --expires_at "$EXPIRES_AT" \
+    --priority "exchange:assign-priority:p2"
 
-echo "$ cf send \$XCFID <assign-payload> --tag exchange:assign --tag exchange:assign-type:validate --future"
-ASSIGN_MSG=$(cf --cf-home "$CF_HOME" send "$XCFID" "$ASSIGN_PAYLOAD" \
-    --tag "exchange:assign" \
-    --tag "exchange:assign-type:validate" \
-    --future \
-    --json)
-ASSIGN_MSG_ID=$(echo "$ASSIGN_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+ASSIGN_MSG_ID=$(cf --cf-home "$CF_HOME" "$XCFID" assigns --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "# assign message ID: $ASSIGN_MSG_ID"
 
 # Wait for engine to process the assign
@@ -414,8 +404,8 @@ if [ "$PAY_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf read \$XCFID --all --tag dontguess:scrip-assign-pay"
-PAY_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "dontguess:scrip-assign-pay" --json 2>/dev/null)
+echo "$ cf \$XCFID scrip-assign-pay --json"
+PAY_MSGS=$(cf --cf-home "$CF_HOME" "$XCFID" scrip-assign-pay --json 2>/dev/null)
 echo "$PAY_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)

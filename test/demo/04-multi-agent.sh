@@ -430,8 +430,8 @@ fi
 tee_section "campfire-log"
 
 echo "# Full campfire message log (all 3 identities' activity):"
-echo "$ cf read \$XCFID --all"
-cf --cf-home "$CF_HOME" read "$XCFID" --all --json 2>/dev/null | python3 -c "
+echo "$ cf \$XCFID messages --json"
+cf --cf-home "$CF_HOME" "$XCFID" messages --json 2>/dev/null | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
 print(f'Total messages: {len(msgs)}')
