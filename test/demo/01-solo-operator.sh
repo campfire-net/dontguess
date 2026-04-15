@@ -70,6 +70,10 @@ else
     echo "# Built: $BINARY"
 fi
 
+# Point dontguess wrapper at the isolated temp environment and local binary
+export DG_HOME="$CF_HOME"
+export DG_OP="$BINARY"
+
 # ---------------------------------------------------------------------------
 # Section: identity — create campfire identity
 # ---------------------------------------------------------------------------
@@ -122,22 +126,15 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 }'
 CONTENT_B64=$(printf '%s' "$CONTENT" | base64 -w0)
 
-PUT_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go HTTP handler: validates POST JSON, returns structured errors',
-    'content': '$CONTENT_B64',
-    'token_cost': 2000,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ cf send \$CAMPFIRE_ID <put-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG=$(cf --cf-home "$CF_HOME" send "$CAMPFIRE_ID" "$PUT_PAYLOAD" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
-    --json)
-PUT_MSG_ID=$(echo "$PUT_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ cf --cf-home \$CF_HOME \$CAMPFIRE_ID put --description ... --content \$CONTENT_B64 --token_cost 2000 --content_type code"
+cf --cf-home "$CF_HOME" "$CAMPFIRE_ID" put \
+    --description "Go HTTP handler: validates POST JSON, returns structured errors" \
+    --content "$CONTENT_B64" \
+    --token_cost 2000 \
+    --content_type code
+# Read message ID from puts view (convention dispatch output is status only, not JSON)
+PUT_MSG_ID=$(cf --cf-home "$CF_HOME" "$CAMPFIRE_ID" puts --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "put message ID: $PUT_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -149,6 +146,8 @@ tee_section "serve"
 echo "$ dontguess serve --poll-interval 500ms &"
 "$BINARY" serve --poll-interval 500ms > "$TMP/serve.log" 2>&1 &
 SERVE_PID=$!
+# Register PID so dontguess wrapper finds the running server (avoids auto-start races)
+echo "$SERVE_PID" > "$CF_HOME/dontguess.pid"
 
 # Wait for serve to print "exchange serving" (up to 10s)
 echo "# Waiting for engine to start..."
@@ -181,7 +180,7 @@ echo "# Waiting for put-accept settle message (auto-accept, up to 10s)..."
 ACCEPT_FOUND=false
 for i in $(seq 1 20); do
     sleep 0.5
-    SETTLE_COUNT=$(cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    SETTLE_COUNT=$(dontguess settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$SETTLE_COUNT" -gt 0 ]; then
         ACCEPT_FOUND=true
@@ -196,8 +195,8 @@ if [ "$ACCEPT_FOUND" != "true" ]; then
     grep "auto-accepted\|auto-accept\|pending" "$TMP/serve.log" 2>/dev/null || echo "# (no auto-accept log lines)"
 fi
 
-echo "$ cf read \$CAMPFIRE_ID --all --tag exchange:settle"
-cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --tag "exchange:settle" 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
+echo "$ dontguess settlements"
+dontguess settlements 2>/dev/null | head -20 || echo "(no settle messages visible yet)"
 
 # ---------------------------------------------------------------------------
 # Section: buy — buyer requests cached inference
@@ -205,20 +204,13 @@ cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --tag "exchange:settle" 2>/dev
 
 tee_section "buy"
 
-BUY_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'Go HTTP handler that validates incoming POST JSON requests',
-    'budget': 5000
-}))
-")
-
-echo "$ cf send \$CAMPFIRE_ID <buy-payload> --tag exchange:buy --future"
-BUY_MSG=$(cf --cf-home "$CF_HOME" send "$CAMPFIRE_ID" "$BUY_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
-    --json)
-BUY_MSG_ID=$(echo "$BUY_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+echo "$ dontguess buy --task 'Go HTTP handler that validates incoming POST JSON requests' --budget 5000"
+dontguess buy \
+    --task "Go HTTP handler that validates incoming POST JSON requests" \
+    --budget 5000
+# Read message ID from buys view (convention dispatch output is status only, not JSON)
+BUY_MSG_ID=$(dontguess buys --json 2>/dev/null | \
+    python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[-1]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
 echo "buy message ID: $BUY_MSG_ID"
 
 # ---------------------------------------------------------------------------
@@ -232,7 +224,7 @@ MATCH_FOUND=false
 for i in $(seq 1 30); do
     sleep 0.5
     # exchange:match tag is used for both real matches and buy-miss standing offers
-    MATCH_COUNT=$(cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --tag "exchange:match" --json 2>/dev/null | \
+    MATCH_COUNT=$(dontguess match-results --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$MATCH_COUNT" -gt 0 ]; then
         MATCH_FOUND=true
@@ -248,8 +240,8 @@ if [ "$MATCH_FOUND" != "true" ]; then
     exit 1
 fi
 
-echo "$ cf read \$CAMPFIRE_ID --all --tag exchange:match"
-MATCH_MSGS=$(cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --tag "exchange:match" --json 2>/dev/null)
+echo "$ dontguess match-results"
+MATCH_MSGS=$(dontguess match-results --json 2>/dev/null)
 echo "$MATCH_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -283,7 +275,7 @@ echo "Buy message ID:    $BUY_MSG_ID"
 echo ""
 
 # Final message count
-FINAL_COUNT=$(cf --cf-home "$CF_HOME" read "$CAMPFIRE_ID" --all --json 2>/dev/null | \
+FINAL_COUNT=$(dontguess messages --json 2>/dev/null | \
     python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo "?")
 echo "Total campfire messages: $FINAL_COUNT"
 echo ""
