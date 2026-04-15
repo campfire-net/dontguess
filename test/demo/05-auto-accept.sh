@@ -77,6 +77,10 @@ else
     echo "# Built: $BINARY"
 fi
 
+# Point dontguess wrapper at the isolated temp environment and local binary
+export DG_HOME="$CF_HOME"
+export DG_OP="$BINARY"
+
 # ---------------------------------------------------------------------------
 # Section: operator-identity — create operator campfire identity
 # ---------------------------------------------------------------------------
@@ -143,24 +147,19 @@ send_put() {
     local content_type="$3"
     local content_b64="$4"
 
-    local payload
-    payload=$(python3 -c "
-import json
-print(json.dumps({
-    'description': '$description',
-    'content': '$content_b64',
-    'token_cost': $token_cost,
-    'content_type': '$content_type',
-}))
-")
-    echo "$ CF_HOME=\$SELLER_CF cf send \$XCFID <put-payload> --tag exchange:put --tag ${content_type}"
-    local msg
-    msg=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$payload" \
-        --tag "exchange:put" \
-        --tag "${content_type}" \
-        --json)
-    echo "$msg" | python3 -c "import json,sys; print('put msg ID: ' + json.load(sys.stdin)['id'])"
-    echo "$msg" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])"
+    echo "$ cf --cf-home \$SELLER_CF \$XCFID put --description \"...\" --content \"\$B64\" --token_cost ${token_cost} --content_type ${content_type}"
+    cf --cf-home "$SELLER_CF" "$XCFID" put \
+        --description "$description" \
+        --content "$content_b64" \
+        --token_cost "$token_cost" \
+        --content_type "$content_type"
+    # Read the message ID from the puts view (convention dispatch output is status only)
+    # View ordering is timestamp desc — msgs[0] is the most recently put.
+    local msg_id
+    msg_id=$(cf --cf-home "$SELLER_CF" "$XCFID" puts --json 2>/dev/null | \
+        python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id'] if msgs else 'unknown')" 2>/dev/null || echo "unknown")
+    echo "put msg ID: $msg_id"
+    echo "$msg_id"
 }
 
 # Shared dummy content (base64 of a one-liner)
@@ -235,7 +234,7 @@ echo "# Waiting for 4 put-accept settle messages (up to 30s)..."
 ACCEPT_COUNT=0
 for i in $(seq 1 60); do
     sleep 0.5
-    ACCEPT_COUNT=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+    ACCEPT_COUNT=$(dontguess settlements --json 2>/dev/null | \
         python3 -c "import json,sys; print(len(json.load(sys.stdin)))" 2>/dev/null || echo 0)
     if [ "$ACCEPT_COUNT" -ge 4 ]; then
         echo "# 4 put-accept settlements received (settle count: $ACCEPT_COUNT)"
@@ -243,8 +242,8 @@ for i in $(seq 1 60); do
     fi
 done
 
-echo "$ cf read \$XCFID --all --tag exchange:settle"
-SETTLE_MSGS=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null)
+echo "$ dontguess settlements"
+SETTLE_MSGS=$(dontguess settlements --json 2>/dev/null)
 echo "$SETTLE_MSGS" | python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
@@ -282,7 +281,7 @@ fi
 # Confirm put 5 is still in pending state (not settled)
 echo ""
 echo "# Checking that put 5 has no settle message..."
-SETTLED_FOR_PUT5=$(cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:settle" --json 2>/dev/null | \
+SETTLED_FOR_PUT5=$(dontguess settlements --json 2>/dev/null | \
     python3 -c "
 import json, sys
 msgs = json.load(sys.stdin)
