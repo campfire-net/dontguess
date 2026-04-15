@@ -199,23 +199,13 @@ func (l *Limiter) Allow(ctx context.Context, key string) (bool, error) {
 }'
 CONTENT_CODE_B64=$(printf '%s' "$CONTENT_CODE" | base64 -w0)
 
-PUT_PAYLOAD_1=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Go rate limiter with Redis backend — sliding window, pipeline ops',
-    'content': '$CONTENT_CODE_B64',
-    'token_cost': 2500,
-    'content_type': 'exchange:content-type:code',
-}))
-")
-
-echo "$ CF_HOME=\$SELLER_CF cf send \$XCFID <put-1-payload> --tag exchange:put --tag exchange:content-type:code"
-PUT_MSG_1=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD_1" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:code" \
-    --json)
-PUT_MSG_ID_1=$(echo "$PUT_MSG_1" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
-echo "# put 1 (code) message ID: $PUT_MSG_ID_1"
+echo "$ cf --cf-home \$SELLER_CF \$XCFID put --description '...' --token_cost 2500 --content_type code"
+cf --cf-home "$SELLER_CF" "$XCFID" put \
+    --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
+    --content "$CONTENT_CODE_B64" \
+    --token_cost 2500 \
+    --content_type code
+echo "# put 1 (code) dispatched"
 
 # --- Put 2: analysis — Terraform module analysis for AWS VPC ---
 CONTENT_ANALYSIS='# Terraform Module Analysis: AWS VPC
@@ -238,22 +228,19 @@ so adding AZs requires re-index. This is a known Terraform footgun.
 - Enable VPC Flow Logs retention policy (30d default is fine)'
 CONTENT_ANALYSIS_B64=$(printf '%s' "$CONTENT_ANALYSIS" | base64 -w0)
 
-PUT_PAYLOAD_2=$(python3 -c "
-import json
-print(json.dumps({
-    'description': 'Terraform module analysis for AWS VPC — 3-tier HA, footgun findings, cost recommendations',
-    'content': '$CONTENT_ANALYSIS_B64',
-    'token_cost': 4000,
-    'content_type': 'exchange:content-type:analysis',
-}))
-")
+echo "$ cf --cf-home \$SELLER_CF \$XCFID put --description '...' --token_cost 4000 --content_type analysis"
+cf --cf-home "$SELLER_CF" "$XCFID" put \
+    --description "Terraform module analysis for AWS VPC — 3-tier HA, footgun findings, cost recommendations" \
+    --content "$CONTENT_ANALYSIS_B64" \
+    --token_cost 4000 \
+    --content_type analysis
+echo "# put 2 (analysis) dispatched"
 
-echo "$ CF_HOME=\$SELLER_CF cf send \$XCFID <put-2-payload> --tag exchange:put --tag exchange:content-type:analysis"
-PUT_MSG_2=$(CF_HOME="$SELLER_CF" cf send "$XCFID" "$PUT_PAYLOAD_2" \
-    --tag "exchange:put" \
-    --tag "exchange:content-type:analysis" \
-    --json)
-PUT_MSG_ID_2=$(echo "$PUT_MSG_2" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Read put message IDs from named view after both puts
+PUTS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" puts --json 2>/dev/null || cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:put" --json 2>/dev/null)
+PUT_MSG_ID_1=$(echo "$PUTS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id']) if msgs else print('')" 2>/dev/null || echo "")
+PUT_MSG_ID_2=$(echo "$PUTS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[1]['id']) if len(msgs)>1 else print('')" 2>/dev/null || echo "")
+echo "# put 1 (code) message ID: $PUT_MSG_ID_1"
 echo "# put 2 (analysis) message ID: $PUT_MSG_ID_2"
 
 # ---------------------------------------------------------------------------
@@ -265,6 +252,7 @@ tee_section "serve"
 echo "$ dontguess serve --poll-interval 500ms &"
 "$BINARY" serve --poll-interval 500ms > "$TMP/serve.log" 2>&1 &
 SERVE_PID=$!
+echo "$SERVE_PID" > "$CF_HOME/dontguess.pid"
 
 # Wait for serve to replay messages (up to 10s)
 echo "# Waiting for engine to start and replay messages..."
@@ -342,20 +330,15 @@ fi
 
 tee_section "buy"
 
-BUY_PAYLOAD=$(python3 -c "
-import json
-print(json.dumps({
-    'task': 'rate limiter implementation in Go',
-    'budget': 5000
-}))
-")
+echo "$ cf --cf-home \$BUYER_CF \$XCFID buy --task 'rate limiter implementation in Go' --budget 5000"
+cf --cf-home "$BUYER_CF" "$XCFID" buy \
+    --task "rate limiter implementation in Go" \
+    --budget 5000
+echo "# buy dispatched"
 
-echo "$ CF_HOME=\$BUYER_CF cf send \$XCFID <buy-payload> --tag exchange:buy --future"
-BUY_MSG=$(CF_HOME="$BUYER_CF" cf send "$XCFID" "$BUY_PAYLOAD" \
-    --tag "exchange:buy" \
-    --future \
-    --json)
-BUY_MSG_ID=$(echo "$BUY_MSG" | python3 -c "import json,sys; print(json.load(sys.stdin)['id'])")
+# Read buy message ID from named view
+BUYS_JSON=$(cf --cf-home "$CF_HOME" "$XCFID" buys --json 2>/dev/null || cf --cf-home "$CF_HOME" read "$XCFID" --all --tag "exchange:buy" --json 2>/dev/null)
+BUY_MSG_ID=$(echo "$BUYS_JSON" | python3 -c "import json,sys; msgs=json.load(sys.stdin); print(msgs[0]['id']) if msgs else print('')" 2>/dev/null || echo "")
 echo "# buy message ID: $BUY_MSG_ID"
 
 # ---------------------------------------------------------------------------
