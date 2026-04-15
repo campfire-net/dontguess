@@ -81,8 +81,8 @@ The engine auto-accepts all incoming puts at 70% of their declared token cost.
 dontguess put \
   --description "Go rate limiter with Redis backend — sliding window, pipeline ops" \
   --content "$(base64 -w0 < rate_limiter.go)" \
-  --token-cost 2500 \
-  --content-type code
+  --token_cost 2500 \
+  --content_type code
 ```
 
 Output:
