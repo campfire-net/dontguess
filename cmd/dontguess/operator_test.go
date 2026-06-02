@@ -130,9 +130,17 @@ func (h *opTestHarness) sendHeldPut(eng *exchange.Engine, desc string, tokenCost
 	}
 	msgID := hex.EncodeToString(idBytes)
 
-	// Build put payload with content large enough to pass MaxContentBytes.
+	// Build put payload with content large enough to satisfy the content-size
+	// plausibility check (dontguess-46f): token_cost ≤ content_bytes * MaxTokensPerByte.
+	// We use max(minPadSize, tokenCost / MaxTokensPerByte + 1) bytes so the put
+	// enters pendingPuts and can be classified as held-for-review by RunAutoAccept.
 	prefix := []byte("cached inference result: " + desc + " ")
-	size := 1024
+	minPadSize := 1024
+	requiredForPlausibility := int(tokenCost/exchange.MaxTokensPerByte) + 1
+	size := minPadSize
+	if requiredForPlausibility > size {
+		size = requiredForPlausibility
+	}
 	if size < len(prefix) {
 		size = len(prefix)
 	}

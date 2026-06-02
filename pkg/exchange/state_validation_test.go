@@ -207,8 +207,18 @@ func TestValidation_Put_MaxTokenCostAccepted(t *testing.T) {
 	h := newTestHarness(t)
 	eng := h.newEngine()
 
+	// MaxTokenCost (MaxInt32 ≈ 2 B) is an overflow guard — it can never be reached
+	// by a legitimate put since content is capped at MaxContentBytes (1 MiB) and
+	// the plausibility check (dontguess-46f) enforces token_cost ≤ content_bytes *
+	// MaxTokensPerByte. Instead we verify that a high-but-plausible token_cost
+	// (one that is consistent with the actual content size) is accepted. We use a
+	// token_cost that is at the plausibility ceiling for the content that buildPutPayload
+	// generates (~45 bytes), which is 45 * MaxTokensPerByte = 45 000.
+	content := "cached inference result: valid description"
+	plausibleMax := int64(len(content)) * exchange.MaxTokensPerByte
+
 	putMsg := h.sendMessage(h.seller,
-		buildPutPayload("valid description", exchange.MaxTokenCost, []string{"go"}),
+		buildPutPayload("valid description", plausibleMax, []string{"go"}),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
@@ -216,7 +226,7 @@ func TestValidation_Put_MaxTokenCostAccepted(t *testing.T) {
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	if err := eng.AutoAcceptPut(putMsg.ID, 7000, time.Now().Add(72*time.Hour)); err != nil {
-		t.Errorf("valid put at max token_cost rejected: %v", err)
+		t.Errorf("valid put at max plausible token_cost (%d) rejected: %v", plausibleMax, err)
 	}
 }
 

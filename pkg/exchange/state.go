@@ -101,6 +101,31 @@ const (
 	// MaxContentBytes is the maximum allowed size for put content (1 MiB).
 	// Content is TAINTED — enforce this limit before storing or hashing.
 	MaxContentBytes = 1048576 // 1 MiB
+
+	// MinBytesPerToken is the minimum plausible bytes-per-token ratio used to
+	// derive the content-size-based token_cost ceiling at put time.
+	//
+	// Token cost represents inference cost, not output size — a small output can
+	// legitimately cost many tokens to produce (e.g. distilling a large codebase
+	// into a short summary). However, there is a physical plausibility floor:
+	// producing a result cannot require more tokens than 1000× the output byte size.
+	// At 1000 tokens/byte the content is implausibly small relative to the claimed
+	// inference cost — a signal of seller inflation rather than real computation.
+	//
+	// Examples:
+	//   1.5 M tokens on  200 bytes → 7500 tokens/byte → REJECT (> 1000)
+	//   10 000 tokens on  30 bytes → 333 tokens/byte  → ACCEPT (≤ 1000)
+	//   1 000 000 tokens on 24 576 bytes → 41 tokens/byte → ACCEPT (≤ 1000)
+	//
+	// Derived ceiling: max_plausible_token_cost = content_size_bytes * MaxTokensPerByte.
+	// A put exceeding that ceiling is silently dropped at applyPut time.
+	// Exposed so tests can compute the same boundary.
+	MaxTokensPerByte = int64(1000)
+
+	// MinBytesPerToken is the reciprocal of MaxTokensPerByte, kept for symmetric
+	// naming in test code that uses the "bytes per token" framing.
+	// MinBytesPerToken = 1 / MaxTokensPerByte (fractional; use MaxTokensPerByte directly).
+	MinBytesPerToken = int64(1) // only used in test helpers for content padding
 )
 
 // InventoryEntry is a single cache entry in the exchange inventory.
@@ -1115,6 +1140,20 @@ func (s *State) applyPut(msg *Message) {
 	}
 	// Enforce size limit on decoded content (TAINTED).
 	if len(contentBytes) > MaxContentBytes {
+		return
+	}
+	// Plausibility check: token_cost must be consistent with content size.
+	// Token cost represents inference cost, not output size. However a genuine
+	// result cannot require more than MaxTokensPerByte tokens per byte of output —
+	// values beyond that threshold indicate seller inflation rather than real
+	// computation. Gross outliers (e.g. 1.5 M tokens on a 200-byte payload at
+	// 7500 tokens/byte) are dropped silently to prevent them from dominating the
+	// reported token-savings metric.
+	maxPlausibleTokenCost := int64(len(contentBytes)) * MaxTokensPerByte
+	if maxPlausibleTokenCost < 1 {
+		maxPlausibleTokenCost = 1
+	}
+	if payload.TokenCost > maxPlausibleTokenCost {
 		return
 	}
 	// Validate compression_tier. Unknown values are silently dropped to "".

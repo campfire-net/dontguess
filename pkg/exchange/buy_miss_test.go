@@ -536,7 +536,14 @@ func TestBuyMiss_TokenCostCapped(t *testing.T) {
 	t.Parallel()
 
 	h := newTestHarness(t)
-	const maxTokenCost int64 = 1_000_000
+	// maxTokenCost is the operator's per-put scrip-payout ceiling (engine option).
+	// We use a small value (100) so the inflated cost (10 000) is plausible from
+	// a content-size perspective (content = 20 000 bytes ≥ inflatedCost tokens)
+	// but still exceeds the operator cap, exercising the handlePut capping path.
+	// (Prior to dontguess-46f this was 1_000_000, but the inflated cost of 100M
+	// would then exceed MaxContentBytes/MinBytesPerToken and be rejected at applyPut
+	// before reaching the cap logic — making the test unexecutable.)
+	const maxTokenCost int64 = 100
 
 	task := "Generate a high-fidelity physics simulation in Rust"
 	taskHash := exchange.TaskDescriptionHash(task)
@@ -570,7 +577,10 @@ func TestBuyMiss_TokenCostCapped(t *testing.T) {
 
 	preSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 
-	// Buyer puts with an inflated token_cost (100× above cap).
+	// Buyer puts with an inflated token_cost (100× above the operator cap).
+	// Content size = 2× inflatedCost bytes so the put passes applyPut's content-size
+	// plausibility check (token_cost ≤ content_bytes / MinBytesPerToken), but the
+	// engine's MaxTokenCost cap then limits the scrip payout — that's what we test.
 	inflatedCost := maxTokenCost * 100
 	putMsg := h.sendMessage(h.buyer,
 		putPayload(task, "sha256:"+fmt.Sprintf("%064x", inflatedCost), "code", inflatedCost, inflatedCost*2),
