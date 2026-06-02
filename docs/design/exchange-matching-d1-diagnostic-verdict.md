@@ -138,3 +138,21 @@ The fixture calls `NewTFIDFEmbedder()` → `IndexCorpus()` → `Rank()` directly
 - Fixture + diagnostic tests: `pkg/matching/d1_diagnostic_test.go`
 - This verdict: `docs/design/exchange-matching-d1-diagnostic-verdict.md`
 - Authority: `docs/design/exchange-matching-measurement-review.md` §2, §3, §5 Track A/D1
+
+---
+
+## CORRECTION (orchestrator + veracity review, 2026-06-02)
+
+**The recommended floor of 0.35 is too high — do NOT use it in M1a.** The verdict's TUNE conclusion stands, but the floor *value* is wrong, and the claim that 0.35 "sits comfortably in this gap" is factually incorrect: the measured separation gap is **junk_max=0.1548 → ideal_min=0.1826**, and 0.35 sits *above* ideal_min.
+
+A floor of 0.35 floors out two **real** ideal entries that this fixture's own data shows are above the junk ceiling:
+- `eventsink-e2e-chained-dispatch` (ideal cosine sim = **0.1826**) → false miss at 0.35
+- `engine-snapshot-inflight` (ideal cosine sim = **0.2010**) → false miss at 0.35
+
+These were mislabeled "acceptable residual / semantic gap TF-IDF cannot bridge" — but both are > junk_max=0.1548, so a floor in **(0.1548, 0.1826)** rejects all junk while recovering both (accuracy 15/20 → 17/20). Discarding real matches is the *opposite* of this swarm's goal (capture real value).
+
+**Corrected recommendation:** cosine floor ≈ **0.16** (clean separation, ~7% margin above junk_max, zero real-entry loss). M1a (dontguess-7d6) must determine the floor empirically by sweeping [0.10..0.40] on this fixture and pick the lowest floor with 100% junk rejection and maximal substantive survival — not hardcode 0.35.
+
+**Test-coverage gap:** `TestD1_SubstantiveReusesSurviveFloor` omits the two floored-out pairs from its assertions, so it passes even while they are lost. M1a must extend that regression gate to assert `eventsink-e2e-chained-dispatch` and `engine-snapshot-inflight` survive the chosen floor.
+
+The weight rebalance (efficiency=0.15, quality=0.80, novelty=0.05) and the single-seller novelty-collapse fix are unaffected by this correction.
