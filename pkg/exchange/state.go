@@ -1164,7 +1164,6 @@ var validCompressionTiers = map[string]struct{}{
 // Rules (aligned with demand.IsSynthetic patterns, restricted to the put/description domain):
 //   - bare "test" (case-insensitive, trimmed) — the exact smoke-test entry from the live exchange
 //   - starts with "upgrade smoke test" — the "upgrade smoke test cf v0.31.2 operator" junk class
-//   - starts with "test " (test followed by a space) — generic test prefixes
 //
 // NOTE: Descriptions like "test coverage audit", "test strategy", "test gap scan",
 // "flock contention test pattern for Go", or "testing the X interface" are NOT rejected —

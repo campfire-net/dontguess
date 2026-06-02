@@ -8,7 +8,11 @@
 
 ## VERDICT: TUNE
 
-**Recommended cosine floor:** 0.35  
+> ⚠️ **CORRECTED:** the floor below was originally 0.35, which is WRONG — it floors out real
+> entries (see the **CORRECTION** section at the end of this document). The implemented and
+> correct floor is **0.16**. The TUNE verdict and weights stand.
+
+**Recommended cosine floor:** ~~0.35~~ → **0.16** (see CORRECTION at end)  
 **Recommended weight changes:** efficiency=0.15, quality=0.80, novelty=0.05  
 **Approach:** M1a (threshold + weight rebalance) — do NOT invoke adversarial-design or replace the TF-IDF embedder.
 
