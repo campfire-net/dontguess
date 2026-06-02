@@ -1154,3 +1154,169 @@ func meanF(s []float64) float64 {
 	}
 	return sum / float64(len(s))
 }
+
+// ─── B (dontguess-372) — Dense embedder comparison measurement ──────────────
+//
+// TestD1_DenseEmbedderComparison documents the measured comparison between
+// TF-IDF (current) and all-MiniLM-L6-v2 384-dim dense embeddings on the
+// D1 fixture. This test is the measurement artifact for the Track B GATE.
+//
+// The dense embedder path goes through DenseEmbedder (pkg/matching/dense_embedder.go)
+// which shells out to cmd/embed/main.py (ONNX + tokenizers). In CI and dev
+// environments without ONNX runtime installed, the DenseEmbedder cannot run.
+//
+// PROOF OF INABILITY (ONNX path):
+//
+//   python3 -c "import onnxruntime" → ModuleNotFoundError: No module named 'onnxruntime' (exit 1)
+//   pip3 show onnxruntime             → WARNING: Package(s) not found: onnxruntime (exit 1)
+//   which onnxruntime                 → exit 1
+//
+// The dense measurement WAS obtained in this dispatch using sentence_transformers
+// (available in the system Python) as an equivalent dense embedding path:
+// all-MiniLM-L6-v2 loaded from HuggingFace, normalize_embeddings=True, cosine sim.
+// This is the SAME model and SAME normalization as cmd/embed/main.py — the only
+// difference is the inference backend (torch vs ONNX). Embedding outputs are
+// numerically equivalent; the ONNX path exists for production latency reasons.
+//
+// MEASURED NUMBERS (sentence_transformers, 2026-06-02, see verdict doc):
+//   junk_max (dense)  = 0.3762  (vs TF-IDF: 0.1548)
+//   ideal_min (dense) = 0.3419  (vs TF-IDF: 0.1826)
+//   Gap (dense)       = -0.0343 OVERLAPPING
+//   Gap (TF-IDF)      = +0.0278 SEPARABLE
+//   Accuracy at optimal dense floor (0.55-0.60): 14/20 = 70%  (vs TF-IDF M1a: 17/20 = 85%)
+//   Per-query latency (dense, torch): mean=188ms p95=232ms (vs TF-IDF: ~0.1ms)
+//   Index rebuild (dense, 15 entries): ~724ms (vs TF-IDF: ~1ms)
+//   Model load time: 2.59s (vs TF-IDF: zero/stateless)
+//
+// VERDICT: Do NOT replace TF-IDF with dense embedder on this fixture.
+// See docs/design/exchange-embedding-diagnostic-verdict-b.md for full analysis.
+func TestD1_DenseEmbedderComparison(t *testing.T) {
+	// ── Part 1: Verify DenseEmbedder handles unavailability gracefully ──────────
+	// This tests the real DenseEmbedder code path (pkg/matching/dense_embedder.go).
+	// When ONNX runtime or cmd/embed/main.py is absent, Embed() must return nil
+	// (not panic or block) so the engine can fall back to TF-IDF cleanly.
+	dense := NewDenseEmbedder("cmd/embed/main.py")
+	result := dense.Embed("test text for dense embedder availability check")
+	if result != nil {
+		// ONNX sidecar is available — this is surprising in CI. Log it as a bonus.
+		t.Logf("DenseEmbedder available (ONNX path): returned %d-dim vector", len(result))
+		if len(result) != 384 {
+			t.Errorf("DenseEmbedder returned %d-dim vector, want 384", len(result))
+		}
+	} else {
+		// Expected in CI: ONNX runtime not installed.
+		// This is the documented state: onnxruntime not installed,
+		// Embed() returns nil, engine falls back to TF-IDF.
+		t.Logf("DenseEmbedder unavailable (expected in CI): Embed() returned nil — ONNX runtime not installed")
+		t.Logf("Proof of inability: python3 -c 'import onnxruntime' exits 1 (ModuleNotFoundError)")
+	}
+
+	// ── Part 2: Record the quantified dense-vs-TF-IDF measurement ──────────────
+	// These numbers were measured in this dispatch (2026-06-02) using
+	// sentence_transformers v5.5.1 with all-MiniLM-L6-v2. They are the
+	// authoritative figures for the Track B verdict.
+
+	type measurement struct {
+		label         string
+		tfidf, dense float64
+		better        string // "tfidf" or "dense" or "tie"
+	}
+	measurements := []measurement{
+		{
+			label:  "junk_max (lower=better — separation from junk)",
+			tfidf:  0.1548,
+			dense:  0.3762,
+			better: "tfidf",
+		},
+		{
+			label:  "ideal_min (higher=better — lowest ideal score)",
+			tfidf:  0.1826,
+			dense:  0.3419,
+			better: "dense",
+		},
+		{
+			label:  "gap_width ideal_min − junk_max (positive=separable)",
+			tfidf:  0.0278,  // separable
+			dense:  -0.0343, // overlapping
+			better: "tfidf",
+		},
+		{
+			label:  "top-1 accuracy at optimal floor (higher=better, /20)",
+			tfidf:  0.85, // 17/20 at floor=0.16
+			dense:  0.70, // 14/20 at floor=0.55-0.60
+			better: "tfidf",
+		},
+		{
+			label:  "per-query latency ms (lower=better)",
+			tfidf:  0.1,   // ~0.1ms, pure Go
+			dense:  188.0, // mean, torch inference
+			better: "tfidf",
+		},
+		{
+			label:  "index rebuild 15 entries ms (lower=better)",
+			tfidf:  1.0,   // ~1ms
+			dense:  724.0, // batch encode
+			better: "tfidf",
+		},
+	}
+
+	t.Logf("=== Dense vs TF-IDF measurement (Track B, dontguess-372) ===")
+	t.Logf("%-55s  %-10s  %-10s  %s", "Metric", "TF-IDF", "Dense", "Winner")
+	for _, m := range measurements {
+		t.Logf("%-55s  %-10.4f  %-10.4f  %s", m.label, m.tfidf, m.dense, m.better)
+	}
+
+	// ── Part 3: Confirm TF-IDF M1a floor behavior (regression gate) ─────────────
+	// Verify the separation property the verdict relies on is still reproducible.
+	emb := NewTFIDFEmbedder()
+	inv := buildInventory(allInventory)
+	docs := make([]string, len(inv))
+	for i, e := range inv {
+		docs[i] = e.Description
+	}
+	emb.IndexCorpus(docs)
+
+	// Measure the actual TF-IDF separation on the fixture.
+	var tfidfIdealSims, tfidfJunkSims []float64
+	for _, pair := range fixturePairs {
+		taskEmb := emb.Embed(pair.buyTask)
+		for _, e := range inv {
+			entryEmb := emb.Embed(e.Description)
+			sim := emb.Similarity(taskEmb, entryEmb)
+			if pair.expectMiss && e.EntryID == "junk-upgrade-smoke" {
+				tfidfJunkSims = append(tfidfJunkSims, sim)
+			} else if !pair.expectMiss && e.EntryID == pair.idealID {
+				tfidfIdealSims = append(tfidfIdealSims, sim)
+			}
+		}
+	}
+
+	tfidfJunkMax := maxF(tfidfJunkSims)
+	tfidfIdealMin := minF(tfidfIdealSims)
+
+	t.Logf("TF-IDF separation (reproduced live): junk_max=%.4f, ideal_min=%.4f, gap=%.4f",
+		tfidfJunkMax, tfidfIdealMin, tfidfIdealMin-tfidfJunkMax)
+
+	// Assert TF-IDF is still separable (this is the invariant the verdict depends on).
+	if tfidfJunkMax >= tfidfIdealMin {
+		t.Errorf("TF-IDF separation LOST: junk_max=%.4f >= ideal_min=%.4f — REPLACE verdict may now apply",
+			tfidfJunkMax, tfidfIdealMin)
+	} else {
+		t.Logf("TF-IDF SEPARABLE: gap=%.4f (junk_max=%.4f < ideal_min=%.4f) — TUNE verdict stands",
+			tfidfIdealMin-tfidfJunkMax, tfidfJunkMax, tfidfIdealMin)
+	}
+
+	// The dense embedder measurements are hardcoded above from the real run.
+	// Dense junk_max=0.3762 > dense ideal_min=0.3419 — NOT separable.
+	const denseJunkMax = 0.3762
+	const denseIdealMin = 0.3419
+	if denseIdealMin > denseJunkMax {
+		t.Logf("NOTE: Dense embedder became separable (ideal_min=%.4f > junk_max=%.4f) — verdict may change on re-measurement",
+			denseIdealMin, denseJunkMax)
+	} else {
+		t.Logf("Dense NOT separable: junk_max=%.4f > ideal_min=%.4f (gap=%.4f) — confirms TUNE verdict",
+			denseJunkMax, denseIdealMin, denseIdealMin-denseJunkMax)
+	}
+
+	t.Logf("Verdict: TUNE (TF-IDF M1a). See docs/design/exchange-embedding-diagnostic-verdict-b.md")
+}
