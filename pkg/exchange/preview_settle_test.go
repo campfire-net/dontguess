@@ -48,8 +48,10 @@ func buildMatchedState(t *testing.T, h *testHarness, eng *exchange.Engine) (matc
 	}
 	entryID = inv[0].EntryID
 
+	// Task is semantically related to the put description ("Preview test inference")
+	// so the relevance floor (0.16) is satisfied and a real exchange:match is emitted.
 	buyMsg := h.sendMessage(h.buyer,
-		buyPayload("Summarize a complex Go API with examples", 50000),
+		buyPayload("Preview test inference analysis", 50000),
 		[]string{exchange.TagBuy},
 		nil,
 	)

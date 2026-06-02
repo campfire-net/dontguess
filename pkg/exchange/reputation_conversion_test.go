@@ -32,15 +32,29 @@ import (
 // for the given entryID. Returns (matchID, previewRequestMsgID, buyer).
 //
 // Each buyer has a unique identity so the dedup logic does not collapse them.
-func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engine, entryID string, taskSuffix string) (matchID, previewReqID string, buyer *testAgent) {
+//
+// matchTask is the task description used for the buy message. It must be
+// semantically similar to the inventory entry so the relevance floor (0.16) is
+// satisfied and a real exchange:match (not exchange:buy-miss) is emitted. The
+// caller is responsible for passing a task that is related to the entry's
+// description. taskSuffix is appended for uniqueness (buy-miss dedup by task
+// hash) but must not change the semantic meaning enough to fall below the floor.
+func generateBuyerMatchPreview(t *testing.T, h *testHarness, eng *exchange.Engine, entryID string, matchTask string, taskSuffix string) (matchID, previewReqID string, buyer *testAgent) {
 	t.Helper()
 
 	buyer = newTestAgent(t)
 
 	preCount, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
 
+	// Append taskSuffix to matchTask for uniqueness (prevents buy-miss dedup across
+	// multiple calls). The suffix must be short so the entry description terms still
+	// dominate the TF-IDF score and the result stays above the relevance floor.
+	task := matchTask
+	if taskSuffix != "" {
+		task = matchTask + " " + taskSuffix
+	}
 	buyMsg := h.sendMessage(buyer,
-		buyPayload("Conversion test task "+taskSuffix, 50000),
+		buyPayload(task, 50000),
 		[]string{exchange.TagBuy},
 		nil,
 	)
@@ -161,7 +175,7 @@ func TestReputation_HighConversion(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "High-conversion inference", fmt.Sprintf("%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 
@@ -214,7 +228,7 @@ func TestReputation_LowConversion(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("low-%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "Low-conversion inference", fmt.Sprintf("low-%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 
@@ -266,7 +280,7 @@ func TestReputation_NeutralConversion(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("neutral-%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "Neutral-conversion inference", fmt.Sprintf("neutral-%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 
@@ -483,7 +497,7 @@ func TestReputation_LowConversionEntries(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("lcv-%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "LowConversion target entry", fmt.Sprintf("lcv-%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 
@@ -545,7 +559,7 @@ func TestReputation_ZeroConversion(t *testing.T) {
 
 	// 10 distinct buyers, 0 convert.
 	for i := 0; i < 10; i++ {
-		generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("zero-%d", i))
+		generateBuyerMatchPreview(t, h, eng, entryID, "Zero-conversion inference", fmt.Sprintf("zero-%d", i))
 	}
 
 	// 10 previews, 0 conversions = 0% conversion rate.
@@ -586,7 +600,7 @@ func TestReputation_FullConversion(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("full-%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "Full-conversion inference", fmt.Sprintf("full-%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 	for i := 0; i < 10; i++ {
@@ -631,7 +645,7 @@ func TestReputation_LowConversionEntries_AtExactBoundary(t *testing.T) {
 	}
 	bps := make([]buyerPreview, 10)
 	for i := 0; i < 10; i++ {
-		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("bnd-%d", i))
+		_, preqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "Boundary conversion entry", fmt.Sprintf("bnd-%d", i))
 		bps[i] = buyerPreview{previewReqID: preqID, buyer: buyer}
 	}
 	for i := 0; i < 3; i++ {
