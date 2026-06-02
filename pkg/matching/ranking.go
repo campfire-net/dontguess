@@ -254,16 +254,43 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 		return nil
 	}
 
-	// Compute task embedding.
-	taskEmb := embedder.Embed(task)
+	taskEmb := embedQuery(task, embedder)
+	sellerCount, maxSellerCount := countSellerAppearances(candidates)
 
 	now := time.Now().UnixNano()
 	halflifeSec := opts.freshnessHalflife() * 24 * 3600
 
-	// Layer 3: count seller appearances for the novelty boost.
-	filtered := candidates
-	sellerCount := make(map[string]int, len(filtered))
-	for _, c := range filtered {
+	passed := applyFloorGate(candidates, taskEmb, embedder, opts)
+
+	results := make([]RankedResult, 0, len(passed))
+	for _, scored := range passed {
+		r := scoreCandidate(scored.c, scored.sim, now, halflifeSec, sellerCount, maxSellerCount, opts)
+		r = applyBehavioralAdjustments(r, scored.c.Signals)
+		results = append(results, r)
+	}
+
+	sortAndTrim(results)
+	return results
+}
+
+// embedQuery embeds the buyer task string and returns the embedding vector.
+func embedQuery(task string, embedder Embedder) []float64 {
+	return embedder.Embed(task)
+}
+
+// scoredCandidate pairs a RankInput with its already-computed similarity score,
+// used to pass floor-gate survivors into scoreCandidate without re-embedding.
+type scoredCandidate struct {
+	c   RankInput
+	sim float64
+}
+
+// countSellerAppearances counts how many times each seller appears in the
+// candidate set and returns the per-seller count map and the maximum count.
+// These are used by scoreCandidate to compute the Layer 3 novelty value.
+func countSellerAppearances(candidates []RankInput) (map[string]int, int) {
+	sellerCount := make(map[string]int, len(candidates))
+	for _, c := range candidates {
 		sellerCount[c.SellerKey]++
 	}
 	maxSellerCount := 1
@@ -272,136 +299,154 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 			maxSellerCount = cnt
 		}
 	}
+	return sellerCount, maxSellerCount
+}
 
-	results := make([]RankedResult, 0, len(filtered))
-
-	for _, c := range filtered {
-		// Compute cosine similarity.
+// applyFloorGate computes cosine similarity for every candidate against the
+// task embedding and returns only those that meet the minimum similarity
+// threshold (opts.minSimilarity()). This is the Layer-0/Layer-1 relevance gate
+// and MUST run before any behavioral adjustments.
+func applyFloorGate(candidates []RankInput, taskEmb []float64, embedder Embedder, opts RankOptions) []scoredCandidate {
+	passed := make([]scoredCandidate, 0, len(candidates))
+	floor := opts.minSimilarity()
+	for _, c := range candidates {
 		entryEmb := embedder.Embed(c.Description)
 		sim := embedder.Similarity(taskEmb, entryEmb)
-
-		// Exclude entries below minimum similarity threshold.
-		if sim < opts.minSimilarity() {
+		if sim < floor {
 			continue
 		}
+		passed = append(passed, scoredCandidate{c: c, sim: sim})
+	}
+	return passed
+}
 
-		// Layer 1: Transaction efficiency.
-		// Efficiency = tokens_saved / price.
-		// We normalize by dividing by a reference value (1000 tokens/scrip) to keep [0,1].
-		// If price is 0, treat as zero efficiency: a zero-price entry has no valid scrip
-		// flow and must not dominate rankings via the free-item path.
-		// If TokenCost is also 0, efficiency is 0 (no work represented).
-		var l1Efficiency float64
-		if c.Price > 0 && c.TokenCost > 0 {
-			ratio := float64(c.TokenCost) / float64(c.Price)
-			// Normalize: ratio of 10 (great deal) → 1.0; ratio < 1 (poor deal) → < 0.1.
-			l1Efficiency = math.Min(ratio/10.0, 1.0)
-		}
-
-		// Layer 2: Value composite.
-		// 2a. Similarity contribution (already computed above).
-		simScore := math.Max(sim, 0) // clamp negative cosine similarity
-
-		// 2b. Seller reputation normalized to [0, 1].
-		repScore := float64(c.SellerReputation) / 100.0
-
-		// 2c. Content freshness: exponential decay.
-		// ageSeconds = time since put; freshness = e^(-age / halflife).
-		ageSeconds := float64(now-c.PutTimestamp) / 1e9
-		if ageSeconds < 0 {
-			ageSeconds = 0
-		}
-		freshnessScore := math.Exp(-ageSeconds / halflifeSec)
-
-		// 2d. Content diversity: unique domains count normalized to [0, 1].
-		// Max possible domains is 5 (per convention).
-		domainScore := math.Min(float64(len(c.Domains))/5.0, 1.0)
-
-		// Layer 2 composite: weighted mix.
-		// Similarity carries the most weight — it gates relevance.
-		l2Quality := 0.50*simScore + 0.25*repScore + 0.15*freshnessScore + 0.10*domainScore
-
-		// Layer 3: Market novelty / discovery boost.
-		// Sellers who appear once get boost=1.0; dominant sellers get boost→0.
-		// novelty = 1 - (sellerCount / maxSellerCount)
-		// This prevents popular sellers from occupying all top slots.
-		//
-		// Single-seller collapse fix (M1a, dontguess-7d6): when the candidate set has
-		// only one unique seller, every entry produces novelty=0 (1-N/N=0). With the
-		// old weights (novelty=0.20, efficiency=0.35) this made efficiency the dominant
-		// non-similarity signal, allowing a high-efficiency junk entry to compete.
-		// Fix: use novelty=0.5 (neutral) when there is only one unique seller — no
-		// discovery boost or penalty, preserving the composite's relevance-first order.
-		var l3Novelty float64
-		if len(sellerCount) == 1 {
-			// Single seller: novelty is undefined. Use neutral 0.5 so the composite
-			// is fully governed by L1 efficiency and L2 quality (relevance).
-			l3Novelty = 0.5
-		} else {
-			l3Novelty = 1.0 - float64(sellerCount[c.SellerKey])/float64(maxSellerCount)
-		}
-
-		// Final composite score (L1 + L2 + L3).
-		composite := opts.weightEfficiency()*l1Efficiency +
-			opts.weightQuality()*l2Quality +
-			opts.weightNovelty()*l3Novelty
-
-		// Behavioral booster (dontguess-860): additive boost for entries that
-		// have been consumed and/or convergently validated by distinct agents.
-		//
-		// Design principles (§3 of docs/design/exchange-token-savings-v06.md):
-		//  - Floor gates first: this code is only reached for above-floor entries
-		//    (sim >= MinSimilarity). The boost CANNOT resurrect below-floor entries.
-		//  - Bounded: capped at MaxBehavioralBoost (0.10) so a highly-consumed
-		//    entry cannot bury a more-relevant alternative whose similarity is
-		//    significantly higher.
-		//  - Gaming-resistant: consume signals are antecedent-anchored (engine
-		//    emits TagConsume, not the buyer); convergence requires >=3 distinct
-		//    keys (DistinctBuyerCount threshold).
-		//  - Zero-safe: when Signals is zero value, boost == 0 → no change to
-		//    existing ranking for entries without signals.
-		behavioralBoost := computeBehavioralBoost(c.Signals)
-		composite += behavioralBoost
-
-		// False-positive demotion (dontguess-046): negative adjustment for entries
-		// with a sustained high deliver-without-consume ratio.
-		//
-		// Design principles:
-		//  - Window guard: demotion is zero when DeliverCount < FalsePositiveWindowMin.
-		//    A single deliver-without-consume must NOT trigger demotion.
-		//  - Bounded: floor at MaxBehavioralDemotion (-0.10), symmetric with the
-		//    positive boost. A demoted entry still outranks a below-floor junk entry.
-		//  - Additive: applied after the positive boost, so a highly-consumed entry
-		//    with a low false-positive ratio is not penalised even if DeliverCount
-		//    is also high (the ratio gates the demotion, not the raw deliver count).
-		//  - Zero-safe: when Signals.DeliverCount == 0, demotion == 0.
-		fpDemotion := computeFalsePositiveDemotion(c.Signals)
-		composite += fpDemotion // fpDemotion is <= 0
-
-		// Confidence is the Layer 2 quality composite (what the buyer sees).
-		confidence := l2Quality
-
-		results = append(results, RankedResult{
-			EntryID:               c.EntryID,
-			Similarity:            sim,
-			Confidence:            confidence,
-			CompositeScore:        composite,
-			IsPartialMatch:        confidence < opts.partialThreshold(),
-			EfficiencyScore:       l1Efficiency,
-			NoveltyBoost:          l3Novelty,
-			BehavioralBoost:       behavioralBoost,
-			FalsePositiveDemotion: fpDemotion,
-		})
+// scoreCandidate computes the 4-layer composite score for a single above-floor
+// candidate. Returns a RankedResult with all score components populated except
+// BehavioralBoost and FalsePositiveDemotion (applied separately by
+// applyBehavioralAdjustments).
+func scoreCandidate(c RankInput, sim float64, now int64, halflifeSec float64, sellerCount map[string]int, maxSellerCount int, opts RankOptions) RankedResult {
+	// Layer 1: Transaction efficiency.
+	// Efficiency = tokens_saved / price.
+	// We normalize by dividing by a reference value (1000 tokens/scrip) to keep [0,1].
+	// If price is 0, treat as zero efficiency: a zero-price entry has no valid scrip
+	// flow and must not dominate rankings via the free-item path.
+	// If TokenCost is also 0, efficiency is 0 (no work represented).
+	var l1Efficiency float64
+	if c.Price > 0 && c.TokenCost > 0 {
+		ratio := float64(c.TokenCost) / float64(c.Price)
+		// Normalize: ratio of 10 (great deal) → 1.0; ratio < 1 (poor deal) → < 0.1.
+		l1Efficiency = math.Min(ratio/10.0, 1.0)
 	}
 
-	// Sort descending by composite score (insertion sort — candidates are small, ~100s).
+	// Layer 2: Value composite.
+	// 2a. Similarity contribution (already computed above).
+	simScore := math.Max(sim, 0) // clamp negative cosine similarity
+
+	// 2b. Seller reputation normalized to [0, 1].
+	repScore := float64(c.SellerReputation) / 100.0
+
+	// 2c. Content freshness: exponential decay.
+	// ageSeconds = time since put; freshness = e^(-age / halflife).
+	ageSeconds := float64(now-c.PutTimestamp) / 1e9
+	if ageSeconds < 0 {
+		ageSeconds = 0
+	}
+	freshnessScore := math.Exp(-ageSeconds / halflifeSec)
+
+	// 2d. Content diversity: unique domains count normalized to [0, 1].
+	// Max possible domains is 5 (per convention).
+	domainScore := math.Min(float64(len(c.Domains))/5.0, 1.0)
+
+	// Layer 2 composite: weighted mix.
+	// Similarity carries the most weight — it gates relevance.
+	l2Quality := 0.50*simScore + 0.25*repScore + 0.15*freshnessScore + 0.10*domainScore
+
+	// Layer 3: Market novelty / discovery boost.
+	// Sellers who appear once get boost=1.0; dominant sellers get boost→0.
+	// novelty = 1 - (sellerCount / maxSellerCount)
+	// This prevents popular sellers from occupying all top slots.
+	//
+	// Single-seller collapse fix (M1a, dontguess-7d6): when the candidate set has
+	// only one unique seller, every entry produces novelty=0 (1-N/N=0). With the
+	// old weights (novelty=0.20, efficiency=0.35) this made efficiency the dominant
+	// non-similarity signal, allowing a high-efficiency junk entry to compete.
+	// Fix: use novelty=0.5 (neutral) when there is only one unique seller — no
+	// discovery boost or penalty, preserving the composite's relevance-first order.
+	var l3Novelty float64
+	if len(sellerCount) == 1 {
+		// Single seller: novelty is undefined. Use neutral 0.5 so the composite
+		// is fully governed by L1 efficiency and L2 quality (relevance).
+		l3Novelty = 0.5
+	} else {
+		l3Novelty = 1.0 - float64(sellerCount[c.SellerKey])/float64(maxSellerCount)
+	}
+
+	// Final composite score (L1 + L2 + L3).
+	composite := opts.weightEfficiency()*l1Efficiency +
+		opts.weightQuality()*l2Quality +
+		opts.weightNovelty()*l3Novelty
+
+	return RankedResult{
+		EntryID:         c.EntryID,
+		Similarity:      sim,
+		Confidence:      l2Quality,
+		CompositeScore:  composite,
+		IsPartialMatch:  l2Quality < opts.partialThreshold(),
+		EfficiencyScore: l1Efficiency,
+		NoveltyBoost:    l3Novelty,
+	}
+}
+
+// applyBehavioralAdjustments adds the behavioral boost and false-positive demotion
+// to a RankedResult that has already passed the floor gate. Boost and demotion are
+// applied additively and bounded per their respective constants. This step MUST run
+// AFTER applyFloorGate — behavioral signals cannot resurrect below-floor entries.
+func applyBehavioralAdjustments(r RankedResult, signals BehavioralSignals) RankedResult {
+	// Behavioral booster (dontguess-860): additive boost for entries that
+	// have been consumed and/or convergently validated by distinct agents.
+	//
+	// Design principles (§3 of docs/design/exchange-token-savings-v06.md):
+	//  - Floor gates first: this code is only reached for above-floor entries
+	//    (sim >= MinSimilarity). The boost CANNOT resurrect below-floor entries.
+	//  - Bounded: capped at MaxBehavioralBoost (0.10) so a highly-consumed
+	//    entry cannot bury a more-relevant alternative whose similarity is
+	//    significantly higher.
+	//  - Gaming-resistant: consume signals are antecedent-anchored (engine
+	//    emits TagConsume, not the buyer); convergence requires >=3 distinct
+	//    keys (DistinctBuyerCount threshold).
+	//  - Zero-safe: when Signals is zero value, boost == 0 → no change to
+	//    existing ranking for entries without signals.
+	behavioralBoost := computeBehavioralBoost(signals)
+	r.CompositeScore += behavioralBoost
+	r.BehavioralBoost = behavioralBoost
+
+	// False-positive demotion (dontguess-046): negative adjustment for entries
+	// with a sustained high deliver-without-consume ratio.
+	//
+	// Design principles:
+	//  - Window guard: demotion is zero when DeliverCount < FalsePositiveWindowMin.
+	//    A single deliver-without-consume must NOT trigger demotion.
+	//  - Bounded: floor at MaxBehavioralDemotion (-0.10), symmetric with the
+	//    positive boost. A demoted entry still outranks a below-floor junk entry.
+	//  - Additive: applied after the positive boost, so a highly-consumed entry
+	//    with a low false-positive ratio is not penalised even if DeliverCount
+	//    is also high (the ratio gates the demotion, not the raw deliver count).
+	//  - Zero-safe: when Signals.DeliverCount == 0, demotion == 0.
+	fpDemotion := computeFalsePositiveDemotion(signals)
+	r.CompositeScore += fpDemotion // fpDemotion is <= 0
+	r.FalsePositiveDemotion = fpDemotion
+
+	return r
+}
+
+// sortAndTrim sorts results in-place descending by CompositeScore using an
+// insertion sort (candidates are small, ~100s entries).
+func sortAndTrim(results []RankedResult) {
 	for i := 1; i < len(results); i++ {
 		for j := i; j > 0 && results[j].CompositeScore > results[j-1].CompositeScore; j-- {
 			results[j], results[j-1] = results[j-1], results[j]
 		}
 	}
-
-	return results
 }
 
 // computeBehavioralBoost computes the additive behavioral signal boost for a
