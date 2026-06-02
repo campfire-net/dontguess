@@ -449,93 +449,65 @@ func buyMsgIDFor(m *Message) string {
 	return ""
 }
 
-// ComputeHitRate reconciles a set of buy orders against a set of match-result
-// messages and returns a HitRateReport.
-//
-// buys are exchange:buy messages (their .ID is the buy order ID).
-// matches are exchange:match messages (hits and misses both carry this tag).
-//
-// Quality-weighted hit classification (M-rebaseline, dontguess-af8):
-// A buy counts as a HIT only when the delivered top result's similarity is at or
-// above opts.MinSimilarity AND the result is not synthetic. Delivered results
-// below the floor are reclassified as MISSES (counted in BelowFloorDowngraded).
-// Historical match-results without a "similarity" field (pre-M2/dontguess-b26)
-// are handled via opts.Embedder recompute (approach A) or reported as
-// UnverifiableHits when recompute is unavailable (approach B).
-//
-// Synthetic exclusion: match-result messages tagged exchange:synthetic (produced
-// by the engine when the buy task matched demand.IsSynthetic) are skipped and
-// their corresponding buy order IDs are removed from the real-buy set.
-//
-// Callers are responsible for windowing (passing only messages within --since).
-//
-// opts is variadic for backward compatibility — existing callers that pass no
-// options get legacy behaviour (no floor gate, all delivered results = hits).
-func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateReport {
-	var o HitRateOptions
-	if len(opts) > 0 {
-		o = opts[0]
-	}
+// buyOutcome is the best-quality match result seen for a single buy order.
+// Populated by classifyBuyOutcomes; consumed by tallyOutcomes and computeNetSavings.
+type buyOutcome struct {
+	hit          bool   // true once a hit (above-floor) result is seen
+	unverifiable bool   // true if best outcome so far is unverifiable (no verified hit yet)
+	miss         bool   // true if at least one result was seen (and none were hits)
+	topEntryID   string // entry_id of the top delivered result (for consume lookup)
+	topTokenCost int64  // token_cost_original of the top delivered result
+}
 
-	// Pass 1: scan match-results to collect synthetic buy IDs.
-	// The engine tags the *response* (match/buy-miss) with exchange:synthetic
-	// when demand.IsSynthetic(task) is true. The originating buy message (sent
-	// by the buyer) carries no such tag — so we identify synthetic buys via
-	// their corresponding tagged response.
+// excludeSyntheticBuys scans matches for exchange:synthetic-tagged responses,
+// counts them in syntheticExcluded, and returns the set of real (non-synthetic)
+// buy IDs derived from buys filtered against the synthetic set.
+//
+// The engine tags the *response* (match/buy-miss) with exchange:synthetic when
+// demand.IsSynthetic(task) is true. The originating buy message carries no such
+// tag — so we identify synthetic buys via their tagged response.
+func excludeSyntheticBuys(buys, matches []Message) (buyIDs map[string]struct{}, syntheticExcluded int) {
 	syntheticBuyIDs := make(map[string]struct{})
-	var syntheticExcluded int
 	for i := range matches {
 		m := &matches[i]
 		if !isMessageSynthetic(m) {
 			continue
 		}
 		syntheticExcluded++
-		buyID := buyMsgIDFor(m)
-		if buyID != "" {
+		if buyID := buyMsgIDFor(m); buyID != "" {
 			syntheticBuyIDs[buyID] = struct{}{}
 		}
 	}
 
-	// Build the set of real (non-synthetic) buy order IDs.
-	buyIDs := make(map[string]struct{}, len(buys))
+	buyIDs = make(map[string]struct{}, len(buys))
 	for i := range buys {
 		id := buys[i].ID
 		if _, isSynthetic := syntheticBuyIDs[id]; !isSynthetic {
 			buyIDs[id] = struct{}{}
 		}
 	}
+	return buyIDs, syntheticExcluded
+}
 
-	// Resolve miss cost per query (defaults to DefaultMissCostPerQuery when unset).
-	missCostPerQuery := o.MissCostPerQuery
-	if missCostPerQuery <= 0 {
-		missCostPerQuery = DefaultMissCostPerQuery
-	}
-
-	// Best outcome per real buy. We track the best quality-gate outcome across
-	// all match-results for a given buy. The ranking is:
-	//   qualityGateHit > qualityGateRecomputedHit > qualityGateUnverifiable >
-	//   qualityGateRecomputedMiss > qualityGateMiss
-	//
-	// We use a simple bool map for hit tracking, plus a separate
-	// unverifiableOnly map for buys whose best outcome is unverifiable.
-	//
-	// For net-savings economics (Track C, dontguess-eff), we also track:
-	//   - topEntryID: the entry_id of the top delivered result (for consume lookup)
-	//   - topTokenCost: token_cost_original of the top delivered result
-	type buyOutcome struct {
-		hit           bool   // true once a hit (above-floor) result is seen
-		unverifiable  bool   // true if best outcome so far is unverifiable (no verified hit yet)
-		miss          bool   // true if at least one result was seen (and none were hits)
-		topEntryID    string // entry_id of the top delivered result (for consume lookup)
-		topTokenCost  int64  // token_cost_original of the top delivered result
-	}
-	outcomeByBuy := make(map[string]*buyOutcome)
-	var unjoinable, realMatchResults int
-	var belowFloorDowngraded, recomputedSimilarity int
+// classifyBuyOutcomes iterates the non-synthetic match-result messages and
+// assigns the best quality-gate outcome to each real buy order.
+//
+// The ranking is:
+//
+//	qualityGateHit > qualityGateRecomputedHit > qualityGateUnverifiable >
+//	qualityGateRecomputedMiss > qualityGateMiss
+//
+// Returns outcomeByBuy (best outcome per buy), plus raw counters for
+// realMatchResults, unjoinable, belowFloorDowngraded, and recomputedSimilarity.
+func classifyBuyOutcomes(matches []Message, buyIDs map[string]struct{}, o HitRateOptions) (
+	outcomeByBuy map[string]*buyOutcome,
+	realMatchResults, unjoinable, belowFloorDowngraded, recomputedSimilarity int,
+) {
+	outcomeByBuy = make(map[string]*buyOutcome)
 
 	for i := range matches {
 		m := &matches[i]
-		// Skip synthetic responses — already counted in syntheticExcluded above.
+		// Skip synthetic responses — already counted in excludeSyntheticBuys.
 		if isMessageSynthetic(m) {
 			continue
 		}
@@ -596,11 +568,13 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 			bo.unverifiable = true
 		}
 	}
+	return outcomeByBuy, realMatchResults, unjoinable, belowFloorDowngraded, recomputedSimilarity
+}
 
-	// Tally results.
-	hits := 0
-	misses := 0
-	unverifiableHits := 0
+// tallyOutcomes counts hits, misses, and unverifiable hits from outcomeByBuy, and
+// computes the quality-weighted HitRatePct (unverifiable hits excluded from both
+// numerator and denominator).
+func tallyOutcomes(outcomeByBuy map[string]*buyOutcome) (hits, misses, unverifiableHits int, hitRatePct float64) {
 	for _, bo := range outcomeByBuy {
 		switch {
 		case bo.hit:
@@ -612,38 +586,47 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 			misses++
 		}
 	}
-	matchedBuys := len(outcomeByBuy)
 
 	// HitRatePct denominator: exclude unverifiable hits (unknown quality).
 	// Only count verified hits and verified misses.
 	verifiedAnswered := hits + misses
-	var hitRatePct float64
 	if verifiedAnswered > 0 {
 		hitRatePct = round2(float64(hits) / float64(verifiedAnswered) * 100)
 	}
+	return hits, misses, unverifiableHits, hitRatePct
+}
 
-	// Count entries that have achieved cross-agent convergence: 3+ distinct buyer keys.
-	// The heritage ungameable trust signal (toolrank lineage, §4.6
-	// docs/design/exchange-per-agent-identity-decision.md). Always 0 when
-	// opts.EntryBuyerMap is nil (current default: single shared identity).
-	var crossAgentConvergence int
-	for _, buyers := range o.EntryBuyerMap {
+// computeConvergence counts inventory entries that have achieved cross-agent
+// convergence: entries where 3 or more DISTINCT buyer agent keys have completed
+// a purchase. The heritage ungameable trust signal (toolrank lineage, §4.6
+// docs/design/exchange-per-agent-identity-decision.md). Always 0 when
+// entryBuyerMap is nil (current default: single shared identity).
+func computeConvergence(entryBuyerMap map[string]map[string]struct{}) (crossAgentConvergence int) {
+	for _, buyers := range entryBuyerMap {
 		if len(buyers) >= 3 {
 			crossAgentConvergence++
 		}
 	}
+	return crossAgentConvergence
+}
 
-	// --- Net token-savings economics (Track C, dontguess-eff) ---
-	// Per §1 of docs/design/exchange-token-savings-v06.md:
-	//   net_tokens_saved = saved_on_real_hits − miss_costs − false_positive_waste
-	//
-	// For each hit buy:
-	//   - If opts.ConsumeCountByEntry is non-nil: a hit is "real" only when the
-	//     entry was consumed (consume count > 0). Un-consumed = false positive.
-	//   - If opts.ConsumeCountByEntry is nil: all hits are treated as real
-	//     (conservative/legacy assumption: every hit saved the buyer).
-	var savedOnRealHits, totalMissCost, totalFalsePositiveWaste int64
-	perQueryEconomics := make([]QueryEconomics, 0, matchedBuys)
+// computeNetSavings builds per-query economics and net token-savings totals from
+// the best outcome per buy.
+//
+// Per §1 of docs/design/exchange-token-savings-v06.md:
+//
+//	net_tokens_saved = saved_on_real_hits − miss_costs − false_positive_waste
+//
+// For each hit buy:
+//   - If opts.ConsumeCountByEntry is non-nil: a hit is "real" only when the
+//     entry was consumed (consume count > 0). Un-consumed = false positive.
+//   - If opts.ConsumeCountByEntry is nil: all hits are treated as real
+//     (conservative/legacy assumption: every hit saved the buyer).
+func computeNetSavings(outcomeByBuy map[string]*buyOutcome, o HitRateOptions, missCostPerQuery int64) (
+	savedOnRealHits, totalMissCost, totalFalsePositiveWaste int64,
+	perQueryEconomics []QueryEconomics,
+) {
+	perQueryEconomics = make([]QueryEconomics, 0, len(outcomeByBuy))
 
 	for buyID, bo := range outcomeByBuy {
 		switch {
@@ -680,16 +663,70 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 			// Miss: buyer paid the round-trip overhead with no value delivered.
 			totalMissCost += missCostPerQuery
 			perQueryEconomics = append(perQueryEconomics, QueryEconomics{
-				BuyID:  buyID,
+				BuyID:   buyID,
 				Outcome: "miss",
-				Saved:  -missCostPerQuery,
+				Saved:   -missCostPerQuery,
 			})
 		}
 	}
+	return savedOnRealHits, totalMissCost, totalFalsePositiveWaste, perQueryEconomics
+}
 
+// ComputeHitRate reconciles a set of buy orders against a set of match-result
+// messages and returns a HitRateReport.
+//
+// buys are exchange:buy messages (their .ID is the buy order ID).
+// matches are exchange:match messages (hits and misses both carry this tag).
+//
+// Quality-weighted hit classification (M-rebaseline, dontguess-af8):
+// A buy counts as a HIT only when the delivered top result's similarity is at or
+// above opts.MinSimilarity AND the result is not synthetic. Delivered results
+// below the floor are reclassified as MISSES (counted in BelowFloorDowngraded).
+// Historical match-results without a "similarity" field (pre-M2/dontguess-b26)
+// are handled via opts.Embedder recompute (approach A) or reported as
+// UnverifiableHits when recompute is unavailable (approach B).
+//
+// Synthetic exclusion: match-result messages tagged exchange:synthetic (produced
+// by the engine when the buy task matched demand.IsSynthetic) are skipped and
+// their corresponding buy order IDs are removed from the real-buy set.
+//
+// Callers are responsible for windowing (passing only messages within --since).
+//
+// opts is variadic for backward compatibility — existing callers that pass no
+// options get legacy behaviour (no floor gate, all delivered results = hits).
+func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateReport {
+	var o HitRateOptions
+	if len(opts) > 0 {
+		o = opts[0]
+	}
+
+	// Resolve miss cost per query (defaults to DefaultMissCostPerQuery when unset).
+	missCostPerQuery := o.MissCostPerQuery
+	if missCostPerQuery <= 0 {
+		missCostPerQuery = DefaultMissCostPerQuery
+	}
+
+	// Phase 1: identify and exclude synthetic buys; build the real buy ID set.
+	buyIDs, syntheticExcluded := excludeSyntheticBuys(buys, matches)
+
+	// Phase 2: classify each non-synthetic match-result against its buy order.
+	outcomeByBuy, realMatchResults, unjoinable, belowFloorDowngraded, recomputedSimilarity :=
+		classifyBuyOutcomes(matches, buyIDs, o)
+
+	// Phase 3: tally hits, misses, unverifiable hits, and compute HitRatePct.
+	hits, misses, unverifiableHits, hitRatePct := tallyOutcomes(outcomeByBuy)
+
+	// Phase 4: count inventory entries with cross-agent convergence (3+ distinct buyers).
+	crossAgentConvergence := computeConvergence(o.EntryBuyerMap)
+
+	// Phase 5: compute net token-savings economics and per-query breakdown.
+	savedOnRealHits, totalMissCost, totalFalsePositiveWaste, perQueryEconomics :=
+		computeNetSavings(outcomeByBuy, o, missCostPerQuery)
+
+	matchedBuys := len(outcomeByBuy)
 	netTokensSaved := savedOnRealHits - totalMissCost - totalFalsePositiveWaste
 
-	rep := HitRateReport{
+	return HitRateReport{
 		TotalBuys:               len(buyIDs),
 		MatchedBuys:             matchedBuys,
 		PendingBuys:             len(buyIDs) - matchedBuys,
@@ -709,7 +746,6 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 		TotalFalsePositiveWaste: totalFalsePositiveWaste,
 		PerQueryEconomics:       perQueryEconomics,
 	}
-	return rep
 }
 
 // round2 rounds to two decimal places.
