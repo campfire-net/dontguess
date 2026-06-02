@@ -103,6 +103,23 @@ func (idx *Index) Len() int {
 	return len(idx.entries)
 }
 
+// HasEmbedding reports whether an entry with the given ID exists in the index
+// (i.e. has a precomputed embedding). Entries that are indexed but scored below
+// the MinSimilarity floor in Search are still present here — HasEmbedding returns
+// true for them. This allows callers to distinguish genuine index-gap entries
+// (not yet embedded, HasEmbedding=false) from below-floor embedded entries
+// (HasEmbedding=true) that the floor intentionally excluded.
+func (idx *Index) HasEmbedding(entryID string) bool {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	for _, e := range idx.entries {
+		if e.input.EntryID == entryID {
+			return true
+		}
+	}
+	return false
+}
+
 // Search returns ranked results for a buy task, capped at maxResults.
 //
 // The embedder embeds the task description at query time. All indexed entries

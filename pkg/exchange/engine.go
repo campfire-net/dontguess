@@ -640,19 +640,35 @@ func (e *Engine) handleBuy(msg *Message) error {
 		})
 	}
 
-	// Append candidates not covered by the semantic index (e.g. index not yet rebuilt).
-	// Note: the relevance floor is enforced by matching.Rank() — entries scored below
-	// MinSimilarity are excluded from semanticResults before reaching here. The fallback
-	// path covers index-gap entries (not yet embedded) and uses reputation+recency ranking.
+	// Append candidates not covered by the semantic index.
+	//
+	// The relevance floor is enforced by matching.Rank() — entries scored below
+	// MinSimilarity are excluded from semanticResults before reaching here.
+	// The fallback path is ONLY for genuine index-gap entries: inventory candidates
+	// that have not yet been embedded (e.g. added between index rebuilds). Entries
+	// that ARE in the index but scored below the floor must NOT enter the fallback —
+	// they were intentionally rejected by the floor and routing them via fallback
+	// would serve a junk hit in place of the correct buy-miss response.
+	//
+	// Gate: use matchIndex.HasEmbedding to distinguish the two populations:
+	//   - HasEmbedding=true  AND not in covered → below-floor embedded entry → skip
+	//   - HasEmbedding=false AND not in covered → genuine index-gap entry     → allow
 	covered := make(map[string]struct{}, len(semanticMatches))
 	for _, sm := range semanticMatches {
 		covered[sm.entry.EntryID] = struct{}{}
 	}
 	var fallbackCandidates []*InventoryEntry
 	for _, c := range candidates {
-		if _, ok := covered[c.EntryID]; !ok {
-			fallbackCandidates = append(fallbackCandidates, c)
+		if _, ok := covered[c.EntryID]; ok {
+			continue // already in semantic results
 		}
+		// Exclude entries that have an embedding but scored below the floor.
+		// They were evaluated and rejected by Rank(); the floor decision stands.
+		if e.matchIndex.HasEmbedding(c.EntryID) {
+			continue
+		}
+		// Genuine index-gap entry (no embedding yet) — allow reputation+recency fallback.
+		fallbackCandidates = append(fallbackCandidates, c)
 	}
 	ranked := e.rankResults(fallbackCandidates, maxResults)
 	for _, entry := range ranked {

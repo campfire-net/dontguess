@@ -71,7 +71,7 @@ func TestLayer0_LowConversionEntryExcludedFromBuyResults(t *testing.T) {
 
 	// Generate 10 previews, 0 conversions (buyers never accept after preview).
 	for i := 0; i < 10; i++ {
-		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-low-noconv-%d", i))
+		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, "Go HTTP handler unit test patterns", fmt.Sprintf("layer0-low-noconv-%d", i))
 		// Emit a preview response but do NOT emit a buyer-accept.
 		prevPayload, _ := json.Marshal(map[string]any{
 			"phase":    "preview",
@@ -176,7 +176,7 @@ func TestLayer0_HighConversionEntryIncluded(t *testing.T) {
 
 	// 8 preview-only (no conversion), then 2 conversions = 2/10 = 20% rate.
 	for i := 0; i < 8; i++ {
-		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-high-noconv-%d", i))
+		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, "Python data analysis with pandas dataframes", fmt.Sprintf("layer0-high-noconv-%d", i))
 		prevPayload, _ := json.Marshal(map[string]any{
 			"phase":    "preview",
 			"entry_id": entryID,
@@ -190,7 +190,7 @@ func TestLayer0_HighConversionEntryIncluded(t *testing.T) {
 		eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 	}
 	for i := 0; i < 2; i++ {
-		_, previewReqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-high-conv-%d", i))
+		_, previewReqID, buyer := generateBuyerMatchPreview(t, h, eng, entryID, "Python data analysis with pandas dataframes", fmt.Sprintf("layer0-high-conv-%d", i))
 		emitPreviewAndAccept(t, h, eng, entryID, previewReqID, buyer)
 	}
 
@@ -277,7 +277,7 @@ func TestLayer0_InsufficientPreviewsNotExcluded(t *testing.T) {
 
 	// Only 5 previews, 0 conversions — below the 10-preview threshold.
 	for i := 0; i < 5; i++ {
-		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-insuf-%d", i))
+		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, "Rust async runtime tokio integration tests", fmt.Sprintf("layer0-insuf-%d", i))
 		prevPayload, _ := json.Marshal(map[string]any{
 			"phase":    "preview",
 			"entry_id": entryID,
@@ -390,7 +390,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 
 	// Phase 1: Buyer A gets a preview-request AND a preview response (pending accept).
 	// The entry has 1 preview, 0 conversions — well below the 10-preview threshold.
-	_, previewReqIDA, buyerA := generateBuyerMatchPreview(t, h, eng, entryID, "layer0-rev-buyerA")
+	_, previewReqIDA, buyerA := generateBuyerMatchPreview(t, h, eng, entryID, "TypeScript React hooks unit testing best practices", "layer0-rev-buyerA")
 	prevPayloadA, _ := json.Marshal(map[string]any{
 		"phase":    "preview",
 		"entry_id": entryID,
@@ -412,7 +412,7 @@ func TestLayer0_ReversibilityAfterConversionImproves(t *testing.T) {
 
 	// Phase 2: Add 9 more previews without conversions → 10 total, 0 conversions → excluded.
 	for i := 0; i < 9; i++ {
-		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, fmt.Sprintf("layer0-rev-noconv-%d", i))
+		_, previewReqID, _ := generateBuyerMatchPreview(t, h, eng, entryID, "TypeScript React hooks unit testing best practices", fmt.Sprintf("layer0-rev-noconv-%d", i))
 		prevPayload, _ := json.Marshal(map[string]any{
 			"phase":    "preview",
 			"entry_id": entryID,
