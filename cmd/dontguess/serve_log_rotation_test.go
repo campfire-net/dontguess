@@ -211,28 +211,44 @@ func TestLogRotation_BackupCap(t *testing.T) {
 	}
 	roller.Close()
 
-	// Lumberjack compresses old segments asynchronously. Close() does not
-	// wait for compression goroutines to finish, so .gz files may still be
-	// in flight. Poll until the gz count stabilises or we time out.
+	// Lumberjack compresses old segments and prunes excess backups in
+	// background goroutines that Close() does not wait for. Poll until the
+	// directory is QUIESCENT — the expected backups are present AND the full
+	// listing is unchanged across two consecutive reads — so no goroutine is
+	// still mutating the dir when t.TempDir() cleanup runs RemoveAll. (A
+	// compaction still in flight otherwise races RemoveAll and fails the test
+	// with "directory not empty".) os.ReadDir returns entries sorted by name,
+	// so a joined listing is a stable snapshot.
+	snapshot := func(entries []os.DirEntry) (string, int) {
+		var b strings.Builder
+		gz := 0
+		for _, e := range entries {
+			b.WriteString(e.Name())
+			b.WriteByte('\n')
+			if strings.HasSuffix(e.Name(), ".gz") {
+				gz++
+			}
+		}
+		return b.String(), gz
+	}
 	var gzCount int
+	var prev string
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			t.Fatalf("ReadDir: %v", err)
 		}
-		gzCount = 0
-		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".gz") {
-				gzCount++
-			}
-		}
-		// After 7 rotations with MaxBackups=5, we expect exactly 5 .gz
-		// files once compression finishes. Stop polling once we see them.
-		if gzCount >= 5 {
+		cur, gz := snapshot(entries)
+		gzCount = gz
+		// After 7 rotations with MaxBackups=5, we expect exactly 5 .gz files
+		// once compression+pruning finishes. Quiescent = expected count seen
+		// and the listing stable across two reads.
+		if gzCount >= 5 && cur == prev {
 			break
 		}
-		time.Sleep(100 * time.Millisecond)
+		prev = cur
+		time.Sleep(150 * time.Millisecond)
 	}
 
 	if gzCount > 5 {
