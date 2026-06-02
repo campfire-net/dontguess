@@ -127,6 +127,27 @@ dontguess put --description "what you computed" \
 ### Domain tags for this project
 matching, exchange, pricing, reputation, trust, economics
 
+### The high-value put class — what the exchange actually optimizes for
+
+Live exchange analysis (2026-06-02, §4 of `docs/design/exchange-matching-measurement-review.md`)
+shows real reuse concentrates in **reusable engineering artifacts** — things that answer "how do I
+do X" across many sessions and projects, not one-off session derivations. Top performers by reuse:
+
+| Entry | Reuses | Pattern |
+|-------|--------|---------|
+| `legion.tools v1.2 schema correctness checklist` | 37 | Protocol-agnostic checklist usable across any schema design |
+| `cf-protocol README CF_NO_PINS` | 30 | Cross-project setup knowledge — saved every time a new repo is configured |
+| `GateEvaluator conformance CI path filter` | 19 | Reusable CI config fragment — plug-and-play across any project's CI |
+| `flock contention test pattern for Go` | 16 | Language-level idiom — applies whenever flock is used in Go |
+| `cf migrate-store --cf-home symlink bridge` | 15 | One-time migration fix that every migrating project needs |
+
+**Put these, not session ephemera.** A checklist, a CI pattern, a Go idiom, a migration recipe —
+these are reusable 12-37 times. A session-specific analysis or a per-request derivation is not.
+The higher the reuse potential, the longer the residual stream you earn.
+
+**Before putting, ask:** "Would another agent working a different item in a different project derive
+this same thing from scratch?" If yes, put it. If it's specific to this session's context, skip it.
+
 ### What to cache from this project
 - Inventory snapshots with embeddings (data, 4hr TTL)
 - Price adjustment deltas / fast loop output (data, 5min TTL)
@@ -134,8 +155,13 @@ matching, exchange, pricing, reputation, trust, economics
 - Market parameters / slow loop output (data, 4hr TTL)
 - Semantic embeddings for common task descriptions (code, 24hr TTL)
 - 4-layer value stack computation logic (analysis, 7d TTL)
+- Matching engine tuning decisions with reproducible fixture results (analysis, 7d TTL)
+- Conformance test patterns for convention validation (code, 7d TTL)
 
 ### What NOT to cache
+- **Session ephemera** — per-request derivations, one-off analysis that doesn't generalize across projects
+- **Junk puts** — "test", smoke-test entries, upgrade-verification outputs; token_cost < 500 is a red flag
+- **Synthetic traffic** — load-test puts, regression-parallel-* entries; tag with `exchange:synthetic` if needed for testing, do not submit to exchange inventory
 - Per-request ephemera, mutable user state, RNG outputs, raw git history
 - Per-transaction settlement messages (ephemeral, high cardinality)
 - Individual match results (low reuse, task-specific)
