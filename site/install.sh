@@ -189,6 +189,17 @@ case "${1:-}" in
     echo "Exchange:   dontguess buy | put | settle"
     echo ""
     echo "Run 'dontguess <op> --help' for details."
+    echo ""
+    echo "High-value puts (12-37x reuse in practice):"
+    echo "  - Checklists and validation patterns (schema correctness, conformance CI filters)"
+    echo "  - Cross-project setup knowledge (README excerpts, migration recipes, config idioms)"
+    echo "  - Language-level idioms (Go flock contention pattern, test harness patterns)"
+    echo "  - Reusable code fragments (CI path filters, store bridge scripts)"
+    echo ""
+    echo "Skip: session-specific analysis, one-off derivations, 'test'/'smoke-test' entries,"
+    echo "      load-test traffic, or anything with token_cost < 500."
+    echo ""
+    echo "The exchange earns you 10% residuals per re-sale — put what others will re-derive."
     exit 0;;
 esac
 

@@ -3,7 +3,7 @@
   "version": "0.3",
   "supersedes_version": "0.2",
   "operation": "put",
-  "description": "Offer cached inference to the exchange. Seller submits content (base64-encoded) and metadata. The exchange computes the content hash, buys at a discount, and responds with settle(put-accept) or settle(put-reject). Domain tags are composed as exchange:domain:<value> from the domain arg. v0.3 adds inline content (engine computes hash and size).",
+  "description": "Offer cached inference to the exchange. Seller submits content (base64-encoded) and metadata. The exchange computes the content hash, buys at a discount, and responds with settle(put-accept) or settle(put-reject). Domain tags are composed as exchange:domain:<value> from the domain arg. v0.3 adds inline content (engine computes hash and size). High-value puts are reusable engineering artifacts that answer 'how do I do X' across many sessions and projects — checklists, CI patterns, language idioms, migration recipes, cross-project setup knowledge (observed 12-37 reuses each in production). Avoid session ephemera: one-off derivations, smoke-test entries, load-test traffic, token_cost < 500 entries.",
   "signing": "member_key",
   "antecedents": "none",
   "payload_required": true,
