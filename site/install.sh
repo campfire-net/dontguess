@@ -98,10 +98,13 @@ main() {
   # --- wrapper script ---
   cat > "${INSTALL_DIR}/dontguess" <<'ENDWRAPPER'
 #!/bin/sh
-# dontguess — turnkey wrapper (v0.4.2)
+# dontguess — turnkey wrapper (v0.5.0)
 # Hardened: DG_HOME pin, flock start, cmdline PID verify, health-probe readiness
 # Health-probe skip: only the invocation that starts the operator runs the probe.
-# CF_HOME identity pin: exchange cf calls always use --cf-home $DG_HOME.
+# CF_HOME identity pin: exchange routing uses --cf-home $DG_HOME.
+# AGENT_CF_HOME: when set, buy/put/settle use --cf-home $AGENT_CF_HOME so each
+#   agent signs with its own Ed25519 key. Unset = identical to prior behavior.
+#   Telemetry records the actual signing agent (AGENT_CF_HOME/identity.json).
 # Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL)
 set -e
 
@@ -119,6 +122,13 @@ CF_HOME="${CF_HOME:-${HOME}/.cf}"
 # DG_HOME pins all singleton exchange state, independent of CF_HOME.
 # Subagents with per-session CF_HOME still find the real exchange here.
 DG_HOME="${DG_HOME:-${HOME}/.cf}"
+
+# AGENT_CF_HOME: per-agent signing identity for buy/put/settle operations.
+# When set, signing ops use this home instead of DG_HOME. Exchange routing
+# (campfire ID, PID, health probe, operator serve) always stays on DG_HOME.
+# Generate once: cf --cf-home $AGENT_CF_HOME init && cf admit $XCFID <pubkey>
+# Unset = current behavior (all ops sign with operator key at DG_HOME).
+_SIGNING_HOME="${AGENT_CF_HOME:-${DG_HOME}}"
 
 CFG="${DG_HOME}/dontguess-exchange.json"
 PID_FILE="${DG_HOME}/dontguess.pid"
@@ -141,8 +151,15 @@ _attempt_log_write() {
   _cwd=$(pwd 2>/dev/null | sed 's/"/\\"/g' || true)
   _cmd=$(printf '%s' "$_ATTEMPT_CMD" | sed 's/"/\\"/g')
   _caller=null
-  if command -v jq >/dev/null 2>&1 && [ -n "${CF_HOME:-}" ] && [ -f "${CF_HOME}/identity.json" ]; then
-    _pk=$(jq -r '.public_key // empty' "${CF_HOME}/identity.json" 2>/dev/null | cut -c1-8 2>/dev/null || true)
+  # Prefer AGENT_CF_HOME/identity.json (actual signing agent) over DG_HOME fallback.
+  _id_src=""
+  if [ -n "${AGENT_CF_HOME:-}" ] && [ -f "${AGENT_CF_HOME}/identity.json" ]; then
+    _id_src="${AGENT_CF_HOME}/identity.json"
+  elif [ -n "${CF_HOME:-}" ] && [ -f "${CF_HOME}/identity.json" ]; then
+    _id_src="${CF_HOME}/identity.json"
+  fi
+  if command -v jq >/dev/null 2>&1 && [ -n "$_id_src" ]; then
+    _pk=$(jq -r '.public_key // empty' "$_id_src" 2>/dev/null | cut -c1-8 2>/dev/null || true)
     case "$_pk" in
       [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _caller="\"${_pk}\"";;
     esac
@@ -339,10 +356,10 @@ if [ "$_i_started_operator" -eq 1 ]; then
 fi
 
 # Run cf, tee stderr to both terminal and capture file, classify, log, exit.
-# Always pass --cf-home "$DG_HOME" so exchange operations use the pinned exchange
-# identity regardless of how CF_HOME is set in the caller's environment.
-# This is the key that allows subagents with per-session CF_HOME to reach the
-# exchange: their CF_HOME has no identity, but DG_HOME always does.
+# Signing operations (buy, put, settle) use --cf-home $_SIGNING_HOME so each
+# agent signs with its own key when AGENT_CF_HOME is set. Exchange routing
+# (campfire ID, PID, health probe, operator serve) always uses DG_HOME.
+# When AGENT_CF_HOME is unset, _SIGNING_HOME == DG_HOME: identical to prior behavior.
 _STDERR_TMP=$(mktemp 2>/dev/null) || _STDERR_TMP=""
 if [ -n "$_STDERR_TMP" ]; then
   # POSIX-compatible stderr tee via named pipe.
@@ -352,12 +369,12 @@ if [ -n "$_STDERR_TMP" ]; then
   if [ -n "$_STDERR_FIFO" ]; then
     tee "$_STDERR_TMP" >&2 < "$_STDERR_FIFO" &
     _TEE_PID=$!
-    "$CF" --cf-home "$DG_HOME" "$XCFID" "$@" 2>"$_STDERR_FIFO"
+    "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@" 2>"$_STDERR_FIFO"
     _CF_EXIT=$?
     wait "$_TEE_PID" 2>/dev/null || true
   else
     # Fallback: capture only, replay after
-    "$CF" --cf-home "$DG_HOME" "$XCFID" "$@" 2>"$_STDERR_TMP"
+    "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@" 2>"$_STDERR_TMP"
     _CF_EXIT=$?
     cat "$_STDERR_TMP" >&2
   fi
@@ -367,7 +384,7 @@ if [ -n "$_STDERR_TMP" ]; then
   exit "$_CF_EXIT"
 else
   # mktemp failed; run without logging (fail-safe)
-  exec "$CF" --cf-home "$DG_HOME" "$XCFID" "$@"
+  exec "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@"
 fi
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"
