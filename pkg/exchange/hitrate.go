@@ -51,6 +51,29 @@ type HitRateOptions struct {
 	// signal from the toolrank lineage (docs/heritage/). §4.6 of
 	// docs/design/exchange-per-agent-identity-decision.md.
 	EntryBuyerMap map[string]map[string]struct{}
+
+	// ConsumeCountByEntry maps entry_id → number of exchange:consume signals
+	// for that entry. Used to compute net-savings economics (Track C, dontguess-eff):
+	// a hit counts as "saved_on_real_hits" only when the delivered entry was
+	// consumed (settled-complete). Un-consumed delivered entries count as
+	// false-positive waste.
+	//
+	// Build this from exchange consume messages using ConsumeCountByEntry(consumes)
+	// before calling ComputeHitRate. When nil, all above-floor hits are treated as
+	// consumed (net-savings = token_cost saved; false_positive_waste = 0).
+	//
+	// The consume signal is the authoritative "buyer used it" behavioral signal —
+	// stronger than a hit (which only means the matcher returned a candidate).
+	// See TagConsume, emitConsumeSignal in engine.go, and §2 of
+	// docs/design/exchange-token-savings-v06.md.
+	ConsumeCountByEntry map[string]int
+
+	// MissCostPerQuery is the token overhead charged per buy that returns no
+	// usable match. Default (when 0) is DefaultMissCostPerQuery (500 tokens),
+	// the ~500-token overhead of a buy round-trip per §1 of
+	// docs/design/exchange-token-savings-v06.md. Override in tests or when the
+	// actual measured overhead differs.
+	MissCostPerQuery int64
 }
 
 // HitRateReport is the result of reconciling buy orders against match-results.
@@ -146,6 +169,88 @@ type HitRateReport struct {
 	// Sourced from opts.EntryBuyerMap (populated by BuildConvergenceMap). When
 	// opts.EntryBuyerMap is nil, CrossAgentConvergence is always 0.
 	CrossAgentConvergence int `json:"cross_agent_convergence"`
+
+	// --- Net token-savings economics (Track C, dontguess-eff) ---
+	// Per docs/design/exchange-token-savings-v06.md §1:
+	//   net_tokens_saved = saved_on_real_hits − miss_costs − false_positive_waste
+
+	// NetTokensSaved is the overall net tokens saved across all buys in the window:
+	//   SavedOnRealHits − TotalMissCost − TotalFalsePositiveWaste
+	//
+	// Positive = the exchange is saving tokens on net. Negative = more waste than value.
+	// This is the primary v0.6 optimization target ("escape velocity").
+	NetTokensSaved int64 `json:"net_tokens_saved"`
+
+	// SavedOnRealHits is the sum of token_cost_original for above-floor hits whose
+	// top delivered entry was subsequently consumed (settle-complete). These are the
+	// buys where the exchange provably saved the buyer from re-deriving.
+	//
+	// When opts.ConsumeCountByEntry is nil, all above-floor hits are treated as
+	// consumed (conservative assumption: every hit saved the buyer).
+	SavedOnRealHits int64 `json:"saved_on_real_hits"`
+
+	// TotalMissCost is the total token overhead for all miss buys:
+	//   Misses × MissCostPerQuery (default: 500 per §1)
+	//
+	// Each miss costs the buyer ~500 tokens in round-trip overhead with no value
+	// delivered. This is the recurring tax paid for a low hit rate.
+	TotalMissCost int64 `json:"total_miss_cost"`
+
+	// TotalFalsePositiveWaste is the sum of token_cost_original for above-floor
+	// hits whose top delivered entry was NOT consumed. These buyers received a
+	// result, paid for it (or at minimum, read it), but re-derived anyway.
+	//
+	// Per §1: "A false positive is worse than a miss." A false positive consumes
+	// buyer tokens reading irrelevant content AND requires re-derivation. This is
+	// the waste the relevance floor was designed to eliminate — but it still occurs
+	// when above-floor matches are semantically adjacent but not actually useful.
+	//
+	// Zero when opts.ConsumeCountByEntry is nil (consume signal unavailable).
+	TotalFalsePositiveWaste int64 `json:"total_false_positive_waste"`
+
+	// PerQueryEconomics is the per-buy breakdown used for A/B'ing floor/embedding/
+	// ranking changes against real net savings. Each element corresponds to one
+	// non-synthetic, answered buy order.
+	//
+	// Ordered by outcome severity: hits first, then false-positives, then misses.
+	// Callers may sort/filter by Saved to identify which queries are the largest
+	// contributors or detractors.
+	//
+	// Empty (not nil) when there are no answered buys.
+	PerQueryEconomics []QueryEconomics `json:"per_query_economics"`
+}
+
+// DefaultMissCostPerQuery is the token overhead assumed per buy that returns no
+// usable match. Per §1 of docs/design/exchange-token-savings-v06.md: "miss_costs
+// — the ~500-token overhead of a buy that returns no usable match."
+//
+// This is the round-trip cost a buyer pays when there is no cache hit: the tokens
+// spent on the buy request, routing, and processing a miss response. Override via
+// HitRateOptions.MissCostPerQuery if the measured overhead differs.
+const DefaultMissCostPerQuery = int64(500)
+
+// QueryEconomics captures the token-savings economics for a single buy order.
+// Used to surface per-query A/B signals when evaluating floor/embedding/ranking
+// changes (Track C, dontguess-eff). See docs/design/exchange-token-savings-v06.md §1.
+type QueryEconomics struct {
+	// BuyID is the buy message ID this record belongs to.
+	BuyID string `json:"buy_id"`
+
+	// Outcome is the final classification of this buy: "hit", "miss",
+	// "false_positive" (delivered above-floor but not consumed), or "pending".
+	Outcome string `json:"outcome"`
+
+	// TokenCostOriginal is the token_cost of the top delivered entry, or 0 for
+	// misses and pending buys. This is the tokens the buyer WOULD have spent if
+	// they had re-derived the result themselves — the potential saving.
+	TokenCostOriginal int64 `json:"token_cost_original,omitempty"`
+
+	// Saved is the net tokens saved by this query:
+	//   hit (consumed):     +token_cost_original
+	//   miss:               −miss_cost_per_query
+	//   false_positive:     −false_positive_waste (token_cost_original re-derive cost)
+	//   pending:            0
+	Saved int64 `json:"saved"`
 }
 
 // isMessageSynthetic reports whether a message carries the exchange:synthetic tag.
@@ -222,6 +327,40 @@ func matchTopSimilarity(m *Message) (float64, bool) {
 		return 0, false
 	}
 	return *p.Results[0].Similarity, true
+}
+
+// matchTopTokenCost extracts the "token_cost_original" field of the top result
+// entry from a hit match-result payload. Returns 0 when absent or unparseable.
+//
+// token_cost_original is the seller's declared token cost for the entry —
+// approximately the tokens the buyer would spend re-deriving it from scratch.
+// It is the basis for saved_on_real_hits and false_positive_waste calculations.
+// See MatchResult.TokenCostOriginal in engine.go.
+func matchTopTokenCost(m *Message) int64 {
+	var p struct {
+		Results []struct {
+			TokenCostOriginal int64 `json:"token_cost_original"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(m.Payload, &p); err != nil || len(p.Results) == 0 {
+		return 0
+	}
+	return p.Results[0].TokenCostOriginal
+}
+
+// matchTopEntryID extracts the "entry_id" field of the top result entry from a
+// hit match-result payload. Returns empty string when absent or unparseable.
+// Used to look up whether the buyer consumed the delivered entry (consume signal).
+func matchTopEntryID(m *Message) string {
+	var p struct {
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
+	}
+	if err := json.Unmarshal(m.Payload, &p); err != nil || len(p.Results) == 0 {
+		return ""
+	}
+	return p.Results[0].EntryID
 }
 
 // matchTopDescription extracts the "description" field of the top result entry
@@ -366,6 +505,12 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 		}
 	}
 
+	// Resolve miss cost per query (defaults to DefaultMissCostPerQuery when unset).
+	missCostPerQuery := o.MissCostPerQuery
+	if missCostPerQuery <= 0 {
+		missCostPerQuery = DefaultMissCostPerQuery
+	}
+
 	// Best outcome per real buy. We track the best quality-gate outcome across
 	// all match-results for a given buy. The ranking is:
 	//   qualityGateHit > qualityGateRecomputedHit > qualityGateUnverifiable >
@@ -373,10 +518,16 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 	//
 	// We use a simple bool map for hit tracking, plus a separate
 	// unverifiableOnly map for buys whose best outcome is unverifiable.
+	//
+	// For net-savings economics (Track C, dontguess-eff), we also track:
+	//   - topEntryID: the entry_id of the top delivered result (for consume lookup)
+	//   - topTokenCost: token_cost_original of the top delivered result
 	type buyOutcome struct {
-		hit          bool // true once a hit (above-floor) result is seen
-		unverifiable bool // true if best outcome so far is unverifiable (no verified hit yet)
-		miss         bool // true if at least one result was seen (and none were hits)
+		hit           bool   // true once a hit (above-floor) result is seen
+		unverifiable  bool   // true if best outcome so far is unverifiable (no verified hit yet)
+		miss          bool   // true if at least one result was seen (and none were hits)
+		topEntryID    string // entry_id of the top delivered result (for consume lookup)
+		topTokenCost  int64  // token_cost_original of the top delivered result
 	}
 	outcomeByBuy := make(map[string]*buyOutcome)
 	var unjoinable, realMatchResults int
@@ -426,9 +577,14 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 		switch outcome {
 		case qualityGateHit:
 			bo.hit = true
+			// Record the top delivered entry for consume-signal lookup.
+			bo.topEntryID = matchTopEntryID(m)
+			bo.topTokenCost = matchTopTokenCost(m)
 		case qualityGateRecomputedHit:
 			bo.hit = true
 			recomputedSimilarity++
+			bo.topEntryID = matchTopEntryID(m)
+			bo.topTokenCost = matchTopTokenCost(m)
 		case qualityGateRecomputedMiss:
 			recomputedSimilarity++
 			belowFloorDowngraded++
@@ -477,20 +633,81 @@ func ComputeHitRate(buys, matches []Message, opts ...HitRateOptions) HitRateRepo
 		}
 	}
 
+	// --- Net token-savings economics (Track C, dontguess-eff) ---
+	// Per §1 of docs/design/exchange-token-savings-v06.md:
+	//   net_tokens_saved = saved_on_real_hits − miss_costs − false_positive_waste
+	//
+	// For each hit buy:
+	//   - If opts.ConsumeCountByEntry is non-nil: a hit is "real" only when the
+	//     entry was consumed (consume count > 0). Un-consumed = false positive.
+	//   - If opts.ConsumeCountByEntry is nil: all hits are treated as real
+	//     (conservative/legacy assumption: every hit saved the buyer).
+	var savedOnRealHits, totalMissCost, totalFalsePositiveWaste int64
+	perQueryEconomics := make([]QueryEconomics, 0, matchedBuys)
+
+	for buyID, bo := range outcomeByBuy {
+		switch {
+		case bo.hit:
+			consumed := true // default: treat as consumed when signal unavailable
+			if o.ConsumeCountByEntry != nil {
+				consumed = o.ConsumeCountByEntry[bo.topEntryID] > 0
+			}
+			if consumed {
+				// Real hit: buyer avoided re-deriving. Save = token_cost_original.
+				savedOnRealHits += bo.topTokenCost
+				perQueryEconomics = append(perQueryEconomics, QueryEconomics{
+					BuyID:             buyID,
+					Outcome:           "hit",
+					TokenCostOriginal: bo.topTokenCost,
+					Saved:             bo.topTokenCost,
+				})
+			} else {
+				// False positive: buyer received result but didn't use it.
+				// Per §1: "A false positive is worse than a miss." The buyer wasted
+				// time reading an irrelevant entry and still had to re-derive.
+				totalFalsePositiveWaste += bo.topTokenCost
+				perQueryEconomics = append(perQueryEconomics, QueryEconomics{
+					BuyID:             buyID,
+					Outcome:           "false_positive",
+					TokenCostOriginal: bo.topTokenCost,
+					Saved:             -bo.topTokenCost,
+				})
+			}
+		case bo.unverifiable && !bo.miss:
+			// Unverifiable hits: we cannot compute economics without consume data.
+			// Omit from per-query economics (they're excluded from HitRatePct too).
+		default:
+			// Miss: buyer paid the round-trip overhead with no value delivered.
+			totalMissCost += missCostPerQuery
+			perQueryEconomics = append(perQueryEconomics, QueryEconomics{
+				BuyID:  buyID,
+				Outcome: "miss",
+				Saved:  -missCostPerQuery,
+			})
+		}
+	}
+
+	netTokensSaved := savedOnRealHits - totalMissCost - totalFalsePositiveWaste
+
 	rep := HitRateReport{
-		TotalBuys:              len(buyIDs),
-		MatchedBuys:            matchedBuys,
-		PendingBuys:            len(buyIDs) - matchedBuys,
-		Hits:                   hits,
-		Misses:                 misses,
-		BelowFloorDowngraded:   belowFloorDowngraded,
-		RecomputedSimilarity:   recomputedSimilarity,
-		UnverifiableHits:       unverifiableHits,
-		HitRatePct:             hitRatePct,
-		MatchResultsTotal:      realMatchResults,
-		UnjoinableMatchResults: unjoinable,
-		SyntheticExcluded:      syntheticExcluded,
-		CrossAgentConvergence:  crossAgentConvergence,
+		TotalBuys:               len(buyIDs),
+		MatchedBuys:             matchedBuys,
+		PendingBuys:             len(buyIDs) - matchedBuys,
+		Hits:                    hits,
+		Misses:                  misses,
+		BelowFloorDowngraded:    belowFloorDowngraded,
+		RecomputedSimilarity:    recomputedSimilarity,
+		UnverifiableHits:        unverifiableHits,
+		HitRatePct:              hitRatePct,
+		MatchResultsTotal:       realMatchResults,
+		UnjoinableMatchResults:  unjoinable,
+		SyntheticExcluded:       syntheticExcluded,
+		CrossAgentConvergence:   crossAgentConvergence,
+		NetTokensSaved:          netTokensSaved,
+		SavedOnRealHits:         savedOnRealHits,
+		TotalMissCost:           totalMissCost,
+		TotalFalsePositiveWaste: totalFalsePositiveWaste,
+		PerQueryEconomics:       perQueryEconomics,
 	}
 	return rep
 }

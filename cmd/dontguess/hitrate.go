@@ -178,6 +178,14 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 	if err != nil {
 		return fmt.Errorf("read match-results: %w", err)
 	}
+	// Consume signals carry the exchange:consume tag (emitted on settle-complete).
+	// Used for net-savings economics: a hit is "real" only when the entry was consumed.
+	consumes, err := readTaggedMessages(client, cfID, exchange.TagConsume, cutoffNano)
+	if err != nil {
+		// Non-fatal: log and continue with consume unavailable (all hits treated as real).
+		fmt.Fprintf(os.Stderr, "warning: could not read consume signals: %v\n", err)
+		consumes = nil
+	}
 
 	// Build cross-agent convergence map from full exchange history (dontguess-412).
 	// Replay all messages (unfiltered by --since) into a fresh State to accumulate
@@ -193,11 +201,13 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 	// Build quality-weighted options (M-rebaseline, dontguess-af8).
 	// MinSimilarity references the M1 floor constant — does NOT hardcode 0.16.
 	// Embedder is a TF-IDF instance primed with the full corpus for recompute.
+	// ConsumeCountByEntry provides the consume signal for net-savings economics (Track C).
 	opts := exchange.HitRateOptions{
-		MinSimilarity: matching.DefaultMinSimilarity(),
-		Embedder:      buildRecomputeEmbedder(buys, matches),
-		BuyTasks:      buildBuyTaskMap(buys),
-		EntryBuyerMap: convergenceMap,
+		MinSimilarity:       matching.DefaultMinSimilarity(),
+		Embedder:            buildRecomputeEmbedder(buys, matches),
+		BuyTasks:            buildBuyTaskMap(buys),
+		EntryBuyerMap:       convergenceMap,
+		ConsumeCountByEntry: exchange.ConsumeCountByEntry(consumes),
 	}
 
 	rep := exchange.ComputeHitRate(buys, matches, opts)
@@ -255,4 +265,33 @@ func printHitRate(rep exchange.HitRateReport, since time.Duration, asJSON bool) 
 	fmt.Printf("  unjoinable:         %d  (match-result with no buy in window)\n", rep.UnjoinableMatchResults)
 	fmt.Println()
 	fmt.Printf("  cross-agent convergence: %d  (inventory entries bought by 3+ distinct agent keys)\n", rep.CrossAgentConvergence)
+	fmt.Println()
+	fmt.Printf("=== net token savings (Track C, dontguess-eff) ===\n\n")
+	fmt.Printf("  NET TOKENS SAVED:       %+d  (saved_on_hits − miss_costs − false_positive_waste)\n", rep.NetTokensSaved)
+	fmt.Printf("  saved on real hits:     %d\n", rep.SavedOnRealHits)
+	fmt.Printf("  miss overhead:          %d  (%d misses × ~%d tokens/miss)\n",
+		rep.TotalMissCost, rep.Misses, exchange.DefaultMissCostPerQuery)
+	fmt.Printf("  false-positive waste:   %d  (delivered+unconsumed entries re-derived)\n", rep.TotalFalsePositiveWaste)
+	if len(rep.PerQueryEconomics) > 0 {
+		fmt.Println()
+		fmt.Printf("  per-query economics (%d answered):\n", len(rep.PerQueryEconomics))
+		for _, q := range rep.PerQueryEconomics {
+			marker := " "
+			if q.Saved > 0 {
+				marker = "+"
+			} else if q.Saved < 0 {
+				marker = "-"
+			}
+			fmt.Printf("    [%s] %-16s %s%d tokens  (entry token_cost=%d)\n",
+				q.Outcome, q.BuyID, marker, abs64(q.Saved), q.TokenCostOriginal)
+		}
+	}
+}
+
+// abs64 returns the absolute value of a int64.
+func abs64(n int64) int64 {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

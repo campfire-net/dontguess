@@ -537,6 +537,183 @@ func TestBuildConvergenceMap_MultiSeller(t *testing.T) {
 	}
 }
 
+// hitMatchWithSimEntry builds a HIT exchange:match fixture with explicit entry_id,
+// token_cost_original, and similarity — the full shape needed for net-savings
+// economics tests (Track C, dontguess-eff).
+func hitMatchWithSimEntry(id, buyID, entryID, description string, similarity float64, tokenCost int64) Message {
+	payload := fmt.Sprintf(
+		`{"results":[{"entry_id":%q,"put_msg_id":"p1","seller_key":"s1",`+
+			`"description":%q,`+
+			`"content_hash":"sha256:ab","content_type":"code","price":120,`+
+			`"confidence":0.55,"similarity":%g,`+
+			`"is_partial_match":false,"seller_reputation":80,`+
+			`"token_cost_original":%d,"age_hours":3}],`+
+			`"search_meta":{"total_candidates":5},"guide":"..."}`,
+		entryID, description, similarity, tokenCost,
+	)
+	return Message{
+		ID:          id,
+		Tags:        []string{TagMatch},
+		Antecedents: []string{buyID},
+		Payload:     []byte(payload),
+	}
+}
+
+// TestNetTokensSaved_FixtureThreeCases is the Track C (dontguess-eff) acceptance
+// test for the net-tokens-saved reporter extension. It covers the three required
+// fixture scenarios from the item DONE condition:
+//
+//  1. Real hit (positive): above-floor delivered result + consumed → SavedOnRealHits > 0
+//  2. Miss (negative): buy-miss → TotalMissCost > 0
+//  3. False-positive delivery (negative): above-floor delivered + NOT consumed
+//     → TotalFalsePositiveWaste > 0
+//
+// All three cases run through the real ComputeHitRate path — no mocks of the
+// reporter under test. The consume signal is supplied via opts.ConsumeCountByEntry
+// (populated by ConsumeCountByEntry from exchange:consume messages), which is the
+// same path the CLI uses.
+//
+// The test also verifies that the existing quality-weighting (similarity floor)
+// and synthetic-exclusion invariants are NOT regressed by the extension.
+func TestNetTokensSaved_FixtureThreeCases(t *testing.T) {
+	floor := matching.DefaultMinSimilarity()
+	aboveSim := floor + 0.20
+	if aboveSim > 1.0 {
+		aboveSim = 1.0
+	}
+
+	// Three buy orders:
+	//   buy-real-hit:         delivered above-floor, entry CONSUMED → real hit
+	//   buy-false-positive:   delivered above-floor, entry NOT consumed → false positive
+	//   buy-miss:             no matching inventory → miss
+	buys := []Message{
+		buyMsg("buy-real-hit", "campfire convention dispatch lifecycle management"),
+		buyMsg("buy-false-positive", "Go flock contention test pattern"),
+		buyMsg("buy-miss", "zzqq nonsense xyzzy no such cached inference"),
+	}
+
+	// Match for real hit: entry "entry-consumed", token_cost 2000.
+	matchRealHit := hitMatchWithSimEntry(
+		"m-real-hit", "buy-real-hit",
+		"entry-consumed",
+		"campfire convention dispatch lifecycle: declare, claim, revoke",
+		aboveSim, 2000,
+	)
+
+	// Match for false positive: entry "entry-unconsumed", token_cost 1500.
+	matchFalsePositive := hitMatchWithSimEntry(
+		"m-false-positive", "buy-false-positive",
+		"entry-unconsumed",
+		"Go flock contention test pattern for exclusive file locks",
+		aboveSim, 1500,
+	)
+
+	// Miss match: buy-miss has no matching inventory.
+	matchMiss := missMatch("m-miss", "buy-miss")
+
+	matches := []Message{matchRealHit, matchFalsePositive, matchMiss}
+
+	// Build consume signal: only "entry-consumed" was consumed (settle-complete).
+	// "entry-unconsumed" has no consume signal → false positive.
+	consumeMsg := Message{
+		ID:          "consume-1",
+		Tags:        []string{TagConsume},
+		Antecedents: []string{"settle-1"},
+		Payload:     []byte(`{"entry_id":"entry-consumed","buyer_key":"buyer-key-1"}`),
+	}
+	consumeCounts := ConsumeCountByEntry([]Message{consumeMsg})
+
+	opts := HitRateOptions{
+		MinSimilarity:       floor,
+		ConsumeCountByEntry: consumeCounts,
+	}
+
+	rep := ComputeHitRate(buys, matches, opts)
+
+	t.Logf("floor=%.4f above=%.4f", floor, aboveSim)
+	t.Logf("report: total=%d hits=%d misses=%d rate=%.2f%%", rep.TotalBuys, rep.Hits, rep.Misses, rep.HitRatePct)
+	t.Logf("net savings: total=%d saved=%d miss_cost=%d fp_waste=%d",
+		rep.NetTokensSaved, rep.SavedOnRealHits, rep.TotalMissCost, rep.TotalFalsePositiveWaste)
+
+	// --- v0.5.0 invariants: quality-weighting and synthetic-exclusion NOT regressed ---
+	if rep.TotalBuys != 3 {
+		t.Errorf("TotalBuys = %d, want 3", rep.TotalBuys)
+	}
+	if rep.Hits != 2 {
+		// Both above-floor delivered results count as hits (quality gate), regardless
+		// of consume status. The consume signal only affects net-savings, not hit-rate.
+		t.Errorf("Hits = %d, want 2 (both above-floor results pass quality gate)", rep.Hits)
+	}
+	if rep.Misses != 1 {
+		t.Errorf("Misses = %d, want 1", rep.Misses)
+	}
+	if rep.SyntheticExcluded != 0 {
+		t.Errorf("SyntheticExcluded = %d, want 0 (no synthetic buys in this fixture)", rep.SyntheticExcluded)
+	}
+
+	// --- Scenario 1: real hit (positive contribution) ---
+	// entry-consumed has consume count > 0 → saved_on_real_hits = 2000.
+	if rep.SavedOnRealHits != 2000 {
+		t.Errorf("SavedOnRealHits = %d, want 2000 (entry-consumed token_cost)", rep.SavedOnRealHits)
+	}
+
+	// --- Scenario 2: miss (negative contribution) ---
+	// 1 miss × DefaultMissCostPerQuery (500) = 500.
+	wantMissCost := int64(1) * DefaultMissCostPerQuery
+	if rep.TotalMissCost != wantMissCost {
+		t.Errorf("TotalMissCost = %d, want %d (1 miss × %d per query)",
+			rep.TotalMissCost, wantMissCost, DefaultMissCostPerQuery)
+	}
+
+	// --- Scenario 3: false-positive delivery (negative contribution) ---
+	// entry-unconsumed was delivered (above-floor hit) but not consumed.
+	// false_positive_waste = token_cost_original = 1500.
+	if rep.TotalFalsePositiveWaste != 1500 {
+		t.Errorf("TotalFalsePositiveWaste = %d, want 1500 (entry-unconsumed token_cost)", rep.TotalFalsePositiveWaste)
+	}
+
+	// --- Net savings: 2000 − 500 − 1500 = 0 in this fixture ---
+	wantNet := int64(2000) - wantMissCost - int64(1500)
+	if rep.NetTokensSaved != wantNet {
+		t.Errorf("NetTokensSaved = %d, want %d (2000 − %d − 1500)",
+			rep.NetTokensSaved, wantNet, wantMissCost)
+	}
+
+	// --- Per-query economics: 3 answered buys → 3 entries (hit, false_positive, miss) ---
+	if len(rep.PerQueryEconomics) != 3 {
+		t.Errorf("len(PerQueryEconomics) = %d, want 3", len(rep.PerQueryEconomics))
+	}
+
+	// Verify the outcomes are correctly classified in per-query economics.
+	outcomeMap := make(map[string]string, 3)
+	savedMap := make(map[string]int64, 3)
+	for _, q := range rep.PerQueryEconomics {
+		outcomeMap[q.BuyID] = q.Outcome
+		savedMap[q.BuyID] = q.Saved
+	}
+
+	if outcomeMap["buy-real-hit"] != "hit" {
+		t.Errorf("buy-real-hit outcome = %q, want hit", outcomeMap["buy-real-hit"])
+	}
+	if savedMap["buy-real-hit"] != 2000 {
+		t.Errorf("buy-real-hit Saved = %d, want 2000", savedMap["buy-real-hit"])
+	}
+
+	if outcomeMap["buy-false-positive"] != "false_positive" {
+		t.Errorf("buy-false-positive outcome = %q, want false_positive", outcomeMap["buy-false-positive"])
+	}
+	if savedMap["buy-false-positive"] != -1500 {
+		t.Errorf("buy-false-positive Saved = %d, want -1500", savedMap["buy-false-positive"])
+	}
+
+	if outcomeMap["buy-miss"] != "miss" {
+		t.Errorf("buy-miss outcome = %q, want miss", outcomeMap["buy-miss"])
+	}
+	if savedMap["buy-miss"] != -DefaultMissCostPerQuery {
+		t.Errorf("buy-miss Saved = %d, want %d", savedMap["buy-miss"], -DefaultMissCostPerQuery)
+	}
+}
+
 // buyMsgIDFor prefers the antecedent and falls back to payload buy_msg_id.
 func TestBuyMsgIDFor(t *testing.T) {
 	withAnt := hitMatch("m-1", "buy-1")
