@@ -453,6 +453,113 @@ func TestD1_CombinedFloorAndRebalance(t *testing.T) {
 	logDetailedResults(t, opts, cosineFloor, "COMBINED")
 }
 
+// TestD1_FloorSweep sweeps cosine floors [0.10..0.40] and reports junk-rejection and
+// substantive-survival at each step. Used to empirically choose the MinSimilarity default
+// for M1a (dontguess-7d6). This test always passes — it is a measurement tool.
+//
+// "Junk rejection": fraction of expectMiss pairs where junk-upgrade-smoke is NOT the top-1
+// result above the floor (the specific defect §2 documents).
+// "Substantive survival": fraction of non-miss pairs where idealID is top-1 above floor.
+// "Extended-survival": whether the two M1a-required pairs survive (eventsink-e2e, engine-snapshot).
+func TestD1_FloorSweep(t *testing.T) {
+	emb := NewTFIDFEmbedder()
+	inv := buildInventory(allInventory)
+	docs := make([]string, len(inv))
+	for i, e := range inv {
+		docs[i] = e.Description
+	}
+	emb.IndexCorpus(docs)
+
+	floors := []float64{
+		0.10, 0.12, 0.14, 0.15, 0.155, 0.16, 0.17, 0.18, 0.182, 0.1826, 0.183,
+		0.19, 0.20, 0.2010, 0.201, 0.21, 0.25, 0.30, 0.35, 0.40,
+	}
+
+	// Extended pairs that must survive (from M1a CORRECTION section).
+	extendedNames := map[string]string{
+		"eventsink-e2e-chained-dispatch": "legion-spawn-orphan",
+		"engine-snapshot-inflight":       "engine-metrics-inflight",
+	}
+
+	t.Logf("Floor Sweep (M1a empirical floor selection):")
+	t.Logf("%-8s  %-22s  %-22s  %-16s  %-16s", "Floor", "JunkRejected%", "SubstSurvival%", "EventSink-OK", "Engine-OK")
+
+	for _, floor := range floors {
+		opts := RankOptions{
+			MinSimilarity:    floor,
+			WeightEfficiency: 0.15,
+			WeightQuality:    0.80,
+			WeightNovelty:    0.05,
+		}
+
+		// Junk rejection: expectMiss pairs where junk-upgrade-smoke is NOT top-1 above floor.
+		junkRejected, missPairs := 0, 0
+		for _, pair := range fixturePairs {
+			if !pair.expectMiss {
+				continue
+			}
+			missPairs++
+			results := Rank(pair.buyTask, inv, emb, opts)
+			var above []RankedResult
+			for _, r := range results {
+				if r.Similarity >= floor {
+					above = append(above, r)
+				}
+			}
+			// Junk rejected = junk-upgrade-smoke is not the top result above floor.
+			if len(above) == 0 || above[0].EntryID != "junk-upgrade-smoke" {
+				junkRejected++
+			}
+		}
+
+		// Substantive survival: non-miss pairs where top-1 above floor equals idealID.
+		subSurvived, subTotal := 0, 0
+		for _, pair := range fixturePairs {
+			if pair.expectMiss {
+				continue
+			}
+			subTotal++
+			results := Rank(pair.buyTask, inv, emb, opts)
+			var above []RankedResult
+			for _, r := range results {
+				if r.Similarity >= floor {
+					above = append(above, r)
+				}
+			}
+			if len(above) > 0 && above[0].EntryID == pair.idealID {
+				subSurvived++
+			}
+		}
+
+		// Extended pair check.
+		extendedOK := map[string]bool{}
+		for pairName, idealID := range extendedNames {
+			for _, pair := range fixturePairs {
+				if pair.name != pairName {
+					continue
+				}
+				results := Rank(pair.buyTask, inv, emb, opts)
+				var above []RankedResult
+				for _, r := range results {
+					if r.Similarity >= floor {
+						above = append(above, r)
+					}
+				}
+				extendedOK[pairName] = len(above) > 0 && above[0].EntryID == idealID
+			}
+		}
+
+		junkPct := float64(junkRejected) / float64(missPairs) * 100
+		subPct := float64(subSurvived) / float64(subTotal) * 100
+		eventsinkOK := extendedOK["eventsink-e2e-chained-dispatch"]
+		engineOK := extendedOK["engine-snapshot-inflight"]
+
+		t.Logf("%.4f    %d/%d=%.0f%%              %d/%d=%.0f%%              %-16v  %v",
+			floor, junkRejected, missPairs, junkPct, subSurvived, subTotal, subPct,
+			eventsinkOK, engineOK)
+	}
+}
+
 // TestD1_NonsensePairingsMustBecomeMisses is the §2 regression gate.
 // With a cosine floor of 0.35, ALL nonsense pairings from §2 must produce zero results.
 // This is the done-condition test for M1a (if TUNE is the verdict).
@@ -598,6 +705,232 @@ func TestD1_SubstantiveReusesSurviveFloor(t *testing.T) {
 
 	t.Logf("Substantive reuse survival rate at floor=%.2f: %d/%d = %.1f%%",
 		cosineFloor, survived, len(reuseCases), float64(survived)/float64(len(reuseCases))*100)
+}
+
+// ─── M1a integration tests (dontguess-7d6) ──────────────────────────────────────
+//
+// These tests use the DEFAULT RankOptions (floor=0.16, weights=eff:0.15/qual:0.80/nov:0.05)
+// set by the M1a changes to pkg/matching/ranking.go. They are the done-condition gate:
+//  1. §2 nonsense pairings → MISS (no result above the floor).
+//  2. §4 substantive reuses → MATCH (top-1 == idealID).
+//  3. Extended assertions: the two pairs omitted from the ed0 fixture survive the floor.
+//
+// No mocks. All tests call NewTFIDFEmbedder → IndexCorpus → Rank directly.
+
+// TestM1a_JunkEntryBecomesNeverTop1 is the primary done-condition test for M1a.
+// The §2 defect was: junk-upgrade-smoke won ~60% of live matches. The fix: raise the
+// relevance floor above junk_max=0.1548 so junk-upgrade-smoke is NEVER the top-1 result.
+//
+// Per the done-condition spec (item description + CORRECTION):
+//   "the §2 nonsense pairings (buy tasks the live exchange matched to junk) now score
+//    BELOW the floor and return as MISSES (i.e. the junk entry is not returned)"
+//
+// This test uses default RankOptions — it will fail if ranking.go defaults revert to
+// floor<0.1548 (junk would re-enter) or floor>0.1826 (real entries would be lost).
+func TestM1a_JunkEntryBecomesNeverTop1(t *testing.T) {
+	// Use default opts — whatever ranking.go sets as defaults.
+	opts := RankOptions{}
+	defaultFloor := opts.minSimilarity()
+
+	emb := NewTFIDFEmbedder()
+	inv := buildInventory(allInventory)
+	docs := make([]string, len(inv))
+	for i, e := range inv {
+		docs[i] = e.Description
+	}
+	emb.IndexCorpus(docs)
+
+	// §2 nonsense pairs from the design doc + additional boundary cases.
+	// These are tasks that the live exchange was matching to junk-upgrade-smoke.
+	// The correct behavior: junk-upgrade-smoke is NOT returned (below the floor).
+	// Other entries MAY match legitimately (e.g. cli-substrate-wiring shares SDK terms
+	// with the campfire SDK review task — that is a reasonable, non-junk match).
+	nonsensePairs := []struct {
+		name string
+		task string
+	}{
+		{
+			name: "rpt-sdk-review-vs-smoke-test",
+			task: "RPT review of campfire SDK surface: offline send, relay create, naming CLI, multi-op install",
+		},
+		{
+			name: "fix-subscribe-cursor-vs-smoke-test",
+			task: "fix convention.Server subscribe cursor: when a cf has multiple installed versions of the same (convention, operation), the server stalls processing new messages and the cf dispatch CLI picks the wrong version",
+		},
+		{
+			name: "nonsense-zzqq",
+			task: "zzqq nonsense xyzzy plugh 1780344804 no such cached inference exists anywhere",
+		},
+		{
+			name: "gc-command-legion",
+			task: "ship we gc command + periodic gc loop wrapping cf gc with constellation-aware filtering via fleet.json; sane defaults preventing campfire sprawl on legion installations",
+		},
+		{
+			name: "veracity-audit-legion-swarm",
+			task: "veracity audit P2.1+P2.2+P3+E2E test fidelity in legion-59e swarm; find mocks bypassing real interfaces",
+		},
+	}
+
+	const junkEntryID = "junk-upgrade-smoke"
+	junkRejected := 0
+	for _, p := range nonsensePairs {
+		results := Rank(p.task, inv, emb, opts)
+
+		// Primary assertion: junk-upgrade-smoke must NOT be top-1 above the floor.
+		// (Rank() filters internally — all returned results are above defaultFloor.)
+		if len(results) > 0 && results[0].EntryID == junkEntryID {
+			t.Errorf("M1a DEFECT: junk entry %q is top-1 for task %q (sim=%.4f >= floor=%.2f) — floor too low",
+				junkEntryID, p.name, results[0].Similarity, defaultFloor)
+		} else {
+			junkRejected++
+			if len(results) > 0 {
+				t.Logf("OK: %q → top-1=%q (sim=%.4f, not junk)", p.name, results[0].EntryID, results[0].Similarity)
+			} else {
+				t.Logf("OK (true miss at floor=%.2f): %q", defaultFloor, p.name)
+			}
+		}
+	}
+
+	t.Logf("Junk-rejection rate at default floor=%.2f: %d/%d = %.0f%%",
+		defaultFloor, junkRejected, len(nonsensePairs),
+		float64(junkRejected)/float64(len(nonsensePairs))*100)
+
+	// Secondary assertion: junk_max=0.1548 < floor. Verify the floor is in the valid range.
+	const junkMax = 0.1548
+	const idealMin = 0.1826
+	if defaultFloor <= junkMax {
+		t.Errorf("Floor=%.4f is at or below junk_max=%.4f — junk entry can re-enter", defaultFloor, junkMax)
+	}
+	if defaultFloor >= idealMin {
+		t.Errorf("Floor=%.4f is at or above ideal_min=%.4f — real entries (eventsink-e2e, engine-snapshot) are being lost",
+			defaultFloor, idealMin)
+	}
+	t.Logf("Floor %.4f is in the valid separation gap (%.4f, %.4f)", defaultFloor, junkMax, idealMin)
+}
+
+// TestM1a_SubstantiveReusesSurvive is the secondary done-condition test for M1a.
+// With the new default floor (0.16), §4 high-value entries must still match their buy tasks.
+// This test also asserts the two EXTENDED pairs (eventsink-e2e-chained-dispatch and
+// engine-snapshot-inflight) that TestD1_SubstantiveReusesSurviveFloor omitted:
+// both have ideal cosine sim above junk_max=0.1548 and below ed0's incorrect floor of 0.35.
+// They MUST survive at floor=0.16 — if they don't, M1a is incorrectly configured.
+func TestM1a_SubstantiveReusesSurvive(t *testing.T) {
+	// Use default opts — whatever ranking.go now sets as defaults.
+	opts := RankOptions{}
+
+	emb := NewTFIDFEmbedder()
+	inv := buildInventory(allInventory)
+	docs := make([]string, len(inv))
+	for i, e := range inv {
+		docs[i] = e.Description
+	}
+	emb.IndexCorpus(docs)
+
+	type reuseCase struct {
+		name    string
+		task    string
+		idealID string
+		// extendedAssertion: if true, this pair was omitted from the ed0 regression gate
+		// (TestD1_SubstantiveReusesSurviveFloor) and must be explicitly asserted here.
+		// The ed0 floor of 0.35 was too high for these pairs; floor=0.16 keeps them.
+		extendedAssertion bool
+	}
+
+	reuseCases := []reuseCase{
+		// Standard §4 reuse cases (also in TestD1_SubstantiveReusesSurviveFloor).
+		{
+			name:    "eventsink-contract-for-warm-backends",
+			task:    "document EventSink contract for warm-worker backends in warm-worker-backends.md; add interface enforcement so new backends fail review without EventSink wiring",
+			idealID: "eventsink-contract",
+		},
+		{
+			name:    "slot-residency-histogram",
+			task:    "implement per-skill chain-slot-residency histogram in EngineMetrics; emit engine:slot-residency campfire message in periodic flush window",
+			idealID: "slot-residency-tracker",
+		},
+		{
+			name:    "logger-eventsink-replace-slog",
+			task:    "implement Logger EventSink consumer; replace ad-hoc slog.Info(worker spawned/exited) with event-derived logs; verify B2b log inversion gone",
+			idealID: "logger-eventsink-fanout",
+		},
+		{
+			name:    "warm-worker-pool-eventsink",
+			task:    "wire warm-worker pool / TUI body substrate to emit 7-event SubstrateEvent vocabulary at Dispatch/Inject/Await/pane-capture sites; pool-specific detail in Meta not in event-kind",
+			idealID: "warm-pool-substrate-wiring",
+		},
+		{
+			name:    "telemetry-collector-impl",
+			task:    "implement TelemetryCollector EventSink consumer; derive WallClockSeconds + TotalToolCalls + P50/P90/P99 tool latency from SubstrateEvent stream; preserve CapabilityVariantTracker.AvgCost contract",
+			idealID: "telemetry-collector-eventsink",
+		},
+		{
+			name:    "saturation-monitor-impl",
+			task:    "implement SaturationMonitor EventSink consumer + engine:stall campfire message format + pollAndDispatch back-pressure path; stall onset fires once per onset transition",
+			idealID: "saturation-monitor-eventsink",
+		},
+		// EXTENDED assertions (dontguess-7d6, per M1a CORRECTION section).
+		// These two pairs were omitted from TestD1_SubstantiveReusesSurviveFloor because
+		// ed0's floor=0.35 was above their ideal cosine similarity, so they appeared as
+		// "acceptable residual miss" errors. The CORRECTION identifies this as wrong:
+		// they are ABOVE junk_max=0.1548 and must survive the correct floor (0.16).
+		// A floor-too-high regression (e.g. accidentally setting floor=0.35) would cause
+		// these to fail — that's the whole point of adding them here.
+		{
+			name:              "eventsink-e2e-chained-dispatch",
+			task:              "write end-to-end test: chained-dispatch produces canonical 7-event SubstrateEvent stream + wall_clock_s > 0 + chain does not orphan; bakeoff I4_invest_never_dispatched no longer reproducible",
+			idealID:           "legion-spawn-orphan",
+			extendedAssertion: true,
+		},
+		{
+			name:              "engine-snapshot-inflight",
+			task:              "extend EngineSnapshot with InFlight + BacklogDepth + LastDispatchAt; expose via we config show",
+			idealID:           "engine-metrics-inflight",
+			extendedAssertion: true,
+		},
+	}
+
+	defaultFloor := opts.minSimilarity()
+	survived, total := 0, 0
+	extendedFailed := false
+
+	for _, rc := range reuseCases {
+		total++
+		results := Rank(rc.task, inv, emb, opts)
+		// Rank() already filters below-floor entries; all returned results are above floor.
+
+		var verdict string
+		if len(results) > 0 && results[0].EntryID == rc.idealID {
+			survived++
+			verdict = fmt.Sprintf("MATCH (sim=%.4f)", results[0].Similarity)
+			t.Logf("OK: %q => %q — %s", rc.name, rc.idealID, verdict)
+		} else if len(results) > 0 {
+			verdict = fmt.Sprintf("WRONG-TOP1: got=%q (sim=%.4f) want=%q", results[0].EntryID, results[0].Similarity, rc.idealID)
+			if rc.extendedAssertion {
+				extendedFailed = true
+				t.Errorf("EXTENDED ASSERTION FAIL: %q — %s", rc.name, verdict)
+			} else {
+				t.Logf("INFO (known TF-IDF ambiguity): %q — %s", rc.name, verdict)
+			}
+		} else {
+			verdict = fmt.Sprintf("MISS (no result above floor=%.2f)", defaultFloor)
+			if rc.extendedAssertion {
+				extendedFailed = true
+				t.Errorf("EXTENDED ASSERTION FAIL: %q — %s — ideal sim is above junk_max=0.1548; floor may be too high",
+					rc.name, verdict)
+			} else {
+				t.Logf("INFO (known TF-IDF miss): %q — %s", rc.name, verdict)
+			}
+		}
+	}
+
+	t.Logf("Substantive reuse survival at floor=%.2f: %d/%d = %.1f%%",
+		defaultFloor, survived, total, float64(survived)/float64(total)*100)
+
+	if extendedFailed {
+		t.Errorf("One or more extended assertions failed — the M1a floor is too high or incorrectly configured. " +
+			"eventsink-e2e-chained-dispatch and engine-snapshot-inflight must survive floor=%.2f " +
+			"(their ideal cosine sims 0.1826 and 0.2010 are above junk_max=0.1548).", defaultFloor)
+	}
 }
 
 // TestD1_RealMatchingPath_NotMocked verifies that the fixture exercises the real

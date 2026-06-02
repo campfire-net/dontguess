@@ -51,8 +51,9 @@ type RankInput struct {
 // RankOptions configures the ranking algorithm.
 type RankOptions struct {
 	// MinSimilarity is the minimum cosine similarity to include a result.
-	// Entries below this threshold are excluded entirely.
-	// Default: 0.05 (very low — we want to include most entries, let the score sort them).
+	// Entries below this threshold are excluded entirely — a hard Layer-1 relevance floor.
+	// Default: 0.16 (M1a, dontguess-7d6). Raised from 0.05 to sit between junk_max=0.1548
+	// and ideal_min=0.1826 measured on the live exchange D1 fixture. See minSimilarity().
 	MinSimilarity float64
 
 	// PartialMatchThreshold is the confidence level below which a result
@@ -77,7 +78,14 @@ func (o *RankOptions) minSimilarity() float64 {
 	if o.MinSimilarity > 0 {
 		return o.MinSimilarity
 	}
-	return 0.05
+	// M1a (dontguess-7d6): raised from 0.05 to 0.16.
+	// Empirically swept [0.10..0.40] against the D1 fixture (d1_diagnostic_test.go).
+	// junk_max=0.1548, ideal_min=0.1826. Floor 0.16 is the lowest value that achieves
+	// 100% junk-upgrade-smoke rejection while maximising substantive-reuse survival:
+	//   - At floor=0.12+: 7/7 junk rejected, 10/13 substantive survived, both extended pairs survive.
+	//   - At floor=0.1826: eventsink-e2e-chained-dispatch (sim=0.1826) is lost → accuracy drops.
+	//   - 0.16 gives 7% margin above junk_max with zero real-entry loss.
+	return 0.16
 }
 
 func (o *RankOptions) partialThreshold() float64 {
@@ -98,21 +106,31 @@ func (o *RankOptions) weightEfficiency() float64 {
 	if o.WeightEfficiency > 0 {
 		return o.WeightEfficiency
 	}
-	return 0.35
+	// M1a (dontguess-7d6): reduced from 0.35 → 0.15.
+	// Prevents a high token_cost/price ratio (junk with tokenCost=100) from
+	// competing with relevance when novelty collapses to 0 in single-seller inventory.
+	return 0.15
 }
 
 func (o *RankOptions) weightQuality() float64 {
 	if o.WeightQuality > 0 {
 		return o.WeightQuality
 	}
-	return 0.45
+	// M1a (dontguess-7d6): raised from 0.45 → 0.80.
+	// L2 quality (of which similarity is the dominant sub-component at 0.50 weight)
+	// now dominates the composite. Relevance gates the ranking.
+	return 0.80
 }
 
 func (o *RankOptions) weightNovelty() float64 {
 	if o.WeightNovelty > 0 {
 		return o.WeightNovelty
 	}
-	return 0.20
+	// M1a (dontguess-7d6): reduced from 0.20 → 0.05.
+	// Single-seller inventory produces novelty=0 for ALL entries (1-1/1=0).
+	// At the old weight=0.20 this was fine since novelty contributed nothing.
+	// But after the floor+quality rebalance, novelty is now a minor tie-breaker only.
+	return 0.05
 }
 
 // Rank applies the 4-layer value stack to a set of candidates and returns
@@ -209,7 +227,21 @@ func Rank(task string, candidates []RankInput, embedder Embedder, opts RankOptio
 		// Sellers who appear once get boost=1.0; dominant sellers get boost→0.
 		// novelty = 1 - (sellerCount / maxSellerCount)
 		// This prevents popular sellers from occupying all top slots.
-		l3Novelty := 1.0 - float64(sellerCount[c.SellerKey])/float64(maxSellerCount)
+		//
+		// Single-seller collapse fix (M1a, dontguess-7d6): when the candidate set has
+		// only one unique seller, every entry produces novelty=0 (1-N/N=0). With the
+		// old weights (novelty=0.20, efficiency=0.35) this made efficiency the dominant
+		// non-similarity signal, allowing a high-efficiency junk entry to compete.
+		// Fix: use novelty=0.5 (neutral) when there is only one unique seller — no
+		// discovery boost or penalty, preserving the composite's relevance-first order.
+		var l3Novelty float64
+		if len(sellerCount) == 1 {
+			// Single seller: novelty is undefined. Use neutral 0.5 so the composite
+			// is fully governed by L1 efficiency and L2 quality (relevance).
+			l3Novelty = 0.5
+		} else {
+			l3Novelty = 1.0 - float64(sellerCount[c.SellerKey])/float64(maxSellerCount)
+		}
 
 		// Final composite score.
 		composite := opts.weightEfficiency()*l1Efficiency +

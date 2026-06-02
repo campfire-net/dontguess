@@ -641,6 +641,9 @@ func (e *Engine) handleBuy(msg *Message) error {
 	}
 
 	// Append candidates not covered by the semantic index (e.g. index not yet rebuilt).
+	// Note: the relevance floor is enforced by matching.Rank() — entries scored below
+	// MinSimilarity are excluded from semanticResults before reaching here. The fallback
+	// path covers index-gap entries (not yet embedded) and uses reputation+recency ranking.
 	covered := make(map[string]struct{}, len(semanticMatches))
 	for _, sm := range semanticMatches {
 		covered[sm.entry.EntryID] = struct{}{}
