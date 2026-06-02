@@ -23,10 +23,11 @@ import (
 // Returns the entryID and putMsgID.
 func setupSmallContentEntry(t *testing.T, h *testHarness, eng *exchange.Engine) (entryID, putMsgID string) {
 	t.Helper()
-	// token_cost = 100 (< SmallContentThreshold 500)
+	// token_cost = 250 (< SmallContentThreshold 500, ≥ MinTokenCost 200 quality gate)
 	// content_size = 200 bytes (< 500 * 4 = 2000 bytes)
+	// Updated from 100 → 250 by dontguess-ed1 quality gate (MinTokenCost=200).
 	putMsg := h.sendMessage(h.seller,
-		putPayload("Tiny Go function one-liner", "sha256:"+fmt.Sprintf("%064x", 99), "code", 100, 200),
+		putPayload("Tiny Go function one-liner", "sha256:"+fmt.Sprintf("%064x", 99), "code", 250, 200),
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		nil,
 	)
@@ -34,7 +35,7 @@ func setupSmallContentEntry(t *testing.T, h *testHarness, eng *exchange.Engine) 
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
-	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+	if err := eng.AutoAcceptPut(putMsg.ID, 175, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 
@@ -667,16 +668,17 @@ func TestSmallContentDispute_ScripRefundPath(t *testing.T) {
 		},
 	})
 
-	// Seed a small-content entry: token_cost=100 (<500), content_size=200 (<2000).
-	// putPrice=70; salePrice = 70 * 120/100 = 84; fee = 84/10 = 8; holdAmount = 92.
+	// Seed a small-content entry: token_cost=250 (<500 SmallContentThreshold, ≥200 MinTokenCost).
+	// putPrice=175 (70% of 250); salePrice computed dynamically by ComputePriceForTest.
+	// Updated from 100 → 250 by dontguess-ed1 quality gate (MinTokenCost=200).
 	putMsg := h.sendMessage(h.seller,
-		putPayload("Tiny Go function one-liner (scrip test)", "sha256:"+fmt.Sprintf("%064x", 777), "code", 100, 200),
+		putPayload("Tiny Go function one-liner (scrip test)", "sha256:"+fmt.Sprintf("%064x", 777), "code", 250, 200),
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
-	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+	if err := eng.AutoAcceptPut(putMsg.ID, 175, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 	inv := eng.State().Inventory()
@@ -839,15 +841,16 @@ func TestSmallContentDispute_MissingEntry_SilentlyDropped(t *testing.T) {
 		},
 	})
 
-	// Seed a small-content entry: token_cost=100, content_size=200.
+	// Seed a small-content entry: token_cost=250 (<500 SmallContentThreshold, ≥200 MinTokenCost).
+	// Updated from 100 → 250 by dontguess-ed1 quality gate (MinTokenCost=200).
 	putMsg := h.sendMessage(h.seller,
-		putPayload("Tiny Go function — expiry test", "sha256:"+fmt.Sprintf("%064x", 555), "code", 100, 200),
+		putPayload("Tiny Go function — expiry test", "sha256:"+fmt.Sprintf("%064x", 555), "code", 250, 200),
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		nil,
 	)
 	msgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
-	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+	if err := eng.AutoAcceptPut(putMsg.ID, 175, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 	inv := eng.State().Inventory()

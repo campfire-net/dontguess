@@ -778,7 +778,7 @@ func TestE2E_ScripBalances(t *testing.T) {
 //
 // Flow:
 //
-//  1. Seller puts content with token_cost = 100 (< 500)
+//  1. Seller puts content with token_cost = 250 (< 500 SmallContentThreshold, ≥ 200 MinTokenCost)
 //  2. Operator auto-accepts the put → entry enters inventory
 //  3. Buyer sends a buy request
 //  4. Engine runs and emits a match (buyer-accept antecedent is the match)
@@ -807,9 +807,11 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
-	// --- Step 1: Seller puts small content (token_cost = 100, < SmallContentThreshold 500) ---
+	// --- Step 1: Seller puts small content (token_cost=250, < SmallContentThreshold=500, ≥MinTokenCost=200) ---
+	// Updated from 100 → 250 by dontguess-ed1 quality gate (MinTokenCost=200).
+	// Still qualifies for small-content dispute path: 250 < SmallContentThreshold(500).
 	putMsg := h.sendMessage(h.seller,
-		putPayload("Tiny Go one-liner helper", "sha256:"+fmt.Sprintf("%064x", 777), "code", 100, 200),
+		putPayload("Tiny Go one-liner helper", "sha256:"+fmt.Sprintf("%064x", 777), "code", 250, 200),
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		nil,
 	)
@@ -821,7 +823,7 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
 	// --- Step 2: Operator auto-accepts the put ---
-	if err := eng.AutoAcceptPut(putMsg.ID, 70, time.Now().Add(72*time.Hour)); err != nil {
+	if err := eng.AutoAcceptPut(putMsg.ID, 175, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut: %v", err)
 	}
 

@@ -134,6 +134,22 @@ const (
 	// naming in test code that uses the "bytes per token" framing.
 	// MinBytesPerToken = 1 / MaxTokensPerByte (fractional; use MaxTokensPerByte directly).
 	MinBytesPerToken = int64(1) // only used in test helpers for content padding
+
+	// MinTokenCost is the minimum accepted TokenCost value on a put (quality gate, dontguess-ed1).
+	//
+	// Puts claiming fewer than MinTokenCost tokens are rejected as low-value —
+	// they represent trivial or synthetic computation (the live "test" entry had
+	// token_cost=100) that pollutes matching quality and inflates the hit-rate metric.
+	//
+	// Value: 500 tokens. This is a conservative floor that admits all legitimate
+	// cached-inference results (real inference rounds cost at minimum a few hundred
+	// tokens for prompt + response) while rejecting the synthetic smoke-test class
+	// (typically token_cost=100) identified in the measurement review §2.
+	//
+	// Composition with 46f: 46f enforces an upper bound (token_cost ≤ content_size *
+	// MaxTokensPerByte). This constant enforces the lower bound. Both checks are in
+	// applyPut and apply independently.
+	MinTokenCost = int64(200)
 )
 
 // InventoryEntry is a single cache entry in the exchange inventory.
@@ -890,6 +906,21 @@ type State struct {
 	// On operator restart the loop re-evaluates all pending puts against the cap.
 	// Set by HoldPutForReview; pruned by PruneHeldForReview when a put leaves pending.
 	heldForReview map[string]struct{}
+
+	// contentHashIndex is the deduplication index for put content hashes (dontguess-ed1).
+	// Key: sha256: prefixed content hash. Value: empty struct (presence check).
+	//
+	// Tracks hashes of entries in pendingPuts and inventory. When applyPut
+	// sees a content_hash already in this index, the put is silently dropped —
+	// the exchange already holds the same content. This prevents sellers from
+	// re-putting identical content under a different description to game pricing.
+	//
+	// Lifecycle:
+	//   - Insert on applyPut (when the put is accepted into pendingPuts).
+	//   - applySettlePutReject does NOT remove from index — prevents re-put of
+	//     the same content immediately after rejection (e.g., junk content).
+	//   - Reset on Replay — rebuilt from the log by re-running applyPut for all msgs.
+	contentHashIndex map[string]struct{}
 }
 
 // NewState creates an empty exchange state.
@@ -936,6 +967,7 @@ func NewState() *State {
 		senderHopDepth:       make(map[string][]int),
 		federationProfiles:   make(map[string]*FederationNodeProfile),
 		heldForReview:        make(map[string]struct{}),
+		contentHashIndex:     make(map[string]struct{}),
 	}
 }
 
@@ -989,6 +1021,10 @@ func (s *State) Replay(msgs []Message) {
 	// senderHopDepth is re-derived from the campfire log on Replay.
 	// Reset it so the replay loop rebuilds it cleanly from messages.
 	s.senderHopDepth = make(map[string][]int)
+	// contentHashIndex is rebuilt from the campfire log on Replay.
+	// The replay loop re-runs applyPut for every exchange:put message, which
+	// repopulates the index from the canonical log.
+	s.contentHashIndex = make(map[string]struct{})
 	// federationProfiles is NOT reset on Replay. The trust_score values written
 	// by the slow loop (via SetFederationTrustScore) are externally managed and
 	// must survive engine restarts. The HopDepth and FirstSeenAt fields will be
@@ -1107,6 +1143,37 @@ var validCompressionTiers = map[string]struct{}{
 	"cold": {},
 }
 
+// isTestLikeDescription reports whether a put description represents synthetic or
+// junk content that should be rejected by the put quality-gate (dontguess-ed1).
+//
+// Rules (aligned with demand.IsSynthetic patterns, restricted to the put/description domain):
+//   - bare "test" (case-insensitive, trimmed) — the exact smoke-test entry from the live exchange
+//   - starts with "upgrade smoke test" — the "upgrade smoke test cf v0.31.2 operator" junk class
+//   - starts with "test " (test followed by a space) — generic test prefixes
+//
+// NOTE: Descriptions like "test coverage audit", "test strategy", "test gap scan",
+// "flock contention test pattern for Go", or "testing the X interface" are NOT rejected —
+// they describe real engineering work. This predicate matches only the narrow
+// synthetic/smoke class identified in measurement review §2. When in doubt, accept.
+//
+// Callers that classify buy miss traffic should use demand.IsSynthetic, which has a
+// broader set of exclusion rules. This function is the put-side analog — narrower,
+// since false positives at put time permanently lose legitimate content from inventory.
+func isTestLikeDescription(desc string) bool {
+	lower := strings.ToLower(strings.TrimSpace(desc))
+	// Reject bare "test" — the exact description of the junk smoke-test entry in
+	// the live exchange that served 1,576 hits (measurement review §2).
+	if lower == "test" {
+		return true
+	}
+	// Reject the "upgrade smoke test" junk class — the cf v0.31.2 operator smoke
+	// test that polluted inventory ("upgrade smoke test cf v0.31.2 operator", etc).
+	if strings.HasPrefix(lower, "upgrade smoke test") {
+		return true
+	}
+	return false
+}
+
 // applyPut processes an exchange:put message.
 func (s *State) applyPut(msg *Message) {
 	var payload struct {
@@ -1164,6 +1231,20 @@ func (s *State) applyPut(msg *Message) {
 	if payload.TokenCost > maxPlausibleTokenCost {
 		return
 	}
+	// Quality gate §1 (dontguess-ed1): token_cost floor.
+	// Puts below MinTokenCost tokens are rejected as low-value/synthetic.
+	// Composition with 46f: 46f enforces the upper bound (token_cost ≤ content_size *
+	// MaxTokensPerByte); this enforces the lower bound. Both apply independently.
+	if payload.TokenCost < MinTokenCost {
+		return
+	}
+	// Quality gate §3 (dontguess-ed1): test-like description rejection.
+	// Reject the "test" and "upgrade smoke test" junk class identified in
+	// measurement review §2. The "test" entry alone served 1,576 hits — 60% of
+	// all real-agent buys were served this junk entry, poisoning match quality.
+	if isTestLikeDescription(payload.Description) {
+		return
+	}
 	// Validate compression_tier. Unknown values are silently dropped to "".
 	tier := payload.CompressionTier
 	if tier != "" {
@@ -1174,6 +1255,13 @@ func (s *State) applyPut(msg *Message) {
 	// Compute content hash from the decoded bytes. Never trust hash from payload.
 	sum := sha256.Sum256(contentBytes)
 	contentHash := "sha256:" + hex.EncodeToString(sum[:])
+	// Quality gate §2 (dontguess-ed1): content-hash deduplication.
+	// Reject puts whose content is already present in inventory or pendingPuts.
+	// This prevents sellers from re-putting identical content under a new description
+	// to bypass expiry, gain a pricing reset, or game the discovery ranking.
+	if _, exists := s.contentHashIndex[contentHash]; exists {
+		return
+	}
 	entry := &InventoryEntry{
 		EntryID:         msg.ID,
 		PutMsgID:        msg.ID,
@@ -1190,6 +1278,11 @@ func (s *State) applyPut(msg *Message) {
 	}
 	s.pendingPuts[msg.ID] = entry
 	s.putToEntry[msg.ID] = msg.ID
+	// Register content hash in the dedup index so subsequent puts with identical
+	// content are rejected (quality gate §2). The hash persists even after the put
+	// is accepted into inventory (the inventory entry retains the same hash).
+	// Not removed on reject — prevents immediate re-put of identical rejected content.
+	s.contentHashIndex[contentHash] = struct{}{}
 }
 
 // applyBuy processes an exchange:buy message.

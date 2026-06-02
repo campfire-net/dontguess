@@ -47,11 +47,18 @@ func TestBelowFloor_JunkOnlyInventory_YieldsMiss(t *testing.T) {
 	h := newTestHarness(t)
 	eng := h.newEngine()
 
-	// Seed the junk entry that caused 60% of false hits in the live exchange (D1 fixture).
-	// This entry's TF-IDF similarity to any unrelated task is ~0.116, below the 0.16 floor.
-	junkDesc := "upgrade smoke test cf v0.31.2 operator"
+	// Seed a low-similarity entry whose TF-IDF match to any unrelated task is ~0.116,
+	// below the 0.16 floor. This simulates the junk class that caused 60% of false
+	// hits in the live exchange (D1 fixture: "upgrade smoke test cf v0.31.2 operator"
+	// matched unrelated engineering tasks).
+	// The description is changed from the live junk form so it passes the put
+	// quality-gate (dontguess-ed1), which rejects "upgrade smoke test" descriptions
+	// before they reach inventory — quality gates the earlier junk before the floor
+	// test can exercise the match-layer fallback logic.
+	// token_cost=500 (≥MinTokenCost=200) so the quality gate passes.
+	junkDesc := "smoke operator validation pre-release build"
 	putMsg := h.sendMessage(h.seller,
-		putPayload(junkDesc, "sha256:aabbccdd00000000000000000000000000000000000000000000000000000001", "analysis", 100, 512),
+		putPayload(junkDesc, "sha256:aabbccdd00000000000000000000000000000000000000000000000000000001", "analysis", 500, 512),
 		[]string{exchange.TagPut, "exchange:content-type:analysis"},
 		nil,
 	)
@@ -63,7 +70,7 @@ func TestBelowFloor_JunkOnlyInventory_YieldsMiss(t *testing.T) {
 	}
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
-	if err := eng.AutoAcceptPut(putMsg.ID, 84, time.Now().Add(72*time.Hour)); err != nil {
+	if err := eng.AutoAcceptPut(putMsg.ID, 350, time.Now().Add(72*time.Hour)); err != nil {
 		t.Fatalf("AutoAcceptPut (junk): %v", err)
 	}
 

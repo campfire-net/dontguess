@@ -486,8 +486,11 @@ func TestBuyMiss_WrongSenderIgnored(t *testing.T) {
 	// wipe the standing offer since it was injected directly, not via campfire messages).
 	preSettle, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 
+	// Use content_size=80001 to produce different content bytes than the impostor
+	// (size=80000), avoiding dedup rejection by contentHashIndex (dontguess-ed1 §2).
+	// The test logic tests sender identity, not content identity.
 	buyerPut := h.sendMessage(h.buyer,
-		putPayload(task, "sha256:"+fmt.Sprintf("%064x", 5678), "code", 40000, 80000),
+		putPayload(task, "sha256:"+fmt.Sprintf("%064x", 5678), "code", 40000, 80001),
 		[]string{exchange.TagPut},
 		nil,
 	)

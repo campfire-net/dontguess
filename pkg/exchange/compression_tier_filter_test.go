@@ -99,22 +99,24 @@ func TestEngine_TierFilter_OnlyMatchingTierIsCandidate(t *testing.T) {
 	//   - seller2: tier="cold" (should NOT match)
 	//   - seller3: no tier     (should NOT match — unset tier ≠ any specific tier)
 
+	// Note: descriptions are unique per entry to avoid content-hash dedup rejection
+	// (dontguess-ed1 quality gate §2). The tier filter tests semantics, not content identity.
 	hotMsg := h.sendMessage(h.seller,
-		putPayloadWithTier("Go HTTP handler generator", "code", "hot", 8000),
+		putPayloadWithTier("Go HTTP handler generator (hot tier)", "code", "hot", 8000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
 
 	seller2 := newTestAgent(t)
 	coldMsg := h.sendMessage(seller2,
-		putPayloadWithTier("Go HTTP handler generator", "code", "cold", 8000),
+		putPayloadWithTier("Go HTTP handler generator (cold tier)", "code", "cold", 8000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
 
 	seller3 := newTestAgent(t)
 	noTierMsg := h.sendMessage(seller3,
-		putPayloadWithTier("Go HTTP handler generator", "code", "", 8000),
+		putPayloadWithTier("Go HTTP handler generator (no tier)", "code", "", 8000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
@@ -218,22 +220,24 @@ func TestEngine_TierFilter_Absent_MatchesAll(t *testing.T) {
 	eng := h.newEngine()
 
 	// Put entries at different tiers.
+	// Note: descriptions are unique per entry to avoid content-hash dedup rejection
+	// (dontguess-ed1 quality gate §2). The tier filter tests semantics, not content identity.
 	hotMsg := h.sendMessage(h.seller,
-		putPayloadWithTier("SQL query optimizer", "code", "hot", 6000),
+		putPayloadWithTier("SQL query optimizer (hot tier)", "code", "hot", 6000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
 
 	seller2 := newTestAgent(t)
 	warmMsg := h.sendMessage(seller2,
-		putPayloadWithTier("SQL query optimizer", "code", "warm", 6000),
+		putPayloadWithTier("SQL query optimizer (warm tier)", "code", "warm", 6000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
 
 	seller3 := newTestAgent(t)
 	noTierMsg := h.sendMessage(seller3,
-		putPayloadWithTier("SQL query optimizer", "code", "", 6000),
+		putPayloadWithTier("SQL query optimizer (no tier)", "code", "", 6000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)

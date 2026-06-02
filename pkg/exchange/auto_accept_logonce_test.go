@@ -91,7 +91,9 @@ func TestRunAutoAccept_CapZero(t *testing.T) {
 	})
 
 	// Submit 3 puts with varying token costs — all should be over-cap at max=0.
-	sendOverCapPut(t, h, "tiny put", 100)
+	// Note: token_cost must be >= MinTokenCost (200) to pass the put quality gate
+	// (dontguess-ed1). Use 500 for the "tiny" put (below 500 was 100 before the gate).
+	sendOverCapPut(t, h, "tiny put", 500)
 	sendOverCapPut(t, h, "medium put", 1000)
 	sendOverCapPut(t, h, "large put", 1_000_000)
 	replayAll(t, h, eng)
