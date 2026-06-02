@@ -527,6 +527,7 @@ func (e *Engine) handleBuy(msg *Message) error {
 		Domains         []string `json:"domains"`
 		MaxResults      int      `json:"max_results"`
 		CompressionTier string   `json:"compression_tier"`
+		Synthetic       bool     `json:"synthetic"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return fmt.Errorf("parsing buy payload: %w", err)
@@ -690,10 +691,13 @@ func (e *Engine) handleBuy(msg *Message) error {
 	}
 
 	// Synthetic detection: identify load-test / probe traffic so responses can be
-	// tagged exchange:synthetic and excluded from metrics. Uses the same canonical
-	// demand.IsSynthetic predicate as the demand backlog — one predicate, both
-	// systems agree on what is synthetic (dontguess-e93).
-	synthetic := demand.IsSynthetic(payload.Task)
+	// tagged exchange:synthetic and excluded from metrics. Two sources are OR'd:
+	//   1. Server-side: demand.IsSynthetic(task) — canonical pattern predicate
+	//      (dontguess-e93); cannot be suppressed by the buyer.
+	//   2. Buyer-declared: payload.Synthetic == true — set by the wrapper when
+	//      DG_SYNTHETIC=1 / CI env is detected (dontguess-18c). Additive only;
+	//      never removes a tag the server would have applied.
+	synthetic := demand.IsSynthetic(payload.Task) || payload.Synthetic
 
 	// Zero-match path: no inventory candidates passed filters or semantic threshold.
 	// Send a buy-miss standing offer to the buyer: if they compute the result and
@@ -931,15 +935,22 @@ func (e *Engine) handlePut(msg *Message) error {
 	}
 
 	// Tag synthetic put-accept responses so inventory metrics can exclude them.
-	// A put is synthetic when its description matches demand.IsSynthetic — the
-	// same canonical predicate used for buy traffic and the demand backlog.
+	// Two sources are OR'd (same policy as handleBuy):
+	//   1. Server-side: demand.IsSynthetic(description) — canonical pattern predicate.
+	//   2. Buyer-declared: put payload "synthetic": true — set by the wrapper when
+	//      DG_SYNTHETIC=1 / CI env is detected (dontguess-18c). Additive only.
+	var putMetaPayload struct {
+		Synthetic bool `json:"synthetic"`
+	}
+	_ = json.Unmarshal(msg.Payload, &putMetaPayload) // best-effort; error → false
+	putSynthetic := demand.IsSynthetic(pending.Description) || putMetaPayload.Synthetic
 	tags := []string{
 		TagSettle,
 		TagPhasePrefix + SettlePhaseStrPutAccept,
 		TagVerdictPrefix + "accepted",
 		TagBuyMiss, // mark as buy-miss fulfillment
 	}
-	if demand.IsSynthetic(pending.Description) {
+	if putSynthetic {
 		tags = append(tags, TagSynthetic)
 	}
 	antecedents := []string{msg.ID}

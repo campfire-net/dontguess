@@ -106,6 +106,12 @@ main() {
 #   agent signs with its own Ed25519 key. Unset = identical to prior behavior.
 #   Telemetry records the actual signing agent (AGENT_CF_HOME/identity.json).
 # Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL)
+# DG_SYNTHETIC: dev/CI synthetic-tag injection (dontguess-18c).
+#   Auto-enabled when DG_SYNTHETIC=1 or CI env var is set.
+#   Opt-out: DG_SYNTHETIC=0 (overrides CI detection).
+#   Effect: buy/put calls get --synthetic appended so the engine tags responses
+#   exchange:synthetic, excluding them from real exchange metrics/inventory.
+#   settle is NOT affected (settlement of real inventory is always real).
 set -e
 
 DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
@@ -358,6 +364,42 @@ if [ "$_i_started_operator" -eq 1 ]; then
     _attempt_log_write 1 "operator_down" 2>/dev/null || true
     exit 1
   fi
+fi
+
+# Synthetic-tag injection (dontguess-18c).
+# Detect dev/CI context and inject --synthetic into buy/put calls so the engine
+# tags its responses exchange:synthetic, excluding them from real metrics.
+# Logic:
+#   DG_SYNTHETIC=0 → always off (explicit opt-out, strongest signal)
+#   DG_SYNTHETIC=1 → always on (explicit opt-in)
+#   CI non-empty  → on (common CI env var set by GitHub Actions, CircleCI, etc.)
+#   --synthetic in args → on (caller passed it directly; wrapper deduplicates)
+#   default       → off (no marker present)
+_DG_INJECT_SYNTHETIC=0
+case "${DG_SYNTHETIC:-}" in
+  0) _DG_INJECT_SYNTHETIC=0 ;;
+  1) _DG_INJECT_SYNTHETIC=1 ;;
+  *)
+    # Check CI env var (set by most CI platforms: GitHub Actions, CircleCI, etc.)
+    if [ -n "${CI:-}" ]; then
+      _DG_INJECT_SYNTHETIC=1
+    fi
+    # Check if --synthetic already in args (caller passed it; honor it, avoid dup)
+    for _a in "$@"; do
+      if [ "$_a" = "--synthetic" ]; then
+        _DG_INJECT_SYNTHETIC=0  # already present; don't double-inject
+        break
+      fi
+    done
+    ;;
+esac
+
+# Build the final argument list, injecting --synthetic for buy/put when active.
+# settle is excluded: settlement of real inventory is always real traffic.
+if [ "$_DG_INJECT_SYNTHETIC" -eq 1 ]; then
+  case "${1:-}" in
+    buy|put) set -- "$@" --synthetic ;;
+  esac
 fi
 
 # Run cf, tee stderr to both terminal and capture file, classify, log, exit.

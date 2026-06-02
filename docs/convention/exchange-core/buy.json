@@ -66,6 +66,13 @@
       "max": 10,
       "default": 3,
       "description": "Maximum matches to return. Default: 3."
+    },
+    {
+      "name": "synthetic",
+      "type": "boolean",
+      "required": false,
+      "default": false,
+      "description": "Mark this buy as dev/CI/test traffic so it is excluded from real exchange metrics and inventory. When true the engine tags its response exchange:synthetic regardless of task content."
     }
   ],
   "produces_tags": [

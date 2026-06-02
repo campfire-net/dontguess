@@ -65,6 +65,13 @@
       "min": 1,
       "max": 10,
       "description": "Optional submission priority (1=highest, 10=lowest). Default: no preference."
+    },
+    {
+      "name": "synthetic",
+      "type": "boolean",
+      "required": false,
+      "default": false,
+      "description": "Mark this put as dev/CI/test traffic so it is excluded from real exchange metrics and inventory. When true the engine tags its put-accept response exchange:synthetic regardless of description content."
     }
   ],
   "produces_tags": [
