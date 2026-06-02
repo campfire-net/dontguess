@@ -737,3 +737,89 @@ func TestBuyMsgIDFor(t *testing.T) {
 		t.Errorf("unjoinable: got %q, want empty", got)
 	}
 }
+
+// TestConsumeCountByEntry_NilOrEmptyReturnsNil is the regression test for the
+// HIGH fix (dontguess-fe7 fix 2): when consumes is nil or empty,
+// ConsumeCountByEntry must return nil — NOT an empty non-nil map.
+//
+// An empty non-nil map causes ComputeHitRate to classify every above-floor hit
+// as a false positive (consumed=false), inverting NetTokensSaved to deeply
+// negative even when the exchange performs perfectly. The nil sentinel tells
+// ComputeHitRate "signal unavailable" and it falls back to the conservative
+// "all hits are real" path.
+func TestConsumeCountByEntry_NilOrEmptyReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	// nil input must return nil.
+	gotNil := ConsumeCountByEntry(nil)
+	if gotNil != nil {
+		t.Errorf("ConsumeCountByEntry(nil) = %v, want nil (signal-unavailable sentinel)", gotNil)
+	}
+
+	// empty slice must also return nil.
+	gotEmpty := ConsumeCountByEntry([]Message{})
+	if gotEmpty != nil {
+		t.Errorf("ConsumeCountByEntry([]) = %v, want nil (signal-unavailable sentinel)", gotEmpty)
+	}
+}
+
+// TestComputeHitRate_NilConsumeSignalNoFalsePositive is the regression test for
+// the HIGH fix (dontguess-fe7 fix 2): with a real above-floor hit and nil/empty
+// consume signal, the hit must NOT be classified as false_positive_waste and
+// NetTokensSaved must NOT invert to negative.
+//
+// Real path: exercises the real ComputeHitRate function with the same
+// opts.ConsumeCountByEntry=nil path used by the CLI when consume read fails
+// or the --since window has no consumes. No mocks of ComputeHitRate.
+func TestComputeHitRate_NilConsumeSignalNoFalsePositive(t *testing.T) {
+	t.Parallel()
+
+	floor := matching.DefaultMinSimilarity()
+	aboveSim := floor + 0.20
+	if aboveSim > 1.0 {
+		aboveSim = 1.0
+	}
+
+	// One buy, one above-floor match (a real hit that would save tokens).
+	buys := []Message{
+		buyMsg("buy-001", "Go flock contention test pattern for exclusive file locks"),
+	}
+	matches := []Message{
+		hitMatchWithSimEntry("m-001", "buy-001", "entry-flock", "flock contention test pattern in Go", aboveSim, 8000),
+	}
+
+	// Regression case A: nil ConsumeCountByEntry (consume read failed).
+	repNil := ComputeHitRate(buys, matches, HitRateOptions{
+		MinSimilarity:       floor,
+		ConsumeCountByEntry: nil,
+	})
+
+	if repNil.TotalFalsePositiveWaste != 0 {
+		t.Errorf("[nil consume] TotalFalsePositiveWaste = %d, want 0 (no consume signal → treat all hits as real)", repNil.TotalFalsePositiveWaste)
+	}
+	if repNil.NetTokensSaved < 0 {
+		t.Errorf("[nil consume] NetTokensSaved = %d, want >= 0 (no false-positive inversion)", repNil.NetTokensSaved)
+	}
+	if repNil.SavedOnRealHits <= 0 {
+		t.Errorf("[nil consume] SavedOnRealHits = %d, want > 0 (hit should be credited as real)", repNil.SavedOnRealHits)
+	}
+
+	// Regression case B: empty non-nil ConsumeCountByEntry (--since window empty).
+	// After fix 2, ConsumeCountByEntry([]) returns nil, so ComputeHitRate gets nil.
+	emptyConsumeCounts := ConsumeCountByEntry([]Message{})
+	if emptyConsumeCounts != nil {
+		t.Fatalf("ConsumeCountByEntry([]) returned non-nil %v — fix 2 not applied", emptyConsumeCounts)
+	}
+
+	repEmpty := ComputeHitRate(buys, matches, HitRateOptions{
+		MinSimilarity:       floor,
+		ConsumeCountByEntry: emptyConsumeCounts, // nil after fix
+	})
+
+	if repEmpty.TotalFalsePositiveWaste != 0 {
+		t.Errorf("[empty consume] TotalFalsePositiveWaste = %d, want 0 (empty window → treat all hits as real)", repEmpty.TotalFalsePositiveWaste)
+	}
+	if repEmpty.NetTokensSaved < 0 {
+		t.Errorf("[empty consume] NetTokensSaved = %d, want >= 0 (no false-positive inversion)", repEmpty.NetTokensSaved)
+	}
+}

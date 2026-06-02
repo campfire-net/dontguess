@@ -235,6 +235,103 @@ func TestAllEntryBehavioralSignals_ReturnMatchingType(t *testing.T) {
 	}
 }
 
+// TestApplyConsume_OperatorGate_NonOperatorConsumeIgnored is the regression test
+// for the CRITICAL fix (dontguess-fe7 fix 1): a consume message whose Sender !=
+// OperatorKey must NOT increment entryConsumeCount. A forged consume from a
+// non-operator member must have zero effect on the behavioral booster.
+//
+// Real path: scratch State with OperatorKey set, Apply via applyLocked → applyConsume.
+// White-box assertion on entryConsumeCount. No mocks of the path under test.
+func TestApplyConsume_OperatorGate_NonOperatorConsumeIgnored(t *testing.T) {
+	t.Parallel()
+
+	const operatorKey = "operator-key-aaaa1111"
+	const attackerKey = "attacker-key-bbbb2222"
+	const entryID = "entry-under-test"
+
+	st := NewState()
+	st.OperatorKey = operatorKey
+
+	// Attacker forges a consume message — sender is NOT the operator.
+	forgedConsume := &Message{
+		ID:     "forged-consume-1",
+		Tags:   []string{TagConsume},
+		Sender: attackerKey,
+		Payload: func() []byte {
+			b, _ := json.Marshal(map[string]any{
+				"entry_id":  entryID,
+				"buyer_key": "buyer-xyz",
+			})
+			return b
+		}(),
+	}
+	st.Apply(forgedConsume)
+
+	// Count must stay 0 — forged consume must be silently ignored.
+	st.mu.RLock()
+	got := st.entryConsumeCount[entryID]
+	st.mu.RUnlock()
+
+	if got != 0 {
+		t.Errorf("non-operator consume incremented entryConsumeCount: got %d, want 0 (operator gate must reject)", got)
+	}
+
+	// Now apply the same consume from the operator — it MUST count.
+	legitimateConsume := &Message{
+		ID:     "legitimate-consume-1",
+		Tags:   []string{TagConsume},
+		Sender: operatorKey,
+		Payload: func() []byte {
+			b, _ := json.Marshal(map[string]any{
+				"entry_id":  entryID,
+				"buyer_key": "buyer-xyz",
+			})
+			return b
+		}(),
+	}
+	st.Apply(legitimateConsume)
+
+	st.mu.RLock()
+	gotAfterOp := st.entryConsumeCount[entryID]
+	st.mu.RUnlock()
+
+	if gotAfterOp != 1 {
+		t.Errorf("operator consume: entryConsumeCount = %d, want 1", gotAfterOp)
+	}
+}
+
+// TestApplyConsume_OperatorGate_EmptyOperatorKeyAcceptsAll verifies backward
+// compatibility: when OperatorKey is "" (not configured), any sender's consume
+// is accepted. This is the pre-v0.6 behavior and must be preserved.
+func TestApplyConsume_OperatorGate_EmptyOperatorKeyAcceptsAll(t *testing.T) {
+	t.Parallel()
+
+	st := NewState()
+	// OperatorKey intentionally left empty — no operator configured.
+
+	anyConsume := &Message{
+		ID:     "consume-from-any-sender",
+		Tags:   []string{TagConsume},
+		Sender: "some-non-operator-key",
+		Payload: func() []byte {
+			b, _ := json.Marshal(map[string]any{
+				"entry_id":  "entry-ABC",
+				"buyer_key": "buyer-1",
+			})
+			return b
+		}(),
+	}
+	st.Apply(anyConsume)
+
+	st.mu.RLock()
+	got := st.entryConsumeCount["entry-ABC"]
+	st.mu.RUnlock()
+
+	if got != 1 {
+		t.Errorf("with empty OperatorKey, consume from any sender should count: got %d, want 1", got)
+	}
+}
+
 // TestAllEntryBehavioralSignals_MultiSellerConvergenceMerged verifies that
 // AllEntryBehavioralSignals correctly sums distinct buyers across multiple
 // sellers for the same entry (derivative/compression scenario where two sellers
@@ -266,14 +363,14 @@ func TestAllEntryBehavioralSignals_MultiSellerConvergenceMerged(t *testing.T) {
 
 	signals := st.AllEntryBehavioralSignals()
 
-	// shared-entry: 3 distinct buyers (001, 002, 003) summed across sellers.
-	// Note: AllEntryBehavioralSignals adds len(buyers) per seller, so 2+2=4 with
-	// buyer-002 counted twice. The spec says "DistinctBuyerCount" is the
-	// sum across sellers (matching BuildConvergenceMap semantics which deduplicates).
-	// However AllEntryBehavioralSignals uses simple len() addition, not dedup.
-	// This is intentional for the booster: even with overlap counted twice, the
-	// signal still reflects genuine multi-seller interest. The convergence gate
-	// (requiring >= 3) is the more rigorous deduped signal (BuildConvergenceMap).
+	// shared-entry: summed buyers across sellers (NOT deduplicated).
+	// AllEntryBehavioralSignals uses simple len(buyers) addition per seller — it does
+	// NOT deduplicate across sellers. With buyer-002 appearing in both seller-A and
+	// seller-B maps, the sum is 2+2=4, not 3. This is intentional: the booster
+	// trades dedup precision for O(1) per-seller iteration. The convergence gate
+	// (BuildConvergenceMap, requiring >= 3 distinct buyers) is the rigorous deduped
+	// signal and is computed separately. MaxBehavioralBoost caps the booster so the
+	// overcounting is acceptable in practice.
 	// We verify the value is >= 3 (converged), not the exact sum.
 	got := signals["shared-entry"].DistinctBuyerCount
 	if got < 3 {

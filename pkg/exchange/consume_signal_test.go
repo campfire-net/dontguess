@@ -249,6 +249,124 @@ func TestConsumeCountByEntry_MultipleConsumes(t *testing.T) {
 	}
 }
 
+// TestConsumeSignal_LiveStateReflectedWithoutReplay is the regression test for
+// the MEDIUM fix (dontguess-fe7 fix 3): after a settle:complete that triggers
+// emitConsumeSignal, the live State.entryConsumeCount (and thus
+// AllEntryBehavioralSignals) must reflect the consume WITHOUT a replay/restart.
+//
+// Real path: real engine (real campfire, real keys), DispatchForTest fires the
+// full handleSettle → emitConsumeSignal → state.Apply chain. We check the live
+// State via AllEntryBehavioralSignals (the same read path used by the match index).
+// No mocks of the path under test.
+func TestConsumeSignal_LiveStateReflectedWithoutReplay(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	// --- Setup: put → accept → buy → match → buyer-accept → deliver ---
+	putMsg := h.sendMessage(h.seller,
+		putPayload("campfire convention dispatch lifecycle management", "sha256:"+fmt.Sprintf("%064x", 777), "code", 12000, 24000),
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
+		nil,
+	)
+	msgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(msgs))
+	if err := eng.AutoAcceptPut(putMsg.ID, 8400, time.Now().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("no inventory after put-accept")
+	}
+	entryID := inv[0].EntryID
+
+	buyMsg := h.sendMessage(h.buyer,
+		buyPayload("convention dispatch lifecycle for campfire coordination", 50000),
+		[]string{exchange.TagBuy},
+		nil,
+	)
+	_ = buyMsg
+
+	// Operator emits a match directly (skip engine auto-match).
+	matchPayloadBytes, _ := json.Marshal(map[string]any{
+		"results": []map[string]any{
+			{"entry_id": entryID, "score": 0.92, "price": 500},
+		},
+	})
+	matchMsg := h.sendMessage(h.operator, matchPayloadBytes,
+		[]string{exchange.TagMatch},
+		[]string{buyMsg.ID},
+	)
+
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	buyerAcceptPayload, _ := json.Marshal(map[string]any{
+		"phase":    exchange.SettlePhaseStrBuyerAccept,
+		"entry_id": entryID,
+		"accepted": true,
+	})
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
+		},
+		[]string{matchMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	deliverPayload, _ := json.Marshal(map[string]any{
+		"phase":       exchange.SettlePhaseStrDeliver,
+		"entry_id":    entryID,
+		"content_ref": "sha256:" + fmt.Sprintf("%064x", 777),
+	})
+	deliverMsg := h.sendMessage(h.operator, deliverPayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrDeliver,
+		},
+		[]string{buyerAcceptMsg.ID},
+	)
+
+	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+
+	// Verify live state has NO consume signal yet.
+	sigsBefore := eng.State().AllEntryBehavioralSignals()
+	if sigsBefore[entryID].ConsumeCount != 0 {
+		t.Fatalf("expected ConsumeCount=0 before complete, got %d", sigsBefore[entryID].ConsumeCount)
+	}
+
+	// --- Key step: dispatch settle:complete through the engine ---
+	// This triggers emitConsumeSignal, which (after fix 3) immediately calls
+	// state.Apply on the emitted consume message.
+	completePayload, _ := json.Marshal(map[string]any{
+		"phase":    exchange.SettlePhaseStrComplete,
+		"entry_id": entryID,
+	})
+	completeMsg := h.sendMessage(h.buyer, completePayload,
+		[]string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrComplete,
+		},
+		[]string{deliverMsg.ID},
+	)
+
+	if err := eng.DispatchForTest(completeMsg); err != nil {
+		t.Fatalf("DispatchForTest(complete): %v", err)
+	}
+
+	// --- Regression assertion: live state reflects the consume WITHOUT replay ---
+	// Before fix 3, entryConsumeCount was only updated on replay. After fix 3,
+	// emitConsumeSignal applies the emitted message immediately to live state.
+	sigsAfter := eng.State().AllEntryBehavioralSignals()
+	if sigsAfter[entryID].ConsumeCount == 0 {
+		t.Errorf("AllEntryBehavioralSignals ConsumeCount = 0 after settle:complete — live state was NOT updated by emitConsumeSignal (fix 3 regression)")
+	}
+}
+
 // TestConsumeCountByEntry_SkipsMalformed verifies that ConsumeCountByEntry
 // silently skips consume messages with missing or unparseable entry_id.
 func TestConsumeCountByEntry_SkipsMalformed(t *testing.T) {

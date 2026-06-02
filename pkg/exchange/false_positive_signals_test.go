@@ -140,7 +140,9 @@ func TestAllEntryBehavioralSignals_IncludesDeliverCount(t *testing.T) {
 	deliverBeta := seedDeliverChain(st, "match-beta", "entry-beta", "ba-beta", "deliver-beta", "buyer-1")
 	deliverBeta.Sender = st.OperatorKey
 	st.Apply(deliverBeta)
-	st.Apply(makeConsumeMessage("consume-beta", "entry-beta", "buyer-1"))
+	consumeBeta := makeConsumeMessage("consume-beta", "entry-beta", "buyer-1")
+	consumeBeta.Sender = st.OperatorKey // operator-sender gate requires operator key
+	st.Apply(consumeBeta)
 
 	signals := st.AllEntryBehavioralSignals()
 
@@ -254,7 +256,9 @@ func TestExpiryCandidates_PastThresholdReported(t *testing.T) {
 		)
 		d.Sender = "op-key"
 		st.Apply(d)
-		st.Apply(makeConsumeMessage("consume-ok-"+string(rune('0'+i)), "entry-OK", "buyer"))
+		cOK := makeConsumeMessage("consume-ok-"+string(rune('0'+i)), "entry-OK", "buyer")
+		cOK.Sender = "op-key" // operator-sender gate requires operator key
+		st.Apply(cOK)
 	}
 
 	candidates := st.ExpiryCandidates()
@@ -470,7 +474,9 @@ func TestExpiryCandidates_ExactRatioThreshold(t *testing.T) {
 		st.Apply(d)
 	}
 	for i := 0; i < 2; i++ {
-		st.Apply(makeConsumeMessage("consume-bl-"+string(rune('0'+i)), "entry-BELOW", "buyer"))
+		cBL := makeConsumeMessage("consume-bl-"+string(rune('0'+i)), "entry-BELOW", "buyer")
+		cBL.Sender = "op-key" // operator-sender gate requires operator key
+		st.Apply(cBL)
 	}
 
 	candidates := st.ExpiryCandidates()

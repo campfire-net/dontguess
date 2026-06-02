@@ -1318,8 +1318,16 @@ func (e *Engine) emitConsumeSignal(completeMsg *Message) error {
 	if err != nil {
 		return fmt.Errorf("consume signal: marshal: %w", err)
 	}
-	if _, err := e.sendOperatorMessage(payload, []string{TagConsume}, []string{completeMsg.ID}); err != nil {
+	consumeMsg, err := e.sendOperatorMessage(payload, []string{TagConsume}, []string{completeMsg.ID})
+	if err != nil {
 		return fmt.Errorf("consume signal: send: %w", err)
+	}
+	// Apply the emitted consume message to live state immediately so that
+	// entryConsumeCount (and thus AllEntryBehavioralSignals) reflects the signal
+	// without requiring a replay/restart. Mirrors the match path (~line 778) and
+	// buy-miss path (~line 848) which also Apply their emitted messages in-band.
+	if consumeMsg != nil {
+		e.state.Apply(consumeMsg)
 	}
 	return nil
 }

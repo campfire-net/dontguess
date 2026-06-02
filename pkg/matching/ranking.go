@@ -500,10 +500,8 @@ func computeFalsePositiveDemotion(s BehavioralSignals) float64 {
 
 	// MaxBehavioralDemotion is negative, so multiply to get a value in [MaxBehavioralDemotion, 0].
 	demotion := norm * MaxBehavioralDemotion
-	// Clamp: demotion must not exceed the floor (more negative than MaxBehavioralDemotion).
-	if demotion < MaxBehavioralDemotion {
-		demotion = MaxBehavioralDemotion
-	}
+	// Note: the lower-bound clamp (demotion < MaxBehavioralDemotion) is unreachable
+	// because norm is already clamped to [0, 1] above, so demotion ∈ [MaxBehavioralDemotion, 0].
 	return demotion
 }
 

@@ -1171,7 +1171,14 @@ func (s *State) GetBuyHoldReservation(matchMsgID string) string {
 // applyConsume processes an exchange:consume message, incrementing the
 // per-entry consume counter. The entry_id is read from the payload and must
 // be non-empty to count. Called from applyLocked.
+//
+// Operator-sender guard: consume messages must originate from the operator.
+// Any non-operator sender is silently rejected to prevent arbitrary campfire
+// members from inflating entryConsumeCount and gaming the behavioral booster.
 func (s *State) applyConsume(msg *Message) {
+	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
+		return
+	}
 	var p struct {
 		EntryID string `json:"entry_id"`
 	}

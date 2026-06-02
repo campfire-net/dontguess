@@ -758,8 +758,17 @@ func BuildConvergenceMap(s *State) map[string]map[string]struct{} {
 // never from the buyer-supplied payload. A missing or unparseable entry_id
 // skips the message.
 //
+// Returns nil when consumes is nil or empty. This is the signal-unavailable
+// sentinel: ComputeHitRate treats a nil ConsumeCountByEntry as "no consume
+// data available" and falls back to the conservative assumption (all hits are
+// real). An empty non-nil map would instead classify every above-floor hit as
+// a false positive, inverting NetTokensSaved even when the exchange performs well.
+//
 // Callers are responsible for windowing (passing only messages within --since).
 func ConsumeCountByEntry(consumes []Message) map[string]int {
+	if len(consumes) == 0 {
+		return nil
+	}
 	counts := make(map[string]int, len(consumes))
 	for i := range consumes {
 		var p struct {
