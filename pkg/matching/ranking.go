@@ -74,6 +74,14 @@ type RankOptions struct {
 	WeightNovelty    float64
 }
 
+// DefaultMinSimilarity returns the default cosine similarity floor used by the
+// matching engine (M1a, dontguess-7d6). Callers that need to apply the same
+// floor outside the matcher (e.g. the hit-rate reporter) MUST use this function
+// rather than hardcoding 0.16, so the constant stays in sync when it changes.
+func DefaultMinSimilarity() float64 {
+	return (&RankOptions{}).minSimilarity()
+}
+
 func (o *RankOptions) minSimilarity() float64 {
 	if o.MinSimilarity > 0 {
 		return o.MinSimilarity

@@ -8,6 +8,7 @@ import (
 
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/matching"
 	"github.com/spf13/cobra"
 )
 
@@ -21,17 +22,34 @@ var hitRateSince time.Duration
 // match-results and joining them (match antecedent[0] = buy order ID), then
 // classifying each match as a HIT (delivered inventory results) or a MISS
 // (buy-miss standing offer). See pkg/exchange/hitrate.go.
+//
+// Quality-weighted (M-rebaseline, dontguess-af8):
+// A delivered result counts as a HIT only when the top result's similarity
+// meets or exceeds the M1 relevance floor (matching.DefaultMinSimilarity()).
+// Historical match-results lacking a "similarity" field (pre-M2/dontguess-b26)
+// have their similarity recomputed using TF-IDF re-embedding of the buy task
+// and the delivered entry's description. Results that cannot be verified are
+// reported as UnverifiableHits and excluded from HitRatePct.
 var hitRateCmd = &cobra.Command{
 	Use:   "hit-rate",
-	Short: "Report buy hit-rate reconstructed from exchange match-results",
-	Long: `Reconstruct buy hit-rate from the exchange message log.
+	Short: "Report quality-weighted buy hit-rate reconstructed from exchange match-results",
+	Long: `Reconstruct quality-weighted buy hit-rate from the exchange message log.
 
 Reads exchange:buy orders and exchange:match results, joins them by buy order
-ID, and classifies each answered buy as a hit (cached inventory delivered) or a
-miss (a buy-miss standing offer — "No cached inference matched"). Buys with no
-match-result yet are pending and excluded from the hit-rate denominator.
+ID, and classifies each answered buy as a hit (cached inventory delivered AND
+similarity ≥ relevance floor) or a miss (buy-miss standing offer, or delivered
+result below the similarity floor). Buys with no match-result yet are pending
+and excluded from the hit-rate denominator.
 
-  hit_rate = hits / (hits + misses) * 100
+  hit_rate = quality-weighted hits / (quality-weighted hits + misses) * 100
+
+The relevance floor is matching.DefaultMinSimilarity() (M1a, dontguess-7d6).
+Historical match-results lacking the "similarity" field (produced before
+M2/dontguess-b26) have similarity recomputed from the buy task and delivered
+entry description using TF-IDF re-embedding.
+
+Synthetic traffic (exchange:synthetic tagged responses) is excluded from all
+counts (M3, dontguess-e93).
 
 Flags:
   --since  only count buys and match-results within this window (default: all)
@@ -66,6 +84,71 @@ func readTaggedMessages(client *protocol.Client, cfID, tag string, cutoffNano in
 	return out, nil
 }
 
+// parseBuyTask extracts the "task" field from an exchange:buy message payload.
+// Returns empty string if the payload cannot be parsed or lacks a task.
+func parseBuyTask(m *exchange.Message) string {
+	var p struct {
+		Task string `json:"task"`
+	}
+	if err := json.Unmarshal(m.Payload, &p); err != nil {
+		return ""
+	}
+	return p.Task
+}
+
+// buildBuyTaskMap builds a map from buy message ID to task text from a slice
+// of exchange:buy messages. Used by the quality-weighted hit-rate reporter to
+// look up the originating task when recomputing similarity for pre-M2 matches.
+func buildBuyTaskMap(buys []exchange.Message) map[string]string {
+	m := make(map[string]string, len(buys))
+	for i := range buys {
+		task := parseBuyTask(&buys[i])
+		if task != "" {
+			m[buys[i].ID] = task
+		}
+	}
+	return m
+}
+
+// buildRecomputeEmbedder creates a TF-IDF embedder primed with the corpus of
+// buy task descriptions and delivered entry descriptions extracted from match
+// results. This gives the embedder a realistic IDF vocabulary so that recomputed
+// similarities are comparable to those computed at match time by the engine.
+//
+// The corpus covers all task texts from buys plus all entry descriptions from
+// delivered match results (those with a "results" array). We include both so
+// that rare technical terms (e.g. "FROST", "campfire", "legion") receive the
+// correct IDF weight rather than defaulting to 1.0 (neutral).
+func buildRecomputeEmbedder(buys []exchange.Message, matches []exchange.Message) *matching.TFIDFEmbedder {
+	emb := matching.NewTFIDFEmbedder()
+
+	// Collect corpus documents: buy tasks + entry descriptions from match results.
+	corpus := make([]string, 0, len(buys)+len(matches)*3)
+	for i := range buys {
+		if task := parseBuyTask(&buys[i]); task != "" {
+			corpus = append(corpus, task)
+		}
+	}
+	for i := range matches {
+		var p struct {
+			Results []struct {
+				Description string `json:"description"`
+			} `json:"results"`
+		}
+		if err := json.Unmarshal(matches[i].Payload, &p); err != nil {
+			continue
+		}
+		for _, r := range p.Results {
+			if r.Description != "" {
+				corpus = append(corpus, r.Description)
+			}
+		}
+	}
+
+	emb.IndexCorpus(corpus)
+	return emb
+}
+
 func runHitRate(_ *cobra.Command, _ []string) error {
 	dgHome := resolveDGHome()
 
@@ -96,7 +179,16 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 		return fmt.Errorf("read match-results: %w", err)
 	}
 
-	rep := exchange.ComputeHitRate(buys, matches)
+	// Build quality-weighted options (M-rebaseline, dontguess-af8).
+	// MinSimilarity references the M1 floor constant — does NOT hardcode 0.16.
+	// Embedder is a TF-IDF instance primed with the full corpus for recompute.
+	opts := exchange.HitRateOptions{
+		MinSimilarity: matching.DefaultMinSimilarity(),
+		Embedder:      buildRecomputeEmbedder(buys, matches),
+		BuyTasks:      buildBuyTaskMap(buys),
+	}
+
+	rep := exchange.ComputeHitRate(buys, matches, opts)
 	printHitRate(rep, hitRateSince, jsonOutput)
 	return nil
 }
@@ -117,10 +209,16 @@ func printHitRate(rep exchange.HitRateReport, since time.Duration, asJSON bool) 
 	fmt.Printf("  total buys:        %d\n", rep.TotalBuys)
 	fmt.Printf("  answered (matched): %d\n", rep.MatchedBuys)
 	fmt.Printf("  pending (no match): %d\n", rep.PendingBuys)
-	fmt.Printf("  hits:              %d\n", rep.Hits)
+	fmt.Printf("  hits (quality):    %d\n", rep.Hits)
 	fmt.Printf("  misses:            %d\n", rep.Misses)
-	fmt.Printf("  HIT RATE:          %.2f%%  (hits / answered)\n", rep.HitRatePct)
+	fmt.Printf("  QUALITY HIT RATE:  %.2f%%  (similarity≥floor hits / verified answered)\n", rep.HitRatePct)
 	fmt.Println()
+	fmt.Printf("  below-floor downgraded: %d  (delivered but similarity < %.2f)\n",
+		rep.BelowFloorDowngraded, matching.DefaultMinSimilarity())
+	fmt.Printf("  similarity recomputed:  %d  (pre-M2 historical, TF-IDF recomputed)\n", rep.RecomputedSimilarity)
+	fmt.Printf("  unverifiable hits:      %d  (no similarity field, no recompute path)\n", rep.UnverifiableHits)
+	fmt.Println()
+	fmt.Printf("  synthetic excluded:     %d\n", rep.SyntheticExcluded)
 	fmt.Printf("  match-results read: %d\n", rep.MatchResultsTotal)
 	fmt.Printf("  unjoinable:         %d  (match-result with no buy in window)\n", rep.UnjoinableMatchResults)
 }
