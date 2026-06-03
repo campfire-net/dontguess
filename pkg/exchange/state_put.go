@@ -145,23 +145,77 @@ var highReuseKeywords = []highReuseClass{
 	},
 }
 
+// minHighReuseWords is the minimum number of description tokens an entry must have
+// to qualify as a §4 high-reuse artifact. Genuine distilled artifacts are *described*
+// (a noun phrase naming the thing, plus its context) — every §4 exemplar and every
+// positive case in put_reuse_class_test.go is ≥5 tokens. Crafted keyword-stuffs that
+// game the classifier ("test pattern go idiom", "checklist schema validation",
+// "readme setup guide") are ≤4 tokens: a bare concatenation of the classifier's own
+// trigger words with no surrounding content. Requiring ≥5 tokens is a structural
+// floor, not a blocklist — it rejects the *shape* of a keyword-stuff (all trigger,
+// no description) regardless of which specific words are used.
+const minHighReuseWords = 5
+
+// highReuseCoSignalWindow is the maximum token distance permitted between a matched
+// primary keyword and its co-signal. In every genuine §4 exemplar the co-signal is
+// part of the same descriptive phrase as the primary (observed max distance: 2). A
+// co-signal that appears far from the primary — e.g. "checklist of things I need to
+// do today … schema" — is incidental, not structural. Bounding the distance (rather
+// than matching the co-signal anywhere in the string) defeats the "pad to the word
+// floor, then jam an unrelated trigger word in" variant of the keyword-stuff attack.
+const highReuseCoSignalWindow = 3
+
+// tokenizeDescription splits a description into lowercased tokens on runs of
+// characters that are not part of a word. Word characters include alphanumerics
+// plus '.', '_', '/', and '-' so that identifiers like "cf-protocol",
+// "--cf-home", "migrate-store", and "legion.tools" survive as single tokens —
+// matching how the §4 artifact names actually read.
+func tokenizeDescription(desc string) []string {
+	return strings.FieldsFunc(strings.ToLower(desc), func(r rune) bool {
+		switch {
+		case r >= 'a' && r <= 'z':
+			return false
+		case r >= '0' && r <= '9':
+			return false
+		case r == '.' || r == '_' || r == '/' || r == '-':
+			return false
+		default:
+			return true
+		}
+	})
+}
+
 // IsHighReuseArtifact reports whether an inventory entry belongs to the §4 high-reuse
 // distilled-artifact class (exchange-matching-measurement-review.md §4).
 //
-// Classification is content-type gated AND keyword-with-co-signal gated. Both gates
-// must pass. This two-gate design makes it substantially harder for an agent to game
-// the classifier:
+// Classification is gated on FOUR structural conditions, all of which must hold. The
+// design goal is gameability resistance: an agent must not be able to mislabel session
+// ephemera as high-reuse to earn the 85% accept price + 20% residual by stuffing the
+// classifier's trigger words into a short, contentless description.
 //
-//   - Gate 1: content_type must be "code", "analysis", or "summary" — the types
-//     that carry reusable engineering artifacts. Session-ephemera types ("review",
-//     "data", "other") are excluded even if they contain a matching keyword.
+//   - Gate 1: content_type must be "code", "analysis", or "summary" — the types that
+//     carry reusable engineering artifacts. Session-ephemera types ("review", "data",
+//     "other") are excluded even if they contain matching keywords.
 //
-//   - Gate 2: description must contain a §4 primary keyword AND at least one
-//     co-occurring structural signal from the same class. A bare keyword mention
-//     (e.g. "analysis of the project readme") fails the co-signal gate.
+//   - Gate 2 (length floor): the description must have at least minHighReuseWords
+//     tokens. A distilled artifact is described, not keyword-tagged. Crafted stuffs
+//     like "test pattern go idiom" (4 tokens) carry only trigger words and fail here.
+//
+//   - Gate 3 (primary keyword): the description must contain a §4 primary keyword.
+//
+//   - Gate 4 (co-signal adjacency): at least one co-signal of the matched class must
+//     appear within highReuseCoSignalWindow tokens of the primary keyword. Requiring
+//     adjacency — not mere presence anywhere in the string — means the co-signal must
+//     be part of the same descriptive phrase as the primary, the way it reads in every
+//     genuine §4 exemplar. This blocks both the bare keyword-stuff (caught by the
+//     length floor) and the "pad to the floor then drop a far-away trigger word" variant.
+//
+// Gates 2 and 4 attack the *structure* of a keyword-stuff (all-trigger / incidental
+// co-signal) rather than enumerating bad strings, so they generalize to crafted inputs
+// not seen at design time.
 //
 // This is intentionally conservative: false negatives (real high-reuse entries that
-// miss the classifier) are acceptable. The exchange still accepts them at the standard
+// miss the classifier) are acceptable — the exchange still accepts them at the standard
 // rate. False positives (ephemera classified as high-reuse) undermine the incentive
 // mechanism and seller trust in pricing fairness.
 func IsHighReuseArtifact(entry *InventoryEntry) bool {
@@ -170,30 +224,63 @@ func IsHighReuseArtifact(entry *InventoryEntry) bool {
 	// types carry session-specific content that rarely generalizes across projects.
 	switch entry.ContentType {
 	case "code", "analysis", "summary":
-		// passes gate 1 — continue to keyword check
+		// passes gate 1 — continue
 	default:
 		return false
 	}
 
-	lower := strings.ToLower(entry.Description)
+	tokens := tokenizeDescription(entry.Description)
 
-	// Gate 2: keyword + co-signal check.
-	// For each class in the table, check that:
-	//   (a) the primary keyword appears in the description, AND
-	//   (b) at least one co-signal also appears.
-	// Both conditions must hold. A bare primary keyword without a co-signal fails.
+	// Gate 2: length floor. Keyword-stuffs are short by nature — they are the trigger
+	// words and nothing else. Genuine artifacts carry descriptive context.
+	if len(tokens) < minHighReuseWords {
+		return false
+	}
+
+	// Gates 3 & 4: primary keyword present AND a co-signal adjacent to it.
+	// For each class, locate every occurrence of the (possibly multi-token) primary
+	// keyword in the token stream, then require a co-signal within the adjacency
+	// window of that occurrence.
 	for _, cls := range highReuseKeywords {
-		if !strings.Contains(lower, cls.primary) {
-			continue
-		}
-		// Primary matched — check for at least one co-signal.
-		for _, sig := range cls.coSignals {
-			if strings.Contains(lower, sig) {
-				return true
+		primTokens := strings.Fields(cls.primary)
+		for pStart := 0; pStart+len(primTokens) <= len(tokens); pStart++ {
+			if !tokensMatchAt(tokens, pStart, primTokens) {
+				continue
+			}
+			pEnd := pStart + len(primTokens) - 1
+			// Window of tokens that count as adjacent to this primary occurrence.
+			lo := pStart - highReuseCoSignalWindow
+			if lo < 0 {
+				lo = 0
+			}
+			hi := pEnd + highReuseCoSignalWindow
+			if hi > len(tokens)-1 {
+				hi = len(tokens) - 1
+			}
+			for i := lo; i <= hi; i++ {
+				if i >= pStart && i <= pEnd {
+					continue // skip the primary tokens themselves
+				}
+				for _, sig := range cls.coSignals {
+					if tokens[i] == sig {
+						return true
+					}
+				}
 			}
 		}
 	}
 	return false
+}
+
+// tokensMatchAt reports whether the sub-slice of tokens beginning at index start
+// equals seq.
+func tokensMatchAt(tokens []string, start int, seq []string) bool {
+	for i, w := range seq {
+		if tokens[start+i] != w {
+			return false
+		}
+	}
+	return true
 }
 
 // applyPut processes an exchange:put message.

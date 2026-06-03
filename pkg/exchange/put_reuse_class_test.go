@@ -96,6 +96,22 @@ func TestHighReuseClassifier_PositiveCases(t *testing.T) {
 			description: "reusable CI config filter for conformance checks",
 			contentType: "code",
 		},
+		// --- dontguess-a0e: over-tightening guards ---
+		// Genuine §4 artifacts that sit close to the new structural thresholds. These
+		// MUST still classify true — proving the length floor (≥5 tokens) and the
+		// co-signal adjacency window (≤3 tokens) do not reject real, terse artifacts.
+		{
+			name:        "edge_five_token_checklist",
+			description: "legion.tools v1.2 schema correctness checklist",
+			contentType: "code",
+			// exactly 5 tokens; primary 'checklist' with 'correctness' adjacent — guards the floor.
+		},
+		{
+			name:        "edge_hyphenated_readme_setup",
+			description: "cf-protocol README CF_NO_PINS setup guide",
+			contentType: "analysis",
+			// 5 tokens incl. hyphenated identifier; 'setup' is 2 tokens from 'readme' — guards tokenizer + window.
+		},
 	}
 
 	for _, tc := range cases {
@@ -178,6 +194,63 @@ func TestHighReuseClassifier_NegativeCases_Ephemera(t *testing.T) {
 			description: "test pattern for distributed systems",
 			contentType: "code",
 			reason:      "'test pattern' present but no language/library/idiom co-signal",
+		},
+		// --- dontguess-a0e: crafted SHORT keyword-stuff ephemera ---
+		// These are minimal concatenations of the classifier's own trigger words with
+		// no surrounding description. They satisfied the old (presence-anywhere) gates
+		// and earned the +15% accept / +10% residual. They MUST classify false: a
+		// distilled artifact is described, not keyword-tagged.
+		{
+			name:        "stuff_test_pattern_go_idiom",
+			description: "test pattern go idiom",
+			contentType: "code",
+			reason:      "4-token keyword-stuff (primary 'test pattern' + co-signals 'go'/'idiom') — below the 5-token artifact floor",
+		},
+		{
+			name:        "stuff_checklist_schema_validation",
+			description: "checklist schema validation",
+			contentType: "analysis",
+			reason:      "3-token keyword-stuff (primary 'checklist' + co-signals 'schema'/'validation') — below the artifact floor",
+		},
+		{
+			name:        "stuff_readme_setup_guide",
+			description: "readme setup guide",
+			contentType: "summary",
+			reason:      "3-token keyword-stuff (primary 'readme' + co-signal 'setup') — below the artifact floor",
+		},
+		{
+			name:        "stuff_migration_recipe_runbook",
+			description: "migration recipe runbook",
+			contentType: "analysis",
+			reason:      "3-token keyword-stuff (primary 'migration recipe' + co-signal 'runbook') — below the artifact floor",
+		},
+		{
+			name:        "stuff_ci_config_filter",
+			description: "ci config filter",
+			contentType: "code",
+			reason:      "3-token keyword-stuff (primary 'ci config' + co-signal 'filter') — below the artifact floor",
+		},
+		// --- dontguess-a0e: PADDED keyword-stuff (defeats a naive length-only fix) ---
+		// These pad to ≥5 tokens but keep the co-signal far from the primary keyword,
+		// so the trigger words are incidental, not a descriptive phrase. The co-signal
+		// adjacency gate (window=3) rejects them even though they clear the length floor.
+		{
+			name:        "padded_test_pattern_far_go",
+			description: "test pattern for my session notes today written in go",
+			contentType: "code",
+			reason:      "9 tokens but 'go' co-signal is 6 tokens from 'test pattern' — incidental, outside the adjacency window",
+		},
+		{
+			name:        "padded_checklist_far_schema",
+			description: "checklist of all the random things I should validate against the schema someday",
+			contentType: "analysis",
+			reason:      "long but 'schema' co-signal is far from 'checklist' — incidental mention, outside adjacency window",
+		},
+		{
+			name:        "padded_readme_far_protocol",
+			description: "readme notes I jotted down about the meeting and the team protocol",
+			contentType: "summary",
+			reason:      "long but 'protocol' co-signal is far from 'readme' — incidental, outside adjacency window",
 		},
 	}
 
