@@ -271,9 +271,16 @@ if [ -f "$PID_FILE" ]; then
 fi
 
 if ! pid_is_operator "$_current_pid"; then
-  if flock -n "$LOCK" sh -c '
+  # Pass all values to the flock subshell via the environment, never by
+  # string-interpolating them into the `sh -c` command text (dontguess-732).
+  # The body below is a fully single-quoted literal: the shell performs NO
+  # expansion on it, so a DG_HOME / DG_OP containing single quotes or other
+  # shell metacharacters cannot break out and inject commands. Inside the
+  # subshell the values are read back as ordinary "$VAR" references.
+  if _DG_PID_FILE="$PID_FILE" _DG_HOME="$DG_HOME" _DG_OP="$DG_OP" _DG_LOG="$LOG" \
+     flock -n "$LOCK" sh -c '
     pid=""
-    pid_file="'"$PID_FILE"'"
+    pid_file="$_DG_PID_FILE"
     [ -f "$pid_file" ] && pid=$(cat "$pid_file" 2>/dev/null || true)
     _is_op() {
       local p="$1"
@@ -289,11 +296,11 @@ if ! pid_is_operator "$_current_pid"; then
     # Pin CF_HOME to DG_HOME so the operator always uses the stable exchange
     # identity, even when this wrapper was called by a subagent whose CF_HOME
     # points at a per-session directory (e.g. /tmp/cf-session-XXX).
-    # Without this pin the operator inherits the caller's CF_HOME and
+    # Without this pin the operator inherits the caller'\''s CF_HOME and
     # protocol.InitWithConfig() may fail or load the wrong identity (dontguess-b6e).
-    nohup env CF_HOME="'"$DG_HOME"'" "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
+    nohup env CF_HOME="$_DG_HOME" "$_DG_OP" serve >"$_DG_LOG" 2>&1 &
     new_pid=$!
-    printf "%d\n" "$new_pid" > "'"$PID_FILE"'"
+    printf "%d\n" "$new_pid" > "$_DG_PID_FILE"
     exit 0
   ' 2>/dev/null; then
     # We won the flock. Check if WE actually started the operator or found it
