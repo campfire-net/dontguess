@@ -75,7 +75,7 @@ fi
 exec "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@"
 `
 	path := filepath.Join(binDir, "dontguess")
-	if err := os.WriteFile(path, []byte(wrapper), 0755); err != nil {
+	if err := writeExecFile(t, path, []byte(wrapper)); err != nil {
 		t.Fatalf("writing wrapperV2: %v", err)
 	}
 }
@@ -372,11 +372,11 @@ printf '%s\n' "$@" >> ` + argLog + `
 printf '---\n' >> ` + argLog + `
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "cf"), []byte(stubCF), 0755); err != nil {
+	if err := writeExecFile(t, filepath.Join(binDir, "cf"), []byte(stubCF)); err != nil {
 		t.Fatalf("writing stub cf: %v", err)
 	}
 	// Install a stub dontguess-operator (not invoked in this test).
-	if err := os.WriteFile(filepath.Join(binDir, "dontguess-operator"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+	if err := writeExecFile(t, filepath.Join(binDir, "dontguess-operator"), []byte("#!/bin/sh\nexit 0\n")); err != nil {
 		t.Fatalf("writing stub operator: %v", err)
 	}
 
@@ -461,7 +461,7 @@ printf '---\n' >> ` + argLog + `
 exit 0
 `
 	stubCFPath := filepath.Join(binDir, "cf")
-	if err := os.WriteFile(stubCFPath, []byte(stubCF), 0755); err != nil {
+	if err := writeExecFile(t, stubCFPath, []byte(stubCF)); err != nil {
 		t.Fatalf("writing stub cf: %v", err)
 	}
 
@@ -469,7 +469,7 @@ exit 0
 	stubOp := `#!/bin/sh
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "dontguess-operator"), []byte(stubOp), 0755); err != nil {
+	if err := writeExecFile(t, filepath.Join(binDir, "dontguess-operator"), []byte(stubOp)); err != nil {
 		t.Fatalf("writing stub operator: %v", err)
 	}
 
@@ -502,7 +502,7 @@ fi
 exec "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@"
 `
 	wrapperPath := filepath.Join(binDir, "dontguess")
-	if err := os.WriteFile(wrapperPath, []byte(wrapper), 0755); err != nil {
+	if err := writeExecFile(t, wrapperPath, []byte(wrapper)); err != nil {
 		t.Fatalf("writing wrapper: %v", err)
 	}
 
@@ -652,7 +652,7 @@ printf '%s\n' "$@" >> ` + argLog + `
 printf '---\n' >> ` + argLog + `
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "curl"), []byte(stubCurl), 0755); err != nil {
+	if err := writeExecFile(t, filepath.Join(binDir, "curl"), []byte(stubCurl)); err != nil {
 		t.Fatalf("writing stub curl: %v", err)
 	}
 
@@ -663,7 +663,7 @@ exit 0
 	stubSh := `#!/bin/sh
 exit 0
 `
-	if err := os.WriteFile(filepath.Join(binDir, "sh"), []byte(stubSh), 0755); err != nil {
+	if err := writeExecFile(t, filepath.Join(binDir, "sh"), []byte(stubSh)); err != nil {
 		t.Fatalf("writing stub sh: %v", err)
 	}
 
@@ -673,31 +673,22 @@ exit 0
 	writeWrapperV2(t, binDir)
 
 	wrapperPath := filepath.Join(binDir, "dontguess")
-	// Under heavy parallel full-suite load, exec of a freshly-written script can
-	// transiently fail (ETXTBSY / fork pressure). Retry a few times so the test is
-	// deterministic — a real "upgrade didn't call curl" still fails after all tries.
+	// No retry needed: writeExecFile (used by writeWrapperV2 and the stub writes
+	// above) writes executables under syscall.ForkLock, so the ETXTBSY race that
+	// previously made freshly-written scripts transiently un-exec'able under heavy
+	// parallel load is eliminated at its source. A single exec is deterministic.
 	var buf bytes.Buffer
-	var curlArgs []string
-	var lastErr error
-	for attempt := 0; attempt < 5; attempt++ {
-		buf.Reset()
-		cmd := exec.Command(wrapperPath, "upgrade")
-		cmd.Env = []string{
-			"HOME=" + testDir,
-			"PATH=" + binDir + ":" + os.Getenv("PATH"),
-		}
-		cmd.Stdout = &buf
-		cmd.Stderr = &buf
-		lastErr = cmd.Run()
-		curlArgs = readArgLog(t, argLog)
-		if len(curlArgs) > 0 {
-			break // curl was invoked — the behavior under test ran
-		}
-		_ = os.Remove(argLog) // clean slate for the retry
+	cmd := exec.Command(wrapperPath, "upgrade")
+	cmd.Env = []string{
+		"HOME=" + testDir,
+		"PATH=" + binDir + ":" + os.Getenv("PATH"),
 	}
-	if len(curlArgs) == 0 && lastErr != nil {
-		t.Logf("upgrade: wrapper exec failed on all attempts: %v", lastErr)
+	cmd.Stdout = &buf
+	cmd.Stderr = &buf
+	if err := cmd.Run(); err != nil {
+		t.Logf("upgrade: wrapper exec failed: %v", err)
 	}
+	curlArgs := readArgLog(t, argLog)
 	t.Logf("upgrade: curl argv = %v", curlArgs)
 	t.Logf("upgrade: wrapper output = %s", buf.String())
 
