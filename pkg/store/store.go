@@ -117,6 +117,20 @@ func (s *Store) Append(rec Record) error {
 // ReadAll reads every record currently on disk, in append order. It opens
 // the backing file independently of the writer handle so a fresh read
 // always observes the latest fsynced state.
+//
+// Torn-tail recovery: a crash mid-Append can leave a truncated final line (the
+// write is not atomic even though a *completed* Append is fsynced — see Append).
+// ReadAll tolerates exactly one unparseable TRAILING line, dropping it and
+// returning every fully-valid record that precedes it. This upholds the package
+// doc's durability contract: every record whose Append returned successfully is
+// newline-terminated and recoverable, and a partial record from an interrupted
+// Append never poisons the whole log.
+//
+// Mid-log corruption is NOT recovered: an unparseable line that is followed by
+// any further non-empty line is real corruption (not a torn tail), so ReadAll
+// surfaces it as an error rather than silently skipping a record in the middle
+// of the append-ordered log. Single-writer append order means only the last
+// line can ever be torn.
 func (s *Store) ReadAll() ([]Record, error) {
 	f, err := os.Open(s.path)
 	if err != nil {
@@ -132,20 +146,37 @@ func (s *Store) ReadAll() ([]Record, error) {
 	// Payloads are base64-encoded JSON bytes and can be large; grow the
 	// scanner's buffer well past bufio's 64KiB default line limit.
 	scanner.Buffer(make([]byte, 0, 64*1024), 16*1024*1024)
+
+	// pendingErr holds an unmarshal failure whose "torn tail vs. mid-log
+	// corruption" verdict is not yet decided: it is a torn tail only if no
+	// further non-empty line follows it. As soon as a later non-empty line
+	// appears, the failure is mid-log corruption and is surfaced.
+	var pendingErr error
 	for scanner.Scan() {
 		line := bytes.TrimSpace(scanner.Bytes())
 		if len(line) == 0 {
 			continue
 		}
+		if pendingErr != nil {
+			// A prior line failed to parse and this non-empty line follows it,
+			// so the failure was NOT the trailing line — real mid-log corruption.
+			return nil, fmt.Errorf("store: unmarshal record (mid-log corruption, not a torn tail): %w", pendingErr)
+		}
 		var rec Record
 		if err := json.Unmarshal(line, &rec); err != nil {
-			return nil, fmt.Errorf("store: unmarshal record: %w", err)
+			// Defer the verdict: a torn tail if this proves to be the last
+			// non-empty line, mid-log corruption if another line follows.
+			pendingErr = err
+			continue
 		}
 		recs = append(recs, rec)
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("store: scan %s: %w", s.path, err)
 	}
+	// A still-pending error here means the unparseable line was the trailing
+	// line: a torn tail from an interrupted Append. Recover by dropping it and
+	// returning the valid prefix.
 	return recs, nil
 }
 

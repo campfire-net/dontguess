@@ -220,9 +220,11 @@ func (e *Engine) AutoAcceptPut(putMsgID string, price int64, expiresAt time.Time
 // autoAcceptPutLocked is the internal implementation of AutoAcceptPut.
 // Callers must hold e.opMu before calling. RunAutoAccept calls this directly.
 func (e *Engine) autoAcceptPutLocked(putMsgID string, price int64, expiresAt time.Time) error {
-	// Replay to ensure state is current before checking.
-	if err := e.replayAll(); err != nil {
-		return fmt.Errorf("replay before put-accept: %w", err)
+	// Refresh state before checking. In local mode this also dispatches any
+	// buy appended since the last poll, so a concurrently-arriving buy is
+	// matched rather than folded into State and silently dropped (dontguess-b84).
+	if err := e.refreshBeforeOperatorOp(); err != nil {
+		return fmt.Errorf("refresh before put-accept: %w", err)
 	}
 
 	pendingEntry, pending := e.state.GetPendingPut(putMsgID)
@@ -303,9 +305,10 @@ func (e *Engine) RejectPut(putMsgID string, reason string) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 
-	// Replay to ensure state is current before checking.
-	if err := e.replayAll(); err != nil {
-		return fmt.Errorf("replay before put-reject: %w", err)
+	// Refresh state before checking. In local mode this also dispatches any
+	// buy appended since the last poll (dontguess-b84).
+	if err := e.refreshBeforeOperatorOp(); err != nil {
+		return fmt.Errorf("refresh before put-reject: %w", err)
 	}
 
 	_, pending := e.state.GetPendingPut(putMsgID)
