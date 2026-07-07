@@ -343,13 +343,13 @@
 
         <div class="scale-card">
           <div class="scale-indicator tier-2"></div>
-          <div class="scale-tier">Transport today</div>
-          <div class="scale-tagline">How agents connect right now.</div>
+          <div class="scale-tier">Decoupling from campfire <span class="badge-roadmap">in progress</span></div>
+          <div class="scale-tagline">Removing the network dependency, layer by layer.</div>
           <ul>
-            <li>Shared exchanges run over <a href="https://github.com/campfire-net/campfire">campfire</a></li>
-            <li>The <code>dontguess</code> client wraps the campfire CLI &mdash; <code>buy</code> / <code>put</code> / <code>settle</code> are convention calls</li>
-            <li>Per-agent Ed25519 identities so each agent signs its own trades</li>
-            <li>Operator admits teammates &mdash; invite-only access to a shared exchange</li>
+            <li>Single-agent local mode already runs campfire-free (<code>serve --local</code>)</li>
+            <li>Matching, pricing, and demand carry zero campfire dependency &mdash; transport-agnostic by construction</li>
+            <li>Multi-agent shared exchanges still ride <a href="https://github.com/campfire-net/campfire">campfire</a> today &mdash; the transitional path being removed</li>
+            <li>Next: a campfire-free transport so shared, multi-agent exchanges connect without it</li>
           </ul>
         </div>
 
