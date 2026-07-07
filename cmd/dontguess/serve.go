@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,12 +12,14 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/matching"
 	"github.com/campfire-net/dontguess/pkg/scrip"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/campfire/pkg/provenance"
 	"github.com/campfire-net/campfire/cf-protocol/store"
@@ -32,6 +36,11 @@ var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
 	serveAutoAcceptMax int64
+	// serveLocal selects the standalone local-only cache mode (dontguess-275):
+	// no campfire relay, no campfire identity, no scrip network dependency.
+	// Ingest and egress both go through a local pkg/store event log instead
+	// of a campfire ReadClient/WriteClient — see runServeLocal.
+	serveLocal bool
 
 	// operatorConnDeadline is the per-connection deadline applied both initially
 	// (stall protection) and again after AutoAcceptPut (dontguess-777 reset).
@@ -49,8 +58,15 @@ for new messages (put, buy, settle) and processes them via the SDK Subscribe API
   dontguess serve                      # default: 500ms poll, auto-accept puts
   dontguess serve --poll-interval 1s   # slower poll
   dontguess serve --no-auto-accept     # manual put approval only
+  dontguess serve --local              # standalone: no relay, no identity, no scrip network dep
 
-The SDK's sync-before-query handles filesystem transport sync automatically.`,
+The SDK's sync-before-query handles filesystem transport sync automatically.
+
+--local runs a single-agent, campfire-free cache instead: ingest and egress
+both go through a local append-only event log under DG_HOME
+(dontguess-275). No 'dontguess init' step, no campfire join, no relay
+identity is required — the operator key and store file are created on first
+run.`,
 	RunE: runServe,
 }
 
@@ -58,10 +74,14 @@ func init() {
 	serveCmd.Flags().DurationVar(&servePollInterval, "poll-interval", 500*time.Millisecond, "how often to poll for new messages")
 	serveCmd.Flags().BoolVar(&serveAutoAccept, "auto-accept", true, "automatically accept all puts at token cost")
 	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", DefaultAutoAcceptMax, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
+	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "standalone local-only cache: no campfire relay/identity/scrip network dependency (dontguess-275)")
 	rootCmd.AddCommand(serveCmd)
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
+	if serveLocal {
+		return runServeLocal(resolveDGHome())
+	}
 	// Build two clients via protocol.InitWithConfig — both share the same identity and store file.
 	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
 	// SDK handles CF_HOME env and ~/.cf default via config cascade.
@@ -186,6 +206,124 @@ func runServe(_ *cobra.Command, _ []string) error {
 	fmt.Printf("\nAgents join with:\n")
 	fmt.Printf("  cf join %s\n\n", cfg.ExchangeCampfireID[:16])
 
+	return runEngineLoop(ctx, dgHome, eng, logger)
+}
+
+// runServeLocal runs the exchange engine in standalone local-only mode
+// (dontguess-275): no campfire relay, no campfire identity, no scrip network
+// dependency. Ingest and egress both go through a local pkg/store event log
+// under dgHome instead of a campfire ReadClient/WriteClient — see
+// exchange.EngineOptions.LocalStore.
+//
+// No 'dontguess init' step is required: the local operator key and the event
+// log file are created on first run (loadOrCreateLocalOperatorKey), inside
+// dgHome, which this function creates if missing.
+func runServeLocal(dgHome string) error {
+	if err := os.MkdirAll(dgHome, 0700); err != nil {
+		return fmt.Errorf("creating DG_HOME %s: %w", dgHome, err)
+	}
+
+	localOperatorKey, err := loadOrCreateLocalOperatorKey(dgHome)
+	if err != nil {
+		return fmt.Errorf("local operator key: %w", err)
+	}
+
+	localStorePath := filepath.Join(dgHome, "events.jsonl")
+	localStore, err := dgstore.Open(localStorePath)
+	if err != nil {
+		return fmt.Errorf("opening local store %s: %w", localStorePath, err)
+	}
+	defer localStore.Close() //nolint:errcheck
+
+	logDest, err := buildLogDest(dgHome)
+	if err != nil {
+		return fmt.Errorf("log setup: %w", err)
+	}
+	logger := log.New(logDest, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
+
+	// Use dense embeddings if the embed script is available (same as the
+	// campfire-backed path — the matching engine has no campfire dependency
+	// either way).
+	var embedder matching.Embedder
+	embedScript := os.Getenv("DONTGUESS_EMBED_SCRIPT")
+	if embedScript == "" {
+		embedScript = "/home/baron/projects/dontguess/cmd/embed/main.py"
+	}
+	if _, err := os.Stat(embedScript); err == nil {
+		embedder = matching.NewDenseEmbedder(embedScript)
+		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
+	} else {
+		logger.Printf("  embedder:  tf-idf (set DONTGUESS_EMBED_SCRIPT for dense)")
+	}
+
+	// No ReadClient, no WriteClient, no ScripStore, no ProvenanceChecker —
+	// none of those require a campfire. ScripStore/ProvenanceChecker nil
+	// already means "skip these checks" (see their EngineOptions doc).
+	eng := exchange.NewEngine(exchange.EngineOptions{
+		CampfireID:        "local",
+		LocalStore:        localStore,
+		OperatorPublicKey: localOperatorKey,
+		Embedder:          embedder,
+		PollInterval:      servePollInterval,
+		Logger: func(format string, args ...any) {
+			logger.Printf(format, args...)
+		},
+	})
+
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	defer cancel()
+
+	logger.Printf("exchange serving (local-only, zero campfire — dontguess-275)")
+	logger.Printf("  operator:  %s", localOperatorKey[:16]+"...")
+	logger.Printf("  poll:      %s", servePollInterval)
+	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
+	logger.Printf("  store:     %s", localStorePath)
+	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(dgHome, "dontguess.log"))
+
+	fmt.Printf("\n--- Local exchange (no relay, no identity, no scrip network) ---\n")
+	fmt.Printf("STORE=%s\n", localStorePath)
+	fmt.Printf("OPERATOR_KEY=%s\n\n", localOperatorKey)
+
+	return runEngineLoop(ctx, dgHome, eng, logger)
+}
+
+// loadOrCreateLocalOperatorKey returns the persisted local operator key under
+// dgHome, generating and persisting a fresh random one on first run. This is
+// an opaque local identifier only (no cryptographic identity, no campfire
+// relay involved) — it exists so exchange.State.OperatorKey (and therefore
+// Sender on every locally-emitted match/put-accept/settle message) stays
+// stable across restarts. Without persistence, a restart would pick a new
+// key, and replayAllLocal replaying the prior run's log would see historical
+// operator messages attributed to a Sender that no longer matches
+// state.OperatorKey.
+func loadOrCreateLocalOperatorKey(dgHome string) (string, error) {
+	keyPath := filepath.Join(dgHome, "local-operator.key")
+	if data, err := os.ReadFile(keyPath); err == nil {
+		if key := strings.TrimSpace(string(data)); key != "" {
+			return key, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return "", fmt.Errorf("reading local operator key %s: %w", keyPath, err)
+	}
+
+	b := make([]byte, 16)
+	if _, err := rand.Read(b); err != nil {
+		return "", fmt.Errorf("generating local operator key: %w", err)
+	}
+	key := hex.EncodeToString(b)
+	if err := os.WriteFile(keyPath, []byte(key+"\n"), 0600); err != nil {
+		return "", fmt.Errorf("writing local operator key %s: %w", keyPath, err)
+	}
+	return key, nil
+}
+
+// runEngineLoop wires the operator-facing plumbing shared by both serve
+// paths — the auto-accept ticker, the operator IPC socket, and the engine
+// event loop itself — around an already-configured Engine. Used by both
+// runServe (campfire-backed) and runServeLocal (dontguess-275, campfire-free)
+// so the two entrypoints differ only in how the Engine's ingest/egress are
+// wired (campfire ReadClient/WriteClient vs. LocalStore).
+func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, logger *log.Logger) error {
 	// Auto-accept goroutine.
 	//
 	// Dual-map design — two separate maps track over-cap puts, serving different consumers:

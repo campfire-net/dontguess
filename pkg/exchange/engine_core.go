@@ -17,6 +17,7 @@ import (
 
 	"github.com/campfire-net/dontguess/pkg/matching"
 	"github.com/campfire-net/dontguess/pkg/scrip"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // MatchingFeeRate is the fraction of the sale price charged as a matching fee.
@@ -92,11 +93,38 @@ type EngineOptions struct {
 	Store store.Store
 	// ReadClient is the protocol client used to subscribe to and replay campfire messages.
 	// If nil, the engine falls back to using Store directly (backward-compat path for tests).
+	//
+	// Ignored for ingest when LocalStore is set — see LocalStore doc.
 	ReadClient *protocol.Client
 	// WriteClient is the protocol client used to send operator-signed messages
 	// (match, settle, burn). It must carry the operator's identity and have
 	// membership in CampfireID recorded in its backing store.
+	//
+	// If nil and LocalStore is set, the engine falls back to appending
+	// operator messages directly to LocalStore instead (see LocalStore doc) —
+	// this is the path a fully standalone, zero-campfire operator process
+	// uses (dontguess-275).
 	WriteClient *protocol.Client
+	// LocalStore is the M1 (individual-tier) campfire-free event log
+	// (pkg/store, dontguess-331) used for INGEST when configured.
+	//
+	// When set, replayAll and the poll loop (run) read exclusively from
+	// LocalStore.Replay() instead of ReadClient.Read/Subscribe — this is the
+	// standalone local-only cutover (dontguess-275): a single agent can
+	// put/buy with zero campfire network dependency. LocalStore takes
+	// priority over ReadClient for ingest whenever both are set.
+	//
+	// Egress (sendOperatorMessage, used by match/put-accept/settle/etc.)
+	// still prefers WriteClient when configured, for callers mid-migration
+	// that want local ingest but still emit onto a campfire (e.g. the
+	// existing test harness). When WriteClient is nil, egress also falls
+	// back to appending directly into LocalStore — see WriteClient doc.
+	//
+	// Single-writer only (per pkg/store's package doc): this milestone does
+	// not add a sequencer or out-of-order/orphan-antecedent buffer. That is
+	// M2 (dontguess-50d), needed once multi-relay nostr ingest can deliver
+	// events out of order.
+	LocalStore *dgstore.Store
 	// PollInterval controls how often the engine polls for new messages.
 	// Defaults to 500ms.
 	PollInterval time.Duration
@@ -241,6 +269,30 @@ type Engine struct {
 	// Not persisted — rebuilt from settle events observed since engine start.
 	// Engine-private; no lock needed (engine event loop is single-threaded).
 	buyerRecentEntries map[string][]buyerSessionEntry
+
+	// localMu guards localMsgByID and localSeen. Ordinarily replayAllLocal
+	// (startup, inside Start/AutoAcceptPut/RejectPut) and pollLocalStore (the
+	// run() poll loop) execute one at a time on a single Engine — but callers
+	// that invoke Start twice on the same Engine without waiting for the
+	// first call's goroutine to exit (only valid if a caller cancels and
+	// fully drains the first Start before starting a second) would otherwise
+	// race on these plain maps/counters. localMu makes that safe rather than
+	// relying on single-invocation discipline holding everywhere.
+	localMu sync.Mutex
+	// localMsgByID indexes every message the engine has ingested from
+	// LocalStore (dontguess-275), by ID. LocalStore (pkg/store) has no
+	// campfire Get/GetMessage to fall back on, so fetchMessage and
+	// sendLocalOperatorMessage use this index instead. Populated by
+	// replayAllLocal (startup) and pollLocalStore (ongoing); only relevant
+	// when EngineOptions.LocalStore is configured. Guarded by localMu.
+	localMsgByID map[string]*Message
+	// localSeen is the count of LocalStore records already ingested (via
+	// replayAllLocal or pollLocalStore). LocalStore is single-writer,
+	// strictly append-order (pkg/store package doc), so a length-based
+	// cursor is sufficient to find "new since last poll" without a sequencer
+	// or orphan buffer (that is M2, dontguess-50d). Only relevant when
+	// EngineOptions.LocalStore is configured. Guarded by localMu.
+	localSeen int
 }
 
 // buyerSessionEntry records a single entry settled by a buyer, used for
@@ -287,6 +339,7 @@ func NewEngine(opts EngineOptions) *Engine {
 		matchIndex:         idx,
 		matchToReservation: make(map[string]string),
 		buyerRecentEntries: make(map[string][]buyerSessionEntry),
+		localMsgByID:       make(map[string]*Message),
 	}
 }
 
@@ -339,9 +392,17 @@ func (e *Engine) dispatchPendingOrders() error {
 	return nil
 }
 
-// fetchMessage retrieves a single message by ID. Uses ReadClient.Get when
-// ReadClient is configured (preferred), otherwise falls back to Store.GetMessage.
+// fetchMessage retrieves a single message by ID. When LocalStore is
+// configured, looks it up in the engine's local ingest index (dontguess-275)
+// — LocalStore has no campfire Get/GetMessage to fall back on. Otherwise uses
+// ReadClient.Get when ReadClient is configured (preferred), or falls back to
+// Store.GetMessage.
 func (e *Engine) fetchMessage(id string) (*Message, error) {
+	if e.opts.LocalStore != nil {
+		e.localMu.Lock()
+		defer e.localMu.Unlock()
+		return e.localMsgByID[id], nil
+	}
 	if e.opts.ReadClient != nil {
 		m, err := e.opts.ReadClient.Get(id)
 		if err != nil {
@@ -356,10 +417,31 @@ func (e *Engine) fetchMessage(id string) (*Message, error) {
 	return FromStoreRecord(rec), nil
 }
 
-// replayAll loads all historical messages from the campfire and rebuilds state.
-// Uses ReadClient.Read with AfterTimestamp=0 to fetch all messages. The SDK
-// handles sync-before-query automatically for filesystem transports.
+// indexLocalMessages records each message's ID -> *Message mapping in
+// localMsgByID, so fetchMessage and sendLocalOperatorMessage can look
+// messages up without a campfire Get/GetMessage (dontguess-275). Caller must
+// hold localMu.
+func (e *Engine) indexLocalMessages(msgs []Message) {
+	for i := range msgs {
+		m := msgs[i]
+		e.localMsgByID[m.ID] = &m
+	}
+}
+
+// replayAll loads all historical messages and rebuilds state.
+//
+// When LocalStore is configured, ingest reads from the campfire-free
+// pkg/store event log instead (dontguess-275) — see replayAllLocal.
+// LocalStore takes priority whenever both LocalStore and ReadClient are set.
+//
+// Otherwise, uses ReadClient.Read with AfterTimestamp=0 to fetch all
+// messages from the campfire. The SDK handles sync-before-query
+// automatically for filesystem transports.
 func (e *Engine) replayAll() error {
+	if e.opts.LocalStore != nil {
+		return e.replayAllLocal()
+	}
+
 	result, err := e.opts.ReadClient.Read(protocol.ReadRequest{
 		CampfireID:     e.opts.CampfireID,
 		AfterTimestamp: 0,
@@ -380,11 +462,46 @@ func (e *Engine) replayAll() error {
 	return nil
 }
 
-// run is the main event loop. It subscribes to the campfire via
-// ReadClient.Subscribe and dispatches messages as they arrive on the channel.
-// An expiry sweep runs on each received message (lazy path) and on a periodic
-// ticker (backstop path) to catch expired claims when no messages arrive.
+// replayAllLocal loads every record currently in LocalStore (pkg/store) and
+// rebuilds state from it — the campfire-free ingest path (dontguess-275). A
+// single local writer appends put/buy/settle/match/etc. records to an
+// append-only JSONL log; append order is fold order (pkg/store package doc),
+// so replaying the full log in order reproduces the same state a campfire
+// fold would (proved by dontguess-331's local_store_fold_test.go).
+func (e *Engine) replayAllLocal() error {
+	msgs, err := e.opts.LocalStore.Replay()
+	if err != nil {
+		return fmt.Errorf("reading local store for replay: %w", err)
+	}
+
+	e.localMu.Lock()
+	e.indexLocalMessages(msgs)
+	e.localSeen = len(msgs)
+	e.localMu.Unlock()
+
+	e.state.Replay(msgs)
+	e.rebuildMatchIndex()
+
+	e.opts.log("engine: replayed %d messages from local store, indexed %d entries",
+		len(msgs), e.matchIndex.Len())
+	return nil
+}
+
+// run is the main event loop.
+//
+// When LocalStore is configured, it polls the campfire-free pkg/store event
+// log instead (dontguess-275) — see runLocal. LocalStore takes priority
+// whenever both LocalStore and ReadClient are set.
+//
+// Otherwise, it subscribes to the campfire via ReadClient.Subscribe and
+// dispatches messages as they arrive on the channel. An expiry sweep runs on
+// each received message (lazy path) and on a periodic ticker (backstop path)
+// to catch expired claims when no messages arrive.
 func (e *Engine) run(ctx context.Context) error {
+	if e.opts.LocalStore != nil {
+		return e.runLocal(ctx)
+	}
+
 	sub := e.opts.ReadClient.Subscribe(ctx, protocol.SubscribeRequest{
 		CampfireID: e.opts.CampfireID,
 		Tags: []string{
@@ -429,6 +546,61 @@ func (e *Engine) run(ctx context.Context) error {
 			return ctx.Err()
 		}
 	}
+}
+
+// runLocal is the campfire-free event loop (dontguess-275). LocalStore
+// (pkg/store) has no subscribe/notify mechanism, so instead of a channel of
+// pushed messages, runLocal polls the store on a ticker and applies+dispatches
+// whatever is new since the last replay/poll (pollLocalStore). Expiry sweeps
+// run on the same ticker cadence as the campfire path's backstop sweep.
+func (e *Engine) runLocal(ctx context.Context) error {
+	ticker := time.NewTicker(e.opts.pollInterval())
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if err := e.pollLocalStore(); err != nil {
+				e.opts.log("engine: local store poll error: %v", err)
+			}
+			e.sweepExpiredClaims()
+			e.sweepExpiredAuctions()
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+// pollLocalStore re-reads the full LocalStore log and applies+dispatches any
+// records beyond localSeen (i.e. appended since replayAllLocal or the
+// previous poll). LocalStore is single-writer and strictly append-order
+// (pkg/store package doc), so a length-based cursor is sufficient — no
+// sequencer or orphan-antecedent buffer is needed here (that machinery is M2,
+// dontguess-50d, for out-of-order multi-relay nostr ingest).
+func (e *Engine) pollLocalStore() error {
+	msgs, err := e.opts.LocalStore.Replay()
+	if err != nil {
+		return fmt.Errorf("polling local store: %w", err)
+	}
+
+	e.localMu.Lock()
+	if len(msgs) <= e.localSeen {
+		e.localMu.Unlock()
+		return nil
+	}
+	newMsgs := msgs[e.localSeen:]
+	e.indexLocalMessages(newMsgs)
+	e.localSeen = len(msgs)
+	e.localMu.Unlock()
+
+	for i := range newMsgs {
+		msg := &newMsgs[i]
+		e.state.Apply(msg)
+		if err := e.dispatch(msg); err != nil {
+			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
+		}
+	}
+	return nil
 }
 
 // dispatch routes a new message to the appropriate handler.
@@ -498,6 +670,9 @@ func tagToProvenanceOp(op string) Operation {
 // depend on store.MessageRecord.
 func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents []string) (*Message, error) {
 	if e.opts.WriteClient == nil {
+		if e.opts.LocalStore != nil {
+			return e.sendLocalOperatorMessage(payload, tags, antecedents)
+		}
 		return nil, fmt.Errorf("engine: WriteClient not configured — cannot send operator message")
 	}
 	msg, err := e.opts.WriteClient.Send(protocol.SendRequest{
@@ -518,7 +693,86 @@ func (e *Engine) sendOperatorMessage(payload []byte, tags []string, antecedents 
 	if sdkMsg == nil {
 		return nil, fmt.Errorf("sent message not found in store: %s", msg.ID)
 	}
-	return FromSDKMessage(sdkMsg), nil
+	result := FromSDKMessage(sdkMsg)
+
+	// Mirror into LocalStore too, if configured, even though WriteClient
+	// already delivered it to the campfire. replayAllLocal is authoritative
+	// and unconditionally invoked at every Start() — it fully resets state
+	// from LocalStore's log. If operator-emitted messages (put-accept,
+	// match, settle, ...) existed only on the campfire side, the next
+	// replayAllLocal call would silently drop them from state (accepted
+	// puts revert to pending, matched orders revert to unmatched, etc.).
+	// Mirroring keeps LocalStore a complete, replay-safe record of every
+	// message this engine has processed or emitted (dontguess-275).
+	if e.opts.LocalStore != nil {
+		if mirrorErr := e.appendLocalRecord(result); mirrorErr != nil {
+			e.opts.log("engine: mirroring operator message %s to local store: %v",
+				shortKey(result.ID), mirrorErr)
+		}
+	}
+	return result, nil
+}
+
+// sendLocalOperatorMessage appends an operator-emitted message (match,
+// put-accept, settle, etc.) directly to LocalStore, with no campfire
+// WriteClient involved at all — the fully campfire-free egress path
+// (dontguess-275) used when the engine runs in local-only mode (LocalStore
+// configured, WriteClient nil).
+//
+// The message ID is a random 32-hex-char string (same generator as
+// newReservationID) since there is no campfire identity to derive an ID
+// from in this mode. Sender is state.OperatorKey, which EngineOptions
+// callers must set explicitly (via OperatorPublicKey) when running without a
+// WriteClient — there is no identity to derive it from otherwise.
+func (e *Engine) sendLocalOperatorMessage(payload []byte, tags []string, antecedents []string) (*Message, error) {
+	if tags == nil {
+		tags = []string{}
+	}
+	if antecedents == nil {
+		antecedents = []string{}
+	}
+	msg := &Message{
+		ID:          newReservationID(),
+		CampfireID:  e.opts.CampfireID,
+		Sender:      e.state.OperatorKey,
+		Payload:     payload,
+		Tags:        tags,
+		Antecedents: antecedents,
+		Timestamp:   time.Now().UnixNano(),
+	}
+	if err := e.appendLocalRecord(msg); err != nil {
+		return nil, fmt.Errorf("engine: appending local operator message: %w", err)
+	}
+	return msg, nil
+}
+
+// appendLocalRecord appends msg to LocalStore and updates the engine's local
+// ingest bookkeeping (localMsgByID, localSeen) so pollLocalStore does not
+// re-ingest and re-dispatch a message the caller has already applied to
+// state directly. Used both when LocalStore is the sole egress path
+// (sendLocalOperatorMessage, WriteClient nil) and to mirror
+// WriteClient-emitted operator messages into LocalStore (sendOperatorMessage)
+// so a later replayAllLocal — authoritative, full state reset — does not
+// lose them. See EngineOptions.LocalStore doc.
+func (e *Engine) appendLocalRecord(msg *Message) error {
+	rec := dgstore.Record{
+		ID:          msg.ID,
+		CampfireID:  msg.CampfireID,
+		Sender:      msg.Sender,
+		Payload:     msg.Payload,
+		Tags:        msg.Tags,
+		Antecedents: msg.Antecedents,
+		Timestamp:   msg.Timestamp,
+		Instance:    msg.Instance,
+	}
+	if err := e.opts.LocalStore.Append(rec); err != nil {
+		return err
+	}
+	e.localMu.Lock()
+	e.localMsgByID[msg.ID] = msg
+	e.localSeen++
+	e.localMu.Unlock()
+	return nil
 }
 
 // handleAssign processes an exchange:assign message from the operator.
@@ -725,10 +979,11 @@ func (e *Engine) handleAssignExpire(msg *Message) error {
 // handles the common case where another agent queries for open tasks.
 //
 // sweepExpiredClaims is called on every received message (lazy) and on the
-// periodic expiry sweep ticker (backstop). It is a no-op if WriteClient is
-// not configured (e.g. read-only engine instances in tests).
+// periodic expiry sweep ticker (backstop). It is a no-op if neither
+// WriteClient nor LocalStore is configured (e.g. read-only engine instances
+// in tests) — sendOperatorMessage requires one of the two to emit anything.
 func (e *Engine) sweepExpiredClaims() {
-	if e.opts.WriteClient == nil {
+	if e.opts.WriteClient == nil && e.opts.LocalStore == nil {
 		return
 	}
 	expired := e.state.ExpireStaleClaimsTS()
@@ -760,10 +1015,10 @@ func (e *Engine) sweepExpiredClaims() {
 // auction and transitions the winner to AssignClaimed.
 //
 // sweepExpiredAuctions is called on every received message (lazy) and on the
-// periodic expiry sweep ticker (backstop). It is a no-op if WriteClient is
-// not configured.
+// periodic expiry sweep ticker (backstop). It is a no-op if neither
+// WriteClient nor LocalStore is configured.
 func (e *Engine) sweepExpiredAuctions() {
-	if e.opts.WriteClient == nil {
+	if e.opts.WriteClient == nil && e.opts.LocalStore == nil {
 		return
 	}
 	pendingIDs := e.state.PendingAuctionCloseTS()
@@ -862,8 +1117,8 @@ func (e *Engine) recordBuyerSettlement(buyerKey, entryID string) {
 //
 // Non-fatal: errors are logged and do not propagate.
 func (e *Engine) stagePredictions(settledEntryID string) {
-	if e.opts.WriteClient == nil {
-		return // read-only engine or test without write client
+	if e.opts.WriteClient == nil && e.opts.LocalStore == nil {
+		return // read-only engine or test without write client / local store
 	}
 	predicted := e.state.PredictNext(settledEntryID)
 	if len(predicted) == 0 {

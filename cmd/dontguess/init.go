@@ -29,7 +29,12 @@ If an exchange config already exists at ~/.cf/dontguess-exchange.json,
 this command is a no-op unless --force is given.
 
   dontguess init
-  dontguess init --alias home.exchange.dontguess --force`,
+  dontguess init --alias home.exchange.dontguess --force
+
+Standalone local-only cache (dontguess-275): if you only need a single-agent,
+campfire-free cache with no relay/identity/scrip network dependency, skip
+this command entirely and run 'dontguess serve --local' — the local operator
+key and event log are bootstrapped on first run.`,
 	RunE: runInit,
 }
 

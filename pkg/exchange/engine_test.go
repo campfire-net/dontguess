@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/campfire-net/campfire/cf-protocol/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // testAgent represents a test participant (operator, seller, or buyer).
@@ -43,12 +45,23 @@ func newTestAgent(t *testing.T) *testAgent {
 type testHarness struct {
 	t              *testing.T
 	cfID           string
-	cfHome         string          // config dir used by exchange.Init
+	cfHome         string           // config dir used by exchange.Init
 	operatorClient *protocol.Client // operator's SDK client (shared store with st)
 	operator       *testAgent
 	seller         *testAgent
 	buyer          *testAgent
 	st             store.Store
+	// localStore is a real pkg/store.Store (dontguess-275) backed by a JSONL
+	// file on disk. sendMessage appends every test message here in addition
+	// to h.st, and newEngineWithOpts wires it into EngineOptions.LocalStore
+	// so h.newEngine()/h.newEngineWithOpts() engines exercise the real
+	// campfire-free ingest path (replayAllLocal/pollLocalStore) against a
+	// real store — not a mock. Egress (match/put-accept/settle) still goes
+	// through WriteClient into h.st unchanged, since LocalStore only takes
+	// priority for ingest (see EngineOptions.LocalStore doc) — this is why
+	// existing assertions against h.st.ListMessages for operator-emitted
+	// messages keep working unmodified.
+	localStore *dgstore.Store
 }
 
 func newTestHarness(t *testing.T) *testHarness {
@@ -83,6 +96,14 @@ func newTestHarness(t *testing.T) *testHarness {
 	}
 	t.Cleanup(func() { st.Close() })
 
+	// Real pkg/store.Store backed by an actual file on disk (dontguess-275) —
+	// the ingest path newEngineWithOpts wires engines to by default.
+	localStore, err := dgstore.Open(filepath.Join(t.TempDir(), "events.jsonl"))
+	if err != nil {
+		t.Fatalf("opening local store: %v", err)
+	}
+	t.Cleanup(func() { localStore.Close() }) //nolint:errcheck
+
 	return &testHarness{
 		t:              t,
 		cfID:           cfg.ExchangeCampfireID,
@@ -92,6 +113,7 @@ func newTestHarness(t *testing.T) *testHarness {
 		seller:         newTestAgent(t),
 		buyer:          newTestAgent(t),
 		st:             st,
+		localStore:     localStore,
 	}
 }
 
@@ -114,6 +136,7 @@ func (h *testHarness) sendMessage(sender *testAgent, payload []byte, tags []stri
 	if tags == nil {
 		tags = []string{}
 	}
+	ts := store.NowNano()
 	rec := store.MessageRecord{
 		ID:          id,
 		CampfireID:  h.cfID,
@@ -121,12 +144,30 @@ func (h *testHarness) sendMessage(sender *testAgent, payload []byte, tags []stri
 		Payload:     payload,
 		Tags:        tags,
 		Antecedents: antecedents,
-		Timestamp:   store.NowNano(),
+		Timestamp:   ts,
 		Signature:   []byte{}, // non-nil required for NOT NULL BLOB constraint in AddMessage
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		h.t.Fatalf("adding message to store: %v", err)
 	}
+
+	// Also append to the real pkg/store.Store (dontguess-275) so engines
+	// wired with EngineOptions.LocalStore (the harness default) ingest this
+	// message via the real campfire-free path — same ID/sender/payload/tags/
+	// antecedents/timestamp as the campfire record above, so both stores
+	// describe the exact same event.
+	if err := h.localStore.Append(dgstore.Record{
+		ID:          id,
+		CampfireID:  h.cfID,
+		Sender:      sender.pubKeyHex,
+		Payload:     payload,
+		Tags:        tags,
+		Antecedents: antecedents,
+		Timestamp:   ts,
+	}); err != nil {
+		h.t.Fatalf("adding message to local store: %v", err)
+	}
+
 	return exchange.FromStoreRecord(&rec)
 }
 
@@ -147,12 +188,20 @@ func (h *testHarness) newEngine() *exchange.Engine {
 
 // newEngineWithOpts creates an engine with the standard harness options plus any
 // caller-supplied overrides applied after the defaults.
+//
+// LocalStore is set to h.localStore so ingest (replayAll/run) exercises the
+// real campfire-free path (dontguess-275) against a real pkg/store.Store —
+// see the testHarness.localStore doc. ReadClient is left set too (harmless —
+// LocalStore takes priority for ingest) for any override that needs it.
+// WriteClient is unchanged, so egress (match/put-accept/settle/etc.) still
+// lands in h.st exactly as before.
 func (h *testHarness) newEngineWithOpts(override func(*exchange.EngineOptions)) *exchange.Engine {
 	opts := exchange.EngineOptions{
 		CampfireID:   h.cfID,
 		Store:        h.st,
 		ReadClient:   protocol.New(h.st, nil),
 		WriteClient:  h.operatorClient,
+		LocalStore:   h.localStore,
 		ReadSkipSync: true,
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
@@ -1842,7 +1891,8 @@ func TestEngine_HandleBuy_DebtorPriorityReducesResults(t *testing.T) {
 
 	ctx1, cancel1 := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel1()
-	go func() { _ = eng.Start(ctx1) }()
+	done1 := make(chan struct{})
+	go func() { defer close(done1); _ = eng.Start(ctx1) }()
 
 	h.sendMessage(nonDebtorBuyer,
 		buyPayloadWithResults("Go HTTP handler implementation", 50000, 4),
@@ -1852,6 +1902,13 @@ func TestEngine_HandleBuy_DebtorPriorityReducesResults(t *testing.T) {
 
 	matchMsgs := waitForMatchCount(t, eng, preCount, 2*time.Second)
 	cancel1()
+	// Wait for the ctx1 Start() goroutine to fully exit before reusing eng for
+	// ctx2 below — eng.Start() is not designed to be entered concurrently by
+	// two goroutines (the local-ingest poll cursor and match index are
+	// engine-private, single-invocation state). Without this wait, ctx1's
+	// trailing tick can race with ctx2's replay/poll and intermittently
+	// "steal" dispatch of the debtor buy sent for ctx2 below.
+	<-done1
 
 	if len(matchMsgs) <= preCount {
 		t.Fatal("non-debtor: no match message emitted")
