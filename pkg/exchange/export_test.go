@@ -144,3 +144,27 @@ var IsHighReuseArtifactForTest = IsHighReuseArtifact
 func (e *Engine) StagePredictionsForTest(settledEntryID string) {
 	e.stagePredictions(settledEntryID)
 }
+
+// FoldAndDispatchLocalSnapshotForTest drives the fold+dispatch path over an
+// explicit LocalStore snapshot — the same code pollLocalStore runs after its
+// Replay(). Exposing the snapshot as an argument lets a white-box test simulate
+// a poll observing a STALE (shorter) snapshot after a concurrent rebuild
+// advanced the dispatch cursor, deterministically and with no timing or mocks.
+func (e *Engine) FoldAndDispatchLocalSnapshotForTest(msgs []Message) {
+	e.foldAndDispatchLocalSnapshot(msgs)
+}
+
+// LocalDispatchedForTest returns the dispatch cursor under localMu, for
+// asserting the cursor never regresses.
+func (e *Engine) LocalDispatchedForTest() int {
+	e.localMu.Lock()
+	defer e.localMu.Unlock()
+	return e.localDispatched
+}
+
+// LocalSeenForTest returns the fold cursor under localMu.
+func (e *Engine) LocalSeenForTest() int {
+	e.localMu.Lock()
+	defer e.localMu.Unlock()
+	return e.localSeen
+}

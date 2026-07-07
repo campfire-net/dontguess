@@ -641,22 +641,42 @@ func (e *Engine) pollLocalStore() error {
 	if err != nil {
 		return fmt.Errorf("polling local store: %w", err)
 	}
+	e.foldAndDispatchLocalSnapshot(msgs)
+	return nil
+}
 
+// foldAndDispatchLocalSnapshot folds any newly-appended records in the given
+// LocalStore snapshot into State and dispatches any not-yet-dispatched records.
+// It is split out of pollLocalStore so the snapshot passed to fold/dispatch is
+// an explicit argument — the snapshot is captured by Replay() OUTSIDE localMu,
+// so two callers (this poll loop and a concurrent rebuildAndDispatchGapLocal)
+// can hold snapshots of DIFFERENT lengths and then serialize on localMu.
+//
+// Both cursors are claimed under localMu and advanced MONOTONICALLY: a stale
+// (shorter) snapshot whose length is at or below an already-claimed cursor
+// claims nothing and can never regress it. This is the invariant that makes a
+// record dispatched EXACTLY ONCE across all concurrent callers. Without it, a
+// poll holding an old snapshot (len 5) that reaches localMu after a rebuild
+// advanced localDispatched to 7 would write localDispatched = 5, reopening the
+// [5:7] gap and re-dispatching records 5,6 on the next poll — double-firing
+// non-idempotent dispatch side effects (e.g. emitConsumeSignal's durable
+// TagConsume append, which feeds the pricing loops). See claimDispatchGap.
+func (e *Engine) foldAndDispatchLocalSnapshot(msgs []Message) {
 	e.localMu.Lock()
 	total := len(msgs)
 	// Claim the fold gap: records appended since the last fold. A prior rebuild
 	// may already have folded some of these via a full state.Replay, so we only
-	// incrementally Apply from localSeen forward — never double-folding.
+	// incrementally Apply from localSeen forward — never double-folding. Guarded
+	// so a stale snapshot cannot regress the fold cursor either.
 	foldStart := e.localSeen
 	if total > e.localSeen {
 		e.indexLocalMessages(msgs[e.localSeen:total])
 		e.localSeen = total
 	}
-	// Claim the dispatch gap: every record not yet dispatched. This can extend
-	// earlier than foldStart when a rebuild folded records without dispatching
-	// them.
-	dispatchStart := e.localDispatched
-	e.localDispatched = total
+	// Claim the dispatch gap: every record not yet dispatched, advancing the
+	// dispatch cursor monotonically. Claimed consistently with THIS snapshot —
+	// the slice dispatched below is msgs[dispatchStart:total] for the same total.
+	dispatchStart := e.claimDispatchGap(total)
 	e.localMu.Unlock()
 
 	// Fold newly-appended records into State (outside localMu; State has its own
@@ -673,7 +693,26 @@ func (e *Engine) pollLocalStore() error {
 			e.opts.log("engine: dispatch error (msg=%s): %v", msg.ID, err)
 		}
 	}
-	return nil
+}
+
+// claimDispatchGap advances the dispatch cursor (localDispatched) to total and
+// returns the start index of the undispatched gap [start:total). The caller
+// MUST hold localMu and MUST dispatch exactly msgs[start:total] over the SAME
+// snapshot whose length is total.
+//
+// The advance is MONOTONIC: if total is at or below the already-claimed cursor
+// (a stale/shorter snapshot, e.g. a poll whose Replay() ran before a concurrent
+// rebuild advanced the cursor), the cursor is left untouched and start is
+// returned >= total — an empty gap — so nothing is claimed and nothing is
+// re-dispatched. This is the single point of truth for the dispatch cursor's
+// monotonic, dispatch-exactly-once discipline shared by pollLocalStore
+// (foldAndDispatchLocalSnapshot) and rebuildAndDispatchGapLocal (dontguess-b84).
+func (e *Engine) claimDispatchGap(total int) int {
+	start := e.localDispatched
+	if total > e.localDispatched {
+		e.localDispatched = total
+	}
+	return start
 }
 
 // rebuildAndDispatchGapLocal rebuilds State from the full LocalStore log (a
@@ -700,8 +739,11 @@ func (e *Engine) rebuildAndDispatchGapLocal() error {
 	e.localMu.Lock()
 	e.indexLocalMessages(msgs)
 	e.localSeen = total
-	dispatchStart := e.localDispatched
-	e.localDispatched = total
+	// Claim the dispatch gap monotonically (same discipline as the poll loop):
+	// a rebuild holding a stale snapshot must not regress a dispatch cursor a
+	// concurrent poll already advanced, or the gap reopens and records
+	// re-dispatch. See claimDispatchGap (dontguess-b84 residual fix).
+	dispatchStart := e.claimDispatchGap(total)
 	e.localMu.Unlock()
 
 	e.state.Replay(msgs)
