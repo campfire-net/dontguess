@@ -923,10 +923,30 @@ func (e *Engine) appendLocalRecord(msg *Message) error {
 		Timestamp:   msg.Timestamp,
 		Instance:    msg.Instance,
 	}
+	// Hold localMu across BOTH the store Append and the cursor increments so the
+	// two are ATOMIC with respect to the concurrent fold path (pollLocalStore /
+	// rebuildAndDispatchGapLocal, via foldAndDispatchLocalSnapshot). Without this,
+	// the record becomes observable to a concurrent LocalStore.Replay() snapshot
+	// the instant Append returns, while foldStart (= localSeen) would not yet cover
+	// it — so that fold's loop would state.Apply() an operator record its emitter
+	// (e.g. emitConsumeSignal) ALSO Applies, a transient in-memory double of a
+	// behavioral signal that feeds the pricing loops (dontguess-90d). Serializing
+	// on localMu forces any fold to run either fully-BEFORE this Append (its
+	// snapshot excludes the record; cursors unchanged) or fully-AFTER the increment
+	// (its snapshot includes the record but foldStart already covers it → skipped),
+	// so the record is applied to State exactly once, by its emitter.
+	//
+	// This holds localMu across Append's fsync; that contention is an accepted
+	// tradeoff for correctness (dontguess-90d). No deadlock: LocalStore.Append is
+	// plain fsynced file I/O in pkg/store (guarded by the store's own mutex) and
+	// never re-enters any path that takes localMu. Cursors are advanced only on a
+	// successful Append — on error we return with localMu released and no cursor,
+	// map, or partial state mutated.
+	e.localMu.Lock()
+	defer e.localMu.Unlock()
 	if err := e.opts.LocalStore.Append(rec); err != nil {
 		return err
 	}
-	e.localMu.Lock()
 	e.localMsgByID[msg.ID] = msg
 	// Operator-emitted messages are applied to State directly by their emitter
 	// and must never be re-dispatched, so advance BOTH cursors. This is correct
@@ -939,7 +959,6 @@ func (e *Engine) appendLocalRecord(msg *Message) error {
 	// marked folded+handled without re-dispatch (dontguess-b84).
 	e.localSeen++
 	e.localDispatched++
-	e.localMu.Unlock()
 	return nil
 }
 
