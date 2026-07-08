@@ -12,8 +12,10 @@ import (
 // contract (docs/design/relay-transport.md §2.4a D2, reworked):
 //
 //   - a message naming exactly one op constant resolves to that op;
-//   - secondary markers that are NOT op constants (buy-miss, consume, synthetic,
-//     phase/domain/verdict tags) are ignored and never select the op;
+//   - secondary markers that are NOT op constants (buy-miss, synthetic,
+//     phase/domain/verdict tags) are ignored and never select the op; TagConsume
+//     WAS such a marker but is now a canonical op (dontguess-13c) — see
+//     "consume_alone" below and TestExchangeOp_ConsumeCarrierSmuggledAuctionCloseIsInert;
 //   - a message naming two or more DISTINCT op constants is ambiguous and
 //     resolves to "" (unroutable) — the smuggled-op defense.
 //
@@ -41,7 +43,12 @@ func TestExchangeOp_CanonicalSourceOnly(t *testing.T) {
 		{"buy_miss_marker_after", []string{TagMatch, TagBuyMiss}, TagMatch},
 		{"buy_miss_marker_before", []string{TagBuyMiss, TagMatch}, TagMatch},
 		{"buy_miss_marker_synthetic", []string{TagBuyMiss, TagMatch, TagSynthetic}, TagMatch},
-		{"consume_is_not_an_op", []string{TagConsume}, ""},
+		// TagConsume IS a canonical op (dontguess-13c, completing the e15
+		// residual): a lone consume tag resolves to itself, same as scrip ops.
+		// It still dispatches via applyLocked's default-branch tag scan (no
+		// switch case for TagConsume), but it MUST count toward the ambiguity
+		// check — see TestExchangeOp_ConsumeCarrierSmuggledAuctionCloseIsInert.
+		{"consume_alone", []string{TagConsume}, TagConsume},
 		{"empty", nil, ""},
 		{"no_op_tags", []string{TagPhasePrefix + "deliver", "exchange:domain:go"}, ""},
 
@@ -265,5 +272,113 @@ func TestExchangeOp_ScripCarrierSmuggledAuctionCloseIsInert(t *testing.T) {
 	})
 	if got := stLegit.GetBuyHoldReservation("buy-msg-1"); got != "reservation-1" {
 		t.Fatalf("legit scrip-buy-hold did not fold/index: GetBuyHoldReservation(buy-msg-1) = %q, want %q", got, "reservation-1")
+	}
+}
+
+// TestExchangeOp_ConsumeCarrierSmuggledAuctionCloseIsInert is the dontguess-13c
+// regression, completing the dontguess-e15 residual: isExchangeOpTag counted
+// scrip ops as canonical but still omitted TagConsume (exchange:consume). A
+// consume-kind message is DISPATCHED through applyLocked's default branch
+// (state_core.go:174, scanning tags for TagConsume) rather than through the
+// op switch, and it is operator-emitted (applyConsume's operator-sender
+// guard) — the same shape as the scrip carrier e15 fixed. Before this fix, a
+// consume-carrier event (Sender=operator, Tags=[TagConsume, smuggled
+// "exchange:assign-auction-close"]) contributed ZERO isExchangeOpTag members
+// from its own consume op, leaving assign-auction-close as the only canonical
+// op found — a clean, unambiguous (and wrong) resolution that would finalize
+// a live Vickrey auction the message never legitimately touched. This test
+// proves DONE at the fold level with a consume carrier, and additionally
+// proves a legitimate lone consume event still folds and increments
+// entryConsumeCount, unaffected by counting TagConsume as canonical.
+func TestExchangeOp_ConsumeCarrierSmuggledAuctionCloseIsInert(t *testing.T) {
+	const operator = "operator-pubkey"
+	base := time.Date(2026, 7, 8, 12, 0, 0, 0, time.UTC).UnixNano()
+
+	newAuctionState := func() (*State, string) {
+		st := NewState()
+		st.OperatorKey = operator
+		assignID := "assign-auction-consume-1"
+		assignPayload, _ := json.Marshal(map[string]any{
+			"entry_id":               "entry-1",
+			"task_type":              "compression",
+			"reward":                 int64(1000),
+			"auction_window_seconds": 10,
+		})
+		st.Apply(&Message{
+			ID:        assignID,
+			Sender:    operator,
+			Tags:      []string{TagAssign},
+			Payload:   assignPayload,
+			Timestamp: base,
+		})
+		for i, bid := range []struct {
+			worker string
+			amount int64
+		}{{"worker-a", 800}, {"worker-b", 600}} {
+			bidPayload, _ := json.Marshal(map[string]any{"bid": bid.amount})
+			st.Apply(&Message{
+				ID:          "bid-" + bid.worker,
+				Sender:      bid.worker,
+				Tags:        []string{TagAssignClaim},
+				Antecedents: []string{assignID},
+				Payload:     bidPayload,
+				Timestamp:   base + int64(i+1)*int64(time.Second),
+			})
+		}
+		if rec := st.AssignByIDForTest()[assignID]; rec == nil || rec.Status != AssignOpen || len(rec.AuctionBids) != 2 {
+			t.Fatalf("setup: want AssignOpen with 2 bids, got %+v", rec)
+		}
+		return st, assignID
+	}
+
+	closeTS := base + 20*int64(time.Second) // after the 10s auction window
+
+	// (1) Consume-carrier smuggle: a consume event (its own op, TagConsume, is
+	// now a canonical op) with the auction-close op riding as a sibling
+	// string — the folded shape of a consume-kind event carrying a smuggled
+	// ["x","exchange:assign-auction-close"] tag. exchangeOp must see two
+	// distinct canonical ops (consume AND assign-auction-close) and fail loud
+	// -> neither the assign-auction-close handler nor applyConsume runs ->
+	// auction stays OPEN and no consume count is recorded.
+	stSmuggle, assignID := newAuctionState()
+	consumePayload, _ := json.Marshal(map[string]any{"entry_id": "entry-1"})
+	stSmuggle.Apply(&Message{
+		ID:          "close-smuggled-via-consume",
+		Sender:      operator,
+		Tags:        []string{TagConsume, TagAssignAuctionClose},
+		Antecedents: []string{assignID},
+		Payload:     consumePayload,
+		Timestamp:   closeTS,
+	})
+	if rec := stSmuggle.AssignByIDForTest()[assignID]; rec.Status != AssignOpen {
+		t.Fatalf("consume-carrier-smuggled auction-close changed the executed op: status = %v, want AssignOpen (inert)", rec.Status)
+	}
+	// NOTE: applyLocked's default branch (state_core.go:174) scans msg.Tags
+	// directly for TagConsume/scrip.TagScripBuyHold — independent of the
+	// resolved (ambiguous -> "") op — so applyConsume still increments
+	// entryConsumeCount here even though the switch-dispatched smuggled op
+	// (assign-auction-close) is correctly blocked above. This is a
+	// pre-existing, broader gap (confirmed to affect scrip.TagScripBuyHold
+	// too, predating dontguess-e15) in the default-branch dispatch itself,
+	// not in isExchangeOpTag/exchangeOp — out of scope for dontguess-13c
+	// (file-scoped to state_put.go) and tracked separately. This test's scope
+	// matches the item's DONE criteria: the smuggled op's own handler
+	// (applyAssignAuctionClose) must not execute, which is proven above.
+
+	// (2) Legit consume event, only its own canonical op: proves counting
+	// TagConsume as canonical does not disturb ordinary consume folding. The
+	// event increments entryConsumeCount exactly as before this fix.
+	stLegit := NewState()
+	stLegit.OperatorKey = operator
+	legitPayload, _ := json.Marshal(map[string]any{"entry_id": "entry-1"})
+	stLegit.Apply(&Message{
+		ID:        "consume-1",
+		Sender:    operator,
+		Tags:      []string{TagConsume},
+		Payload:   legitPayload,
+		Timestamp: base,
+	})
+	if sig := stLegit.AllEntryBehavioralSignals()["entry-1"]; sig.ConsumeCount != 1 {
+		t.Fatalf("legit consume did not fold/index: ConsumeCount = %d, want 1", sig.ConsumeCount)
 	}
 }

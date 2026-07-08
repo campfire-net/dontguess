@@ -20,9 +20,9 @@ var validCompressionTiers = map[string]struct{}{
 
 // isExchangeOpTag reports whether a tag is a first-class exchange operation
 // constant — the canonical vocabulary that selects a fold/dispatch handler.
-// Secondary markers (exchange:buy-miss, exchange:consume, exchange:synthetic)
-// and phase/domain/verdict tags are deliberately NOT in this set: they never
-// select the executed op.
+// Secondary markers (exchange:buy-miss, exchange:synthetic) and phase/domain/
+// verdict tags are deliberately NOT in this set: they never select the
+// executed op.
 //
 // Scrip ops (dontguess:scrip-*) ARE included (dontguess-e15, wave-7 security
 // review of dontguess-c22). A scrip-kind (Kind=3411) message's own canonical op
@@ -39,6 +39,20 @@ var validCompressionTiers = map[string]struct{}{
 // ambiguity check and exchangeOp fails loud, matching the invariant documented
 // on exchangeOp below: an ["x","exchange:*"] op-collision must be inert for
 // every event kind, not just put/buy/match/settle/assign*.
+//
+// TagConsume (exchange:consume) IS included (dontguess-13c, completing the
+// e15 residual). Like scrip ops, a consume-kind message is DISPATCHED through
+// applyLocked's default branch (state_core.go:174, scanning for TagConsume)
+// rather than through the switch above, and it is operator-emitted (see
+// applyConsume's operator-sender guard). Before this fix, TagConsume was
+// listed only as a "secondary marker" excluded from this set, so a
+// consume-carrier event (Sender=operator, Tags=[TagConsume, smuggled
+// "exchange:assign-auction-close"]) contributed ZERO isExchangeOpTag members
+// from its own consume op, leaving the smuggled assign-auction-close tag as
+// the only canonical op found — the same unambiguous-and-wrong resolution
+// class e15 fixed for scrip. Counting TagConsume here closes that same gap:
+// any additional distinct canonical op tag on a consume-kind event — smuggled
+// or not — now trips the ambiguity check and exchangeOp fails loud.
 func isExchangeOpTag(t string) bool {
 	switch t {
 	case TagPut, TagBuy, TagMatch, TagSettle,
@@ -46,7 +60,8 @@ func isExchangeOpTag(t string) bool {
 		TagAssignExpire, TagAssignAuctionClose,
 		scrip.TagScripMint, scrip.TagScripBurn, scrip.TagScripPutPay, scrip.TagScripBuyHold,
 		scrip.TagScripSettle, scrip.TagScripAssignPay, scrip.TagScripDisputeRefund,
-		scrip.TagScripLoanMint, scrip.TagScripLoanRepay, scrip.TagScripLoanVigAccrue:
+		scrip.TagScripLoanMint, scrip.TagScripLoanRepay, scrip.TagScripLoanVigAccrue,
+		TagConsume:
 		return true
 	}
 	return false
@@ -80,8 +95,12 @@ func isExchangeOpTag(t string) bool {
 //
 // Secondary markers that are not op constants round-trip losslessly and fold
 // correctly: a buy-miss standing offer tagged [exchange:buy-miss, exchange:match]
-// still resolves to the single op TagMatch; an exchange:consume message resolves
-// to "" and is handled by the applyLocked default branch.
+// still resolves to the single op TagMatch. A lone exchange:consume message
+// resolves to its own canonical op (TagConsume, dontguess-13c); since
+// applyLocked's switch has no case for TagConsume, it still falls through to
+// the default branch, which scans tags for TagConsume and calls applyConsume —
+// same as scrip ops (dontguess-e15), whose canonical ops likewise fall through
+// to the default branch's tag scan.
 func exchangeOp(tags []string) string {
 	found := ""
 	for _, t := range tags {
