@@ -51,11 +51,26 @@ Requires a running or initialized exchange (dontguess init must have been run).`
 }
 
 func init() {
+	agentInitCmd.Flags().String("parent", "",
+		"provision an ephemeral subagent that signs under this parent fleet member's npub (no new key is minted)")
 	rootCmd.AddCommand(agentInitCmd)
 }
 
-func runAgentInit(_ *cobra.Command, args []string) error {
-	name := args[0]
+func runAgentInit(cmd *cobra.Command, args []string) error {
+	parent := ""
+	if cmd != nil {
+		parent, _ = cmd.Flags().GetString("parent")
+	}
+	return runAgentInitCore(resolveDGHome(), args[0], parent)
+}
+
+// runAgentInitCore provisions agent <name> under dgHome. When parent is empty
+// the agent is a long-lived FLEET MEMBER and gets a persistent secp256k1 npub.
+// When parent names another agent, <name> is an ephemeral SUBAGENT that signs
+// under the parent fleet member's npub — no new npub is minted (the Sybil /
+// convergence-integrity defense; see docs/design/nostr-first-rebuild-decision.md
+// key-management ruling and docs/design/convergence-sybil-defense.md).
+func runAgentInitCore(dgHome, name, parent string) error {
 	// Security: the name becomes a path component under DG_HOME/agents. Reject
 	// path separators and any "." / ".." traversal — otherwise `agent-init ..`
 	// resolves to DG_HOME itself and would load the operator's identity (CVE-class
@@ -64,8 +79,18 @@ func runAgentInit(_ *cobra.Command, args []string) error {
 		strings.ContainsAny(name, "/\\") || strings.Contains(name, "..") {
 		return fmt.Errorf("invalid agent name %q: must be a single path component without '/', '\\', or '..'", name)
 	}
-
-	dgHome := resolveDGHome()
+	// The parent name (if any) becomes a path component too — same validation.
+	// This also guarantees a subagent can never name the operator ('.'/'..')
+	// as its parent: the operator key is never borrowed.
+	if parent != "" {
+		if parent == "." || parent == ".." ||
+			strings.ContainsAny(parent, "/\\") || strings.Contains(parent, "..") {
+			return fmt.Errorf("invalid parent name %q: must be a single path component without '/', '\\', or '..'", parent)
+		}
+		if parent == name {
+			return fmt.Errorf("agent %q cannot be its own parent", name)
+		}
+	}
 
 	// Load exchange config — we need ExchangeCampfireID.
 	cfg, err := exchange.LoadConfig(dgHome)
@@ -146,21 +171,49 @@ func runAgentInit(_ *cobra.Command, args []string) error {
 		}
 	}
 
-	// Step 6: issue the secp256k1/schnorr nostr identity (the FORCED re-key —
-	// campfire's Ed25519 keys are dead). This is the identity that will sign
-	// nostr events and authenticate to the team relay via NIP-42. It is
-	// persisted alongside the campfire identity in the same agent home, keyed by
-	// the persistent agent name, so re-running loads the SAME npub rather than
-	// minting a throwaway (key-management ruling: a persistent fleet member has
-	// a persistent npub; ephemeral subagents adopt their parent's key, never a
-	// fresh one). See docs/design/nostr-first-rebuild-decision.md (NFR key mgmt).
-	nostrID, nostrCreated, err := identity.LoadOrCreate(agentHome)
-	if err != nil {
-		return fmt.Errorf("issue secp256k1 identity for agent %q: %w", name, err)
-	}
-	nostrAction := "loaded existing"
-	if nostrCreated {
-		nostrAction = "generated new"
+	// Step 6: issue (or borrow) the secp256k1/schnorr nostr identity — the
+	// identity that signs nostr events and authenticates to the team relay via
+	// NIP-42. This is where the key-management ruling is enforced by
+	// construction (docs/design/nostr-first-rebuild-decision.md key-mgmt ruling;
+	// docs/design/convergence-sybil-defense.md):
+	//
+	//   - FLEET MEMBER (no --parent): gets a PERSISTENT npub via LoadOrCreate.
+	//     Re-running loads the SAME key rather than minting a throwaway.
+	//   - EPHEMERAL SUBAGENT (--parent P): signs under P's fleet-member npub via
+	//     BorrowParent. No new independent npub is minted — a fresh throwaway per
+	//     subagent would destroy reputation continuity AND inflate convergence
+	//     independence (a Sybil vector). Convergence is scored at the parent
+	//     (fleet-member) npub granularity.
+	//
+	// The operator key is never borrowed: parent is constrained to a single path
+	// component under agents/, so it can never resolve to DG_HOME (the operator
+	// home). A subagent that named the operator would have to name '.'/'..',
+	// which the validation above rejects.
+	var nostrID *identity.Secp256k1Identity
+	var nostrAction string
+	if parent != "" {
+		parentHome := filepath.Join(agentsRoot, parent)
+		// Defense in depth (mirrors the agentHome guard): the parent must stay
+		// strictly under agents/ — never the operator home, never outside.
+		if parentHome == agentsRoot || parentHome == dgHome ||
+			!strings.HasPrefix(parentHome+string(filepath.Separator), agentsRoot+string(filepath.Separator)) {
+			return fmt.Errorf("invalid parent %q: resolves outside the agents directory", parent)
+		}
+		nostrID, err = identity.BorrowParent(agentHome, parentHome)
+		if err != nil {
+			return fmt.Errorf("borrow parent %q for subagent %q: %w", parent, name, err)
+		}
+		nostrAction = fmt.Sprintf("borrowed parent %q", parent)
+	} else {
+		var nostrCreated bool
+		nostrID, nostrCreated, err = identity.LoadOrCreate(agentHome)
+		if err != nil {
+			return fmt.Errorf("issue secp256k1 identity for agent %q: %w", name, err)
+		}
+		nostrAction = "loaded existing"
+		if nostrCreated {
+			nostrAction = "generated new"
+		}
 	}
 
 	// Step 7: print the export line to stdout (for eval) and info to stderr.
