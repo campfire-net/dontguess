@@ -623,12 +623,15 @@ func (e *Engine) sendPreviewResponse(msg *Message, matchMsgID string, entry *Inv
 // emits content when the deliver message is tracked in state (deliverToMatch is
 // populated), which guarantees the sender was the operator.
 func (e *Engine) handleSettleDeliverContent(msg *Message) error {
-	// Skip if this message already carries content — it is the engine's own
-	// emitted response and must not be re-processed.
+	// Skip if this message already carries content or a blob pointer — it is
+	// the engine's own emitted response and must not be re-processed. Both
+	// fields are checked because the two delivery shapes (inline vs. pointer,
+	// see emitDeliverContent) populate different fields.
 	var incoming struct {
-		Content string `json:"content"`
+		Content     string `json:"content"`
+		BlobPointer string `json:"blob_pointer"`
 	}
-	if err := json.Unmarshal(msg.Payload, &incoming); err == nil && incoming.Content != "" {
+	if err := json.Unmarshal(msg.Payload, &incoming); err == nil && (incoming.Content != "" || incoming.BlobPointer != "") {
 		return nil
 	}
 
@@ -636,20 +639,6 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 	entry, ok := e.state.EntryForDeliver(msg.ID)
 	if !ok {
 		e.opts.log("engine: settle-deliver: cannot derive entry for deliver=%s — antecedent chain missing or non-operator sender", shortKey(msg.ID))
-		return nil
-	}
-
-	// Resolve the full deliver content. For offloaded entries (dontguess-7783),
-	// entry.Content holds only the inline preview slice — the full content
-	// must be fetched from the Blossom blob store and verified against
-	// entry.ContentHash before it can ever be delivered to a buyer.
-	deliverBytes, err := e.resolveDeliverContent(entry)
-	if err != nil {
-		e.opts.log("engine: settle-deliver: entry=%s: %v", shortKey(entry.EntryID), err)
-		return nil
-	}
-	if len(deliverBytes) == 0 {
-		e.opts.log("engine: settle-deliver: entry=%s has no content — cannot emit deliver", shortKey(entry.EntryID))
 		return nil
 	}
 
@@ -665,29 +654,47 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 		return nil
 	}
 
-	return e.emitDeliverContent(msg, entry, deliverBytes, buyerKey)
+	return e.emitDeliverContent(msg, entry, buyerKey)
 }
 
-// resolveDeliverContent returns the full content bytes to deliver for entry.
+// emitDeliverContent builds and sends the settle(deliver) message for entry.
 //
-// If entry has no BlobPointer, the content was never offloaded — entry.Content
-// already holds the full bytes (legacy / small-content path), returned as-is.
+// Two mutually exclusive shapes, chosen by entry.BlobPointer:
 //
-// If entry has a BlobPointer (dontguess-7783), the full content lives only in
-// the Blossom blob store. This fetches it and verifies its sha256 against
-// entry.ContentHash — the client-side hash verification that mitigates a
-// tampered or corrupted blob (a mismatch here means the blob store returned
-// content that does not match what the seller originally put, and it is
-// refused rather than delivered).
-func (e *Engine) resolveDeliverContent(entry *InventoryEntry) ([]byte, error) {
-	if entry.BlobPointer == "" {
-		return entry.Content, nil
+//   - Offloaded entry (dontguess-7783, BlobPointer set): the full content
+//     lives only in the Blossom blob store — entry.Content holds just the
+//     inline preview slice, never the full bytes. Per the shipped design
+//     (docs/design/nostr-first-rebuild-decision.md L114/L183 — "full deliver
+//     is a Blossom pointer + client-side hash verification"), this emits the
+//     BlobPointer and entry.ContentHash, NOT the bytes. The buyer fetches the
+//     blob directly from Blossom and verifies its sha256 against content_hash
+//     themselves before trusting it. The operator never fetches or inlines
+//     the oversize content at deliver time (dontguess-05d2: the previous
+//     implementation fetched-and-verified server-side, then still inlined
+//     the full bytes into the outgoing message, defeating the offload).
+//   - Legacy/small entry (no BlobPointer): entry.Content already holds the
+//     full bytes and is delivered inline, unchanged from before.
+//
+// Size guard: regardless of why an entry lacks a BlobPointer, content larger
+// than BlossomOffloadThreshold is never inlined into the outgoing message —
+// a hard boundary enforced at delivery time, independent of whatever put-time
+// policy produced the entry.
+func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKey string) error {
+	if entry.BlobPointer != "" {
+		return e.emitDeliverPointer(msg, entry, buyerKey)
 	}
-	return e.state.FetchAndVerifyBlob(entry)
-}
 
-// emitDeliverContent builds and sends the content-bearing settle(deliver) message.
-func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, content []byte, buyerKey string) error {
+	content := entry.Content
+	if len(content) == 0 {
+		e.opts.log("engine: settle-deliver: entry=%s has no content — cannot emit deliver", shortKey(entry.EntryID))
+		return nil
+	}
+	if len(content) > BlossomOffloadThreshold {
+		e.opts.log("engine: settle-deliver: entry=%s content size %d exceeds BlossomOffloadThreshold %d but has no BlobPointer — refusing to inline",
+			shortKey(entry.EntryID), len(content), BlossomOffloadThreshold)
+		return nil
+	}
+
 	rawHash := sha256.Sum256(content)
 	contentHash := "sha256:" + hex.EncodeToString(rawHash[:])
 
@@ -703,13 +710,48 @@ func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, content
 		return fmt.Errorf("engine: settle-deliver: marshal content payload for entry=%s: %w", shortKey(entry.EntryID), err)
 	}
 
+	return e.sendDeliverMessage(msg, entry, buyerKey, deliverContentPayload, contentHash)
+}
+
+// emitDeliverPointer emits the pointer-shaped settle(deliver) message for a
+// Blossom-offloaded entry: a BlobPointer + content_hash, never the bytes. The
+// buyer is responsible for fetching entry.BlobPointer from the Blossom blob
+// store and verifying the fetched bytes' sha256 against content_hash before
+// trusting the content. See State.FetchAndVerifyBlob for the equivalent check
+// implemented for callers that fetch on the buyer's behalf server-side rather
+// than delivering a pointer for the buyer to resolve itself.
+func (e *Engine) emitDeliverPointer(msg *Message, entry *InventoryEntry, buyerKey string) error {
+	if entry.ContentHash == "" {
+		e.opts.log("engine: settle-deliver: entry=%s has BlobPointer but no content_hash — refusing to emit pointer deliver", shortKey(entry.EntryID))
+		return nil
+	}
+
+	deliverPointerPayload, err := e.marshal(map[string]any{
+		"phase":        SettlePhaseStrDeliver,
+		"entry_id":     entry.EntryID,
+		"blob_pointer": entry.BlobPointer,
+		"content_hash": entry.ContentHash,
+		"buyer":        buyerKey,
+		"guide":        "Content is stored off-relay in Blossom (too large to inline). Fetch it via blob_pointer, then verify integrity YOURSELF before trusting it: SHA-256 hash the fetched bytes and compare to content_hash. A mismatch means the blob host served tampered or corrupted bytes — discard it and dispute rather than send settle(complete). To confirm receipt after a successful verify, send settle(complete) with the content_hash. A compression task may be posted for you — completing it earns 30% of token_cost in scrip (you have the content cached, making you the ideal compressor).",
+	})
+	if err != nil {
+		return fmt.Errorf("engine: settle-deliver: marshal pointer payload for entry=%s: %w", shortKey(entry.EntryID), err)
+	}
+
+	return e.sendDeliverMessage(msg, entry, buyerKey, deliverPointerPayload, entry.ContentHash)
+}
+
+// sendDeliverMessage emits the settle(deliver) convention message shared by
+// both the inline-content and pointer delivery shapes, antecedent to the
+// operator's deliver trigger (msg).
+func (e *Engine) sendDeliverMessage(msg *Message, entry *InventoryEntry, buyerKey string, payload []byte, contentHash string) error {
 	tags := []string{
 		TagSettle,
 		TagPhasePrefix + SettlePhaseStrDeliver,
 	}
 	antecedents := []string{msg.ID}
 
-	_, err = e.sendOperatorMessage(deliverContentPayload, tags, antecedents)
+	_, err := e.sendOperatorMessage(payload, tags, antecedents)
 	if err != nil {
 		return fmt.Errorf("engine: settle-deliver: send content for entry=%s: %w", shortKey(entry.EntryID), err)
 	}

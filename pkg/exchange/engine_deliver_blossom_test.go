@@ -1,20 +1,32 @@
 package exchange_test
 
-// Engine-level round-trip tests for the Blossom deliver path (dontguess-7783).
+// Engine-level round-trip tests for the Blossom deliver path (dontguess-7783,
+// dontguess-05d2).
 //
 // Covered:
 //   - Full flow: oversize put (offloaded to Blossom) -> put-accept -> buy ->
-//     match -> operator deliver trigger -> engine fetches the full content
-//     from the blob store, verifies it against the content-hash, and emits a
-//     settle(deliver) message whose content sha256 matches the ORIGINAL full
-//     content the seller put (not the inline preview slice).
-//   - Tampered blob: if the bytes resolvable via the entry's BlobPointer no
-//     longer match its ContentHash, the engine refuses to deliver — no
-//     content-bearing settle(deliver) message is emitted.
+//     match -> operator deliver trigger -> engine emits a settle(deliver)
+//     message carrying a Blossom POINTER + content_hash — never the full
+//     bytes (docs/design/nostr-first-rebuild-decision.md L114/L183: "full
+//     deliver is a Blossom pointer + client-side hash verification").
+//   - Client-side verify-on-fetch: the buyer fetches entry.BlobPointer from
+//     the blob store directly and verifies the fetched bytes' sha256 against
+//     the delivered content_hash. A healthy blob verifies and matches the
+//     original put content exactly (not the inline preview slice).
+//   - Tampered blob: the operator still delivers the pointer (it does not
+//     fetch or gate on blob health at deliver time — verification is the
+//     client's job, per the design), but the buyer's client-side verify
+//     catches the mismatch and refuses to trust the fetched bytes.
+//   - Size guard: content that exceeded BlossomOffloadThreshold but somehow
+//     lacks a BlobPointer (e.g. no blob store was configured at put time) is
+//     NEVER inlined into an outgoing settle(deliver) message — the engine
+//     refuses to emit any content-bearing or pointer-bearing deliver message
+//     at all rather than leak oversize bytes onto the relay.
 
 import (
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"testing"
 	"time"
@@ -35,6 +47,71 @@ func buildOversizeDeliverableState(t *testing.T, h *testHarness, eng *exchange.E
 
 	eng.State().SetBlobStore(blobStore)
 
+	entryID, deliverMsg, originalContent := seedOversizePut(t, h, eng, "TestEngineDeliverBlossom round trip")
+
+	inv := eng.State().Inventory()
+	found := false
+	for _, e := range inv {
+		if e.EntryID == entryID {
+			found = true
+			if e.BlobPointer == "" {
+				t.Fatal("expected oversize entry to have a BlobPointer after put-accept")
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected inventory entry after put-accept")
+	}
+
+	return deliverMsg, originalContent
+}
+
+// buildOversizeDeliverableStateNoBlobStore mirrors buildOversizeDeliverableState
+// but deliberately configures NO blob store, so oversize content is stored
+// fully inline (BlobPointer == "") — the legacy/no-offload path. This models
+// the defensive scenario the emitDeliverContent size guard protects against:
+// an entry whose content exceeds BlossomOffloadThreshold but has no
+// BlobPointer to deliver as a pointer instead.
+func buildOversizeDeliverableStateNoBlobStore(t *testing.T, h *testHarness, eng *exchange.Engine) (
+	deliverMsg *exchange.Message,
+	originalContent []byte,
+) {
+	t.Helper()
+
+	entryID, deliverMsg, originalContent := seedOversizePut(t, h, eng, "TestEngineDeliverBlossom size guard (no blob store)")
+
+	inv := eng.State().Inventory()
+	found := false
+	for _, e := range inv {
+		if e.EntryID == entryID {
+			found = true
+			if e.BlobPointer != "" {
+				t.Fatal("expected no BlobPointer when no blob store is configured")
+			}
+			if len(e.Content) <= exchange.BlossomOffloadThreshold {
+				t.Fatalf("expected inline content to exceed BlossomOffloadThreshold (%d), got %d",
+					exchange.BlossomOffloadThreshold, len(e.Content))
+			}
+		}
+	}
+	if !found {
+		t.Fatal("expected inventory entry after put-accept")
+	}
+
+	return deliverMsg, originalContent
+}
+
+// seedOversizePut drives put -> put-accept -> buy -> match -> buyer-accept ->
+// operator deliver-trigger for a 64 KiB (> BlossomOffloadThreshold) entry.
+// Whether the entry ends up offloaded depends solely on whether a blob store
+// was configured on eng.State() before this call — callers set that up.
+func seedOversizePut(t *testing.T, h *testHarness, eng *exchange.Engine, desc string) (
+	entryID string,
+	deliverMsg *exchange.Message,
+	originalContent []byte,
+) {
+	t.Helper()
+
 	// 64 KiB of line-structured pseudo-code — exceeds BlossomOffloadThreshold
 	// (32 KiB). Line-structured (not a flat byte pattern) so PreviewAssembler's
 	// boundary-snapping behaves normally (see buildLargePutPayload doc).
@@ -44,7 +121,6 @@ func buildOversizeDeliverableState(t *testing.T, h *testHarness, eng *exchange.E
 	}
 	originalContent = buf[:64*1024]
 
-	desc := "Large cached analysis document for TestEngineDeliverBlossom round trip"
 	putPayloadBytes, _ := json.Marshal(map[string]any{
 		"description":  desc,
 		"content":      base64.StdEncoding.EncodeToString(originalContent),
@@ -69,10 +145,7 @@ func buildOversizeDeliverableState(t *testing.T, h *testHarness, eng *exchange.E
 	if len(inv) == 0 {
 		t.Fatal("expected inventory entry after put-accept")
 	}
-	entryID := inv[0].EntryID
-	if inv[0].BlobPointer == "" {
-		t.Fatal("expected oversize entry to have a BlobPointer after put-accept")
-	}
+	entryID = inv[0].EntryID
 
 	buyMsg := h.sendMessage(h.buyer,
 		buyPayload("Find a large cached analysis document for testing round trips", 50000000),
@@ -127,13 +200,31 @@ func buildOversizeDeliverableState(t *testing.T, h *testHarness, eng *exchange.E
 	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
-	return deliverMsg, originalContent
+	return entryID, deliverMsg, originalContent
 }
 
-// findDeliverContentMessage scans settle messages for the operator-emitted
-// deliver message carrying a content field, same predicate used by
-// TestSettleDeliver_ContentDelivered.
+// deliverPointerPayload is the shape of the settle(deliver) message the
+// engine emits for a Blossom-offloaded entry.
+type deliverPointerPayload struct {
+	BlobPointer string `json:"blob_pointer"`
+	ContentHash string `json:"content_hash"`
+}
+
+// findDeliverContentMessage scans settle messages for an operator-emitted
+// deliver message carrying an inline content field.
 func findDeliverContentMessage(h *testHarness) *store.MessageRecord {
+	return findOperatorDeliverMessage(h, "content")
+}
+
+// findDeliverPointerMessage scans settle messages for an operator-emitted
+// deliver message carrying a blob_pointer field (the offloaded-entry shape).
+func findDeliverPointerMessage(h *testHarness) *store.MessageRecord {
+	return findOperatorDeliverMessage(h, "blob_pointer")
+}
+
+// findOperatorDeliverMessage scans settle messages for an operator-emitted,
+// deliver-phase message whose payload has requiredField present.
+func findOperatorDeliverMessage(h *testHarness, requiredField string) *store.MessageRecord {
 	msgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	for i := range msgs {
 		m := &msgs[i]
@@ -154,7 +245,7 @@ func findDeliverContentMessage(h *testHarness) *store.MessageRecord {
 		if err := json.Unmarshal(m.Payload, &payload); err != nil {
 			continue
 		}
-		if _, hasContent := payload["content"]; !hasContent {
+		if _, has := payload[requiredField]; !has {
 			continue
 		}
 		return m
@@ -162,11 +253,62 @@ func findDeliverContentMessage(h *testHarness) *store.MessageRecord {
 	return nil
 }
 
-// TestEngineDeliverBlossom_FetchesFullContentAndVerifies verifies that for an
-// oversize (Blossom-offloaded) entry, the deliver path fetches the FULL
-// content from the blob store (not the inline preview slice) and its sha256
-// matches what the seller originally put.
-func TestEngineDeliverBlossom_FetchesFullContentAndVerifies(t *testing.T) {
+// TestEngineDeliverBlossom_DeliversPointerNotInlineBytes verifies that for an
+// oversize (Blossom-offloaded) entry, the deliver path emits a settle(deliver)
+// message carrying a Blossom pointer + content_hash — and that the message
+// does NOT carry an inline content field. This is the direct regression test
+// for dontguess-05d2: the engine previously fetched-and-verified the full
+// content server-side and STILL inlined it into the outgoing message,
+// defeating the offload dontguess-7783 shipped to keep oversize bytes off
+// the relay.
+func TestEngineDeliverBlossom_DeliversPointerNotInlineBytes(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+
+	blobStore := exchange.NewMemoryBlobStore()
+	deliverMsg, _ := buildOversizeDeliverableState(t, h, eng, blobStore)
+
+	deliverRec, _ := h.st.GetMessage(deliverMsg.ID)
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(deliverRec)); err != nil {
+		t.Fatalf("DispatchForTest deliver: %v", err)
+	}
+
+	if contentMsg := findDeliverContentMessage(h); contentMsg != nil {
+		t.Fatal("engine inlined full content for a Blossom-offloaded entry — must deliver a pointer instead (dontguess-05d2)")
+	}
+
+	pointerMsg := findDeliverPointerMessage(h)
+	if pointerMsg == nil {
+		t.Fatal("engine did not emit a settle(deliver) message with a blob_pointer field")
+	}
+
+	var payload deliverPointerPayload
+	if err := json.Unmarshal(pointerMsg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal deliver pointer payload: %v", err)
+	}
+
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("expected inventory entry")
+	}
+	entry := inv[0]
+
+	if payload.BlobPointer != entry.BlobPointer {
+		t.Errorf("delivered blob_pointer = %q, want entry.BlobPointer %q", payload.BlobPointer, entry.BlobPointer)
+	}
+	if payload.ContentHash != entry.ContentHash {
+		t.Errorf("delivered content_hash = %q, want entry.ContentHash %q", payload.ContentHash, entry.ContentHash)
+	}
+}
+
+// TestEngineDeliverBlossom_ClientVerifiesFetchedBlobAgainstHash simulates the
+// buyer's client-side responsibility per the shipped design: given the
+// delivered blob_pointer + content_hash, fetch the blob directly and verify
+// its sha256 before trusting it. Against a healthy blob store, the fetched
+// bytes verify and match the ORIGINAL full content the seller put (not the
+// inline preview slice).
+func TestEngineDeliverBlossom_ClientVerifiesFetchedBlobAgainstHash(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
 	eng := h.newEngine()
@@ -179,40 +321,47 @@ func TestEngineDeliverBlossom_FetchesFullContentAndVerifies(t *testing.T) {
 		t.Fatalf("DispatchForTest deliver: %v", err)
 	}
 
-	contentMsg := findDeliverContentMessage(h)
-	if contentMsg == nil {
-		t.Fatal("engine did not emit a settle(deliver) message with content field")
+	pointerMsg := findDeliverPointerMessage(h)
+	if pointerMsg == nil {
+		t.Fatal("engine did not emit a settle(deliver) message with a blob_pointer field")
+	}
+	var payload deliverPointerPayload
+	if err := json.Unmarshal(pointerMsg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal deliver pointer payload: %v", err)
 	}
 
-	var payload struct {
-		Content string `json:"content"`
-	}
-	if err := json.Unmarshal(contentMsg.Payload, &payload); err != nil {
-		t.Fatalf("unmarshal deliver content payload: %v", err)
-	}
-	deliveredBytes, err := base64.StdEncoding.DecodeString(payload.Content)
+	// Client-side: fetch the blob directly via the delivered pointer, then
+	// verify its sha256 against the delivered content_hash BEFORE trusting it.
+	fetched, err := blobStore.Fetch(payload.BlobPointer)
 	if err != nil {
-		t.Fatalf("base64-decode delivered content: %v", err)
+		t.Fatalf("client fetch via delivered blob_pointer: %v", err)
+	}
+	gotHash := sha256.Sum256(fetched)
+	gotHashStr := "sha256:" + hex.EncodeToString(gotHash[:])
+	if gotHashStr != payload.ContentHash {
+		t.Fatalf("client-side verify failed on a healthy blob: fetched hash %s != delivered content_hash %s",
+			gotHashStr, payload.ContentHash)
 	}
 
-	if len(deliveredBytes) != len(originalContent) {
-		t.Fatalf("delivered content length = %d, want %d (full content, not the inline preview slice)",
-			len(deliveredBytes), len(originalContent))
+	if len(fetched) != len(originalContent) {
+		t.Fatalf("client-fetched content length = %d, want %d (full content, not the inline preview slice)",
+			len(fetched), len(originalContent))
 	}
-
 	originalHash := sha256.Sum256(originalContent)
-	deliveredHash := sha256.Sum256(deliveredBytes)
-	if originalHash != deliveredHash {
-		t.Errorf("delivered content hash mismatch:\n  got  sha256:%x\n  want sha256:%x",
-			deliveredHash, originalHash)
+	if gotHash != originalHash {
+		t.Errorf("client-fetched content hash mismatch:\n  got  sha256:%x\n  want sha256:%x", gotHash, originalHash)
 	}
 }
 
-// TestEngineDeliverBlossom_TamperedBlobRefusesDelivery verifies that if the
-// blob resolvable via the entry's BlobPointer does not match its recorded
-// ContentHash (simulated tamper/corruption), the engine does NOT emit a
-// content-bearing settle(deliver) message.
-func TestEngineDeliverBlossom_TamperedBlobRefusesDelivery(t *testing.T) {
+// TestEngineDeliverBlossom_ClientDetectsTamperedBlob verifies that when the
+// blob resolvable via the delivered pointer does not match the delivered
+// content_hash (simulated tamper/corruption at the blob host), the BUYER's
+// client-side verify-on-fetch catches it. The operator still emits the
+// pointer deliver message unconditionally — it does not fetch or gate on
+// blob health at deliver time (that would defeat the point of not inlining);
+// verification is the client's responsibility per the design
+// (nostr-first-rebuild-decision.md L114/L183).
+func TestEngineDeliverBlossom_ClientDetectsTamperedBlob(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
 	eng := h.newEngine()
@@ -224,6 +373,49 @@ func TestEngineDeliverBlossom_TamperedBlobRefusesDelivery(t *testing.T) {
 
 	deliverMsg, _ := buildOversizeDeliverableState(t, h, eng, tamperingStore)
 
+	deliverRec, _ := h.st.GetMessage(deliverMsg.ID)
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(deliverRec)); err != nil {
+		t.Fatalf("DispatchForTest deliver: %v", err)
+	}
+
+	pointerMsg := findDeliverPointerMessage(h)
+	if pointerMsg == nil {
+		t.Fatal("engine did not emit a settle(deliver) pointer message — operator should deliver the pointer regardless of blob health, per design")
+	}
+	var payload deliverPointerPayload
+	if err := json.Unmarshal(pointerMsg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal deliver pointer payload: %v", err)
+	}
+
+	// Client-side: fetch via the delivered pointer (through the tampering
+	// store) and verify against the delivered content_hash.
+	fetched, err := tamperingStore.Fetch(payload.BlobPointer)
+	if err != nil {
+		t.Fatalf("client fetch via delivered blob_pointer: %v", err)
+	}
+	gotHash := sha256.Sum256(fetched)
+	gotHashStr := "sha256:" + hex.EncodeToString(gotHash[:])
+	if gotHashStr == payload.ContentHash {
+		t.Fatal("client-side verify did not detect a tampered blob — hash matched when it should not have")
+	}
+}
+
+// TestEngineDeliverBlossom_OversizeContentNeverInlinedWithoutBlobPointer
+// verifies the size guard in emitDeliverContent: an entry whose content
+// exceeds BlossomOffloadThreshold but has no BlobPointer (e.g. no blob store
+// was configured at put time, so the legacy inline-everything path stored it
+// fully inline) must NEVER be inlined into an outgoing settle(deliver)
+// message. The engine refuses to emit any content-bearing OR pointer-bearing
+// deliver message in this case — there is no pointer to deliver, and the
+// bytes are too large to inline.
+func TestEngineDeliverBlossom_OversizeContentNeverInlinedWithoutBlobPointer(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	eng := h.newEngine()
+	// Deliberately no SetBlobStore call — content stays inline regardless of size.
+
+	deliverMsg, _ := buildOversizeDeliverableStateNoBlobStore(t, h, eng)
+
 	preMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	preCount := len(preMsgs)
 
@@ -232,14 +424,16 @@ func TestEngineDeliverBlossom_TamperedBlobRefusesDelivery(t *testing.T) {
 		t.Fatalf("DispatchForTest deliver: %v", err)
 	}
 
-	// No new content-bearing deliver message should have been emitted.
 	if contentMsg := findDeliverContentMessage(h); contentMsg != nil {
-		t.Fatal("engine emitted a content-bearing deliver message for a tampered blob — hash verification did not stop delivery")
+		t.Fatal("engine inlined oversize content that has no BlobPointer — size guard did not stop delivery")
+	}
+	if pointerMsg := findDeliverPointerMessage(h); pointerMsg != nil {
+		t.Fatal("engine emitted a blob_pointer deliver message for an entry with no BlobPointer")
 	}
 
 	postMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
 	if len(postMsgs) > preCount {
-		t.Fatalf("expected no new settle messages after a tamper-detected deliver, got %d new", len(postMsgs)-preCount)
+		t.Fatalf("expected no new settle messages after a size-guard-refused deliver, got %d new", len(postMsgs)-preCount)
 	}
 }
 
