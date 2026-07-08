@@ -24,6 +24,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sync"
 
@@ -47,10 +48,26 @@ type Record struct {
 	// Instance is tainted (sender-asserted) metadata, carried through
 	// unchanged — see proto.Message.Instance for the trust caveat.
 	Instance string `json:"instance,omitempty"`
+	// Origin distinguishes how this record entered the local log:
+	// "" or "local" = operator-authored, "relay" = ingested from a relay by
+	// the M2 Intake path (docs/design/relay-transport.md §2.1). Additive,
+	// persisted, JSON omitempty. ToMessage does NOT carry this into
+	// proto.Message — it is a store-local provenance marker, not part of
+	// the exchange message shape.
+	Origin string `json:"origin,omitempty"`
+	// Seq is the operator-assigned monotonic fold order stamped by the M2
+	// Sequencer at the ingest boundary (docs/design/relay-transport.md
+	// §2.1, §2.4 step 4). Additive, persisted, JSON omitempty. ToMessage
+	// does NOT carry this into proto.Message for the same reason as Origin.
+	Seq int64 `json:"seq,omitempty"`
 }
 
 // ToMessage converts a Record to a proto.Message, the type the exchange
-// engine's State.Replay/Apply already consume.
+// engine's State.Replay/Apply already consume. Origin and Seq are
+// deliberately NOT copied here (docs/design/relay-transport.md §2.1: "Both
+// JSON fields with omitempty; ToMessage ignores them (no proto.Message
+// change)") — they are store-local provenance/ordering metadata, not part
+// of the wire message shape.
 func (r Record) ToMessage() proto.Message {
 	return proto.Message{
 		ID:          r.ID,
@@ -62,6 +79,17 @@ func (r Record) ToMessage() proto.Message {
 		Timestamp:   r.Timestamp,
 		Instance:    r.Instance,
 	}
+}
+
+// fileSyncer is the subset of *os.File that Store needs to write and
+// durably flush the log. It exists (rather than using *os.File directly)
+// so an internal white-box test can substitute a counting fake to verify
+// BatchAppend's single-fsync contract without depending on OS-level
+// syscall tracing. *os.File satisfies this interface unchanged.
+type fileSyncer interface {
+	io.Writer
+	Sync() error
+	Close() error
 }
 
 // Store is a single-writer, append-only local event log backed by a flat
@@ -78,7 +106,7 @@ func (r Record) ToMessage() proto.Message {
 type Store struct {
 	mu   sync.Mutex
 	path string
-	w    *os.File
+	w    fileSyncer
 }
 
 // Open opens (creating if necessary) the append-only log at path for
@@ -110,6 +138,44 @@ func (s *Store) Append(rec Record) error {
 	defer s.mu.Unlock()
 	if _, err := s.w.Write(line); err != nil {
 		return fmt.Errorf("store: write record %s: %w", rec.ID, err)
+	}
+	return s.w.Sync()
+}
+
+// BatchAppend writes recs to the end of the log as N JSON lines under ONE
+// store-mutex hold and ONE fsync (docs/design/relay-transport.md §2.1, ADV-11
+// backfill-storm mitigation) — the same atomic-write discipline Append uses,
+// scaled to a batch. It is all-or-nothing: every record is validated and
+// marshaled into an in-memory buffer BEFORE the mutex is taken or any byte
+// touches the file, so a single invalid record (e.g. empty ID) or marshal
+// failure anywhere in the batch aborts the whole call with zero bytes
+// written — no record in a failed batch is ever observable via
+// ReadAll/Replay. On success, the batch is written as one Write call
+// followed by one Sync call, and records land in slice order, preserving
+// the single-writer append-order-is-fold-order invariant the package doc
+// requires.
+func (s *Store) BatchAppend(recs []Record) error {
+	if len(recs) == 0 {
+		return nil
+	}
+
+	var buf bytes.Buffer
+	for _, rec := range recs {
+		if rec.ID == "" {
+			return fmt.Errorf("store: batch append: record ID must not be empty")
+		}
+		line, err := json.Marshal(rec)
+		if err != nil {
+			return fmt.Errorf("store: batch append: marshal record %s: %w", rec.ID, err)
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, err := s.w.Write(buf.Bytes()); err != nil {
+		return fmt.Errorf("store: batch append: write %d records: %w", len(recs), err)
 	}
 	return s.w.Sync()
 }

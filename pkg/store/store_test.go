@@ -224,6 +224,209 @@ func TestStore_Append_RejectsEmptyID(t *testing.T) {
 	}
 }
 
+// TestStore_BatchAppend_AllOrNothing proves BatchAppend's atomicity
+// contract (dontguess-ba98, docs/design/relay-transport.md §2.1): a batch
+// containing one invalid record must fail the WHOLE call, and no record
+// from that batch — not even the valid ones that sorted earlier in the
+// slice — may ever become observable via ReadAll. Validation/marshal
+// happens entirely before the mutex is taken or any byte touches the file.
+func TestStore_BatchAppend_AllOrNothing(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	recs := []store.Record{
+		{ID: "a", Timestamp: 1, Origin: "relay", Seq: 1},
+		{ID: "", Timestamp: 2, Origin: "relay", Seq: 2}, // invalid: empty ID
+		{ID: "c", Timestamp: 3, Origin: "relay", Seq: 3},
+	}
+	if err := s.BatchAppend(recs); err == nil {
+		t.Fatal("BatchAppend with an invalid record in the batch: expected error, got nil")
+	}
+
+	got, err := s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("BatchAppend partial failure leaked %d records onto disk, want 0 (all-or-nothing)", len(got))
+	}
+
+	// A subsequent valid batch must succeed and be the ONLY content —
+	// proving the failed batch left no residue for the next call to build on.
+	valid := []store.Record{{ID: "x", Timestamp: 10, Origin: "local", Seq: 1}}
+	if err := s.BatchAppend(valid); err != nil {
+		t.Fatalf("BatchAppend (valid, after failed batch): %v", err)
+	}
+	got, err = s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll after valid batch: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "x" {
+		t.Fatalf("ReadAll after valid batch = %v, want exactly [{ID: x}]", got)
+	}
+}
+
+// TestStore_BatchAppend_EmptyBatchIsNoop proves BatchAppend(nil/empty) does
+// not write a spurious empty line or error.
+func TestStore_BatchAppend_EmptyBatchIsNoop(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	if err := s.BatchAppend(nil); err != nil {
+		t.Fatalf("BatchAppend(nil): %v", err)
+	}
+	got, err := s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("ReadAll after BatchAppend(nil) = %d records, want 0", len(got))
+	}
+}
+
+// TestStore_BatchAppend_PreservesOrderAndOriginSeq proves BatchAppend
+// preserves slice order (single-writer append-order-is-fold-order) and that
+// Origin/Seq round-trip losslessly through the JSONL persist+ReadAll path
+// (dontguess-ba98, docs/design/relay-transport.md §2.1).
+func TestStore_BatchAppend_PreservesOrderAndOriginSeq(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	recs := []store.Record{
+		{ID: "a", Sender: "s1", Timestamp: 10, Origin: "local", Seq: 1},
+		{ID: "b", Sender: "s2", Timestamp: 20, Antecedents: []string{"a"}, Origin: "relay", Seq: 2},
+		{ID: "c", Sender: "s3", Timestamp: 30, Antecedents: []string{"b"}, Origin: "relay", Seq: 3},
+	}
+	if err := s.BatchAppend(recs); err != nil {
+		t.Fatalf("BatchAppend: %v", err)
+	}
+
+	got, err := s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	if len(got) != len(recs) {
+		t.Fatalf("ReadAll returned %d records, want %d", len(got), len(recs))
+	}
+	for i, want := range recs {
+		if got[i].ID != want.ID {
+			t.Errorf("record %d: ID = %q, want %q (batch order not preserved)", i, got[i].ID, want.ID)
+		}
+		if got[i].Origin != want.Origin {
+			t.Errorf("record %d (%s): Origin = %q, want %q", i, want.ID, got[i].Origin, want.Origin)
+		}
+		if got[i].Seq != want.Seq {
+			t.Errorf("record %d (%s): Seq = %d, want %d", i, want.ID, got[i].Seq, want.Seq)
+		}
+	}
+
+	// Origin/Seq must also round-trip through Replay()'s underlying ReadAll
+	// call — Replay itself converts to proto.Message (which has no
+	// Origin/Seq fields by design), but the record-level read they're
+	// backed by must still preserve them until that conversion.
+	msgs, err := s.Replay()
+	if err != nil {
+		t.Fatalf("Replay: %v", err)
+	}
+	if len(msgs) != len(recs) {
+		t.Fatalf("Replay returned %d messages, want %d", len(msgs), len(recs))
+	}
+	for i, want := range recs {
+		if msgs[i].ID != want.ID {
+			t.Errorf("Replay message %d: ID = %q, want %q", i, msgs[i].ID, want.ID)
+		}
+	}
+}
+
+// TestStore_Append_And_BatchAppend_InterleavedPreserveOrder proves the two
+// write paths share the same mutex/append discipline: mixing Append and
+// BatchAppend calls on one Store still yields a single strictly-ordered log.
+func TestStore_Append_And_BatchAppend_InterleavedPreserveOrder(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { s.Close() }) //nolint:errcheck
+
+	if err := s.Append(store.Record{ID: "a", Timestamp: 1, Origin: "local"}); err != nil {
+		t.Fatalf("Append(a): %v", err)
+	}
+	if err := s.BatchAppend([]store.Record{
+		{ID: "b", Timestamp: 2, Origin: "relay", Seq: 1},
+		{ID: "c", Timestamp: 3, Origin: "relay", Seq: 2},
+	}); err != nil {
+		t.Fatalf("BatchAppend: %v", err)
+	}
+	if err := s.Append(store.Record{ID: "d", Timestamp: 4, Origin: "local"}); err != nil {
+		t.Fatalf("Append(d): %v", err)
+	}
+
+	got, err := s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll: %v", err)
+	}
+	wantIDs := []string{"a", "b", "c", "d"}
+	if len(got) != len(wantIDs) {
+		t.Fatalf("ReadAll returned %d records, want %d", len(got), len(wantIDs))
+	}
+	for i, want := range wantIDs {
+		if got[i].ID != want {
+			t.Errorf("record %d: ID = %q, want %q", i, got[i].ID, want)
+		}
+	}
+}
+
+// TestRecord_ToMessage_IgnoresOriginAndSeq proves ToMessage does not leak
+// Origin/Seq into the proto.Message it produces (docs/design/relay-transport.md
+// §2.1: "ToMessage ignores them (no proto.Message change)"). Two records
+// identical except for Origin/Seq must convert to identical messages.
+func TestRecord_ToMessage_IgnoresOriginAndSeq(t *testing.T) {
+	t.Parallel()
+	base := store.Record{
+		ID:          "a",
+		CampfireID:  "cf1",
+		Sender:      "s1",
+		Payload:     []byte(`{"n":1}`),
+		Tags:        []string{"exchange:put"},
+		Antecedents: []string{"z"},
+		Timestamp:   100,
+		Instance:    "worker-1",
+	}
+	local := base
+	local.Origin = "local"
+	local.Seq = 0
+
+	relay := base
+	relay.Origin = "relay"
+	relay.Seq = 42
+
+	msgLocal := local.ToMessage()
+	msgRelay := relay.ToMessage()
+
+	if msgLocal.ID != msgRelay.ID || msgLocal.Sender != msgRelay.Sender ||
+		msgLocal.Timestamp != msgRelay.Timestamp || msgLocal.Instance != msgRelay.Instance ||
+		string(msgLocal.Payload) != string(msgRelay.Payload) {
+		t.Fatalf("ToMessage output differs between Origin/Seq variants: local=%+v relay=%+v", msgLocal, msgRelay)
+	}
+}
+
 func TestStore_Replay_ReturnsMessagesInAppendOrder(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
