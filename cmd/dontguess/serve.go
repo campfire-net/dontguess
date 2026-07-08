@@ -19,7 +19,9 @@ import (
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/identity"
 	"github.com/campfire-net/dontguess/pkg/matching"
+	"github.com/campfire-net/dontguess/pkg/relay"
 	"github.com/campfire-net/dontguess/pkg/scrip"
 	dgstore "github.com/campfire-net/dontguess/pkg/store"
 	"github.com/spf13/cobra"
@@ -228,6 +230,24 @@ func runServeLocal(dgHome string) error {
 	}
 	defer localStore.Close() //nolint:errcheck
 
+	// M2 relay transport (dontguess-4bd) is opt-in: when DONTGUESS_RELAY_URL is
+	// set, the local operator additionally federates over a single NIP-42 relay.
+	// The relay operator identity is a persisted secp256k1 (nostr) key — NOT the
+	// opaque local key — because the Outbox signs events and the NIP-42 handshake
+	// require it, and its pubkey becomes the engine's operator key so operator
+	// records' Sender matches the key the Outbox re-signs with and the Intake
+	// gates authorship on. Unset => unchanged campfire-free single-agent mode.
+	relayURL := os.Getenv("DONTGUESS_RELAY_URL")
+	var relaySigner *identity.Secp256k1Identity
+	engineOperatorKey := localOperatorKey
+	if relayURL != "" {
+		relaySigner, err = loadOrCreateNostrOperatorIdentity(dgHome)
+		if err != nil {
+			return fmt.Errorf("nostr operator identity: %w", err)
+		}
+		engineOperatorKey = relaySigner.PubKeyHex()
+	}
+
 	logDest, err := buildLogDest(dgHome)
 	if err != nil {
 		return fmt.Errorf("log setup: %w", err)
@@ -255,7 +275,7 @@ func runServeLocal(dgHome string) error {
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        "local",
 		LocalStore:        localStore,
-		OperatorPublicKey: localOperatorKey,
+		OperatorPublicKey: engineOperatorKey,
 		Embedder:          embedder,
 		PollInterval:      servePollInterval,
 		Logger: func(format string, args ...any) {
@@ -265,6 +285,22 @@ func runServeLocal(dgHome string) error {
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
+
+	// Attach the M2 relay transport (Intake + Outbox + restart-seed) if
+	// configured. The engine folds only from LocalStore, so the relay legs are
+	// off the buy/match hot path (docs/design/relay-transport.md §2.4); the
+	// live dial/handshake is owned by relay.Conn (dontguess-13f, infra-gated).
+	if relayURL != "" {
+		conn := relay.New(relayURL, relaySigner)
+		defer conn.Close() //nolint:errcheck
+		stop, err := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
+			localStorePath+".pubcursor", conn, conn, 5*time.Second, logger.Printf)
+		if err != nil {
+			return fmt.Errorf("attaching relay transport: %w", err)
+		}
+		defer stop()
+		logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
+	}
 
 	logger.Printf("exchange serving (local-only, zero campfire — dontguess-275)")
 	logger.Printf("  operator:  %s", localOperatorKey[:16]+"...")
@@ -308,6 +344,37 @@ func loadOrCreateLocalOperatorKey(dgHome string) (string, error) {
 		return "", fmt.Errorf("writing local operator key %s: %w", keyPath, err)
 	}
 	return key, nil
+}
+
+// loadOrCreateNostrOperatorIdentity returns the persisted secp256k1 (nostr)
+// operator identity under dgHome, minting and persisting a fresh one on first
+// run. This is the LONG-LIVED relay operator key: it signs the Outbox's
+// published events and drives the NIP-42 handshake, and its content-hash event
+// ids must be stable across process restarts for the restart-seed echo dedup to
+// match (docs/design/relay-transport.md §2.2/§D). The private key is stored
+// 32-byte hex at 0600 — handle only inside DG_HOME.
+func loadOrCreateNostrOperatorIdentity(dgHome string) (*identity.Secp256k1Identity, error) {
+	keyPath := filepath.Join(dgHome, "nostr-operator.key")
+	if data, err := os.ReadFile(keyPath); err == nil {
+		if privHex := strings.TrimSpace(string(data)); privHex != "" {
+			id, err := identity.FromPrivHex(privHex)
+			if err != nil {
+				return nil, fmt.Errorf("parsing persisted nostr operator key %s: %w", keyPath, err)
+			}
+			return id, nil
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading nostr operator key %s: %w", keyPath, err)
+	}
+
+	id, err := identity.Generate()
+	if err != nil {
+		return nil, fmt.Errorf("generating nostr operator identity: %w", err)
+	}
+	if err := os.WriteFile(keyPath, []byte(id.PrivHex()+"\n"), 0600); err != nil {
+		return nil, fmt.Errorf("writing nostr operator key %s: %w", keyPath, err)
+	}
+	return id, nil
 }
 
 // runEngineLoop wires the operator-facing plumbing shared by both serve
