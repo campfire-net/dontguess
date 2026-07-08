@@ -1,6 +1,7 @@
 package exchange
 
 import (
+	"container/heap"
 	"errors"
 	"fmt"
 	"sort"
@@ -81,6 +82,29 @@ type Sequencer struct {
 	// both the dedup index and the orphan buffer: an event stays here until all
 	// its antecedents are emitted.
 	buffered map[string]*Message
+
+	// trueOrphans is the O(1)-maintained count of buffered events that have at
+	// least one antecedent that has never been INGESTED at all (neither
+	// emitted nor currently buffered) -- a genuine gap, as opposed to an event
+	// that is merely waiting for Drain to cascade-release an antecedent that
+	// has already arrived. This is the quantity the ingest-time bound guards:
+	// it is exactly the quantity Seal() would ultimately report as
+	// unrecoverable if no further events ever arrive, so bounding it (rather
+	// than bounding raw buffer size) never trips on a large but eventually-
+	// resolvable causal chain fed in via Ingest before any Drain call (e.g.
+	// SequenceForFold's batch replay path).
+	trueOrphans int
+	// missingCount[id] is the number of currently-unknown (never-ingested,
+	// deduplicated) antecedents that buffered event `id` still has. Only
+	// entries with a positive count exist; entries are removed once the count
+	// reaches zero. len(missingCount) == trueOrphans at all times.
+	missingCount map[string]int
+	// missingWaiters[a] lists the buffered event ids that count `a` among
+	// their currently-unknown antecedents. When `a` is ingested (arrives, by
+	// any means -- buffered or immediately emitted), every waiter's
+	// missingCount is decremented in O(1) amortized total work, and any
+	// waiter that reaches zero is no longer a true orphan.
+	missingWaiters map[string][]string
 }
 
 // NewSequencer returns a Sequencer with the given orphan-buffer bound. A
@@ -90,9 +114,11 @@ func NewSequencer(maxOrphans int) *Sequencer {
 		maxOrphans = DefaultMaxOrphans
 	}
 	return &Sequencer{
-		maxOrphans: maxOrphans,
-		emitted:    make(map[string]struct{}),
-		buffered:   make(map[string]*Message),
+		maxOrphans:     maxOrphans,
+		emitted:        make(map[string]struct{}),
+		buffered:       make(map[string]*Message),
+		missingCount:   make(map[string]int),
+		missingWaiters: make(map[string][]string),
 	}
 }
 
@@ -108,6 +134,9 @@ func (s *Sequencer) MarkEmitted(ids ...string) {
 			continue
 		}
 		s.emitted[id] = struct{}{}
+		// A seeded id is now "known" the same as an ingested one: resolve any
+		// buffered event that was counting it as a true (never-arrived) gap.
+		s.resolveArrivalLocked(id)
 	}
 }
 
@@ -118,6 +147,18 @@ func (s *Sequencer) MarkEmitted(ids ...string) {
 //
 // An event with an empty ID is rejected: nostr event ids are content hashes and
 // an empty id cannot be deduped or referenced as an antecedent.
+//
+// Ingest maintains the orphan bound itself, in O(1) amortized work, rather than
+// deferring the check to Drain: an event is a TRUE orphan only if at least one
+// of its antecedents has never been ingested at all (neither emitted nor
+// currently buffered). An antecedent that is merely buffered-but-not-yet-
+// released is NOT a gap — Drain's causal cascade resolves it in the same pass
+// once its own antecedents land, so a large causally-in-order batch (e.g. the
+// full replay set SequenceForFold ingests before its single Drain call) never
+// trips the bound. A genuine flood of events referencing antecedents that never
+// arrive — the actual denial-of-service shape — is rejected LOUD right here,
+// before the buffer can grow past the configured bound, instead of only being
+// detected after Drain has already absorbed unbounded memory.
 func (s *Sequencer) Ingest(m Message) error {
 	if m.ID == "" {
 		return fmt.Errorf("sequencer: refusing to ingest event with empty ID")
@@ -130,9 +171,106 @@ func (s *Sequencer) Ingest(m Message) error {
 	if _, ok := s.buffered[m.ID]; ok {
 		return nil // duplicate still waiting in the buffer
 	}
+
+	// Deduplicated set of antecedents that have never been ingested at all —
+	// the true gaps. O(k) in the number of antecedents on this one event
+	// (small, bounded per-event), never proportional to buffer size.
+	var missing []string
+	if len(m.Antecedents) > 0 {
+		seen := make(map[string]struct{}, len(m.Antecedents))
+		for _, a := range m.Antecedents {
+			if a == "" {
+				continue
+			}
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			seen[a] = struct{}{}
+			if !s.isKnownLocked(a) {
+				missing = append(missing, a)
+			}
+		}
+	}
+
+	if len(missing) > 0 && s.trueOrphans+1 > s.maxOrphans {
+		return fmt.Errorf("%w: ingesting %s would bring true orphans to %d, exceeding bound %d",
+			ErrOrphanBufferOverflow, shortKey(m.ID), s.trueOrphans+1, s.maxOrphans)
+	}
+
 	cp := m
 	s.buffered[m.ID] = &cp
+	if len(missing) > 0 {
+		s.missingCount[m.ID] = len(missing)
+		s.trueOrphans++
+		for _, a := range missing {
+			s.missingWaiters[a] = append(s.missingWaiters[a], m.ID)
+		}
+	}
+	// This event's own id is now known; resolve any earlier-buffered event
+	// that was counting m.ID as one of its missing antecedents.
+	s.resolveArrivalLocked(m.ID)
 	return nil
+}
+
+// isKnownLocked reports whether id has been ingested in any form — released
+// (emitted) or still buffered. Caller must hold s.mu.
+func (s *Sequencer) isKnownLocked(id string) bool {
+	if _, ok := s.emitted[id]; ok {
+		return true
+	}
+	_, ok := s.buffered[id]
+	return ok
+}
+
+// resolveArrivalLocked notifies every buffered event that was counting id
+// among its missing (never-ingested) antecedents that id has now arrived,
+// decrementing each waiter's missingCount and, when it reaches zero, removing
+// it from the true-orphan count. Amortized O(1) per waiter over the object's
+// lifetime: each (event, antecedent) edge is resolved at most once. Caller
+// must hold s.mu.
+func (s *Sequencer) resolveArrivalLocked(id string) {
+	waiters := s.missingWaiters[id]
+	if len(waiters) == 0 {
+		return
+	}
+	delete(s.missingWaiters, id)
+	for _, w := range waiters {
+		c, ok := s.missingCount[w]
+		if !ok {
+			continue // already resolved via another path (defensive)
+		}
+		c--
+		if c <= 0 {
+			delete(s.missingCount, w)
+			s.trueOrphans--
+		} else {
+			s.missingCount[w] = c
+		}
+	}
+}
+
+// messageHeap is a min-heap of buffered *Message ordered by the canonical
+// (Timestamp, ID) release key. It backs Drain's cascade so the globally
+// smallest ready event is always released next in O(log n), instead of
+// re-scanning the entire remaining buffer to find it.
+type messageHeap []*Message
+
+func (h messageHeap) Len() int { return len(h) }
+func (h messageHeap) Less(i, j int) bool {
+	if h[i].Timestamp != h[j].Timestamp {
+		return h[i].Timestamp < h[j].Timestamp
+	}
+	return h[i].ID < h[j].ID
+}
+func (h messageHeap) Swap(i, j int) { h[i], h[j] = h[j], h[i] }
+func (h *messageHeap) Push(x any)   { *h = append(*h, x.(*Message)) }
+func (h *messageHeap) Pop() any {
+	old := *h
+	n := len(old)
+	item := old[n-1]
+	old[n-1] = nil
+	*h = old[:n-1]
+	return item
 }
 
 // Drain releases every event that is now causally ready — every antecedent
@@ -141,40 +279,80 @@ func (s *Sequencer) Ingest(m Message) error {
 // each release so that an event made ready by the release of its antecedent
 // takes its correct canonical position. The returned slice is in ascending Seq.
 //
+// Drain runs in O(N log N) over the currently buffered set (N events, each
+// with a small bounded number of antecedents): it builds the causal
+// dependency graph once — for each buffered event, how many of its distinct
+// antecedents are still un-emitted, and a reverse index from antecedent id to
+// waiting dependents — then releases ready events off a canonical-order
+// min-heap, pushing each dependent onto the heap the instant its last pending
+// antecedent is emitted. Every event is visited, and every antecedent edge is
+// walked, exactly once; this replaces the previous algorithm's repeated
+// full-buffer rescan per single release (O(N) work × N releases = O(N^2)).
+//
 // Events whose antecedents are still absent remain buffered (orphans). If, after
 // releasing everything releasable, the number of remaining orphans exceeds the
 // configured bound, Drain returns ErrOrphanBufferOverflow — a loud failure, not
 // a silent drop. The events released before the overflow are still returned so
 // the caller can fold them; the overflow signals the caller to stop and alert.
+// In normal operation this residual check should never fire: Ingest already
+// bounds true orphans at ingest time. It stays as a defense-in-depth invariant
+// check on the actual backlog size, cheap (O(1)) since Drain already has
+// len(s.buffered) in hand.
 func (s *Sequencer) Drain() ([]Sequenced, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if len(s.buffered) == 0 {
+		return nil, nil
+	}
+
+	pending := make(map[string]int, len(s.buffered))
+	dependents := make(map[string][]string)
+	h := &messageHeap{}
+	for id, m := range s.buffered {
+		seen := make(map[string]struct{}, len(m.Antecedents))
+		n := 0
+		for _, a := range m.Antecedents {
+			if a == "" {
+				continue
+			}
+			if _, dup := seen[a]; dup {
+				continue
+			}
+			seen[a] = struct{}{}
+			if _, ok := s.emitted[a]; ok {
+				continue // already satisfied
+			}
+			n++
+			dependents[a] = append(dependents[a], id)
+		}
+		pending[id] = n
+		if n == 0 {
+			heap.Push(h, s.buffered[id])
+		}
+	}
+
 	var out []Sequenced
-	for {
-		var ready []*Message
-		for _, m := range s.buffered {
-			if s.antecedentsSatisfiedLocked(m) {
-				ready = append(ready, m)
-			}
-		}
-		if len(ready) == 0 {
-			break
-		}
-		// Canonical selection: smallest (Timestamp, ID) among the ready set.
-		// This makes the release order a pure function of the event set and its
-		// antecedent DAG — independent of ingest/arrival order.
-		sort.Slice(ready, func(i, j int) bool {
-			if ready[i].Timestamp != ready[j].Timestamp {
-				return ready[i].Timestamp < ready[j].Timestamp
-			}
-			return ready[i].ID < ready[j].ID
-		})
-		m := ready[0]
+	for h.Len() > 0 {
+		m := heap.Pop(h).(*Message)
 		s.emitted[m.ID] = struct{}{}
 		delete(s.buffered, m.ID)
+		delete(pending, m.ID)
 		out = append(out, Sequenced{Seq: s.nextSeq, Msg: *m})
 		s.nextSeq++
+		for _, depID := range dependents[m.ID] {
+			left, ok := pending[depID]
+			if !ok {
+				continue
+			}
+			left--
+			if left <= 0 {
+				delete(pending, depID)
+				heap.Push(h, s.buffered[depID])
+			} else {
+				pending[depID] = left
+			}
+		}
 	}
 
 	if len(s.buffered) > s.maxOrphans {
