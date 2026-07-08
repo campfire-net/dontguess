@@ -168,3 +168,12 @@ func (e *Engine) LocalSeenForTest() int {
 	defer e.localMu.Unlock()
 	return e.localSeen
 }
+
+// ReplayAllForTest exposes the engine's startup replay (replayAll → the
+// LocalStore-sequenced replayAllLocal when SequencedIngest is set) so a
+// black-box property test can drive the REAL ingest fold path over a
+// deliberately-permuted LocalStore and inspect the resulting State — without
+// running the full poll loop (which would race the assertions).
+func (e *Engine) ReplayAllForTest() error {
+	return e.replayAll()
+}

@@ -125,6 +125,26 @@ type EngineOptions struct {
 	// M2 (dontguess-50d), needed once multi-relay nostr ingest can deliver
 	// events out of order.
 	LocalStore *dgstore.Store
+	// SequencedIngest routes the startup replay fold (replayAllLocal) through
+	// the operator-side Sequencer (dontguess-50d, M2) before folding, instead
+	// of trusting LocalStore append order as fold order.
+	//
+	// It exists because multi-relay nostr ingest gives NO total order and NO
+	// causal delivery: an e-tagged event can be persisted out of causal order,
+	// so append order is no longer fold order. With this set, replayAllLocal
+	// re-derives the canonical, deterministic fold order from the events'
+	// antecedent DAG (Sequencer.SequenceForFold) and FAILS LOUD if the causal
+	// closure is broken (a pruned/unrecoverable antecedent) rather than folding
+	// a silently-truncated chain (dontguess-553 lesson).
+	//
+	// Default false preserves the M1 single-writer append-order path exactly.
+	// When true and LocalStore is unset it is a no-op (only the LocalStore
+	// replay path is sequenced). MaxOrphans bounds the pending-antecedent
+	// buffer; zero uses DefaultMaxOrphans.
+	SequencedIngest bool
+	// MaxOrphans bounds the Sequencer's pending-antecedent buffer when
+	// SequencedIngest is set. Zero uses DefaultMaxOrphans (~1000).
+	MaxOrphans int
 	// PollInterval controls how often the engine polls for new messages.
 	// Defaults to 500ms.
 	PollInterval time.Duration
@@ -520,6 +540,19 @@ func (e *Engine) replayAllLocal() error {
 	msgs, err := e.opts.LocalStore.Replay()
 	if err != nil {
 		return fmt.Errorf("reading local store for replay: %w", err)
+	}
+
+	// M2 (dontguess-50d): under multi-relay nostr ingest the persisted log is
+	// no longer in causal order — an e-tagged event can be stored before its
+	// antecedent. Re-derive the canonical, deterministic fold order from the
+	// antecedent DAG via the operator-side Sequencer, and FAIL LOUD on a broken
+	// causal closure (pruned antecedent) rather than folding a truncated chain.
+	if e.opts.SequencedIngest {
+		ordered, seqErr := SequenceForFold(msgs, e.opts.MaxOrphans)
+		if seqErr != nil {
+			return fmt.Errorf("sequencing local store for replay: %w", seqErr)
+		}
+		msgs = ordered
 	}
 
 	e.localMu.Lock()
