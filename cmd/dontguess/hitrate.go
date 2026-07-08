@@ -62,28 +62,6 @@ func init() {
 	rootCmd.AddCommand(hitRateCmd)
 }
 
-// readTaggedMessages reads all messages with the given tag from the exchange
-// campfire and returns them as exchange.Message, filtered to those at or after
-// cutoffNano (cutoffNano <= 0 means no time filter).
-func readTaggedMessages(client *protocol.Client, cfID, tag string, cutoffNano int64) ([]exchange.Message, error) {
-	result, err := client.Read(protocol.ReadRequest{
-		CampfireID: cfID,
-		Tags:       []string{tag},
-	})
-	if err != nil {
-		return nil, err
-	}
-	out := make([]exchange.Message, 0, len(result.Messages))
-	for i := range result.Messages {
-		m := result.Messages[i]
-		if cutoffNano > 0 && m.Timestamp < cutoffNano {
-			continue
-		}
-		out = append(out, *exchange.FromSDKMessage(&m))
-	}
-	return out, nil
-}
-
 // parseBuyTask extracts the "task" field from an exchange:buy message payload.
 // Returns empty string if the payload cannot be parsed or lacks a task.
 func parseBuyTask(m *exchange.Message) string {
@@ -169,18 +147,18 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 	}
 	cfID := cfg.ExchangeCampfireID
 
-	buys, err := readTaggedMessages(client, cfID, exchange.TagBuy, cutoffNano)
+	buys, err := readFilter(client, cfID, buysFilter(cutoffNano))
 	if err != nil {
 		return fmt.Errorf("read buys: %w", err)
 	}
 	// Match-results carry the exchange:match tag (both hits and misses).
-	matches, err := readTaggedMessages(client, cfID, exchange.TagMatch, cutoffNano)
+	matches, err := readFilter(client, cfID, matchesFilter(cutoffNano))
 	if err != nil {
 		return fmt.Errorf("read match-results: %w", err)
 	}
 	// Consume signals carry the exchange:consume tag (emitted on settle-complete).
 	// Used for net-savings economics: a hit is "real" only when the entry was consumed.
-	consumes, err := readTaggedMessages(client, cfID, exchange.TagConsume, cutoffNano)
+	consumes, err := readFilter(client, cfID, consumesFilter(cutoffNano))
 	if err != nil {
 		// Non-fatal: log and continue with consume unavailable (all hits treated as real).
 		fmt.Fprintf(os.Stderr, "warning: could not read consume signals: %v\n", err)

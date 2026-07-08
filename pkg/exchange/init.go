@@ -216,15 +216,6 @@ func Init(opts InitOptions) (*Config, *protocol.Client, error) {
 		fmt.Fprintf(os.Stderr, "warning: promoting convention declarations: %v\n", err)
 	}
 
-	// Create standard named views for convention read operations.
-	// On a fresh init the store has no synced messages, so all views are created.
-	viewsCreated, viewErr := EnsureViews(campfireID, client)
-	if viewErr != nil {
-		fmt.Fprintf(os.Stderr, "warning: creating named views: %v\n", viewErr)
-	} else if viewsCreated > 0 {
-		fmt.Fprintf(os.Stderr, "created %d named views\n", viewsCreated)
-	}
-
 	// Register in naming hierarchy.
 	aliases := naming.NewAliasStore(configDir)
 	alias := opts.alias()

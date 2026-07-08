@@ -88,7 +88,7 @@ type EngineOptions struct {
 	OperatorPublicKey string
 	// Store is the campfire message store (SQLite).
 	// Deprecated: use ReadClient and WriteClient. Kept for backward compatibility
-	// with callers that have not yet migrated (e.g. EnsureViews, CampfireScripStore).
+	// with callers that have not yet migrated (e.g. CampfireScripStore).
 	// The engine no longer calls Store.ListMessages directly; all reads go via ReadClient.
 	Store store.Store
 	// ReadClient is the protocol client used to subscribe to and replay campfire messages.

@@ -195,11 +195,18 @@ func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, 
 	cutoffNano := cutoff.UnixNano()
 	cfID := cfg.ExchangeCampfireID
 
+	// countFilter counts messages matching f's kinds/tags (see reqfilter.go)
+	// that fall at or after cutoffNano, while also tracking globalMaxTS across
+	// every call — the max timestamp observed across ALL queried messages,
+	// unfiltered by cutoff, used by the caller for last_activity tracking.
+	// This dual-purpose windowing isn't something readFilter supports, so the
+	// loop stays local; f's Tags/Kinds->legacyTags() is the only piece reused
+	// from the ReqFilter abstraction.
 	var globalMaxTS int64
-	readTag := func(tag string) int {
+	countFilter := func(f ReqFilter) int {
 		req := protocol.ReadRequest{
 			CampfireID: cfID,
-			Tags:       []string{tag},
+			Tags:       f.legacyTags(),
 		}
 		result, err := client.Read(req)
 		if err != nil {
@@ -217,12 +224,12 @@ func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, 
 		return count
 	}
 
-	buys := readTag(exchange.TagBuy)
-	matches := readTag(exchange.TagMatch)
-	settlements := readTag(exchange.TagSettle)
-	puts := readTag(exchange.TagPut)
-	putAccepts := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept)
-	putRejects := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutReject)
+	buys := countFilter(buysFilter(0))
+	matches := countFilter(matchesFilter(0))
+	settlements := countFilter(settlementsFilter(0))
+	puts := countFilter(putsFilter(0))
+	putAccepts := countFilter(putAcceptsFilter(0))
+	putRejects := countFilter(putRejectsFilter(0))
 
 	return ExchangeCounts{
 		Buys:          buys,
@@ -239,10 +246,13 @@ func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, 
 func readExchangeViewsWithClient(client *protocol.Client, st store.Store, cfID string, cutoff time.Time) ExchangeCounts {
 	cutoffNano := cutoff.UnixNano()
 
-	readTag := func(tag string) (int, int64) {
+	// countFilter mirrors readExchangeViews' but with SkipSync always set (the
+	// caller has already synced, or the campfire is HTTP-mode push delivery —
+	// see protocol.ReadRequest.SkipSync doc). Test-only entry point.
+	countFilter := func(f ReqFilter) (int, int64) {
 		req := protocol.ReadRequest{
 			CampfireID: cfID,
-			Tags:       []string{tag},
+			Tags:       f.legacyTags(),
 			SkipSync:   true,
 		}
 		result, err := client.Read(req)
@@ -262,12 +272,12 @@ func readExchangeViewsWithClient(client *protocol.Client, st store.Store, cfID s
 		return count, maxTS
 	}
 
-	buys, _ := readTag(exchange.TagBuy)
-	matches, _ := readTag(exchange.TagMatch)
-	settlements, _ := readTag(exchange.TagSettle)
-	puts, _ := readTag(exchange.TagPut)
-	putAccepts, _ := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept)
-	putRejects, _ := readTag(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutReject)
+	buys, _ := countFilter(buysFilter(0))
+	matches, _ := countFilter(matchesFilter(0))
+	settlements, _ := countFilter(settlementsFilter(0))
+	puts, _ := countFilter(putsFilter(0))
+	putAccepts, _ := countFilter(putAcceptsFilter(0))
+	putRejects, _ := countFilter(putRejectsFilter(0))
 
 	return ExchangeCounts{
 		Buys:          buys,

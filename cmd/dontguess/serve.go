@@ -118,14 +118,6 @@ func runServe(_ *cobra.Command, _ []string) error {
 	}
 	defer st.Close()
 
-	// Ensure standard named views exist (idempotent — skips existing).
-	viewsCreated, viewErr := exchange.EnsureViews(cfg.ExchangeCampfireID, writeClient)
-	if viewErr != nil {
-		log.Printf("[exchange] warning: ensuring named views: %v", viewErr)
-	} else if viewsCreated > 0 {
-		log.Printf("[exchange] created %d missing named views", viewsCreated)
-	}
-
 	cs, err := scrip.NewCampfireScripStore(cfg.ExchangeCampfireID, readClient, cfg.OperatorKeyHex)
 	if err != nil {
 		return fmt.Errorf("creating scrip store: %w", err)
