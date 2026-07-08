@@ -332,6 +332,15 @@ type Engine struct {
 	// is dispatched twice. Guarded by localMu; always localDispatched <=
 	// localSeen. Only relevant when EngineOptions.LocalStore is configured.
 	localDispatched int
+
+	// emitClockMu guards lastEmitNanos, the monotonic wall-clock source for
+	// locally-emitted (sendLocalOperatorMessage) operator messages. See
+	// nextMonotonicTimestamp (engine_settle.go) and docs/design/
+	// relay-transport.md §E MUST-ENFORCE(1): emitted-event timestamps must be
+	// non-decreasing so (Timestamp,ID) batch order reproduces true emission
+	// order on a Seq-less DR rebuild.
+	emitClockMu   sync.Mutex
+	lastEmitNanos int64
 }
 
 // buyerSessionEntry records a single entry settled by a buyer, used for
@@ -950,7 +959,7 @@ func (e *Engine) sendLocalOperatorMessage(payload []byte, tags []string, anteced
 		Payload:     payload,
 		Tags:        tags,
 		Antecedents: antecedents,
-		Timestamp:   time.Now().UnixNano(),
+		Timestamp:   e.nextMonotonicTimestamp(),
 	}
 	if err := e.appendLocalRecord(msg); err != nil {
 		return nil, fmt.Errorf("engine: appending local operator message: %w", err)

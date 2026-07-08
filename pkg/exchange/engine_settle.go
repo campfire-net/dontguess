@@ -46,15 +46,25 @@ func (e *Engine) handleSettle(msg *Message) error {
 	}
 
 	// Emit a consume/accept behavioral signal when the buyer completes a
-	// transaction. This fires unconditionally (with or without ScripStore) so
-	// the reporter can measure actual buyer usage, not just matcher hits.
+	// transaction. This fires unconditionally when no ScripStore is configured
+	// (no reservation concept exists) so the reporter can measure actual buyer
+	// usage, not just matcher hits. When a ScripStore IS configured, the
+	// reservation-consumed check runs BEFORE the emit (relay-transport.md §E
+	// MUST-ENFORCE(3), ADV-7 defense-in-depth): a settle(complete) redelivery
+	// whose reservation was already consumed (or never existed) must not emit
+	// a second/spurious consume signal.
 	if phase == SettlePhaseStrComplete {
-		if err := e.emitConsumeSignal(msg); err != nil {
-			// Best-effort: log but do not abort the settle flow.
-			e.opts.log("engine: settle: emitConsumeSignal: %v", err)
+		if e.opts.ScripStore == nil || e.hasLiveReservationForComplete(msg) {
+			if err := e.emitConsumeSignal(msg); err != nil {
+				// Best-effort: log but do not abort the settle flow.
+				e.opts.log("engine: settle: emitConsumeSignal: %v", err)
+			}
+			// Refresh behavioral signals in the match index after settle:complete.
+			e.matchIndex.SetBehavioralSignals(e.state.AllEntryBehavioralSignals())
+		} else {
+			e.opts.log("engine: settle: complete msg=%s has no live reservation (already consumed or absent) — skipping consume signal",
+				shortKey(msg.ID))
 		}
-		// Refresh behavioral signals in the match index after settle:complete.
-		e.matchIndex.SetBehavioralSignals(e.state.AllEntryBehavioralSignals())
 	}
 
 	if e.opts.ScripStore == nil {
@@ -134,6 +144,33 @@ func (e *Engine) resolveSellerFromComplete(msg *Message) (string, string, bool) 
 	return sellerKey, deliverMsgID, true
 }
 
+// hasLiveReservationForComplete reports whether a settle(complete) message's
+// match has a live (not-yet-consumed) scrip reservation, i.e. whether
+// e.matchToReservation still holds an entry for the match derived from this
+// complete message's antecedent chain (complete → deliver → match).
+//
+// Used to gate emitConsumeSignal (relay-transport.md §E MUST-ENFORCE(3)): a
+// redelivered settle(complete) whose reservation was already consumed by an
+// earlier dispatch of the same event — or a settle(complete) for a match
+// that never had a buyer-accept scrip hold in the first place — must not
+// emit a consume signal. This mirrors, without duplicating, the reservation
+// lookup handleSettleComplete performs a moment later for the actual
+// settlement; on the false path handleSettleComplete's own antecedent-chain
+// / "no reservation found" logging still runs (accepted duplication for a
+// log line on an already-error/edge path, not a correctness concern).
+func (e *Engine) hasLiveReservationForComplete(msg *Message) bool {
+	_, deliverMsgID, ok := e.resolveSellerFromComplete(msg)
+	if !ok {
+		return false
+	}
+	matchMsgID, ok := e.state.MatchForDeliver(deliverMsgID)
+	if !ok {
+		return false
+	}
+	reservationID, hasReservation := e.matchToReservation[matchMsgID]
+	return hasReservation && reservationID != ""
+}
+
 // checkDeadlineMiss checks whether the settle(complete) arrived after the
 // guarantee_deadline. If so, issues a full refund and returns (true, err).
 // If no deadline miss, returns (false, nil).
@@ -193,6 +230,33 @@ func (e *Engine) performScripSettlement(ctx context.Context, msg *Message, selle
 		return err
 	}
 
+	// EMIT-DURABLE-THEN-MUTATE (relay-transport.md §E MUST-ENFORCE(2)): the
+	// scrip-settle convention message must land in the durable log BEFORE any
+	// balance mutation runs — matching the ordering handleDeadlineMissRefund
+	// already uses. The previous ordering here mutated balances first and
+	// emitted last (ADV-12): a crash between the two left a live balance
+	// change with no durable record for Replay to reconstruct on restart,
+	// silently destroying the seller/operator credit. scrip-burn failure
+	// stays best-effort (fee-sink bookkeeping only, not fund custody) but is
+	// still emitted before the mutation for the same reason.
+	if _, emitErr := e.sendOperatorMessage(settlePayload,
+		[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
+		// Restore reservation so the settle can be retried.
+		if restoreErr := e.opts.ScripStore.SaveReservation(ctx, res); restoreErr != nil {
+			e.opts.log("engine: settle: CRITICAL: failed to restore reservation %s after scrip-settle emit failure: %v",
+				shortKey(reservationID), restoreErr)
+			return fmt.Errorf("scrip: settle reservation %s: emit scrip-settle failed AND restore failed (reservation lost): %w",
+				shortKey(reservationID), emitErr)
+		}
+		return fmt.Errorf("scrip: settle: emit scrip-settle: %w", emitErr)
+	}
+	if len(burnPayload) > 0 {
+		if _, emitErr := e.sendOperatorMessage(burnPayload,
+			[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
+			e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
+		}
+	}
+
 	// Credit residual to seller.
 	if err := e.creditResidualToSeller(ctx, msg, sellerKey, reservationID, residual, res); err != nil {
 		return err
@@ -203,24 +267,43 @@ func (e *Engine) performScripSettlement(ctx context.Context, msg *Message, selle
 		return err
 	}
 
-	// Emit scrip convention messages.
-	if _, emitErr := e.sendOperatorMessage(settlePayload,
-		[]string{scrip.TagScripSettle}, []string{msg.ID}); emitErr != nil {
-		e.opts.log("engine: warning: emit scrip-settle: %v", emitErr)
-	}
-	if len(burnPayload) > 0 {
-		if _, emitErr := e.sendOperatorMessage(burnPayload,
-			[]string{scrip.TagScripBurn}, []string{msg.ID}); emitErr != nil {
-			e.opts.log("engine: warning: emit scrip-burn: %v", emitErr)
-		}
-	}
-
 	// Clean up engine-side mapping now that the reservation is consumed.
 	delete(e.matchToReservation, matchMsgID)
 
 	e.opts.log("engine: settle: reservation=%s seller=%s price=%d residual=%d fee_burned=%d exchange=%d",
 		shortKey(reservationID), shortKey(sellerKey), price, residual, fee, exchangeRevenue)
 	return nil
+}
+
+// nextMonotonicTimestamp returns a UnixNano timestamp guaranteed to be
+// STRICTLY greater than any timestamp previously returned by this method on
+// this Engine instance. It is the local emission clock used by
+// sendLocalOperatorMessage (engine_core.go) for every operator-emitted
+// message in LocalStore/relay-only mode (EngineOptions.WriteClient == nil).
+//
+// Guards docs/design/relay-transport.md §E MUST-ENFORCE(1): a nanosecond-
+// granularity wall-clock tie between two fast successive emissions, or a
+// backward NTP step, would otherwise let two of the operator's own emitted
+// events land with equal or reordered timestamps. That matters specifically
+// for scrip events (scrip-settle, scrip-buy-hold, scrip-burn, scrip-
+// dispute-refund): a Seq-less DR rebuild orders events by the canonical
+// (Timestamp,ID) linear extension (Sequencer.SequenceForFold), and ID is a
+// random identifier uncorrelated with emission order — so a timestamp tie
+// among the operator's own totally-ordered emissions (§E: all scrip events
+// are operator-authored and never causally concurrent with each other)
+// would let the tie-break scramble true emission order on rebuild, breaking
+// fold determinism. This is the operator's own single-writer local clock —
+// no cross-process coordination is needed (relay/campfire-delivered events
+// carry their own transport timestamp, assigned upstream, not here).
+func (e *Engine) nextMonotonicTimestamp() int64 {
+	e.emitClockMu.Lock()
+	defer e.emitClockMu.Unlock()
+	now := time.Now().UnixNano()
+	if now <= e.lastEmitNanos {
+		now = e.lastEmitNanos + 1
+	}
+	e.lastEmitNanos = now
+	return now
 }
 
 // marshalSettlePayloads marshals the scrip-settle and scrip-burn payloads
