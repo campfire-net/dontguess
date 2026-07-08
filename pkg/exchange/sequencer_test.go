@@ -351,9 +351,6 @@ func TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest(t *testing.T) {
 // The bound is set to N so no orphan-bound error is in play — this test is
 // purely about algorithmic complexity, not correctness (covered elsewhere).
 func TestSequencer_DrainNoQuadraticRescan(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping O(N) perf regression guard in -short mode")
-	}
 	const n = 20000
 	s := NewSequencer(n + 1)
 	// Build the chain root -> e0 -> e1 -> ... -> e(n-2), then ingest in

@@ -4,13 +4,29 @@ package exchange_test
 // used by the value stack gate.
 //
 // TestTaskCompletionRate_ColdStart — fresh state returns 1.0 (no denominator).
-// TestTaskCompletionRate_AfterComplete — after a full put→buy→complete flow
-//   driven by the engine event loop, TaskCompletionRate returns 1.0.
+// TestTaskCompletionRate_AfterComplete — after a full put→buy→match→accept→
+//   deliver→complete flow, TaskCompletionRate returns 1.0.
 // TestTaskCompletionRate_AcceptedNotCompleted — after buyer-accept but before
 //   settle(complete), TaskCompletionRate is 0.0 (0 completed / 1 accepted).
+//
+// Both flow tests drive the engine SYNCHRONOUSLY via DispatchForTest (the same
+// exported test hook used throughout this package — see settle_deliver_test.go,
+// e2e_test.go) instead of running the real-time engine event loop
+// (eng.Start(ctx) in a goroutine) and polling the store with a sleep loop.
+// handleBuy (invoked by DispatchForTest) emits the match message inline before
+// returning, so the match is guaranteed present the moment DispatchForTest
+// returns — no timing window, no t.Skip("engine may have filtered due to test
+// timing"), and no reliance on wall-clock scheduling. This makes both tests
+// deterministic and safe under -race.
+//
+// acceptedOrders/completedSettlements (the numerator/denominator backing
+// TaskCompletionRate) are populated purely by State.Apply when a
+// settle(buyer-accept)/settle(complete) message is replayed — see
+// state_settle.go applySettleBuyerAccept/applySettleComplete — so those steps
+// only need State().Replay, matching the pattern already used in e2e_test.go's
+// TestFullExchangeFlow.
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"testing"
@@ -34,21 +50,19 @@ func TestTaskCompletionRate_ColdStart(t *testing.T) {
 	}
 }
 
-// TestTaskCompletionRate_AcceptedNotCompleted verifies that after buyer-accept
-// settles but before settle(complete), TaskCompletionRate is 0.0 (the denominator
-// has grown but the numerator has not). This is the scenario the Layer 0 gate
-// is designed to detect early: orders accepted but not delivering value.
-func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
-	t.Parallel()
+// taskCompletionRateFixture drives put → put-accept → buy → (synchronous)
+// match → buyer-accept for the Layer 0 gate tests below. It returns the match
+// message and the entry_id the buyer selected. The engine is driven entirely
+// via DispatchForTest/State().Replay — no goroutine, no sleep, no timeout.
+func taskCompletionRateFixture(t *testing.T, seed int) (h *testHarness, eng *exchange.Engine, matchMsg *store.MessageRecord, entryID string) {
+	t.Helper()
 
-	h := newTestHarness(t)
-	eng := h.newEngine()
-
-	// put → put-accept → buy → engine match → buyer-accept (stop before complete).
+	h = newTestHarness(t)
+	eng = h.newEngine()
 
 	// Step 1: put.
 	putMsg := h.sendMessage(h.seller,
-		putPayload("Layer0 test entry", "sha256:"+fmt.Sprintf("%064x", 11), "code", 5000, 8000),
+		putPayload(fmt.Sprintf("Layer0 test entry %d", seed), "sha256:"+fmt.Sprintf("%064x", seed), "code", 5000, 8000),
 		[]string{exchange.TagPut, "exchange:content-type:code"},
 		nil,
 	)
@@ -65,58 +79,66 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 	msgs, _ = h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(msgs))
 
-	// Step 3: buy.
+	inv := eng.State().Inventory()
+	if len(inv) == 0 {
+		t.Fatal("expected inventory entry after put-accept")
+	}
+
+	// Step 3: buy, dispatched synchronously — handleBuy emits the match
+	// message inline before DispatchForTest returns.
 	buyMsg := h.sendMessage(h.buyer,
-		buyPayload("Layer0 task", 10000),
+		buyPayload(fmt.Sprintf("Layer0 task %d", seed), 10000),
 		[]string{exchange.TagBuy},
 		nil,
 	)
-	_ = buyMsg
-	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(exchange.FromStoreRecords(msgs))
-
-	// Step 4: engine match (run engine event loop briefly).
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	preMatchCount := len(preMatchMsgs)
-
-	go func() { _ = eng.Start(ctx) }()
-
-	var matchMsgs []store.MessageRecord
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-		if len(matchMsgs) > preMatchCount {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
+	buyRec, err := h.st.GetMessage(buyMsg.ID)
+	if err != nil {
+		t.Fatalf("GetMessage buy: %v", err)
 	}
-	cancel()
-
-	if len(matchMsgs) <= preMatchCount {
-		t.Skip("no match emitted — skip (engine may have filtered due to test timing)")
+	eng.State().Apply(exchange.FromStoreRecord(buyRec))
+	if err := eng.DispatchForTest(exchange.FromStoreRecord(buyRec)); err != nil {
+		t.Fatalf("DispatchForTest(buy): %v", err)
 	}
 
-	matchMsg := matchMsgs[len(matchMsgs)-1]
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
-	// Parse match payload to get entry ID.
+	matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	if len(matchMsgs) == 0 {
+		t.Fatal("DispatchForTest(buy) did not emit a match message")
+	}
+	last := matchMsgs[len(matchMsgs)-1]
+	matchMsg = &last
+
 	var mp struct {
 		Results []struct {
 			EntryID string `json:"entry_id"`
 		} `json:"results"`
 	}
-	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
-		t.Skip("could not parse match results — skipping")
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("unmarshal match payload: %v", err)
 	}
+	if len(mp.Results) == 0 {
+		t.Fatal("match message has no results")
+	}
+	entryID = mp.Results[0].EntryID
+
+	return h, eng, matchMsg, entryID
+}
+
+// TestTaskCompletionRate_AcceptedNotCompleted verifies that after buyer-accept
+// settles but before settle(complete), TaskCompletionRate is 0.0 (the denominator
+// has grown but the numerator has not). This is the scenario the Layer 0 gate
+// is designed to detect early: orders accepted but not delivering value.
+func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
+	t.Parallel()
+
+	h, eng, matchMsg, entryID := taskCompletionRateFixture(t, 11)
 
 	// Step 5: buyer-accept only (no deliver or complete).
 	acceptPayload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
-		"entry_id": mp.Results[0].EntryID,
+		"entry_id": entryID,
 		"accepted": true,
 	})
 	h.sendMessage(h.buyer,
@@ -124,7 +146,7 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 		[]string{exchange.TagSettle, "exchange:phase:buyer-accept"},
 		[]string{matchMsg.ID},
 	)
-	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// With 1 accepted, 0 completed: rate should be 0.0.
@@ -136,69 +158,12 @@ func TestTaskCompletionRate_AcceptedNotCompleted(t *testing.T) {
 
 // TestTaskCompletionRate_AfterComplete verifies that after the full
 // put → put-accept → buy → match → buyer-accept → deliver → complete flow
-// (driven by the real engine event loop), TaskCompletionRate returns 1.0.
+// (driven synchronously via DispatchForTest/Replay), TaskCompletionRate
+// returns 1.0.
 func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 	t.Parallel()
 
-	h := newTestHarness(t)
-	eng := h.newEngine()
-
-	// Step 1: put.
-	putMsg := h.sendMessage(h.seller,
-		putPayload("Layer0 complete test", "sha256:"+fmt.Sprintf("%064x", 22), "code", 5000, 8000),
-		[]string{exchange.TagPut, "exchange:content-type:code"},
-		nil,
-	)
-	msgs, err := h.st.ListMessages(h.cfID, 0)
-	if err != nil {
-		t.Fatalf("list: %v", err)
-	}
-	eng.State().Replay(exchange.FromStoreRecords(msgs))
-
-	// Step 2: put-accept.
-	if err := eng.AutoAcceptPut(putMsg.ID, 3500, time.Now().Add(24*time.Hour)); err != nil {
-		t.Fatalf("AutoAcceptPut: %v", err)
-	}
-	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(exchange.FromStoreRecords(msgs))
-
-	// Step 3: buy.
-	buyMsg := h.sendMessage(h.buyer,
-		buyPayload("Layer0 complete task", 10000),
-		[]string{exchange.TagBuy},
-		nil,
-	)
-	_ = buyMsg
-	msgs, _ = h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(exchange.FromStoreRecords(msgs))
-
-	// Step 4: engine match.
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-
-	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	preMatchCount := len(preMatchMsgs)
-
-	go func() { _ = eng.Start(ctx) }()
-
-	var matchMsgs []store.MessageRecord
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		matchMsgs, _ = h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-		if len(matchMsgs) > preMatchCount {
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	cancel()
-
-	if len(matchMsgs) <= preMatchCount {
-		t.Skip("no match emitted — skip (engine timing)")
-	}
-
-	matchMsg := matchMsgs[len(matchMsgs)-1]
-	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
-	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+	h, eng, matchMsg, entryID := taskCompletionRateFixture(t, 22)
 
 	var mp struct {
 		Results []struct {
@@ -206,10 +171,9 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 			Price   int64  `json:"price"`
 		} `json:"results"`
 	}
-	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
-		t.Skip("could not parse match results")
+	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil {
+		t.Fatalf("unmarshal match payload: %v", err)
 	}
-
 	salePrice := mp.Results[0].Price
 	if salePrice == 0 {
 		salePrice = 5000
@@ -218,7 +182,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 	// Step 5: buyer-accept.
 	acceptPayload, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
-		"entry_id": mp.Results[0].EntryID,
+		"entry_id": entryID,
 		"accepted": true,
 	})
 	buyerAcceptMsg := h.sendMessage(h.buyer,
@@ -226,7 +190,7 @@ func TestTaskCompletionRate_AfterComplete(t *testing.T) {
 		[]string{exchange.TagSettle, "exchange:phase:buyer-accept"},
 		[]string{matchMsg.ID},
 	)
-	allMsgs, _ = h.st.ListMessages(h.cfID, 0)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
 	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
 
 	// Verify rate is 0.0 before complete.
