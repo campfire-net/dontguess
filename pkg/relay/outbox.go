@@ -97,6 +97,27 @@ func WithLagAlarmThreshold(n int64) OutboxOption {
 	return func(o *Outbox) { o.lagAlarm = n }
 }
 
+// WithEmittedSeeder wires the operator-echo dedup seed (§D, relay-transport.md).
+// seed is invoked with the SIGNED nostr event id (the NIP-01 content hash) of
+// every operator-authored record STRICTLY BEFORE that event is published to the
+// relay. Production wires it to Sequencer.MarkEmitted so the emitted-set already
+// contains the content-hash id before any relay echo of that event can possibly
+// arrive at the concurrent Intake subscriber — closing the seed-after-publish
+// TOCTOU (a wave-9-review HIGH) whereby the echo re-folds the operator's own
+// event and double-credits scrip.
+//
+// Why the SIGNED id and not the local record id: the Outbox re-signs each local
+// record, and identity.SignEvent stamps a content-hash id that DIFFERS from the
+// pre-signature store record id. The relay echo carries the signed id, so the
+// seed MUST use the signed id (ev.ID after toSignedEvent) or the echo would not
+// dedup (the earlier pre-sign-id bug this reworks).
+//
+// A nil seed (the default) is exactly today's behavior — no seeding, no echo
+// dedup wiring — so the Outbox is drop-in when relay echo dedup is not wired.
+func WithEmittedSeeder(seed func(id string)) OutboxOption {
+	return func(o *Outbox) { o.seedEmitted = seed }
+}
+
 // Outbox publishes operator-authored local records to the relay, off the hot
 // path, advancing a crash-durable cursor on each ACK. See the file doc for the
 // two load-bearing invariants (ping-pong prevention, crash-safe republish).
@@ -113,6 +134,11 @@ type Outbox struct {
 	cursor  *cursorFile
 	backoff Backoff
 	logf    func(format string, args ...interface{})
+
+	// seedEmitted, if non-nil, is called with the SIGNED content-hash event id of
+	// each operator-authored record STRICTLY BEFORE it is published (echo dedup,
+	// §D). nil = today's behavior (no seeding). See WithEmittedSeeder.
+	seedEmitted func(id string)
 
 	lagAlarm int64 // publish_lag threshold for the loud alarm (0 = disabled)
 
@@ -234,6 +260,20 @@ func (o *Outbox) Tick(ctx context.Context) error {
 			// record at RF=1 forever with no signal).
 			o.logf("outbox: FATAL cannot convert/sign local record %s for publish: %v", rec.ID, err)
 			return fmt.Errorf("outbox: convert/sign record %s: %w", rec.ID, err)
+		}
+
+		// ECHO DEDUP SEED — seed STRICTLY BEFORE publish (§D, wave-9 TOCTOU fix).
+		// The relay echoes a published event back to the concurrent Intake
+		// subscriber the instant it accepts the EVENT frame; an echo can therefore
+		// only ever arrive AFTER publishWithRetry has sent the frame. Seeding the
+		// emitted-set with the signed content-hash id here — before publish — makes
+		// the seed happen-before any possible echo, so Sequencer.Ingest dedups the
+		// echo and it cannot re-fold (double scrip credit). MarkEmitted is
+		// idempotent and pre-seeding a not-yet-published id is safe: if publish
+		// fails and a later Tick republishes, toSignedEvent re-derives the IDENTICAL
+		// content-hash id, so the seed still matches (never a stale/orphan seed).
+		if o.seedEmitted != nil {
+			o.seedEmitted(ev.ID)
 		}
 
 		if err := o.publishWithRetry(ctx, ev); err != nil {
