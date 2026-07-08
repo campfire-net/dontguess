@@ -125,3 +125,76 @@ func TestVerifyAuthEvent_Rejections(t *testing.T) {
 		t.Errorf("rejected a relay URL differing only by trailing slash: %v", err)
 	}
 }
+
+// TestRelayURLMatch locks the scoped case-folding contract: scheme and host
+// are case-insensitive, but path and query are compared byte-for-byte. Before
+// this fix, relayURLMatch ran strings.EqualFold over the entire URL, so an
+// AUTH event minted for one relay path (e.g. a per-tenant path segment) would
+// also match a different path or query on the same host — an authorization
+// bypass across paths that share a host.
+func TestRelayURLMatch(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		a, b string
+		want bool
+	}{
+		{"identical", "wss://relay.example/A", "wss://relay.example/A", true},
+		{"trailing slash tolerated", "wss://relay.example/A", "wss://relay.example/A/", true},
+		{"scheme case-insensitive", "WSS://relay.example/A", "wss://relay.example/A", true},
+		{"host case-insensitive", "wss://Relay.Example/A", "wss://relay.example/A", true},
+		{"no-path host case-insensitive", "wss://Relay.Example", "wss://relay.example", true},
+		{"path case-SENSITIVE: differs by case only", "wss://relay.example/A", "wss://relay.example/a", false},
+		{"path differs entirely", "wss://relay.example/A", "wss://relay.example/B", false},
+		{"query case-SENSITIVE", "wss://relay.example/A?Token=X", "wss://relay.example/A?Token=x", false},
+		{"query differs entirely", "wss://relay.example/A?t=1", "wss://relay.example/A?t=2", false},
+		{"no scheme delimiter: exact fallback, equal", "relay.example/A", "relay.example/A", true},
+		{"no scheme delimiter: exact fallback, case differs", "relay.example/A", "relay.example/a", false},
+		{"different host entirely", "wss://relay.example/A", "wss://evil.example/A", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := relayURLMatch(tc.a, tc.b); got != tc.want {
+				t.Errorf("relayURLMatch(%q, %q) = %v, want %v", tc.a, tc.b, got, tc.want)
+			}
+			// Must be symmetric.
+			if got := relayURLMatch(tc.b, tc.a); got != tc.want {
+				t.Errorf("relayURLMatch(%q, %q) [swapped] = %v, want %v", tc.b, tc.a, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestVerifyAuthEvent_RejectsCrossPathReplay proves the fixed relayURLMatch is
+// wired through VerifyAuthEvent end-to-end: an AUTH event minted for one
+// relay path must not verify against a different path on the same host, even
+// though the old whole-URL EqualFold would have accepted it (same
+// case-insensitive string modulo the path segment being lowercase already —
+// this test uses a path-case difference, which is the exact hole the bug
+// allowed).
+func TestVerifyAuthEvent_RejectsCrossPathReplay(t *testing.T) {
+	t.Parallel()
+
+	signer, _ := Generate()
+	const mintedFor = "wss://relay.example/tenant/Alpha"
+	const challenge = "cross-path-challenge"
+
+	ev, err := BuildAuthEvent(signer, mintedFor, challenge)
+	if err != nil {
+		t.Fatalf("BuildAuthEvent: %v", err)
+	}
+	now := time.Unix(ev.CreatedAt, 0)
+
+	// Same event must still verify at the exact relay it was minted for.
+	if _, err := VerifyAuthEvent(ev, mintedFor, challenge, now); err != nil {
+		t.Fatalf("VerifyAuthEvent rejected an event at its own minted relay: %v", err)
+	}
+
+	// A different path on the same host (case-different tenant segment) must
+	// be rejected.
+	const otherPath = "wss://relay.example/tenant/alpha"
+	if _, err := VerifyAuthEvent(ev, otherPath, challenge, now); err == nil {
+		t.Fatal("VerifyAuthEvent accepted an event minted for a different relay path (path case-fold hole)")
+	}
+}

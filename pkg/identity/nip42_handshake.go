@@ -64,15 +64,25 @@ func ClientAuthenticate(conn FrameConn, signer Signer, relayURL string) error {
 // RelayAuthenticate performs the relay half of the handshake: issue a fresh
 // random challenge, read the client's signed AUTH event, verify it against the
 // challenge and relay URL, then enforce the allowlist. It returns the
-// authenticated hex pubkey on success. A nil allowlist means "no allowlist
-// enforcement" (individual tier); a non-nil allowlist rejects any pubkey not on
-// it.
+// authenticated hex pubkey on success.
+//
+// allowlist is required and fails closed: a nil allowlist is a configuration
+// error, not "no enforcement" — it is rejected outright before any handshake
+// I/O happens, so an unconfigured relay cannot silently admit every
+// cryptographically-valid pubkey. Callers that genuinely want an open relay
+// (e.g. single-operator/individual tier with no fleet to restrict to) must
+// opt in explicitly by passing OpenAllowlist(), which is a named, auditable
+// choice at the call site rather than an implicit consequence of a nil.
 //
 // This is the "allowlist enforced at handshake" gate: authenticity
 // (VerifyAuthEvent) and authorization (allowlist) are both checked before the
 // connection is considered authed, and both failure paths send a rejecting OK
 // so the client learns it was refused rather than hanging.
 func RelayAuthenticate(conn FrameConn, relayURL string, allowlist *Allowlist) (string, error) {
+	if allowlist == nil {
+		return "", fmt.Errorf("relay auth: nil allowlist not permitted (fail-closed); pass identity.OpenAllowlist() to explicitly disable enforcement")
+	}
+
 	challenge, err := NewChallenge()
 	if err != nil {
 		return "", fmt.Errorf("relay auth: new challenge: %w", err)
@@ -100,9 +110,10 @@ func RelayAuthenticate(conn FrameConn, relayURL string, allowlist *Allowlist) (s
 		return "", fmt.Errorf("relay auth: %w", verifyErr)
 	}
 
-	// Allowlist enforcement. A nil allowlist disables the gate (individual tier
-	// / open relay); a non-nil one is fail-closed.
-	if allowlist != nil && !allowlist.Allowed(pubkey) {
+	// Allowlist enforcement. allowlist is guaranteed non-nil here (checked at
+	// the top of the function); OpenAllowlist() explicitly disables the gate,
+	// anything else is fail-closed.
+	if !allowlist.Allowed(pubkey) {
 		sendOK(conn, ev.ID, false, "restricted: npub not on fleet allowlist")
 		return "", fmt.Errorf("relay auth: pubkey %s not on allowlist", pubkey)
 	}

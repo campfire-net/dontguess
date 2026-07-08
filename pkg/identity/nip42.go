@@ -84,11 +84,45 @@ func VerifyAuthEvent(ev *Event, relayURL, challenge string, now time.Time) (stri
 }
 
 // relayURLMatch compares two relay URLs for NIP-42 purposes, tolerating a
-// trailing-slash difference and case-insensitive scheme/host but nothing else.
+// trailing-slash difference and case-insensitive scheme/host but nothing
+// else. Path and query are compared byte-for-byte: an AUTH event minted for
+// one relay path (e.g. wss://relay.example/A) must not be accepted at a
+// different path or query on the same host (wss://relay.example/B), so only
+// the scheme and host are case-folded before comparison.
 func relayURLMatch(a, b string) bool {
 	na := strings.TrimRight(strings.TrimSpace(a), "/")
 	nb := strings.TrimRight(strings.TrimSpace(b), "/")
-	return strings.EqualFold(na, nb)
+	if na == nb {
+		return true
+	}
+	schemeHostA, restA, okA := splitSchemeHost(na)
+	schemeHostB, restB, okB := splitSchemeHost(nb)
+	if !okA || !okB {
+		// Couldn't identify a scheme/host boundary in one or both URLs; fall
+		// back to exact match rather than risk case-folding path/query.
+		return false
+	}
+	if !strings.EqualFold(schemeHostA, schemeHostB) {
+		return false
+	}
+	return restA == restB
+}
+
+// splitSchemeHost splits a relay URL of the form "scheme://host[/rest]" into
+// the "scheme://host" portion and the remaining "/rest" (path+query, which
+// may be empty). ok is false if no "://" delimiter is found.
+func splitSchemeHost(u string) (schemeHost, rest string, ok bool) {
+	schemeIdx := strings.Index(u, "://")
+	if schemeIdx < 0 {
+		return "", "", false
+	}
+	hostStart := schemeIdx + len("://")
+	slashIdx := strings.Index(u[hostStart:], "/")
+	if slashIdx < 0 {
+		// No path/query component.
+		return u, "", true
+	}
+	return u[:hostStart+slashIdx], u[hostStart+slashIdx:], true
 }
 
 // NewChallenge returns a fresh random challenge string (32 bytes hex) for a
