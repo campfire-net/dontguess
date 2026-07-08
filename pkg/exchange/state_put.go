@@ -16,18 +16,64 @@ var validCompressionTiers = map[string]struct{}{
 	"cold": {},
 }
 
-// exchangeOp returns the exchange operation tag from a message's tag list,
-// or "" if none is present.
-func exchangeOp(tags []string) string {
-	for _, t := range tags {
-		switch t {
-		case TagPut, TagBuy, TagMatch, TagSettle,
-			TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
-			TagAssignExpire, TagAssignAuctionClose:
-			return t
-		}
+// isExchangeOpTag reports whether a tag is a first-class exchange operation
+// constant — the canonical vocabulary that selects a fold/dispatch handler.
+// Secondary markers (exchange:buy-miss, exchange:consume, exchange:synthetic),
+// phase/domain/verdict tags, and scrip ops are deliberately NOT in this set:
+// they never select the executed op.
+func isExchangeOpTag(t string) bool {
+	switch t {
+	case TagPut, TagBuy, TagMatch, TagSettle,
+		TagAssign, TagAssignClaim, TagAssignComplete, TagAssignAccept, TagAssignReject,
+		TagAssignExpire, TagAssignAuctionClose:
+		return true
 	}
-	return ""
+	return false
+}
+
+// exchangeOp returns the single exchange operation tag that identifies a
+// message, or "" if the message carries no operation tag OR carries an ambiguous
+// set of them.
+//
+// CANONICAL-SOURCE RULE (docs/design/relay-transport.md §2.4a D2, reworked). The
+// executed op is derived ONLY from a message's canonical operation vocabulary:
+// the primary op the nostr adapter reconstructs from the event Kind
+// (put/buy/match/settle) plus the structured ["op"] discriminator it emits for
+// the shared kinds (3405 assign*, 3411 scrip). A ["x", <raw>] passthrough tag —
+// the adapter's lossless carrier for secondary markers such as
+// exchange:buy-miss — is NOT a canonical op source and MUST NEVER select the
+// executed op.
+//
+// A folded message is a flat []string in which a smuggled
+// ["x","exchange:assign-auction-close"] value is indistinguishable BY STRING
+// from a legitimate discriminator, so this function cannot infer provenance from
+// the value alone. It instead enforces the invariant that a well-formed message
+// names EXACTLY ONE canonical op: if two or more DISTINCT op constants are
+// present the canonical source is ambiguous and the function FAILS LOUD (returns
+// "", i.e. unroutable/dropped) rather than silently returning the first — which,
+// in attacker-chosen wire order, could be the smuggled one. An
+// ["x","exchange:*"] op-collision is therefore INERT: it can never quietly
+// become the op. This defends every transport that can construct a
+// proto.Message, not just nostr, and does so without touching the LOCKED
+// proto.Message shape (no canonical Op field).
+//
+// Secondary markers that are not op constants round-trip losslessly and fold
+// correctly: a buy-miss standing offer tagged [exchange:buy-miss, exchange:match]
+// still resolves to the single op TagMatch; an exchange:consume message resolves
+// to "" and is handled by the applyLocked default branch.
+func exchangeOp(tags []string) string {
+	found := ""
+	for _, t := range tags {
+		if !isExchangeOpTag(t) {
+			continue
+		}
+		if found != "" && t != found {
+			// Two distinct canonical op constants — ambiguous source, fail loud.
+			return ""
+		}
+		found = t
+	}
+	return found
 }
 
 // settlePhasFromTags extracts the exchange:phase:* value from tags.

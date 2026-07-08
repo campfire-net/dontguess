@@ -349,3 +349,111 @@ func TestFoldedMessageDrivesUnchangedEngine(t *testing.T) {
 		t.Fatalf("folded put not recognised by unchanged engine: pendingPuts=%d want 1", got)
 	}
 }
+
+// TestBuyMissMarkerRoundTripsAndFoldsAsMatch is the regression guard for the
+// wave-6 false-positive that this rework removes (dontguess-c22, DONE #2). A
+// buy-miss standing offer is a broadcast operator message tagged
+// [exchange:buy-miss, exchange:match] and serialized as a KindMatch (3403) event;
+// the buy-miss marker rides as a lossless ["x","exchange:buy-miss"] passthrough.
+// It MUST survive ToNostrEvent -> FromNostrEvent intact and fold through the
+// UNCHANGED exchange State as a match (the buy-miss demand signal is a core
+// feature: "a buy miss registers demand"). No such round-trip+fold test existed.
+func TestBuyMissMarkerRoundTripsAndFoldsAsMatch(t *testing.T) {
+	buyMsgID := sampleAnte0
+	buyMiss := &proto.Message{
+		ID:          sampleID,
+		Sender:      sampleSender, // operator broadcast
+		CampfireID:  "cf",
+		Payload:     []byte(`{"task_hash":"abcd","offered_price_rate":70,"buy_msg_id":"` + buyMsgID + `"}`),
+		Tags:        []string{exchange.TagMatch, exchange.TagBuyMiss},
+		Antecedents: []string{buyMsgID},
+		Timestamp:   1_717_000_000_000_000_000,
+	}
+
+	ev, err := ToNostrEvent(buyMiss)
+	if err != nil {
+		t.Fatalf("ToNostrEvent: %v", err)
+	}
+	if ev.Kind != KindMatch {
+		t.Fatalf("buy-miss kind = %d, want KindMatch %d", ev.Kind, KindMatch)
+	}
+	// The buy-miss marker must serialize as an ["x", ...] passthrough, not be dropped.
+	var sawBuyMissX bool
+	for _, tag := range ev.Tags {
+		if tag[0] == tagX && len(tag) >= 2 && tag[1] == exchange.TagBuyMiss {
+			sawBuyMissX = true
+		}
+	}
+	if !sawBuyMissX {
+		t.Fatalf("buy-miss marker not carried as an x-tag on the event: %v", ev.Tags)
+	}
+
+	folded, err := FromNostrEvent(ev)
+	if err != nil {
+		t.Fatalf("FromNostrEvent: %v (the buy-miss marker must NOT be rejected)", err)
+	}
+	// Marker round-trips losslessly.
+	if !hasStr(folded.Tags, exchange.TagBuyMiss) || !hasStr(folded.Tags, exchange.TagMatch) {
+		t.Fatalf("round-trip lost a tag: got %v, want both %q and %q", folded.Tags, exchange.TagMatch, exchange.TagBuyMiss)
+	}
+
+	// Folds through the UNCHANGED engine as a match: the standing offer marks its
+	// antecedent buy order matched.
+	st := exchange.NewState()
+	st.Apply(folded)
+	if !st.IsOrderMatched(buyMsgID) {
+		t.Fatalf("buy-miss did not fold as a match: order %q not marked matched", buyMsgID)
+	}
+}
+
+// TestReservedXTagSmuggleIsNotRejectedButInert proves the two halves of the
+// rework's adapter contract (dontguess-c22, DONE #1): the adapter does NOT reject
+// a reserved-vocabulary x-tag (the wave-6 blunt rejection is gone — that would
+// also unfold legitimate buy-miss/consume markers), and the smuggled op is INERT
+// at the fold because exchangeOp fails loud on the resulting two-op ambiguity.
+//
+// Craft the b67d exploit event: kind=3405 signed by a NON-operator, discriminator
+// ["op","exchange:assign-claim"] (a benign worker op) plus a smuggled
+// ["x","exchange:assign-auction-close"]. FromNostrEvent must succeed and carry
+// both op strings; folding it must NOT execute an auction-close (no auction is
+// set up here, so the observable is simply that the message routes to no handler
+// and mutates nothing — the full inert-vs-canonical proof lives in the exchange
+// package's TestExchangeOp_SmuggledAuctionCloseIsInertAtFold).
+func TestReservedXTagSmuggleIsNotRejectedButInert(t *testing.T) {
+	ev := &Event{
+		ID:     sampleID,
+		PubKey: sampleSender, // attacker's OWN key, not the operator
+		Kind:   KindAssign,
+		Tags: [][]string{
+			{tagP, sampleSender},
+			{tagOp, exchange.TagAssignClaim},
+			{tagX, exchange.TagAssignAuctionClose}, // smuggled reserved op
+		},
+	}
+	folded, err := FromNostrEvent(ev)
+	if err != nil {
+		t.Fatalf("FromNostrEvent rejected a reserved x-tag: %v (the blunt rejection must be gone)", err)
+	}
+	if !hasStr(folded.Tags, exchange.TagAssignClaim) || !hasStr(folded.Tags, exchange.TagAssignAuctionClose) {
+		t.Fatalf("smuggle round-trip lost a tag: got %v", folded.Tags)
+	}
+
+	// Folding the two-op message must not panic; the smuggled auction-close is
+	// inert because exchangeOp resolves the ambiguous op-set to "" so no handler
+	// runs (the full inert-vs-canonical proof is in the exchange package —
+	// TestExchangeOp_SmuggledAuctionCloseIsInertAtFold, which can reach the
+	// package-private assign state that this cross-package test cannot).
+	st := exchange.NewState()
+	st.OperatorKey = sampleSender
+	st.Apply(folded) // must not panic / must route to no handler
+}
+
+// hasStr reports whether s contains v.
+func hasStr(s []string, v string) bool {
+	for _, x := range s {
+		if x == v {
+			return true
+		}
+	}
+	return false
+}
