@@ -19,6 +19,22 @@ type Allowlist struct {
 	// hex pubkey -> the label it was admitted under (npub or hex), for
 	// diagnostics only. Presence in the map is the authorization.
 	members map[string]string
+
+	// open, when true, makes Allowed report true for every pubkey. Only
+	// OpenAllowlist sets this — it exists so "no allowlist enforcement" is an
+	// explicit, named choice at the call site rather than an implicit
+	// consequence of passing nil. See RelayAuthenticate.
+	open bool
+}
+
+// OpenAllowlist returns an Allowlist that admits every pubkey. Pass this to
+// RelayAuthenticate to explicitly disable allowlist enforcement (e.g. a
+// single-operator/individual-tier relay with no fleet to restrict to). This
+// is the only supported way to disable enforcement — RelayAuthenticate
+// rejects a nil allowlist outright so an unconfigured allowlist fails closed
+// instead of silently admitting anyone.
+func OpenAllowlist() *Allowlist {
+	return &Allowlist{open: true}
 }
 
 // NewAllowlist builds an allowlist from a mix of npub ("npub1…") and 64-char
@@ -63,8 +79,12 @@ func (a *Allowlist) Add(entry string) error {
 }
 
 // Allowed reports whether the given hex pubkey (as it appears on a nostr event)
-// is on the allowlist. Comparison is case-insensitive on the hex.
+// is on the allowlist. Comparison is case-insensitive on the hex. An
+// OpenAllowlist reports true unconditionally.
 func (a *Allowlist) Allowed(pubkeyHex string) bool {
+	if a.open {
+		return true
+	}
 	_, ok := a.members[strings.ToLower(strings.TrimSpace(pubkeyHex))]
 	return ok
 }

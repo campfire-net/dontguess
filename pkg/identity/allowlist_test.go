@@ -47,3 +47,24 @@ func TestAllowlist_RejectsMalformed(t *testing.T) {
 		}
 	}
 }
+
+// TestOpenAllowlist_AdmitsEveryPubkey proves OpenAllowlist().Allowed reports
+// true unconditionally, including for a pubkey nobody ever admitted — this is
+// the explicit, named opt-out from allowlist enforcement that RelayAuthenticate
+// requires callers to pass instead of a bare nil.
+func TestOpenAllowlist_AdmitsEveryPubkey(t *testing.T) {
+	t.Parallel()
+
+	al := OpenAllowlist()
+	if al.Len() != 0 {
+		t.Fatalf("OpenAllowlist Len = %d, want 0 (no explicit members)", al.Len())
+	}
+
+	stranger, _ := Generate()
+	if !al.Allowed(stranger.PubKeyHex()) {
+		t.Error("OpenAllowlist rejected a pubkey; want unconditional admission")
+	}
+	if !al.Allowed("not-even-a-valid-pubkey") {
+		t.Error("OpenAllowlist rejected a garbage string; want unconditional admission")
+	}
+}

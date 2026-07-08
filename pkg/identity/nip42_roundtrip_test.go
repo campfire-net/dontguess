@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -124,4 +125,79 @@ func TestNIP42RoundTrip_StrangerRejected(t *testing.T) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for relay result")
 	}
+}
+
+// TestRelayAuthenticate_NilAllowlistFailsClosed proves RelayAuthenticate no
+// longer treats a nil allowlist as "no enforcement" (individual tier). A nil
+// allowlist is now a configuration error that is rejected outright, before
+// any handshake I/O — so a relay that forgot to configure an allowlist
+// cannot silently admit every cryptographically-valid pubkey. The rejection
+// must happen without the relay ever writing a challenge frame: this is
+// checked directly against a conn stub, not over a real websocket, so the
+// test can assert zero bytes were written.
+func TestRelayAuthenticate_NilAllowlistFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	conn := &recordingConn{}
+	pubkey, err := RelayAuthenticate(conn, "wss://relay.example", nil)
+	if err == nil {
+		t.Fatal("RelayAuthenticate accepted a nil allowlist (should fail closed)")
+	}
+	if pubkey != "" {
+		t.Fatalf("RelayAuthenticate returned pubkey %q on the nil-allowlist error path, want empty", pubkey)
+	}
+	if !strings.Contains(err.Error(), "nil allowlist") {
+		t.Fatalf("error %q does not explain the nil-allowlist rejection", err.Error())
+	}
+	if conn.writes != 0 {
+		t.Fatalf("RelayAuthenticate wrote %d frame(s) before rejecting a nil allowlist; want 0 (fail fast, no wasted handshake I/O)", conn.writes)
+	}
+}
+
+// TestRelayAuthenticate_OpenAllowlistAdmitsAnyPubkey proves the explicit
+// opt-in path: passing identity.OpenAllowlist() (rather than nil) is the only
+// supported way to disable allowlist enforcement, and it still admits a
+// pubkey with no prior allowlist membership.
+func TestRelayAuthenticate_OpenAllowlistAdmitsAnyPubkey(t *testing.T) {
+	t.Parallel()
+
+	stranger, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	relayURL, results := wsRelay(t, OpenAllowlist())
+	conn := dial(t, relayURL)
+
+	if err := ClientAuthenticate(conn, stranger, relayURL); err != nil {
+		t.Fatalf("ClientAuthenticate (OpenAllowlist should accept anyone): %v", err)
+	}
+
+	select {
+	case res := <-results:
+		if res.err != nil {
+			t.Fatalf("relay reported auth error under OpenAllowlist: %v", res.err)
+		}
+		if res.pubkey != stranger.PubKeyHex() {
+			t.Fatalf("relay authed pubkey %s, want %s", res.pubkey, stranger.PubKeyHex())
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for relay result")
+	}
+}
+
+// recordingConn is a minimal FrameConn stub that records how many frames were
+// written, so TestRelayAuthenticate_NilAllowlistFailsClosed can assert the
+// nil-allowlist guard rejects before any handshake I/O occurs.
+type recordingConn struct {
+	writes int
+}
+
+func (c *recordingConn) WriteMessage(messageType int, data []byte) error {
+	c.writes++
+	return nil
+}
+
+func (c *recordingConn) ReadMessage() (int, []byte, error) {
+	return 0, nil, fmt.Errorf("recordingConn: ReadMessage should not be called")
 }
