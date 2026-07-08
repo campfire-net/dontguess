@@ -565,6 +565,12 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 		}
 		writeOperatorResp(conn, map[string]any{"ok": true})
 
+	case OpMetrics:
+		// Degradation counters (docs/design/relay-transport.md §2.4a D4 + §3):
+		// dispatch trust-gate rejections, counted and alarmed rather than
+		// silently dropped (dontguess-388). Read-only, no engine mutation.
+		enc.Encode(map[string]any{"degradation": eng.DegradationSnapshot()}) //nolint:errcheck
+
 	default:
 		writeOperatorResp(conn, map[string]any{"ok": false, "error": "unknown op: " + req.Op})
 	}

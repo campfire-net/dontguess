@@ -87,11 +87,13 @@ type OperatorHealth struct {
 
 // StatusSnapshot is the full status snapshot returned by collectStatus.
 type StatusSnapshot struct {
-	SchemaVersion   int             `json:"schema_version"`
-	Since           string          `json:"since"`
-	WrapperAttempts WrapperAttempts `json:"wrapper_attempts"`
-	Exchange        ExchangeCounts  `json:"exchange"`
-	Operator        OperatorHealth  `json:"operator"`
+	SchemaVersion   int                         `json:"schema_version"`
+	Since           string                      `json:"since"`
+	WrapperAttempts WrapperAttempts             `json:"wrapper_attempts"`
+	Exchange        ExchangeCounts              `json:"exchange"`
+	Operator        OperatorHealth              `json:"operator"`
+	Degradation     *exchange.DegradationCounts `json:"degradation"`
+	DegradationNote string                      `json:"degradation_note,omitempty"`
 }
 
 // --------------------------------------------------------------------------
@@ -471,6 +473,43 @@ func readHeldCount(dgHome string) (*int, string) {
 }
 
 // --------------------------------------------------------------------------
+// Degradation metrics via socket
+// --------------------------------------------------------------------------
+
+// readDegradationMetrics dials the operator socket and requests OpMetrics —
+// the dispatch trust-gate rejection counters (docs/design/relay-transport.md
+// §2.4a D4 + §3, dontguess-388): not-allowlisted, not-operator, and
+// low-reputation trust denials, each a DISTINCT counted+alarmed bucket rather
+// than a silent nil-drop. On failure (operator unreachable), returns nil and
+// a note — mirrors readHeldCount's degrade-gracefully contract so `status`
+// still renders when the operator isn't running.
+func readDegradationMetrics(dgHome string) (*exchange.DegradationCounts, string) {
+	sockPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
+	conn, err := net.DialTimeout("unix", sockPath, 2*time.Second)
+	if err != nil {
+		return nil, "operator not reachable"
+	}
+	defer conn.Close()
+
+	conn.SetDeadline(time.Now().Add(2 * time.Second)) //nolint:errcheck
+
+	enc := json.NewEncoder(conn)
+	if err := enc.Encode(map[string]any{"op": OpMetrics}); err != nil {
+		return nil, "operator not reachable"
+	}
+
+	var resp struct {
+		Degradation exchange.DegradationCounts `json:"degradation"`
+	}
+	dec := json.NewDecoder(conn)
+	if err := dec.Decode(&resp); err != nil {
+		return nil, "operator not reachable"
+	}
+
+	return &resp.Degradation, ""
+}
+
+// --------------------------------------------------------------------------
 // collectStatus
 // --------------------------------------------------------------------------
 
@@ -496,12 +535,16 @@ func collectStatus(dgHome string, since time.Duration) (*StatusSnapshot, error) 
 
 	op := readOperatorHealth(dgHome, cutoff, lastActivityNano)
 
+	degradation, degradationNote := readDegradationMetrics(dgHome)
+
 	snap := &StatusSnapshot{
 		SchemaVersion:   1,
 		Since:           since.String(),
 		WrapperAttempts: wa,
 		Exchange:        excCounts,
 		Operator:        op,
+		Degradation:     degradation,
+		DegradationNote: degradationNote,
 	}
 	return snap, nil
 }
@@ -544,6 +587,17 @@ func printStatus(snap *StatusSnapshot, asJSON bool) {
 		fmt.Printf("  puts held:      %d\n", *snap.Exchange.PutsHeld)
 	} else {
 		fmt.Printf("  puts held:      n/a (%s)\n", snap.Exchange.PutsHeldNote)
+	}
+	fmt.Println()
+
+	fmt.Printf("Degradation (dispatch trust-gate rejections)\n")
+	if snap.Degradation != nil {
+		fmt.Printf("  not allowlisted: %d\n", snap.Degradation.TrustDenialNotAllowlisted)
+		fmt.Printf("  not operator:    %d\n", snap.Degradation.TrustDenialNotOperator)
+		fmt.Printf("  low reputation:  %d\n", snap.Degradation.TrustDenialLowReputation)
+		fmt.Printf("  other:           %d\n", snap.Degradation.TrustDenialOther)
+	} else {
+		fmt.Printf("  n/a (%s)\n", snap.DegradationNote)
 	}
 	fmt.Println()
 

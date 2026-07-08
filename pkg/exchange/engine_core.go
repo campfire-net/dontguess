@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -341,6 +342,12 @@ type Engine struct {
 	// order on a Seq-less DR rebuild.
 	emitClockMu   sync.Mutex
 	lastEmitNanos int64
+
+	// degradation counts trust-gate rejections in the dispatch fold (§2.4a D4 +
+	// §3). Always non-nil (initialized in NewEngine); never touched when
+	// EngineOptions.TrustChecker is nil, since the trust gate itself is
+	// skipped in that mode.
+	degradation *DegradationMetrics
 }
 
 // buyerSessionEntry records a single entry settled by a buyer, used for
@@ -348,6 +355,50 @@ type Engine struct {
 type buyerSessionEntry struct {
 	entryID   string
 	settledAt time.Time
+}
+
+// DegradationMetrics holds the dispatch trust-gate rejection counters
+// (docs/design/relay-transport.md §2.4a D4 + §3 "provenance_rejected"). Every
+// trust-denial reason is a DISTINCT, separately-alarmed counter — mirroring
+// pkg/relay's IntakeMetrics/WatchdogMetrics pattern (relay/metrics.go):
+// not-allowlisted, not-operator, and below-reputation are different failure
+// classes with different triage paths and MUST NOT be collapsed into one
+// bucket. No trust-gate rejection may `return nil` from dispatch silently
+// (LOCKED-5) — every increment here is paired with a loud log line at the
+// call site (dispatch, engine_core.go).
+//
+// All counters are atomic.Int64 so the poll-loop goroutine and any concurrent
+// operator-socket handler goroutine can both dispatch through the trust gate
+// without a lock.
+type DegradationMetrics struct {
+	// TrustDenialNotAllowlisted counts dispatch trust-gate rejections where the
+	// sender lacks TrustAllowlisted standing for an allowlisted-tier operation
+	// (e.g. a non-fleet-member put or assign-claim).
+	TrustDenialNotAllowlisted atomic.Int64
+	// TrustDenialNotOperator counts rejections where the sender is not the
+	// operator key for an operator-only operation (e.g. a forged match,
+	// settle(put-accept), or assign-post).
+	TrustDenialNotOperator atomic.Int64
+	// TrustDenialLowReputation counts rejections from TrustChecker's seller
+	// reputation floor (ErrLowReputation) — a seller who has burned trust is
+	// blocked from further sell-side operations independent of allowlist
+	// membership.
+	TrustDenialLowReputation atomic.Int64
+	// TrustDenialOther counts trust-gate rejections that don't fit the above
+	// buckets (e.g. RequiredLevel returning an unknown-op/unknown-phase error).
+	// Present so a future new rejection class is still counted, never dropped
+	// into a silent nil-return while its bucket is added.
+	TrustDenialOther atomic.Int64
+}
+
+// DegradationCounts is a plain (non-atomic) point-in-time copy of
+// DegradationMetrics, safe to marshal to JSON for the status/observability
+// path (cmd/dontguess/status.go).
+type DegradationCounts struct {
+	TrustDenialNotAllowlisted int64 `json:"trust_denial_not_allowlisted"`
+	TrustDenialNotOperator    int64 `json:"trust_denial_not_operator"`
+	TrustDenialLowReputation  int64 `json:"trust_denial_low_reputation"`
+	TrustDenialOther          int64 `json:"trust_denial_other"`
 }
 
 // engineCtx returns the shutdown context stored at Start time.
@@ -388,12 +439,25 @@ func NewEngine(opts EngineOptions) *Engine {
 		matchToReservation: make(map[string]string),
 		buyerRecentEntries: make(map[string][]buyerSessionEntry),
 		localMsgByID:       make(map[string]*Message),
+		degradation:        &DegradationMetrics{},
 	}
 }
 
 // State returns the engine's live state view.
 func (e *Engine) State() *State {
 	return e.state
+}
+
+// DegradationSnapshot returns a point-in-time copy of the trust-denial
+// counters (docs/design/relay-transport.md §2.4a D4 + §3) for reporting —
+// the CLI status/observability path (cmd/dontguess/status.go) and tests.
+func (e *Engine) DegradationSnapshot() DegradationCounts {
+	return DegradationCounts{
+		TrustDenialNotAllowlisted: e.degradation.TrustDenialNotAllowlisted.Load(),
+		TrustDenialNotOperator:    e.degradation.TrustDenialNotOperator.Load(),
+		TrustDenialLowReputation:  e.degradation.TrustDenialLowReputation.Load(),
+		TrustDenialOther:          e.degradation.TrustDenialOther.Load(),
+	}
 }
 
 // MatchIndexLen returns the number of entries currently in the semantic match index.
@@ -817,9 +881,14 @@ func (e *Engine) dispatch(msg *Message) error {
 		trustOp := tagToTrustOp(op)
 		if trustOp != "" {
 			if err := e.opts.TrustChecker.Check(msg.Sender, trustOp, phase); err != nil {
-				e.opts.log("engine: trust rejected msg=%s op=%s sender=%s: %v",
-					msg.ID, op, shortKey(msg.Sender), err)
-				return nil // silently reject — don't propagate error to poll loop
+				reason := e.recordTrustDenial(trustOp, phase, err)
+				e.opts.log("engine: trust rejected msg=%s op=%s sender=%s reason=%s: %v",
+					msg.ID, op, shortKey(msg.Sender), reason, err)
+				// Counted + alarmed above (§2.4a D4) — the message is dropped
+				// pre-fold and dispatch returns nil (not an error) so the poll
+				// loop doesn't treat a routine trust rejection as a transport
+				// fault, but the rejection itself is never a silent nil-drop.
+				return nil
 			}
 		}
 	}
@@ -883,6 +952,38 @@ func tagToTrustOp(op string) Operation {
 		return OperationAssignAuctionClose
 	default:
 		return "" // unknown operation — no trust check
+	}
+}
+
+// recordTrustDenial buckets a TrustChecker.Check rejection into exactly one
+// DISTINCT counter on e.degradation and returns the reason string used in the
+// dispatch log line. Mirrors the pkg/relay IntakeMetrics pattern
+// (docs/design/relay-transport.md §2.4a D4): not-allowlisted, not-operator,
+// and low-reputation are different attack/misconfiguration classes with
+// different triage paths, so they are never collapsed into one bucket. Every
+// path increments exactly one counter — none is a silent nil-drop (§3
+// "provenance_rejected").
+//
+// required is looked up via TrustChecker.RequiredLevel (read-only; does not
+// touch trust.go's Check/RequiredLevel logic) so a not-allowlisted rejection
+// (required==TrustAllowlisted) can be told apart from a not-operator
+// rejection (required==TrustOperator) — both surface through the same
+// ErrInsufficientTrust sentinel from Check.
+func (e *Engine) recordTrustDenial(op Operation, phase SettlePhase, err error) string {
+	switch {
+	case errors.Is(err, ErrLowReputation):
+		e.degradation.TrustDenialLowReputation.Add(1)
+		return "low-reputation"
+	case errors.Is(err, ErrInsufficientTrust):
+		if required, rlErr := e.opts.TrustChecker.RequiredLevel(op, phase); rlErr == nil && required == TrustOperator {
+			e.degradation.TrustDenialNotOperator.Add(1)
+			return "not-operator"
+		}
+		e.degradation.TrustDenialNotAllowlisted.Add(1)
+		return "not-allowlisted"
+	default:
+		e.degradation.TrustDenialOther.Add(1)
+		return "other"
 	}
 }
 
