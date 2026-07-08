@@ -278,6 +278,44 @@ func TestLoudDegradation(t *testing.T) {
 			t.Error("expected error on nil event")
 		}
 	})
+	t.Run("from_nostr_assign_unknown_op_rejected", func(t *testing.T) {
+		// dontguess-c08: an ["op", ...] value not in assignOps must fail loud, not
+		// fold silently as if it were a real sub-op.
+		ev := &Event{ID: sampleID, PubKey: sampleSender, Kind: KindAssign, Tags: [][]string{
+			{tagP, sampleSender},
+			{tagOp, "exchange:assign:forged-sub-op"},
+		}}
+		if _, err := FromNostrEvent(ev); err == nil {
+			t.Error("expected error folding an assign event with an unknown op discriminator")
+		}
+	})
+	t.Run("from_nostr_scrip_unknown_op_rejected", func(t *testing.T) {
+		// Same discipline for kind 3411 against scripOps.
+		ev := &Event{ID: sampleID, PubKey: sampleSender, Kind: KindScrip, Tags: [][]string{
+			{tagP, sampleSender},
+			{tagOp, "dontguess:scrip:forged"},
+		}}
+		if _, err := FromNostrEvent(ev); err == nil {
+			t.Error("expected error folding a scrip event with an unknown op discriminator")
+		}
+	})
+	t.Run("from_nostr_op_tag_on_base_kind_ignored", func(t *testing.T) {
+		// dontguess-c08: a base kind (3401-3404) fully determines its op from the
+		// kind alone. A stray ["op", ...] tag on a base-kind event must not be
+		// trusted or folded as a second/competing op tag — it is ignored, and the
+		// message still decodes cleanly to the kind's single base op.
+		ev := &Event{ID: sampleID, PubKey: sampleSender, Kind: KindPut, Tags: [][]string{
+			{tagP, sampleSender},
+			{tagOp, exchange.TagAssignClaim}, // forged/irrelevant op tag on a put event
+		}}
+		msg, err := FromNostrEvent(ev)
+		if err != nil {
+			t.Fatalf("FromNostrEvent: unexpected error: %v", err)
+		}
+		if !reflect.DeepEqual(msg.Tags, []string{exchange.TagPut}) {
+			t.Errorf("Tags: got %#v, want only the base op %q (op tag on base kind must be ignored)", msg.Tags, exchange.TagPut)
+		}
+	})
 }
 
 // TestFoldedMessageDrivesUnchangedEngine proves the adapter output is folded by

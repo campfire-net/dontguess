@@ -141,7 +141,13 @@ func FromNostrEvent(ev *Event) (*proto.Message, error) {
 	}
 
 	// Reconstruct the base op tag from the kind. Assign/scrip resolve their exact
-	// sub-op from the ["op", <tag>] discriminator below.
+	// sub-op from the ["op", <tag>] discriminator below. The op-discriminator (not
+	// a bare phase tag) is the ratified mechanism for shared kinds — a phase tag
+	// cannot distinguish assign's 7 sub-ops; see
+	// docs/design/nostr-first-rebuild-decision.md §Nostr Architecture
+	// (dontguess-c08 reconciliation note) and the tagOp handling below, which
+	// validates the discriminator against assignOps/scripOps and fails loudly on
+	// an unknown value or a stray op tag on a base kind.
 	sharedKind := ev.Kind == KindAssign || ev.Kind == KindScrip
 	if baseOp, ok := kindToBaseOp[ev.Kind]; ok {
 		msg.Tags = append(msg.Tags, baseOp)
@@ -162,10 +168,26 @@ func FromNostrEvent(ev *Event) (*proto.Message, error) {
 		case tagP:
 			// Author reference; Sender is authoritative from PubKey. Ignore.
 		case tagOp:
-			if len(t) >= 2 {
-				msg.Tags = append(msg.Tags, t[1])
-				opFound = true
+			if !sharedKind {
+				// The op discriminator only applies to shared kinds (3405
+				// assign*, 3411 scrip*). Base kinds (3401-3404) already fully
+				// determine their op from the kind; an op tag on a base kind
+				// is not part of the mapping and is ignored rather than
+				// trusted (dontguess-c08).
+				continue
 			}
+			if len(t) < 2 {
+				continue
+			}
+			opSet := assignOps
+			if ev.Kind == KindScrip {
+				opSet = scripOps
+			}
+			if _, known := opSet[t[1]]; !known {
+				return nil, fmt.Errorf("nostr: FromNostrEvent: kind %d op discriminator %q is not a known op", ev.Kind, t[1])
+			}
+			msg.Tags = append(msg.Tags, t[1])
+			opFound = true
 		case tagT:
 			if len(t) >= 2 {
 				msg.Tags = append(msg.Tags, domainPrefix+t[1])

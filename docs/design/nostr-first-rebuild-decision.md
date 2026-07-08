@@ -149,9 +149,11 @@ Organized by the four tiers. The frame holds: **the authoritative-operator footp
 | `buy` | 3402 | regular, immutable | task descriptor; future-fulfillment handled operator-side |
 | `match` | 3403 | regular, immutable | `["e", <buy-id>, "", "reply"]` — direct equivalent of `Antecedents[0]` |
 | `settle` | 3404 | regular, immutable | `phase` tag (mirrors today's `exchange:phase:*`); `e`-tag chains to prior phase |
-| `assign*` (7 sub-ops) | 3405 | regular, immutable | single kind + `phase` tag (mirrors settle's phase compaction) |
-| scrip ops (mint/burn/pay/loan) | 3411 | regular, immutable | phase/op tag; **team-tier, on the authed relay** |
+| `assign*` (7 sub-ops) | 3405 | regular, immutable | single kind + `["op", <sub-op>]` discriminator (a bare `phase` tag cannot distinguish 7 assign sub-ops — see below) |
+| scrip ops (mint/burn/pay/loan) | 3411 | regular, immutable | single kind + `["op", <sub-op>]` discriminator; **team-tier, on the authed relay** |
 | **inventory + dynamic price projection** | **30401** | **addressable** (`d`-tag = `content_hash`) | operator-republished *projection*, latest-wins |
+
+**Op-discriminator, not phase-tag, is the mechanism for shared kinds (ratified dontguess-c08, reconciling the table above with the shipped `pkg/nostr` adapter):** `assign*` has 7 sub-ops (`assign`, `assign_claim`, `assign_complete`, `assign_accept`, `assign_reject`, `assign_expire`, `assign_auction_close`) sharing kind 3405; a single `phase` tag (borrowed from `settle`, which only ever has a handful of phase values) cannot losslessly distinguish 7 sub-ops from the kind + phase pair alone without ambiguity against `settle`'s own phase vocabulary. The adapter instead emits an `["op", <sub-op-tag>]` tag on every 3405/3411 event and treats it as an authoritative discriminator on decode: `FromNostrEvent` validates the tag value against the known `assignOps`/`scripOps` set for that kind and fails loudly (returns an error) on an unrecognised value, and ignores/rejects a stray `op` tag found on a base-kind event (3401-3404), which fully determines its op from the kind alone. This table's `phase` mention for `assign*` is superseded by the op-tag mechanism; `phase` may still appear on assign/settle events for phase state independent of the op-tag sub-op selector.
 
 **`Antecedents[0]` → `e`-tag is clean and low-risk:** code reads only index `[0]`, so this is NIP-01's simple reply marker, not NIP-10 threading. No impedance mismatch.
 
