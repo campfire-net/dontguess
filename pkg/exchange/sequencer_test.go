@@ -12,7 +12,9 @@ package exchange
 
 import (
 	"errors"
+	"fmt"
 	"testing"
+	"time"
 )
 
 // seqMsg builds a synthetic event for the sequencer. Only ID, Timestamp, and
@@ -185,20 +187,75 @@ func TestSequencer_SealFailsLoudOnPrunedAntecedent(t *testing.T) {
 	}
 }
 
-func TestSequencer_OverflowFailsLoud(t *testing.T) {
+func TestSequencer_OverflowFailsLoudAtIngest(t *testing.T) {
+	// dontguess-afb: the orphan bound is enforced AT INGEST (O(1) per call),
+	// not deferred to Drain — a reorder/gap flood must not be able to buffer
+	// past the bound before anyone calls Drain. Each of these three events
+	// waits on a DISTINCT antecedent that never arrives, so all three are true
+	// orphans (the antecedent is never known — never emitted, never buffered).
 	s := NewSequencer(2) // bound = 2 orphans
-	// Three orphans, each waiting on a distinct never-arriving antecedent.
-	for _, id := range []string{"o1", "o2", "o3"} {
+	for _, id := range []string{"o1", "o2"} {
 		if err := s.Ingest(seqMsg(id, 10, "missing-"+id)); err != nil {
 			t.Fatalf("Ingest %s: %v", id, err)
 		}
 	}
-	_, err := s.Drain()
+	// The third true orphan pushes the count to 3 over a bound of 2: Ingest
+	// itself must fail loud, right here, before it is buffered.
+	err := s.Ingest(seqMsg("o3", 10, "missing-o3"))
 	if err == nil {
-		t.Fatal("Drain returned nil with 3 orphans over a bound of 2; must fail loud")
+		t.Fatal("Ingest of the 3rd true orphan over a bound of 2 returned nil; must fail loud")
 	}
 	if !errors.Is(err, ErrOrphanBufferOverflow) {
-		t.Fatalf("Drain error = %v, want ErrOrphanBufferOverflow", err)
+		t.Fatalf("Ingest error = %v, want ErrOrphanBufferOverflow", err)
+	}
+	// The rejected event must not have been buffered (bounded memory: the
+	// point of checking at ingest is that the buffer never grows past bound).
+	if got := s.PendingCount(); got != 2 {
+		t.Fatalf("PendingCount after rejected overflow ingest = %d, want 2 (o3 not buffered)", got)
+	}
+	// Drain over the two orphans that WERE admitted must succeed cleanly (no
+	// residual overflow — they are within bound).
+	released, err := s.Drain()
+	if err != nil {
+		t.Fatalf("Drain over in-bound orphans: unexpected error: %v", err)
+	}
+	if len(released) != 0 {
+		t.Fatalf("Drain released %v; both remaining events are still orphaned, want nothing released", idsOf(released))
+	}
+}
+
+// TestSequencer_TrueOrphanCountIsNotRawBufferSize proves the O(1) ingest-time
+// counter tracks TRUE orphans (an antecedent that has never been ingested at
+// all), not raw buffer occupancy.
+func TestSequencer_TrueOrphanCountIsNotRawBufferSize(t *testing.T) {
+	// A causally in-order chain where each event's antecedent is already
+	// BUFFERED (not yet emitted) by the time the child is ingested must NOT
+	// count any of the chain as a true orphan, even though every one of them
+	// sits in the raw buffer simultaneously. This is the distinction that
+	// keeps a legitimate large in-order batch from tripping the bound (see
+	// TestSequencer_LargeCausallyInOrderBatchDoesNotTripBound).
+	s := NewSequencer(2) // bound = 2 true orphans; chain below is longer than that
+	root := seqMsg("root", 0)
+	if err := s.Ingest(root); err != nil {
+		t.Fatalf("Ingest root: %v", err)
+	}
+	prev := "root"
+	for i := 0; i < 10; i++ {
+		id := fmt.Sprintf("c%d", i)
+		if err := s.Ingest(seqMsg(id, int64(i+1), prev)); err != nil {
+			t.Fatalf("Ingest %s: %v", id, err)
+		}
+		prev = id
+	}
+	if got := s.PendingCount(); got != 11 {
+		t.Fatalf("PendingCount = %d, want 11 (root + 10 chained, none of them true orphans)", got)
+	}
+	released, err := s.Drain()
+	if err != nil {
+		t.Fatalf("Drain: unexpected error: %v", err)
+	}
+	if len(released) != 11 {
+		t.Fatalf("Drain released %d events, want all 11 (fully causally closed chain)", len(released))
 	}
 }
 
@@ -224,6 +281,125 @@ func TestSequenceForFold_PrunedAntecedentFailsLoud(t *testing.T) {
 	}
 	if out != nil {
 		t.Fatalf("SequenceForFold returned a partial ordering %v on failure; must return nil (no silent truncated fold)", idsOfMsgs(out))
+	}
+}
+
+// TestSequenceForFold_LargeCausallyInOrderBatchDoesNotTripBound is the
+// dontguess-afb regression: the recovery/replay path (SequenceForFold) feeds
+// an entire batch through Ingest before a single Drain call. A long,
+// perfectly-resolvable causal chain fed in ORDER (each antecedent ingested
+// before its child) must never trip the true-orphan bound, however long the
+// chain — because by the time a child is ingested its antecedent is already
+// KNOWN (buffered), not a true gap. Bound is deliberately set small (10) and
+// the chain is 50x longer, to prove the bound tracks true orphans, not raw
+// batch size.
+func TestSequenceForFold_LargeCausallyInOrderBatchDoesNotTripBound(t *testing.T) {
+	const n = 500
+	const bound = 10
+	msgs := make([]Message, 0, n)
+	msgs = append(msgs, seqMsg("root", 0))
+	prev := "root"
+	for i := 0; i < n-1; i++ {
+		id := fmt.Sprintf("e%d", i)
+		msgs = append(msgs, seqMsg(id, int64(i+1), prev))
+		prev = id
+	}
+	out, err := SequenceForFold(msgs, bound)
+	if err != nil {
+		t.Fatalf("SequenceForFold over a %d-event in-order chain with bound %d: unexpected error: %v", n, bound, err)
+	}
+	if len(out) != n {
+		t.Fatalf("SequenceForFold released %d events, want all %d", len(out), n)
+	}
+	if out[0].ID != "root" || out[len(out)-1].ID != prev {
+		t.Fatalf("SequenceForFold order = [%s..%s], want [root..%s] (causal order preserved)", out[0].ID, out[len(out)-1].ID, prev)
+	}
+}
+
+// TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest proves the actual
+// DoS-shaped attack — many events each referencing a DISTINCT antecedent that
+// never arrives — is rejected loud, and rejected EARLY (at ingest, not after
+// the whole flood has already been buffered): SequenceForFold must return
+// ErrOrphanBufferOverflow without ever reaching Drain/Seal for the excess.
+func TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest(t *testing.T) {
+	const bound = 50
+	msgs := make([]Message, 0, bound+1)
+	for i := 0; i < bound+1; i++ {
+		id := fmt.Sprintf("o%d", i)
+		msgs = append(msgs, seqMsg(id, int64(i), "missing-"+id))
+	}
+	out, err := SequenceForFold(msgs, bound)
+	if err == nil {
+		t.Fatalf("SequenceForFold over %d true orphans with bound %d returned nil error; must fail loud", len(msgs), bound)
+	}
+	if !errors.Is(err, ErrOrphanBufferOverflow) {
+		t.Fatalf("error = %v, want ErrOrphanBufferOverflow", err)
+	}
+	if out != nil {
+		t.Fatalf("SequenceForFold returned a partial ordering %v on overflow; must return nil", idsOfMsgs(out))
+	}
+}
+
+// TestSequencer_DrainNoQuadraticRescan is a regression guard for the O(N^2)
+// DoS: the prior Drain implementation rescanned the ENTIRE remaining buffer to
+// find the single next-ready event, once per release (O(N) work x N releases
+// = O(N^2)). Feed a large batch in REVERSE causal order (each child ingested
+// before its antecedent — the worst case for a rescan-based algorithm, since
+// nothing is ready until the very last ingest) and time a single Drain call.
+// The new heap-based cascade is O(N log N): for N=20000 that is comfortably
+// sub-second; the old O(N^2) algorithm is many seconds to minutes at this N.
+// The bound is set to N so no orphan-bound error is in play — this test is
+// purely about algorithmic complexity, not correctness (covered elsewhere).
+func TestSequencer_DrainNoQuadraticRescan(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping O(N) perf regression guard in -short mode")
+	}
+	const n = 20000
+	s := NewSequencer(n + 1)
+	// Build the chain root -> e0 -> e1 -> ... -> e(n-2), then ingest in
+	// REVERSE order: e(n-2) first (references e(n-3), unknown), ... , root
+	// last. Nothing is causally ready until the final Ingest lands "root".
+	ids := make([]string, n)
+	ids[0] = "root"
+	for i := 1; i < n; i++ {
+		ids[i] = fmt.Sprintf("e%d", i)
+	}
+	for i := n - 1; i >= 0; i-- {
+		var ante string
+		if i > 0 {
+			ante = ids[i-1]
+		}
+		var m Message
+		if ante == "" {
+			m = seqMsg(ids[i], int64(i))
+		} else {
+			m = seqMsg(ids[i], int64(i), ante)
+		}
+		if err := s.Ingest(m); err != nil {
+			t.Fatalf("Ingest %s: %v", ids[i], err)
+		}
+	}
+	start := time.Now()
+	released, err := s.Drain()
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Drain: unexpected error: %v", err)
+	}
+	if len(released) != n {
+		t.Fatalf("Drain released %d events, want all %d", len(released), n)
+	}
+	for i, r := range released {
+		if r.Msg.ID != ids[i] {
+			t.Fatalf("release %d = %s, want %s (causal order)", i, r.Msg.ID, ids[i])
+		}
+	}
+	// Generous bound: O(N log N) for N=20000 is sub-second on any reasonable
+	// hardware; the prior O(N^2) algorithm would take many seconds to
+	// minutes. This is a coarse regression guard against reintroducing a
+	// full-buffer rescan per release, not a tight performance SLA.
+	const budget = 5 * time.Second
+	if elapsed > budget {
+		t.Fatalf("Drain of %d causally-chained events took %v, want < %v (likely reintroduced an O(N^2) rescan)", n, elapsed, budget)
 	}
 }
 
