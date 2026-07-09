@@ -627,21 +627,6 @@ func (s *Sequencer) PendingAntecedents() map[string][]string {
 	return out
 }
 
-// antecedentsSatisfiedLocked reports whether every antecedent of m has been
-// released. An empty antecedent id is ignored (roots and messages that carry no
-// causal predecessor). Caller must hold s.mu.
-func (s *Sequencer) antecedentsSatisfiedLocked(m *Message) bool {
-	for _, a := range m.Antecedents {
-		if a == "" {
-			continue
-		}
-		if _, ok := s.emitted[a]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
 // firstMissingAntecedentLocked returns the first antecedent of m that has not
 // been released, or "" if all are satisfied. Caller must hold s.mu.
 func (s *Sequencer) firstMissingAntecedentLocked(m *Message) string {

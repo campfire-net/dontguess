@@ -198,3 +198,42 @@ func TestVerifyAuthEvent_RejectsCrossPathReplay(t *testing.T) {
 		t.Fatal("VerifyAuthEvent accepted an event minted for a different relay path (path case-fold hole)")
 	}
 }
+
+// TestParseOK_MalformedFrameRejected locks ParseOK's error handling (dontguess-246
+// LOW). Before the fix, ParseOK discarded the json.Unmarshal errors for the
+// eventID (element 1) and accepted (element 2) fields via `_ = json.Unmarshal(...)`,
+// so a malformed ["OK", …] frame — e.g. a relay sending a non-string event id or
+// a non-bool accepted flag — silently decoded as eventID="", accepted=false, nil
+// error: a rejection indistinguishable from a well-formed "relay says no". A
+// caller (ClientAuthenticate) would report a clean "relay rejected" instead of
+// surfacing the protocol violation.
+func TestParseOK_MalformedFrameRejected(t *testing.T) {
+	t.Parallel()
+
+	// A well-formed OK frame still parses cleanly (regression guard for the fix).
+	t.Run("well-formed frame parses", func(t *testing.T) {
+		id, accepted, msg, err := ParseOK([]byte(`["OK","abc123",true,"ok"]`))
+		if err != nil {
+			t.Fatalf("ParseOK on well-formed frame returned error: %v", err)
+		}
+		if id != "abc123" || !accepted || msg != "ok" {
+			t.Fatalf("ParseOK = (%q, %v, %q), want (\"abc123\", true, \"ok\")", id, accepted, msg)
+		}
+	})
+
+	// element 1 (event id) is not a string.
+	t.Run("non-string event id rejected", func(t *testing.T) {
+		_, _, _, err := ParseOK([]byte(`["OK",123,true,"ok"]`))
+		if err == nil {
+			t.Fatal("ParseOK accepted a frame with a non-string event id (element 1) — malformed frame silently treated as valid")
+		}
+	})
+
+	// element 2 (accepted) is not a bool.
+	t.Run("non-bool accepted rejected", func(t *testing.T) {
+		_, _, _, err := ParseOK([]byte(`["OK","abc123","not-a-bool","ok"]`))
+		if err == nil {
+			t.Fatal("ParseOK accepted a frame with a non-bool accepted flag (element 2) — malformed frame silently treated as valid")
+		}
+	})
+}

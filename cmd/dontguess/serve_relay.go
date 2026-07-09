@@ -655,6 +655,21 @@ func attachRelayTransport(
 	return func() { wg.Wait() }, nil
 }
 
+// shutdownRelayTransport tears down an attached relay transport in the ONLY
+// safe order: cancel the context FIRST, then close the underlying connection,
+// then wait for the reader/outbox goroutines to actually exit. stop (the
+// wg.Wait() returned by attachRelayTransport) blocks until those goroutines
+// observe ctx.Done() and return — calling stop() before cancel() hangs
+// forever (dontguess-e35). closeConn may be nil (e.g. a fake connection in
+// tests with nothing to close); cancel and stop must not be nil.
+func shutdownRelayTransport(cancel context.CancelFunc, closeConn func() error, stop func()) {
+	cancel()
+	if closeConn != nil {
+		_ = closeConn()
+	}
+	stop()
+}
+
 // reconnectSlackSeconds is the backfill overlap (seconds) subtracted from the
 // watermark on (re)subscribe so no event straddling the cursor is missed; the
 // Sequencer dedups the redelivered overlap (§2.5).

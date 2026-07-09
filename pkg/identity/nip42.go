@@ -215,8 +215,12 @@ func ParseOK(raw []byte) (eventID string, accepted bool, message string, err err
 	if e := json.Unmarshal(arr[0], &label); e != nil || label != "OK" {
 		return "", false, "", fmt.Errorf("parse OK frame: first element is not \"OK\"")
 	}
-	_ = json.Unmarshal(arr[1], &eventID)
-	_ = json.Unmarshal(arr[2], &accepted)
+	if e := json.Unmarshal(arr[1], &eventID); e != nil {
+		return "", false, "", fmt.Errorf("parse OK frame: element 1 (event id) is not a string: %w", e)
+	}
+	if e := json.Unmarshal(arr[2], &accepted); e != nil {
+		return "", false, "", fmt.Errorf("parse OK frame: element 2 (accepted) is not a bool: %w", e)
+	}
 	if len(arr) >= 4 {
 		_ = json.Unmarshal(arr[3], &message)
 	}

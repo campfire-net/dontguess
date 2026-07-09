@@ -1111,3 +1111,59 @@ func TestGuardOperatorKeyMigration_WarnsOnCampfireEraRecords(t *testing.T) {
 		t.Fatalf("clean store: guard counted %d / logged %q, want 0 and silent", n, logged2)
 	}
 }
+
+// --------------------------------------------------------------------------
+// TestShutdownRelayTransport_NoHangOnCtxCancel (dontguess-e35)
+// --------------------------------------------------------------------------
+
+// TestShutdownRelayTransport_NoHangOnCtxCancel proves the shutdown-ordering fix
+// for runServeLocal's relay-enabled path (dontguess-e35 HIGH). Before the fix,
+// runServeLocal registered `defer conn.Close()` and `defer stop()` (stop being
+// attachRelayTransport's wg.Wait()) SEPARATELY, after an unconditional
+// `defer cancel()` — under Go's LIFO defer order, stop() (which blocks until
+// the reader/outbox goroutines observe ctx.Done()) ran BEFORE cancel(), so
+// shutdown hung forever whenever DONTGUESS_RELAY_URL was set.
+//
+// This test attaches the SAME attachRelayTransport used by runServeLocal to an
+// in-process fake relay (ctx-aware, mirroring TestRelayRoundTrip's setup), then
+// calls the production shutdownRelayTransport helper — the exact function
+// runServeLocal now defers — and asserts it returns well within a generous
+// timeout. Before the fix this scenario (stop() called without a prior cancel)
+// hangs indefinitely; the bounded select below turns that hang into a failing
+// test instead of a wedged CI run.
+func TestShutdownRelayTransport_NoHangOnCtxCancel(t *testing.T) {
+	dir := t.TempDir()
+	ls, err := dgstore.Open(dir + "/events.jsonl")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = ls.Close() })
+
+	operator, _ := identity.Generate()
+	ctx, cancel := context.WithCancel(context.Background())
+
+	relayConn := newFakeRelayConn(true /* echo */)
+	stop, err := attachRelayTransport(ctx, ls, operator, operator.PubKeyHex(),
+		dir+"/events.jsonl.pubcursor", relayConn, relayConn, 5*time.Millisecond, nil)
+	if err != nil {
+		t.Fatalf("attachRelayTransport: %v", err)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		// Mirrors runServeLocal's single combined defer exactly: cancel, then
+		// close (nil here — fakeRelayConn has no Close of its own to wire up,
+		// matching the frameReceiver/frameSender contract), then wait.
+		shutdownRelayTransport(cancel, nil, stop)
+	}()
+
+	select {
+	case <-done:
+		// shutdownRelayTransport returned — cancel() ran before stop()
+		// (wg.Wait()), exactly as the fix requires.
+	case <-time.After(5 * time.Second):
+		t.Fatal("shutdownRelayTransport hung: stop() (wg.Wait()) never returned — " +
+			"cancel() did not run before wait, reproducing the dontguess-e35 shutdown hang")
+	}
+}

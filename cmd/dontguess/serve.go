@@ -305,13 +305,21 @@ func runServeLocal(dgHome string) error {
 	// live dial/handshake is owned by relay.Conn (dontguess-13f, infra-gated).
 	if relayURL != "" {
 		conn := relay.New(relayURL, relaySigner)
-		defer conn.Close() //nolint:errcheck
 		stop, err := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
 			localStorePath+".pubcursor", conn, conn, 5*time.Second, logger.Printf)
 		if err != nil {
 			return fmt.Errorf("attaching relay transport: %w", err)
 		}
-		defer stop()
+		// Single combined shutdown defer (dontguess-e35): registering
+		// `defer conn.Close()` and `defer stop()` separately raced Go's LIFO
+		// defer order against attachRelayTransport's contract — stop()
+		// (wg.Wait()) blocks until the reader/outbox goroutines observe
+		// ctx.Done() and return, but the bare `defer cancel()` registered
+		// BEFORE this block runs LAST under LIFO, so stop() ran first and
+		// hung forever whenever the relay was enabled. shutdownRelayTransport
+		// cancels first, then waits, regardless of where the outer
+		// `defer cancel()` sits in the stack.
+		defer shutdownRelayTransport(cancel, conn.Close, stop)
 		logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
 	}
 
