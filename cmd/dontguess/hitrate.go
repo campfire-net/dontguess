@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/matching"
 	"github.com/spf13/cobra"
@@ -130,51 +129,33 @@ func buildRecomputeEmbedder(buys []exchange.Message, matches []exchange.Message)
 func runHitRate(_ *cobra.Command, _ []string) error {
 	dgHome := resolveDGHome()
 
-	cfg, err := exchange.LoadConfig(dgHome)
+	allMsgs, err := loadLocalMessages(dgHome)
 	if err != nil {
-		return fmt.Errorf("load exchange config: %w", err)
+		return fmt.Errorf("loading local store: %w", err)
 	}
-
-	client, _, err := protocol.Init(dgHome)
-	if err != nil {
-		return fmt.Errorf("protocol.Init: %w", err)
-	}
-	defer client.Close()
 
 	var cutoffNano int64
 	if hitRateSince > 0 {
 		cutoffNano = time.Now().Add(-hitRateSince).UnixNano()
 	}
-	cfID := cfg.ExchangeCampfireID
 
-	buys, err := readFilter(client, cfID, buysFilter(cutoffNano))
-	if err != nil {
-		return fmt.Errorf("read buys: %w", err)
-	}
+	buys := readFilter(allMsgs, buysFilter(cutoffNano))
 	// Match-results carry the exchange:match tag (both hits and misses).
-	matches, err := readFilter(client, cfID, matchesFilter(cutoffNano))
-	if err != nil {
-		return fmt.Errorf("read match-results: %w", err)
-	}
+	matches := readFilter(allMsgs, matchesFilter(cutoffNano))
 	// Consume signals carry the exchange:consume tag (emitted on settle-complete).
 	// Used for net-savings economics: a hit is "real" only when the entry was consumed.
-	consumes, err := readFilter(client, cfID, consumesFilter(cutoffNano))
-	if err != nil {
-		// Non-fatal: log and continue with consume unavailable (all hits treated as real).
-		fmt.Fprintf(os.Stderr, "warning: could not read consume signals: %v\n", err)
-		consumes = nil
-	}
+	consumes := readFilter(allMsgs, consumesFilter(cutoffNano))
 
 	// Build cross-agent convergence map from full exchange history (dontguess-412).
 	// Replay all messages (unfiltered by --since) into a fresh State to accumulate
 	// EntryBuyerMap across the full history — convergence is a cumulative property,
-	// not a windowed one. AfterTimestamp=0 fetches all messages in log order.
-	convergenceMap, err := buildConvergenceMapFromClient(client, cfID, cfg.OperatorKeyHex)
+	// not a windowed one.
+	operatorKey, err := resolveLocalOperatorKey(dgHome)
 	if err != nil {
 		// Non-fatal: log and continue with zero convergence rather than failing.
-		fmt.Fprintf(os.Stderr, "warning: could not build convergence map: %v\n", err)
-		convergenceMap = nil
+		fmt.Fprintf(os.Stderr, "warning: could not resolve local operator key: %v\n", err)
 	}
+	convergenceMap := buildConvergenceMap(allMsgs, operatorKey)
 
 	// Build quality-weighted options (M-rebaseline, dontguess-af8).
 	// MinSimilarity references the M1 floor constant — does NOT hardcode 0.16.
@@ -193,24 +174,37 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 	return nil
 }
 
-// buildConvergenceMapFromClient reads all exchange messages (full history, no
-// time filter), replays them into a fresh State, and returns the merged
-// EntryBuyerMap via BuildConvergenceMap. This is unfiltered by --since because
-// cross-agent convergence is a cumulative property of the inventory lifecycle,
-// not a windowed metric. The operator key is required to construct the State.
-func buildConvergenceMapFromClient(client *protocol.Client, cfID, operatorKeyHex string) (map[string]map[string]struct{}, error) {
-	result, err := client.Read(protocol.ReadRequest{
-		CampfireID:     cfID,
-		AfterTimestamp: 0,
-	})
-	if err != nil {
-		return nil, fmt.Errorf("read all messages: %w", err)
-	}
-	msgs := exchange.FromSDKMessages(result.Messages)
+// buildConvergenceMap replays msgs (the full local store history, unfiltered
+// by --since — cross-agent convergence is a cumulative property of the
+// inventory lifecycle, not a windowed metric) into a fresh State and returns
+// the merged EntryBuyerMap via BuildConvergenceMap. operatorKeyHex must be the
+// same key the local operator authored match/settle messages with (see
+// resolveLocalOperatorKey) or State.Replay's sender-must-be-operator checks
+// reject them, undercounting convergence.
+func buildConvergenceMap(msgs []exchange.Message, operatorKeyHex string) map[string]map[string]struct{} {
 	st := exchange.NewState()
 	st.OperatorKey = operatorKeyHex
 	st.Replay(msgs)
-	return exchange.BuildConvergenceMap(st), nil
+	return exchange.BuildConvergenceMap(st)
+}
+
+// resolveLocalOperatorKey returns the key the local (campfire-free) operator
+// authors match/settle messages with, mirroring runServeLocal's own
+// resolution (serve.go's engineOperatorKey): the persisted nostr operator
+// identity's pubkey when the M2 relay transport is enabled
+// (DONTGUESS_RELAY_URL set), otherwise the opaque local operator key. A
+// read-only command replaying the local store needs the SAME key the engine
+// used when it wrote those messages, or exchange.State's sender-must-be-
+// operator checks would reject genuine operator messages during replay.
+func resolveLocalOperatorKey(dgHome string) (string, error) {
+	if os.Getenv("DONTGUESS_RELAY_URL") != "" {
+		id, err := loadOrCreateNostrOperatorIdentity(dgHome)
+		if err != nil {
+			return "", fmt.Errorf("nostr operator identity: %w", err)
+		}
+		return id.PubKeyHex(), nil
+	}
+	return loadOrCreateLocalOperatorKey(dgHome)
 }
 
 func printHitRate(rep exchange.HitRateReport, since time.Duration, asJSON bool) {

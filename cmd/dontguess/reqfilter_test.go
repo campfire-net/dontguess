@@ -6,8 +6,6 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/nostr"
 )
@@ -116,64 +114,39 @@ func TestReqFilter_SinceCarriesThrough(t *testing.T) {
 }
 
 // --------------------------------------------------------------------------
-// readFilter — since/until/limit behavior against a real campfire store.
+// readFilter — since/until/limit/tag behavior against an in-memory message
+// slice (dontguess-b13: readFilter no longer talks to a campfire client, it
+// filters the []exchange.Message replayed from the local DG_HOME store — see
+// loadLocalMessages). Tests build that slice directly instead of standing up
+// a real campfire.
 // --------------------------------------------------------------------------
+
+// msg is a small exchange.Message builder for these tests.
+func msg(id string, tags []string, ts int64) exchange.Message {
+	return exchange.Message{
+		ID:        id,
+		Sender:    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+		Payload:   []byte(`{}`),
+		Tags:      tags,
+		Timestamp: ts,
+	}
+}
 
 func TestReadFilter_SinceUntilLimit(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
-
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
-	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
-	}
-	t.Cleanup(func() { initClient.Close() })
-
-	st, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	cfID := cfg.ExchangeCampfireID
-
-	// Insert 5 puts at distinct, known timestamps 100ns apart.
-	base := store.NowNano()
+	// 5 puts at distinct, known timestamps 100ns apart.
+	base := int64(1_000_000)
 	var timestamps []int64
+	var msgs []exchange.Message
 	for i := 0; i < 5; i++ {
 		ts := base + int64(i)*100
 		timestamps = append(timestamps, ts)
-		rec := store.MessageRecord{
-			ID:          fmt.Sprintf("test-put-%d", i),
-			CampfireID:  cfID,
-			Sender:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-			Payload:     []byte(`{}`),
-			Tags:        []string{exchange.TagPut},
-			Antecedents: []string{},
-			Timestamp:   ts,
-			Signature:   []byte{},
-		}
-		if _, err := st.AddMessage(rec); err != nil {
-			t.Fatalf("AddMessage %d: %v", i, err)
-		}
+		msgs = append(msgs, msg(fmt.Sprintf("test-put-%d", i), []string{exchange.TagPut}, ts))
 	}
 
-	readClient := protocol.New(st, nil)
-
 	t.Run("no window returns all", func(t *testing.T) {
-		got, err := readFilter(readClient, cfID, putsFilter(0))
-		if err != nil {
-			t.Fatalf("readFilter: %v", err)
-		}
+		got := readFilter(msgs, putsFilter(0))
 		if len(got) != 5 {
 			t.Errorf("len = %d, want 5", len(got))
 		}
@@ -181,10 +154,7 @@ func TestReadFilter_SinceUntilLimit(t *testing.T) {
 
 	t.Run("since excludes earlier messages", func(t *testing.T) {
 		f := putsFilter(timestamps[2])
-		got, err := readFilter(readClient, cfID, f)
-		if err != nil {
-			t.Fatalf("readFilter: %v", err)
-		}
+		got := readFilter(msgs, f)
 		if len(got) != 3 { // indices 2,3,4
 			t.Errorf("len = %d, want 3", len(got))
 		}
@@ -193,10 +163,7 @@ func TestReadFilter_SinceUntilLimit(t *testing.T) {
 	t.Run("until excludes later messages", func(t *testing.T) {
 		f := putsFilter(0)
 		f.Until = timestamps[2] // exclusive upper bound
-		got, err := readFilter(readClient, cfID, f)
-		if err != nil {
-			t.Fatalf("readFilter: %v", err)
-		}
+		got := readFilter(msgs, f)
 		if len(got) != 2 { // indices 0,1
 			t.Errorf("len = %d, want 2", len(got))
 		}
@@ -205,10 +172,7 @@ func TestReadFilter_SinceUntilLimit(t *testing.T) {
 	t.Run("since and until combine to a window", func(t *testing.T) {
 		f := putsFilter(timestamps[1])
 		f.Until = timestamps[4] // [1,4) -> indices 1,2,3
-		got, err := readFilter(readClient, cfID, f)
-		if err != nil {
-			t.Fatalf("readFilter: %v", err)
-		}
+		got := readFilter(msgs, f)
 		if len(got) != 3 {
 			t.Errorf("len = %d, want 3", len(got))
 		}
@@ -217,10 +181,7 @@ func TestReadFilter_SinceUntilLimit(t *testing.T) {
 	t.Run("limit caps the result", func(t *testing.T) {
 		f := putsFilter(0)
 		f.Limit = 2
-		got, err := readFilter(readClient, cfID, f)
-		if err != nil {
-			t.Fatalf("readFilter: %v", err)
-		}
+		got := readFilter(msgs, f)
 		if len(got) != 2 {
 			t.Errorf("len = %d, want 2", len(got))
 		}
@@ -229,59 +190,16 @@ func TestReadFilter_SinceUntilLimit(t *testing.T) {
 
 // TestReadFilter_KindOnlyMatchesThatOp confirms readFilter's Kinds->tag
 // translation is exclusive: a buysFilter never returns a put message even
-// when both exist in the same campfire.
+// when both exist in the same message slice.
 func TestReadFilter_KindOnlyMatchesThatOp(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
-
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
-	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
+	msgs := []exchange.Message{
+		msg("put-1", []string{exchange.TagPut}, 1),
+		msg("buy-1", []string{exchange.TagBuy}, 2),
 	}
-	t.Cleanup(func() { initClient.Close() })
 
-	st, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	cfID := cfg.ExchangeCampfireID
-
-	insert := func(id string, tags []string) {
-		t.Helper()
-		rec := store.MessageRecord{
-			ID:          id,
-			CampfireID:  cfID,
-			Sender:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-			Payload:     []byte(`{}`),
-			Tags:        tags,
-			Antecedents: []string{},
-			Timestamp:   store.NowNano(),
-			Signature:   []byte{},
-		}
-		if _, err := st.AddMessage(rec); err != nil {
-			t.Fatalf("AddMessage %s: %v", id, err)
-		}
-	}
-	insert("put-1", []string{exchange.TagPut})
-	insert("buy-1", []string{exchange.TagBuy})
-
-	readClient := protocol.New(st, nil)
-
-	got, err := readFilter(readClient, cfID, buysFilter(0))
-	if err != nil {
-		t.Fatalf("readFilter: %v", err)
-	}
+	got := readFilter(msgs, buysFilter(0))
 	if len(got) != 1 || got[0].ID != "buy-1" {
 		t.Errorf("buysFilter returned %+v, want exactly [buy-1]", got)
 	}
@@ -308,67 +226,22 @@ func TestReadFilter_KindOnlyMatchesThatOp(t *testing.T) {
 func TestReadFilter_BuyMissExcludesPutAcceptFulfillment(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
-
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
-	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
-	}
-	t.Cleanup(func() { initClient.Close() })
-
-	st, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	cfID := cfg.ExchangeCampfireID
-
-	insert := func(id string, tags []string) {
-		t.Helper()
-		rec := store.MessageRecord{
-			ID:          id,
-			CampfireID:  cfID,
-			Sender:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-			Payload:     []byte(`{}`),
-			Tags:        tags,
-			Antecedents: []string{},
-			Timestamp:   store.NowNano(),
-			Signature:   []byte{},
-		}
-		if _, err := st.AddMessage(rec); err != nil {
-			t.Fatalf("AddMessage %s: %v", id, err)
-		}
+	msgs := []exchange.Message{
+		// The still-open standing offer — exact tag shape from
+		// pkg/exchange/engine_buy.go's buy-miss emission: [TagBuyMiss, TagMatch].
+		msg("buy-miss-standing", []string{exchange.TagBuyMiss, exchange.TagMatch}, 1),
+		// The fulfillment — exact tag shape from emitPutAccept
+		// (pkg/exchange/engine_put.go): [TagSettle, phase:put-accept,
+		// verdict:accepted, TagBuyMiss].
+		msg("buy-miss-fulfilled", []string{
+			exchange.TagSettle,
+			exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept,
+			exchange.TagVerdictPrefix + "accepted",
+			exchange.TagBuyMiss,
+		}, 2),
 	}
 
-	// The still-open standing offer — exact tag shape from
-	// pkg/exchange/engine_buy.go's buy-miss emission: [TagBuyMiss, TagMatch].
-	insert("buy-miss-standing", []string{exchange.TagBuyMiss, exchange.TagMatch})
-
-	// The fulfillment — exact tag shape from emitPutAccept
-	// (pkg/exchange/engine_put.go): [TagSettle, phase:put-accept,
-	// verdict:accepted, TagBuyMiss].
-	insert("buy-miss-fulfilled", []string{
-		exchange.TagSettle,
-		exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept,
-		exchange.TagVerdictPrefix + "accepted",
-		exchange.TagBuyMiss,
-	})
-
-	readClient := protocol.New(st, nil)
-
-	got, err := readFilter(readClient, cfID, buyMissFilter(0))
-	if err != nil {
-		t.Fatalf("readFilter: %v", err)
-	}
+	got := readFilter(msgs, buyMissFilter(0))
 	if len(got) != 1 || got[0].ID != "buy-miss-standing" {
 		t.Errorf("buyMissFilter returned %+v, want exactly [buy-miss-standing]", got)
 	}
@@ -381,57 +254,35 @@ func TestReadFilter_BuyMissExcludesPutAcceptFulfillment(t *testing.T) {
 func TestReadFilter_ConsumesFilterMatchesActualTag(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
-
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
-	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
-	}
-	t.Cleanup(func() { initClient.Close() })
-
-	st, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	cfID := cfg.ExchangeCampfireID
-
-	insert := func(id string, tags []string) {
-		t.Helper()
-		rec := store.MessageRecord{
-			ID:          id,
-			CampfireID:  cfID,
-			Sender:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
-			Payload:     []byte(`{}`),
-			Tags:        tags,
-			Antecedents: []string{},
-			Timestamp:   store.NowNano(),
-			Signature:   []byte{},
-		}
-		if _, err := st.AddMessage(rec); err != nil {
-			t.Fatalf("AddMessage %s: %v", id, err)
-		}
+	msgs := []exchange.Message{
+		msg("consume-1", []string{exchange.TagConsume}, 1),
+		msg("match-1", []string{exchange.TagMatch}, 2),
 	}
 
-	insert("consume-1", []string{exchange.TagConsume})
-	insert("match-1", []string{exchange.TagMatch})
-
-	readClient := protocol.New(st, nil)
-
-	got, err := readFilter(readClient, cfID, consumesFilter(0))
-	if err != nil {
-		t.Fatalf("readFilter: %v", err)
-	}
+	got := readFilter(msgs, consumesFilter(0))
 	if len(got) != 1 || got[0].ID != "consume-1" {
 		t.Errorf("consumesFilter returned %+v, want exactly [consume-1]", got)
+	}
+}
+
+// --------------------------------------------------------------------------
+// loadLocalMessages — reads the local DG_HOME event log (dontguess-b13:
+// replaces the campfire protocol.Client the observability commands used to
+// read from).
+// --------------------------------------------------------------------------
+
+// TestLoadLocalMessages_EmptyDGHome verifies loadLocalMessages creates (but
+// does not error on) a missing events.jsonl and returns an empty slice —
+// the state a fresh DG_HOME is in before `dontguess serve` has ever run.
+func TestLoadLocalMessages_EmptyDGHome(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	got, err := loadLocalMessages(dir)
+	if err != nil {
+		t.Fatalf("loadLocalMessages: %v", err)
+	}
+	if len(got) != 0 {
+		t.Errorf("len = %d, want 0 (fresh DG_HOME)", len(got))
 	}
 }

@@ -1,9 +1,12 @@
 package main
 
 import (
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
+	"fmt"
+	"path/filepath"
+
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/nostr"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // ReqFilter is a NIP-01-shaped exchange query: kinds, tag filters, and a
@@ -13,13 +16,14 @@ import (
 // ReqFilter value below, constructed by the *Filter helper functions in
 // hitrate.go, status.go, and demand.go.
 //
-// The exchange still runs over the campfire transport (no relay yet — see
+// Campfire-free (dontguess-b13, nostr-first cutover): the operator's data
+// lives in the LOCAL DG_HOME event log (pkg/store — the same append-only
+// store runServeLocal folds; see serve.go's localStorePath), not a campfire.
+// loadLocalMessages replays that log into []exchange.Message and readFilter
+// applies Kinds+Tags+ExcludeTags+Since+Until+Limit to it entirely in memory —
+// there is no server-side query to delegate to, and no relay yet either (see
 // docs/design/nostr-first-rebuild-decision.md §Sequencer, dontguess-50d), so
-// readFilter translates Kinds+Tags into the campfire client's tag-based
-// protocol.ReadRequest. Since/Until/Limit are applied client-side because
-// campfire's ReadRequest exposes only a single AfterTimestamp lower bound and
-// no upper bound or kind filter — once a real relay lands, readFilter is the
-// only function that needs to change.
+// this is also where a real relay's REQ semantics would eventually plug in.
 type ReqFilter struct {
 	// Kinds selects exchange operation kinds (pkg/nostr Kind* constants).
 	// A message matches if its kind is one of these. Nil/empty means no kind
@@ -42,9 +46,8 @@ type ReqFilter struct {
 
 	// ExcludeTags holds literal legacy exchange tags: a message is dropped
 	// from the result even if it matches Kinds/Tags when it also carries any
-	// tag listed here (passed straight through to protocol.ReadRequest.
-	// ExcludeTags, which the underlying store treats as "exclude if message
-	// has ANY of these exact tags" — see cf-protocol/internal/store).
+	// tag listed here — "exclude if message has ANY of these exact tags"
+	// (see readFilter/matchesAnyTag below).
 	//
 	// This exists because some legacy tags are stamped on more than one
 	// logical message type: emitPutAccept (pkg/exchange/engine_put.go) tags a
@@ -81,9 +84,9 @@ var kindToOpTag = map[int]string{
 	nostr.KindSettle: exchange.TagSettle,
 }
 
-// legacyTags renders f's Kinds+Tags into the set of legacy campfire tags to
-// OR together in a protocol.ReadRequest.Tags query. A nil/empty result means
-// "no tag filter" (protocol.ReadRequest treats that as "match everything").
+// legacyTags renders f's Kinds+Tags into the set of legacy exchange tags to
+// OR together when matching a message's Tags (see readFilter/matchesAnyTag).
+// A nil/empty result means "no tag filter" — matches everything.
 func (f ReqFilter) legacyTags() []string {
 	var tags []string
 	for _, k := range f.Kinds {
@@ -176,31 +179,70 @@ func buyMissFilter(since int64) ReqFilter {
 	}
 }
 
-// readFilter executes f against the exchange campfire identified by cfID and
-// returns matching messages as exchange.Message, applying Since/Until/Limit
-// client-side (see ReqFilter doc).
-func readFilter(client *protocol.Client, cfID string, f ReqFilter) ([]exchange.Message, error) {
-	result, err := client.Read(protocol.ReadRequest{
-		CampfireID:  cfID,
-		Tags:        f.legacyTags(),
-		ExcludeTags: f.ExcludeTags,
-	})
+// localStoreFilename is the DG_HOME-relative path of the local event log
+// runServeLocal (serve.go) opens/appends to. The observability commands read
+// the SAME file so `dontguess status`/`demand`/`hit-rate` see exactly what
+// the operator has folded — see docs/design/nostr-first-rebuild-decision.md.
+const localStoreFilename = "events.jsonl"
+
+// loadLocalMessages opens the local DG_HOME event log and replays it into
+// []exchange.Message (a type alias for []proto.Message, the same shape
+// client.Read used to hand back over campfire), in append order.
+//
+// dgstore.Open creates the file if it doesn't exist yet (matching
+// runServeLocal's first-run behavior), but this package never calls
+// Append/BatchAppend on the returned Store, so a read-only command never
+// writes to it beyond that empty-file creation.
+func loadLocalMessages(dgHome string) ([]exchange.Message, error) {
+	path := filepath.Join(dgHome, localStoreFilename)
+	st, err := dgstore.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("opening local store %s: %w", path, err)
 	}
-	out := make([]exchange.Message, 0, len(result.Messages))
-	for i := range result.Messages {
-		m := result.Messages[i]
+	defer st.Close() //nolint:errcheck
+	return st.Replay()
+}
+
+// matchesAnyTag reports whether tags contains at least one entry from want.
+// An empty want means "no filter" — matches everything (see legacyTags()'s
+// doc: "A nil/empty result means no tag filter").
+func matchesAnyTag(tags, want []string) bool {
+	if len(want) == 0 {
+		return true
+	}
+	for _, t := range tags {
+		for _, w := range want {
+			if t == w {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// readFilter filters msgs (typically the full loadLocalMessages replay, in
+// store append order) by f's Kinds/Tags/ExcludeTags/Since/Until/Limit and
+// returns the matching subset, preserving order.
+func readFilter(msgs []exchange.Message, f ReqFilter) []exchange.Message {
+	want := f.legacyTags()
+	out := make([]exchange.Message, 0, len(msgs))
+	for _, m := range msgs {
 		if f.Since > 0 && m.Timestamp < f.Since {
 			continue
 		}
 		if f.Until > 0 && m.Timestamp >= f.Until {
 			continue
 		}
-		out = append(out, *exchange.FromSDKMessage(&m))
+		if !matchesAnyTag(m.Tags, want) {
+			continue
+		}
+		if len(f.ExcludeTags) > 0 && matchesAnyTag(m.Tags, f.ExcludeTags) {
+			continue
+		}
+		out = append(out, m)
 		if f.Limit > 0 && len(out) >= f.Limit {
 			break
 		}
 	}
-	return out, nil
+	return out
 }
