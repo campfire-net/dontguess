@@ -982,7 +982,7 @@ func TestOperatorCLI_SocketPath(t *testing.T) {
 		}
 	})
 
-	// Case 2: Default (no DG_HOME). Verify it contains ~/.cf/ipc/dontguess.sock.
+	// Case 2: Default (no DG_HOME). dontguess's own home is ~/.dontguess, NOT ~/.cf.
 	t.Run("default (no DG_HOME)", func(t *testing.T) {
 		t.Setenv("DG_HOME", "")
 		home, err := os.UserHomeDir()
@@ -990,7 +990,7 @@ func TestOperatorCLI_SocketPath(t *testing.T) {
 			t.Skip("no UserHomeDir — skip default path test")
 		}
 		got := socketPath()
-		wantSuffix := "/.cf/ipc/dontguess.sock"
+		wantSuffix := "/.dontguess/ipc/dontguess.sock"
 		wantFull := home + wantSuffix
 		if got != wantFull {
 			t.Errorf("socketPath() = %q, want %q", got, wantFull)
