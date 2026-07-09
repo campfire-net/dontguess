@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -52,12 +52,11 @@ func newInsuredMatchFixture(t *testing.T, guaranteeSeconds int) *insuredMatchFix
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	seedInventoryEntry(t, h, eng, "deadline determinism entry", "code", 8000, 5600)

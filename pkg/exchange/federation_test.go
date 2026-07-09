@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/pricing"
@@ -91,7 +91,7 @@ func TestFederationProfile_HopDepthTracked(t *testing.T) {
 
 	// 3 messages: hop depths 0, 2, 2 → median = 2.
 	antecedentSets := [][]string{
-		nil,           // hop depth 0
+		nil,          // hop depth 0
 		{"a1", "a2"}, // hop depth 2
 		{"b1", "b2"}, // hop depth 2
 	}
@@ -438,7 +438,6 @@ func TestFederationProfile_TransactionCountIncrements(t *testing.T) {
 		t.Error("expected IsNewNode=true with TransactionCount=0")
 	}
 }
-
 
 // TestSenderHopDepth_BoundedWindow verifies that senderHopDepth is capped at
 // SenderHopDepthWindowSize even when more than that many messages arrive from

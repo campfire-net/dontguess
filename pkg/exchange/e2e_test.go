@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -138,8 +138,8 @@ func TestE2E_FullHappyPath(t *testing.T) {
 
 	var matchPayload struct {
 		Results []struct {
-			EntryID  string  `json:"entry_id"`
-			Price    int64   `json:"price"`
+			EntryID    string  `json:"entry_id"`
+			Price      int64   `json:"price"`
 			Confidence float64 `json:"confidence"`
 		} `json:"results"`
 	}
@@ -207,10 +207,10 @@ func TestE2E_FullHappyPath(t *testing.T) {
 	// --- Step 7: Buyer completes the transaction ---
 	salePrice := matchPayload.Results[0].Price
 	completePayload, _ := json.Marshal(map[string]any{
-		"phase":                  "complete",
-		"entry_id":               matchPayload.Results[0].EntryID,
-		"price":                  salePrice,
-		"content_hash_verified":  true,
+		"phase":                 "complete",
+		"entry_id":              matchPayload.Results[0].EntryID,
+		"price":                 salePrice,
+		"content_hash_verified": true,
 	})
 	h.sendMessage(h.buyer, completePayload,
 		[]string{
@@ -253,11 +253,10 @@ func TestE2E_BuyerReject(t *testing.T) {
 	// at buyer-accept time. A buyer who rejects after seeing the match never touches escrow.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -315,7 +314,9 @@ func TestE2E_BuyerReject(t *testing.T) {
 
 	// Parse entry_id from match.
 	var mp struct {
-		Results []struct{ EntryID string `json:"entry_id"` } `json:"results"`
+		Results []struct {
+			EntryID string `json:"entry_id"`
+		} `json:"results"`
 	}
 	if err := json.Unmarshal(matchMsg.Payload, &mp); err != nil || len(mp.Results) == 0 {
 		t.Fatalf("parsing match payload: %v", err)
@@ -527,12 +528,11 @@ func TestE2E_ScripBalances(t *testing.T) {
 	// First, seed the inventory so we can compute the price.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// Seed one inventory entry: put_price = 5600, sale_price = 6720, fee = 672, hold = 7392.
@@ -731,7 +731,7 @@ func TestE2E_ScripBalances(t *testing.T) {
 	}
 
 	// --- Step 7: Replay — fresh store reproduces same balances ---
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("step 7 (replay): NewCampfireScripStore: %v", err)
 	}
@@ -799,12 +799,11 @@ func TestE2E_SmallContentDisputePath(t *testing.T) {
 	// Wire a scrip store so we can verify the refund path.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// --- Step 1: Seller puts small content (token_cost=250, < SmallContentThreshold=500, ≥MinTokenCost=200) ---
@@ -1054,7 +1053,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	addScripMintMsg(t, h, operatorKey, operatorMint)
 
 	// Construct the CampfireScripStore after mint messages are in the log.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	cs, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -1133,7 +1132,7 @@ func TestE2E_AssignPay(t *testing.T) {
 	}
 
 	// Fresh replay: verify a new CampfireScripStore derives the same balances.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh replay): %v", err)
 	}
@@ -1175,12 +1174,11 @@ func TestE2E_PreviewBeforePurchaseHappyPath(t *testing.T) {
 	// Wire a real CampfireScripStore so we can verify scrip movement.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// --- Step 1: Seller puts content large enough for preview (token_cost >= 500) ---
@@ -1583,12 +1581,11 @@ func TestE2E_ContentDeliveryRoundTrip(t *testing.T) {
 	// Wire a real CampfireScripStore for scrip balance assertions.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      collectLog,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            collectLog,
 	})
 
 	// --- Step 1: Seller puts cached inference with known content bytes ---

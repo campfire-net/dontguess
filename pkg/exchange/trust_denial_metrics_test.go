@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
@@ -46,8 +46,6 @@ func injectMsg(t *testing.T, h *testHarness, tag, senderKey string) *store.Messa
 		Payload:    payload,
 		Tags:       []string{tag},
 		Timestamp:  time.Now().UnixNano(),
-		ReceivedAt: time.Now().UnixNano(),
-		Signature:  []byte{0x00},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage tag=%s: %v", tag, err)

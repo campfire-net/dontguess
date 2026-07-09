@@ -19,7 +19,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
@@ -528,11 +528,11 @@ func TestEngineDispatch_PreviewRequest_AssemblerMetadataPopulated(t *testing.T) 
 
 	// Parse the preview payload.
 	var payload struct {
-		EntryID      string `json:"entry_id"`
-		ContentType  string `json:"content_type"`
-		TotalTokens  int    `json:"total_tokens"`
-		PreviewTokens int   `json:"preview_tokens"`
-		Chunks       []any  `json:"chunks"`
+		EntryID       string `json:"entry_id"`
+		ContentType   string `json:"content_type"`
+		TotalTokens   int    `json:"total_tokens"`
+		PreviewTokens int    `json:"preview_tokens"`
+		Chunks        []any  `json:"chunks"`
 	}
 	if err := json.Unmarshal(previewMsg.Payload, &payload); err != nil {
 		t.Fatalf("parsing preview payload: %v", err)

@@ -32,7 +32,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -83,12 +83,11 @@ func TestSettle_SellerAddBudgetFailureAfterDurableEmit_NoRestoreNoSettleFailed(t
 	// Phase 1: build the settle chain (put → accept → buy → match →
 	// buyer-accept → deliver) using a real CampfireScripStore.
 	eng1 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
 	})
 
 	_, deliverMsg, _ := buildSettleChainForPriceTests(t, h, eng1, cs, "GraphQL schema migration helper", 4000)
@@ -107,12 +106,11 @@ func TestSettle_SellerAddBudgetFailureAfterDurableEmit_NoRestoreNoSettleFailed(t
 		err:  scrip.ErrConflict, // arbitrary non-nil error
 	}
 	eng2 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  failStore,
-		Logger:      func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        failStore,
+		Logger:            func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
 	})
 
 	// Replay all state into eng2 so it knows about the antecedent chain,
@@ -274,12 +272,11 @@ func TestSettle_OperatorAddBudgetFailureAfterDurableEmit_NoRollbackNoRestore(t *
 
 	// Phase 1: build the settle chain using a real CampfireScripStore.
 	eng1 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
 	})
 
 	_, deliverMsg, _ := buildSettleChainForPriceTests(t, h, eng1, cs, "operator-rollback test entry", 4000)
@@ -302,12 +299,11 @@ func TestSettle_OperatorAddBudgetFailureAfterDurableEmit_NoRollbackNoRestore(t *
 		operatorErr: scrip.ErrConflict,
 	}
 	eng2 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  failStore,
-		Logger:      func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        failStore,
+		Logger:            func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
 	})
 
 	// Replay all state into eng2.

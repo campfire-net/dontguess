@@ -15,8 +15,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/store"
 )
 
 // --------------------------------------------------------------------------
@@ -156,7 +156,6 @@ func TestRunAutoAccept_ShortPutMsgID(t *testing.T) {
 		Tags:        []string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		Antecedents: []string{},
 		Timestamp:   store.NowNano(),
-		Signature:   []byte{},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage with short ID: %v", err)

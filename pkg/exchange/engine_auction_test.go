@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -171,7 +171,7 @@ func TestEngine_AuctionVickreyPrice_PaymentCorrectness(t *testing.T) {
 	h := newTestHarness(t)
 
 	// Build scrip store for balance verification.
-	cs, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	cs, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore: %v", err)
 	}
@@ -180,12 +180,11 @@ func TestEngine_AuctionVickreyPrice_PaymentCorrectness(t *testing.T) {
 	}
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	worker1 := newTestAgent(t)

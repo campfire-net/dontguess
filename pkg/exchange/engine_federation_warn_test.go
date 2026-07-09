@@ -12,8 +12,6 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
 
@@ -30,9 +28,8 @@ func TestEngine_FederationGuardWarning(t *testing.T) {
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:             h.cfID,
-		Store:                  h.st,
-		ReadClient:             protocol.New(h.st, nil),
-		WriteClient:            h.newOperatorClient(),
+		LocalStore:             h.st,
+		OperatorPublicKey:      h.operator.pubKeyHex,
 		BrokeredMatchMode:      true,
 		FederationGuardEnabled: false,
 		Logger: func(format string, args ...any) {
@@ -86,9 +83,8 @@ func TestEngine_FederationGuardNoWarning(t *testing.T) {
 
 			eng := exchange.NewEngine(exchange.EngineOptions{
 				CampfireID:             h.cfID,
-				Store:                  h.st,
-				ReadClient:             protocol.New(h.st, nil),
-				WriteClient:            h.newOperatorClient(),
+				LocalStore:             h.st,
+				OperatorPublicKey:      h.operator.pubKeyHex,
 				BrokeredMatchMode:      tc.brokeredMatchMode,
 				FederationGuardEnabled: tc.federationGuardEnabled,
 				Logger: func(format string, args ...any) {

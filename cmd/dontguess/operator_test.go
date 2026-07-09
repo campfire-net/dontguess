@@ -24,65 +24,55 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	store "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // ---- minimal in-package test harness ----
 
 type opTestHarness struct {
-	t              *testing.T
-	cfID           string
-	cfHome         string
-	operatorClient *protocol.Client
-	st             store.Store
-	seller         string // hex pubkey
+	t        *testing.T
+	cfID     string
+	operator string // operator hex pubkey (egress attribution)
+	st       *store.Store
+	seller   string // hex pubkey
 }
 
 func newOpTestHarness(t *testing.T) *opTestHarness {
 	t.Helper()
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
 
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
-	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
-	}
-	t.Cleanup(func() { initClient.Close() })
-
-	st, err := store.Open(store.StorePath(cfHome))
+	// Campfire-free harness (dontguess-657): a single local pkg/store event
+	// log backs everything — no exchange.Init, no campfire client. The engine
+	// ingests from and emits operator egress into this store (WriteClient nil ⇒
+	// LocalStore egress), and the operator socket-server tests observe it via
+	// h.st.ListMessages.
+	st, err := store.Open(store.StorePath(t.TempDir()))
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
-	t.Cleanup(func() { st.Close() })
+	t.Cleanup(func() { _ = st.Close() })
 
-	// Generate a seller identity.
-	pub, _, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatalf("generating seller key: %v", err)
+	genKey := func(what string) string {
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("generating %s key: %v", what, err)
+		}
+		return hex.EncodeToString(pub)
 	}
-	sellerKey := hex.EncodeToString(pub)
 
 	return &opTestHarness{
-		t:              t,
-		cfID:           cfg.ExchangeCampfireID,
-		cfHome:         cfHome,
-		operatorClient: initClient,
-		st:             st,
-		seller:         sellerKey,
+		t:        t,
+		cfID:     genKey("campfire-id"), // opaque 64-hex identifier, shape of a campfire ID
+		operator: genKey("operator"),
+		st:       st,
+		seller:   genKey("seller"),
 	}
 }
 
 // conventionDirForOpTest locates the convention directory by walking up from the
 // current working directory. Mirrors the pattern used in pkg/exchange/init_test.go.
+// Still used by agent_init_test.go / bucketed_write_test.go, which exercise the
+// campfire convention bootstrap directly.
 func conventionDirForOpTest(t *testing.T) string {
 	t.Helper()
 	dir, err := os.Getwd()
@@ -104,14 +94,12 @@ func conventionDirForOpTest(t *testing.T) string {
 	return ""
 }
 
-// newEngine returns an exchange.Engine wired to the harness.
+// newEngine returns a campfire-free exchange.Engine wired to the harness.
 func (h *opTestHarness) newEngine() *exchange.Engine {
 	opts := exchange.EngineOptions{
-		CampfireID:   h.cfID,
-		Store:        h.st,
-		ReadClient:   protocol.New(h.st, nil),
-		WriteClient:  h.operatorClient,
-		ReadSkipSync: true,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator,
 		Logger: func(format string, args ...any) {
 			h.t.Logf("[engine] "+format, args...)
 		},
@@ -167,7 +155,6 @@ func (h *opTestHarness) sendHeldPut(eng *exchange.Engine, desc string, tokenCost
 		Tags:        []string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"},
 		Antecedents: []string{},
 		Timestamp:   store.NowNano(),
-		Signature:   []byte{},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		h.t.Fatalf("AddMessage: %v", err)
