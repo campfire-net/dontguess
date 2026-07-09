@@ -21,9 +21,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // --------------------------------------------------------------------------
@@ -290,52 +289,38 @@ func TestStatus_SocketUnreachable(t *testing.T) {
 // TestStatus_ExchangeReader
 // --------------------------------------------------------------------------
 
-// TestStatus_ExchangeReader creates a real in-process exchange campfire,
-// inserts a few put/buy/settle messages directly into the store, then calls
-// readExchangeViewsWithClient and asserts the counts are correct.
+// TestStatus_ExchangeReader creates a local DG_HOME event log, appends a few
+// put/buy/settle records directly to it, then calls readExchangeViews (the
+// real code path — dontguess-b13, campfire-free) and asserts the counts are
+// correct.
 func TestStatus_ExchangeReader(t *testing.T) {
 	t.Parallel()
 
-	cfHome := t.TempDir()
-	transportDir := t.TempDir()
-	convDir := conventionDirForOpTest(t)
+	dgHome := t.TempDir()
 
-	cfg, initClient, err := exchange.Init(exchange.InitOptions{
-		ConfigDir:         cfHome,
-		Transport:         protocol.FilesystemTransport{Dir: transportDir},
-		BeaconDir:         t.TempDir(),
-		ConventionDir:     convDir,
-		SkipConfigCascade: true,
-	})
+	st, err := dgstore.Open(filepath.Join(dgHome, localStoreFilename))
 	if err != nil {
-		t.Fatalf("exchange.Init: %v", err)
+		t.Fatalf("dgstore.Open: %v", err)
 	}
-	t.Cleanup(func() { initClient.Close() })
 
-	st, err := store.Open(store.StorePath(cfHome))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	cfID := cfg.ExchangeCampfireID
 	cutoff := time.Now().Add(-2 * time.Hour)
 
-	// Insert real store messages for each tag we count.
+	// Insert local store records for each tag we count.
+	n := 0
 	insertMsg := func(tag string) {
 		t.Helper()
-		rec := store.MessageRecord{
-			ID:          fmt.Sprintf("test-%d-%s", time.Now().UnixNano(), tag),
-			CampfireID:  cfID,
+		n++
+		rec := dgstore.Record{
+			ID:          fmt.Sprintf("test-%d-%s", n, tag),
+			CampfireID:  "local",
 			Sender:      "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
 			Payload:     []byte(`{}`),
 			Tags:        []string{tag},
 			Antecedents: []string{},
-			Timestamp:   store.NowNano(),
-			Signature:   []byte{},
+			Timestamp:   time.Now().UnixNano(),
 		}
-		if _, err := st.AddMessage(rec); err != nil {
-			t.Fatalf("AddMessage tag=%s: %v", tag, err)
+		if err := st.Append(rec); err != nil {
+			t.Fatalf("Append tag=%s: %v", tag, err)
 		}
 	}
 
@@ -348,9 +333,14 @@ func TestStatus_ExchangeReader(t *testing.T) {
 	insertMsg(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutAccept)
 	insertMsg(exchange.TagPhasePrefix + exchange.SettlePhaseStrPutReject)
 
-	// Build a read client against the same store.
-	readClient := protocol.New(st, nil)
-	counts := readExchangeViewsWithClient(readClient, st, cfID, cutoff)
+	if err := st.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	counts, _, err := readExchangeViews(dgHome, cutoff)
+	if err != nil {
+		t.Fatalf("readExchangeViews: %v", err)
+	}
 
 	if counts.PutsSubmitted != 2 {
 		t.Errorf("PutsSubmitted = %d, want 2", counts.PutsSubmitted)

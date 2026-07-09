@@ -6,9 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/dontguess/pkg/demand"
-	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/spf13/cobra"
 )
 
@@ -17,9 +15,10 @@ var demandSince time.Duration
 
 // demandCmd reports the clustered demand backlog from the exchange miss log.
 //
-// It reads all exchange:buy-miss messages from the exchange campfire (read-only),
-// excludes synthetic traffic (regression-*, timeout-178*, test-class), clusters
-// the remaining real misses by theme, and prints the assignable work queue.
+// It reads all exchange:buy-miss messages from the local DG_HOME event log
+// (read-only — see reqfilter.go's loadLocalMessages), excludes synthetic
+// traffic (regression-*, timeout-178*, test-class), clusters the remaining
+// real misses by theme, and prints the assignable work queue.
 //
 // Each item in the backlog represents unmet demand: a buyer described a task,
 // no cached inference matched, and the exchange posted a 70%-rate standing offer.
@@ -60,23 +59,17 @@ func init() {
 func runDemand(_ *cobra.Command, _ []string) error {
 	dgHome := resolveDGHome()
 
-	cfg, err := exchange.LoadConfig(dgHome)
+	allMsgs, err := loadLocalMessages(dgHome)
 	if err != nil {
-		return fmt.Errorf("load exchange config: %w", err)
+		return fmt.Errorf("loading local store: %w", err)
 	}
-
-	client, _, err := protocol.Init(dgHome)
-	if err != nil {
-		return fmt.Errorf("protocol.Init: %w", err)
-	}
-	defer client.Close()
 
 	var cutoffNano int64
 	if demandSince > 0 {
 		cutoffNano = time.Now().Add(-demandSince).UnixNano()
 	}
 
-	// Read all exchange:buy-miss messages from the campfire (read-only).
+	// Read all exchange:buy-miss messages from the local store (read-only).
 	// buy-miss standing offers carry both TagBuyMiss and TagMatch tags; query
 	// by TagBuyMiss to get only misses (not the hit-match messages). TagBuyMiss
 	// doesn't own a nostr kind (it's a discriminator on a kind-3403 match
@@ -86,22 +79,19 @@ func runDemand(_ *cobra.Command, _ []string) error {
 	// is ALSO stamped with TagBuyMiss to link it back to the offer it filled,
 	// so without the exclusion this read would return fulfillment messages
 	// too and BuildBacklog would misparse them as phantom empty-task misses.
-	rawMisses, err := readFilter(client, cfg.ExchangeCampfireID, buyMissFilter(cutoffNano))
-	if err != nil {
-		return fmt.Errorf("read miss log: %w", err)
-	}
+	rawMisses := readFilter(allMsgs, buyMissFilter(cutoffNano))
 
 	// Convert exchange.Message to demand.MissMessage.
-	msgs := make([]demand.MissMessage, len(rawMisses))
+	missMsgs := make([]demand.MissMessage, len(rawMisses))
 	for i, m := range rawMisses {
-		msgs[i] = demand.MissMessage{
+		missMsgs[i] = demand.MissMessage{
 			ID:        m.ID,
 			Payload:   m.Payload,
 			Timestamp: m.Timestamp,
 		}
 	}
 
-	bl := demand.BuildBacklog(msgs)
+	bl := demand.BuildBacklog(missMsgs)
 
 	if jsonOutput {
 		enc := json.NewEncoder(os.Stdout)

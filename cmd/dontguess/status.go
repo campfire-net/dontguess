@@ -14,8 +14,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/spf13/cobra"
 )
@@ -179,45 +177,32 @@ func readWrapperLog(dgHome string, cutoff time.Time) WrapperAttempts {
 // Exchange view reader
 // --------------------------------------------------------------------------
 
-// readExchangeViews reads counts from the exchange campfire views for messages
-// within the since window. Returns zero counts on any error (not fatal for
-// the overall status command). Also returns the max timestamp (nanos) seen
-// across all messages, used by the caller for last_activity tracking.
+// readExchangeViews reads counts from the local DG_HOME event log (see
+// reqfilter.go's loadLocalMessages) for messages within the since window.
+// Returns zero counts on any error (not fatal for the overall status
+// command). Also returns the max timestamp (nanos) seen across all messages,
+// used by the caller for last_activity tracking.
 func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, error) {
-	cfg, err := exchange.LoadConfig(dgHome)
+	msgs, err := loadLocalMessages(dgHome)
 	if err != nil {
-		return ExchangeCounts{}, 0, fmt.Errorf("load exchange config: %w", err)
+		return ExchangeCounts{}, 0, fmt.Errorf("loading local store: %w", err)
 	}
-
-	client, _, err := protocol.Init(dgHome)
-	if err != nil {
-		return ExchangeCounts{}, 0, fmt.Errorf("protocol.Init: %w", err)
-	}
-	defer client.Close()
 
 	cutoffNano := cutoff.UnixNano()
-	cfID := cfg.ExchangeCampfireID
 
 	// countFilter counts messages matching f's kinds/tags (see reqfilter.go)
 	// that fall at or after cutoffNano, while also tracking globalMaxTS across
-	// every call — the max timestamp observed across ALL queried messages,
+	// every call — the max timestamp observed across ALL matching messages,
 	// unfiltered by cutoff, used by the caller for last_activity tracking.
-	// This dual-purpose windowing isn't something readFilter supports, so the
-	// loop stays local; f's Tags/Kinds->legacyTags() and ExcludeTags are the
-	// only pieces reused from the ReqFilter abstraction.
+	// This dual-purpose windowing isn't something readFilter's Since/Until
+	// supports directly (f is always passed with Since=0, matching all time),
+	// so the loop stays local; readFilter's tag matching is the only piece
+	// reused from the ReqFilter abstraction.
 	var globalMaxTS int64
 	countFilter := func(f ReqFilter) int {
-		req := protocol.ReadRequest{
-			CampfireID:  cfID,
-			Tags:        f.legacyTags(),
-			ExcludeTags: f.ExcludeTags,
-		}
-		result, err := client.Read(req)
-		if err != nil {
-			return 0
-		}
+		matched := readFilter(msgs, f)
 		count := 0
-		for _, m := range result.Messages {
+		for _, m := range matched {
 			if m.Timestamp > globalMaxTS {
 				globalMaxTS = m.Timestamp
 			}
@@ -243,55 +228,6 @@ func readExchangeViews(dgHome string, cutoff time.Time) (ExchangeCounts, int64, 
 		PutsAccepted:  putAccepts,
 		PutsRejected:  putRejects,
 	}, globalMaxTS, nil
-}
-
-// readExchangeViewsWithClient is used in tests to pass in a pre-built client
-// and store instead of calling protocol.Init.
-func readExchangeViewsWithClient(client *protocol.Client, st store.Store, cfID string, cutoff time.Time) ExchangeCounts {
-	cutoffNano := cutoff.UnixNano()
-
-	// countFilter mirrors readExchangeViews' but with SkipSync always set (the
-	// caller has already synced, or the campfire is HTTP-mode push delivery —
-	// see protocol.ReadRequest.SkipSync doc). Test-only entry point.
-	countFilter := func(f ReqFilter) (int, int64) {
-		req := protocol.ReadRequest{
-			CampfireID:  cfID,
-			Tags:        f.legacyTags(),
-			ExcludeTags: f.ExcludeTags,
-			SkipSync:    true,
-		}
-		result, err := client.Read(req)
-		if err != nil {
-			return 0, 0
-		}
-		count := 0
-		var maxTS int64
-		for _, m := range result.Messages {
-			if m.Timestamp >= cutoffNano {
-				count++
-			}
-			if m.Timestamp > maxTS {
-				maxTS = m.Timestamp
-			}
-		}
-		return count, maxTS
-	}
-
-	buys, _ := countFilter(buysFilter(0))
-	matches, _ := countFilter(matchesFilter(0))
-	settlements, _ := countFilter(settlementsFilter(0))
-	puts, _ := countFilter(putsFilter(0))
-	putAccepts, _ := countFilter(putAcceptsFilter(0))
-	putRejects, _ := countFilter(putRejectsFilter(0))
-
-	return ExchangeCounts{
-		Buys:          buys,
-		Matches:       matches,
-		Settlements:   settlements,
-		PutsSubmitted: puts,
-		PutsAccepted:  putAccepts,
-		PutsRejected:  putRejects,
-	}
 }
 
 // --------------------------------------------------------------------------
@@ -321,8 +257,9 @@ func readOperatorHealth(dgHome string, cutoff time.Time, msgLastActivity int64) 
 	// Uptime: try /proc/<pid>/stat, fall back to pid file mtime.
 	h.UptimeSeconds = processUptime(pid, pidPath)
 
-	// Store size.
-	dbPath := store.StorePath(dgHome)
+	// Store size: the local DG_HOME event log (reqfilter.go's
+	// localStoreFilename), not the legacy campfire store.db.
+	dbPath := filepath.Join(dgHome, localStoreFilename)
 	if info, err := os.Stat(dbPath); err == nil {
 		h.StoreSizeBytes = info.Size()
 	}
