@@ -42,12 +42,9 @@ jobs:
         uses: sigstore/cosign-installer@v3
 
       - name: Build binaries
-        env:
-          GOPRIVATE: github.com/campfire-net/campfire
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           LDFLAGS_DONTGUESS="-s -w -X main.Version=${VERSION}"
-          LDFLAGS_SELLER="-s -w -X main.Version=${VERSION}"
           OUTDIR="dist"
           mkdir -p "${OUTDIR}"
 
@@ -64,30 +61,23 @@ jobs:
             ARCH="${TARGET#*/}"
             LABEL="${OS}_${ARCH}"
 
-            for CMD in dontguess seller; do
-              BIN="${CMD}"
-              if [ "${OS}" = "windows" ]; then
-                BIN="${CMD}.exe"
-              fi
+            BIN="dontguess"
+            if [ "${OS}" = "windows" ]; then
+              BIN="dontguess.exe"
+            fi
 
-              LDFLAGS="${LDFLAGS_DONTGUESS}"
-              if [ "${CMD}" = "seller" ]; then
-                LDFLAGS="${LDFLAGS_SELLER}"
-              fi
-
-              GOOS="${OS}" GOARCH="${ARCH}" go build \
-                -ldflags "${LDFLAGS}" \
-                -o "${OUTDIR}/${CMD}_${LABEL}/${BIN}" \
-                "./cmd/${CMD}"
-            done
+            GOOS="${OS}" GOARCH="${ARCH}" go build \
+              -ldflags "${LDFLAGS_DONTGUESS}" \
+              -o "${OUTDIR}/dontguess_${LABEL}/${BIN}" \
+              "./cmd/dontguess"
 
             # Archive: tar.gz for linux/darwin, zip for windows
             if [ "${OS}" = "windows" ]; then
-              (cd "${OUTDIR}" && zip -r "dontguess_${LABEL}.zip" "dontguess_${LABEL}/" "seller_${LABEL}/")
+              (cd "${OUTDIR}" && zip -r "dontguess_${LABEL}.zip" "dontguess_${LABEL}/")
             else
               tar -czf "${OUTDIR}/dontguess_${LABEL}.tar.gz" \
                 -C "${OUTDIR}" \
-                "dontguess_${LABEL}/" "seller_${LABEL}/"
+                "dontguess_${LABEL}/"
             fi
           done
 

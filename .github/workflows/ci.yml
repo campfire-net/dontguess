@@ -19,32 +19,13 @@ jobs:
         with:
           go-version: '1.25'
 
-      - name: Configure git for private repo access
-        run: |
-          git config --global url."https://${{ secrets.GITHUB_TOKEN }}:x-oauth-basic@github.com/".insteadOf "https://github.com/"
-
-      - name: Install cf
-        run: |
-          CF_VER=$(curl -fsSL https://api.github.com/repos/campfire-net/campfire/releases/latest | grep '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
-          curl -fsSL "https://github.com/campfire-net/campfire/releases/download/${CF_VER}/cf_linux_amd64.tar.gz" | tar xz -C /tmp
-          sudo install -m 755 /tmp/cf_linux_amd64/cf /usr/local/bin/cf
-
       - name: Run tests
-        env:
-          GOPRIVATE: github.com/campfire-net/campfire
         # -race is load-bearing: pkg/exchange dispatch, pkg/relay (intake/outbox/watchdog/conn)
         # and pkg/scrip run concurrent goroutines with shared state (M2 nostr surface).
         run: go test -race ./...
 
       - name: Build check
-        env:
-          GOPRIVATE: github.com/campfire-net/campfire
         run: go build ./cmd/dontguess
 
       - name: Vet
         run: go vet ./...
-
-      - name: E2E install test
-        env:
-          GOPRIVATE: github.com/campfire-net/campfire
-        run: ./test/e2e-install.sh
