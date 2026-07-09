@@ -3,10 +3,22 @@ package main
 // agent_init_test.go — ground-source tests for dontguess agent-init subcommand.
 //
 // Decision reference: docs/design/exchange-per-agent-identity-decision.md §7
-// Item: dontguess-04f
+// Item: dontguess-04f. Updated for dontguess-88e (de-campfire agent-init):
+// agent-init no longer admits/joins the agent to the exchange campfire — it
+// provisions ONLY a secp256k1 nostr identity (see agent_init_nostr_test.go,
+// agent_init_hardening_test.go, agent_init_sybil_test.go for the nostr-first
+// identity coverage). The campfire admit/join assertions previously here
+// (Ed25519 pubkey via protocol.Init, GetMembership join verification) are
+// removed — there is nothing left to admit or join. What remains
+// re-expressed in nostr terms: distinct identities per agent, idempotent
+// re-init, and the on-disk agent-home layout.
 //
-// All tests run against a scratch filesystem-transport exchange — NOT ~/.cf.
-// No ~/.cf mutations occur; all state lives in t.TempDir() paths.
+// scratchExchange still provisions a full campfire-backed exchange config —
+// it is retained as shared test scaffolding for the sibling agent_init_*_test.go
+// files, which use dgHome as an arbitrary scratch DG_HOME regardless of
+// whether a campfire exchange backs it. All tests run against scratch temp
+// dirs — NOT ~/.cf. No ~/.cf mutations occur; all state lives in t.TempDir()
+// paths.
 
 import (
 	"os"
@@ -16,6 +28,7 @@ import (
 
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	"github.com/campfire-net/dontguess/pkg/identity"
 )
 
 // scratchExchange initializes a scratch exchange in a temp dir and returns
@@ -55,24 +68,23 @@ func runAgentInitWith(t *testing.T, dgHome, name string) error {
 	return runAgentInitCore(dgHome, name, "", true)
 }
 
-// agentPubKey reads the public key hex from an agent home directory by loading
-// the identity.json via protocol.Init (idempotent — just loads, never re-generates
-// because identity.json already exists).
-func agentPubKey(t *testing.T, agentHome string) string {
+// agentNpub reads the nostr npub for an agent home directory via
+// identity.Load — the canonical accessor for a fleet member's own persistent
+// secp256k1 identity (mirrors agent_init_nostr_test.go).
+func agentNpub(t *testing.T, agentHome string) string {
 	t.Helper()
-	client, _, err := protocol.Init(agentHome)
+	id, err := identity.Load(agentHome)
 	if err != nil {
-		t.Fatalf("protocol.Init(%s): %v", agentHome, err)
+		t.Fatalf("identity.Load(%s): %v", agentHome, err)
 	}
-	defer client.Close()
-	return client.PublicKeyHex()
+	return id.Npub()
 }
 
 // TestAgentInit_GeneratesDistinctIdentity verifies:
-//  1. Two distinct names produce two distinct Ed25519 public keys.
-//  2. Re-running the same name yields the SAME key (idempotency — no clobber).
-//  3. Each agent home is under $DG_HOME/agents/<name>/.
-//  4. Admit and join run against a scratch campfire (not ~/.cf).
+//  1. Two distinct names produce two distinct secp256k1 npubs.
+//  2. Re-running the same name yields the SAME npub (idempotency — no clobber).
+//  3. Each agent home is under $DG_HOME/agents/<name>/ and holds a nostr identity.
+//  4. No ~/.cf mutation occurs — everything lives under the scratch dgHome.
 func TestAgentInit_GeneratesDistinctIdentity(t *testing.T) {
 	t.Parallel()
 
@@ -83,9 +95,9 @@ func TestAgentInit_GeneratesDistinctIdentity(t *testing.T) {
 		t.Fatalf("agent-init alice: %v", err)
 	}
 	aliceHome := filepath.Join(dgHome, "agents", "alice")
-	aliceKey1 := agentPubKey(t, aliceHome)
+	aliceKey1 := agentNpub(t, aliceHome)
 	if aliceKey1 == "" {
-		t.Fatal("alice pubkey is empty")
+		t.Fatal("alice npub is empty")
 	}
 
 	// --- init bob ---
@@ -93,29 +105,29 @@ func TestAgentInit_GeneratesDistinctIdentity(t *testing.T) {
 		t.Fatalf("agent-init bob: %v", err)
 	}
 	bobHome := filepath.Join(dgHome, "agents", "bob")
-	bobKey := agentPubKey(t, bobHome)
+	bobKey := agentNpub(t, bobHome)
 	if bobKey == "" {
-		t.Fatal("bob pubkey is empty")
+		t.Fatal("bob npub is empty")
 	}
 
-	// Assert 1: alice and bob have distinct public keys.
+	// Assert 1: alice and bob have distinct npubs.
 	if aliceKey1 == bobKey {
-		t.Errorf("alice and bob have the same pubkey %s — expected distinct identities", aliceKey1)
+		t.Errorf("alice and bob have the same npub %s — expected distinct identities", aliceKey1)
 	}
 
-	// Assert 2: idempotency — re-init alice yields the same key (no clobber).
+	// Assert 2: idempotency — re-init alice yields the same npub (no clobber).
 	if err := runAgentInitWith(t, dgHome, "alice"); err != nil {
 		t.Fatalf("agent-init alice (2nd run): %v", err)
 	}
-	aliceKey2 := agentPubKey(t, aliceHome)
+	aliceKey2 := agentNpub(t, aliceHome)
 	if aliceKey1 != aliceKey2 {
-		t.Errorf("alice pubkey changed on re-init: first=%s second=%s — identity was clobbered", aliceKey1, aliceKey2)
+		t.Errorf("alice npub changed on re-init: first=%s second=%s — identity was clobbered", aliceKey1, aliceKey2)
 	}
 
-	// Assert 3: agent homes are at expected paths.
+	// Assert 3: agent homes are at expected paths and hold a nostr identity.
 	for _, home := range []string{aliceHome, bobHome} {
-		if _, err := os.Stat(filepath.Join(home, "identity.json")); err != nil {
-			t.Errorf("identity.json missing at %s: %v", home, err)
+		if _, err := os.Stat(filepath.Join(home, identity.IdentityFile)); err != nil {
+			t.Errorf("%s missing at %s: %v", identity.IdentityFile, home, err)
 		}
 	}
 
@@ -127,50 +139,29 @@ func TestAgentInit_GeneratesDistinctIdentity(t *testing.T) {
 			t.Errorf("dgHome %s is inside ~/.cf — test must use a scratch dir", dgHome)
 		}
 	}
-
-	// Assert 5: both agents are admitted to (and joined) the exchange campfire.
-	// Verify by loading each agent client and checking its stored membership.
-	for _, tc := range []struct {
-		name string
-		home string
-	}{
-		{"alice", aliceHome},
-		{"bob", bobHome},
-	} {
-		aClient, _, err := protocol.Init(tc.home)
-		if err != nil {
-			t.Fatalf("protocol.Init(%s): %v", tc.name, err)
-		}
-		defer aClient.Close()
-
-		// GetMembership reads from the agent's own store (populated by Join).
-		// This verifies the real join path ran, not just the admit path.
-		m, err := aClient.GetMembership(agentExchangeID(t, dgHome))
-		if err != nil {
-			t.Errorf("%s GetMembership: %v", tc.name, err)
-			continue
-		}
-		if m == nil {
-			t.Errorf("%s is not a member of the exchange campfire — join did not run", tc.name)
-		}
-	}
 }
 
 // TestAgentInit_RejectsPathTraversal verifies that malicious agent names which
 // would resolve outside (or to the root of) $DG_HOME/agents are rejected — most
 // importantly ".." and ".", which would otherwise resolve to DG_HOME itself and
-// load the OPERATOR's identity, handing the caller operator signing authority
-// (HIGH-severity privilege escalation). Regression for the V4 veracity finding.
+// mint the nostr identity INTO the OPERATOR's home, handing the caller
+// operator signing authority (HIGH-severity privilege escalation). Regression
+// for the V4 veracity finding, re-expressed in nostr terms for dontguess-88e:
+// the escalation vector used to be loading the operator's Ed25519 campfire
+// identity.json; post de-campfire it is minting nostr-identity.json at
+// DG_HOME via identity.LoadOrCreate(agentHome) when agentHome resolves to
+// dgHome itself.
 func TestAgentInit_RejectsPathTraversal(t *testing.T) {
 	t.Parallel()
 
 	dgHome, _ := scratchExchange(t)
 
-	// The operator identity must exist and remain untouched after rejected calls.
-	opIdentity := filepath.Join(dgHome, "identity.json")
-	before, err := os.ReadFile(opIdentity)
-	if err != nil {
-		t.Fatalf("reading operator identity.json: %v", err)
+	// No nostr identity exists at DG_HOME root before any agent-init call —
+	// confirms the file we check afterward wasn't already there for other
+	// reasons (e.g. an operator nostr identity planted by a different test).
+	opNostrIdentity := filepath.Join(dgHome, identity.IdentityFile)
+	if _, err := os.Stat(opNostrIdentity); !os.IsNotExist(err) {
+		t.Fatalf("precondition failed: %s already exists at dgHome root", identity.IdentityFile)
 	}
 
 	for _, name := range []string{"..", ".", "../evil", "a/b", "a\\b", "", "foo/../..", "x..y"} {
@@ -180,14 +171,11 @@ func TestAgentInit_RejectsPathTraversal(t *testing.T) {
 		}
 	}
 
-	// The operator identity.json must be byte-identical — nothing clobbered it,
-	// and `agent-init ..` must NOT have loaded/used the operator key.
-	after, err := os.ReadFile(opIdentity)
-	if err != nil {
-		t.Fatalf("reading operator identity.json after: %v", err)
-	}
-	if string(before) != string(after) {
-		t.Error("operator identity.json changed after rejected agent-init calls — traversal not contained")
+	// No nostr identity may have been minted at DG_HOME root — that would mean
+	// a rejected name still resolved agentHome to dgHome and the operator's
+	// signing identity was created/borrowed.
+	if _, err := os.Stat(opNostrIdentity); !os.IsNotExist(err) {
+		t.Errorf("%s was created at dgHome root after rejected agent-init calls — traversal not contained", identity.IdentityFile)
 	}
 
 	// No agent home should have been created for any rejected name.
@@ -200,14 +188,4 @@ func TestAgentInit_RejectsPathTraversal(t *testing.T) {
 	// Note: "x..y" contains ".." and is rejected by the conservative Contains(name, "..")
 	// guard even though it is not a traversal — acceptable: agent names are operator-chosen
 	// and need not contain "..".
-}
-
-// agentExchangeID reads the exchange campfire ID from the dgHome config.
-func agentExchangeID(t *testing.T, dgHome string) string {
-	t.Helper()
-	cfg, err := exchange.LoadConfig(dgHome)
-	if err != nil {
-		t.Fatalf("LoadConfig(%s): %v", dgHome, err)
-	}
-	return cfg.ExchangeCampfireID
 }
