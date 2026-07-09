@@ -25,7 +25,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/demand"
 	"github.com/campfire-net/dontguess/pkg/exchange"
@@ -200,4 +200,3 @@ func demandBuyPayload(t *testing.T, task string, budget int64) []byte {
 	}
 	return b
 }
-

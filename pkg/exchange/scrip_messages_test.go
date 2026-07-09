@@ -19,11 +19,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
 )
+
 // countMsgsWithTag counts messages in the store with the given tag.
 func countMsgsWithTag(t *testing.T, h *testHarness, tag string) int {
 	t.Helper()
@@ -43,12 +44,11 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// Seed one inventory entry; put_price = 5600, sale price = 6720, fee = 672, hold = 7392.
@@ -138,7 +138,7 @@ func TestBuyHold_EmitsConventionMessage(t *testing.T) {
 
 	// Verify CampfireScripStore can materialize the hold: after a full Replay,
 	// a fresh store should show the buyer's balance as reduced by holdAmount.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}
@@ -159,12 +159,11 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// Seed inventory; put_price = 5600, sale_price = 6720.
@@ -304,7 +303,7 @@ func TestSettle_EmitsConventionMessages(t *testing.T) {
 	}
 
 	// Verify CampfireScripStore replays correctly: seller gets residual, operator gets revenue.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}

@@ -21,7 +21,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -99,11 +99,15 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 	bs := newBlockingScripStore()
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       bs,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        bs,
+		// Fast poll so the buyer-accept is dispatched promptly under a saturated
+		// -race scheduler; the production 500ms default gives the 3s wait below
+		// too few cycles under load. Observation latency only — no assertion
+		// depends on the cadence (dontguess-657).
+		PollInterval: 25 * time.Millisecond,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -233,11 +237,10 @@ func TestEngine_HandlerCtxIsBackground_BeforeStart(t *testing.T) {
 	cs := newCampfireScripStore(t, h)
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},

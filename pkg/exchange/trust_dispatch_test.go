@@ -13,7 +13,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
@@ -23,11 +23,10 @@ func newEngineWithTrust(t *testing.T, checker *exchange.TrustChecker) (*testHarn
 	t.Helper()
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:   h.cfID,
-		Store:        h.st,
-		ReadClient:   h.newOperatorClient(),
-		WriteClient:  h.newOperatorClient(),
-		TrustChecker: checker,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		TrustChecker:      checker,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -77,8 +76,6 @@ func injectPutMsg(t *testing.T, h *testHarness, senderKey string) *store.Message
 		Payload:    payload,
 		Tags:       []string{exchange.TagPut, "exchange:content-type:text"},
 		Timestamp:  time.Now().UnixNano(),
-		ReceivedAt: time.Now().UnixNano(),
-		Signature:  []byte{0x00},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage put: %v", err)
@@ -101,8 +98,6 @@ func injectBuyMsg(t *testing.T, h *testHarness, senderKey string) *store.Message
 		Payload:    payload,
 		Tags:       []string{exchange.TagBuy},
 		Timestamp:  time.Now().UnixNano(),
-		ReceivedAt: time.Now().UnixNano(),
-		Signature:  []byte{0x00},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage buy: %v", err)
@@ -223,10 +218,9 @@ func TestTrustDispatch_NilChecker_AllOperationsPass(t *testing.T) {
 	t.Parallel()
 	h := newTestHarness(t)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},

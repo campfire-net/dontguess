@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -119,12 +119,11 @@ func TestSettle_PriceLockedAtBuyerAcceptTime(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	res, deliverMsg, salePrice := buildSettleChainForPriceTests(t, h, eng, cs, "SQL migration generator", 5000)
@@ -194,12 +193,11 @@ func TestSettle_CompleteWithoutBuyerAcceptIsSkipped(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:       h.cfID,
-		Store:            h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient:      h.newOperatorClient(),
-		ScripStore:       cs,
-		Logger:           func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	seedInventoryEntry(t, h, eng, "Docker compose generator skip test", "code", 12000, 6000)

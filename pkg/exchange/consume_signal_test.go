@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
@@ -69,7 +69,15 @@ func TestConsumeSignal_RecordedAndQueryablePerEntry(t *testing.T) {
 	defer cancel()
 
 	preMatchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-	go func() { _ = eng.Start(ctx) }()
+	// Await the engine goroutine's exit after cancel (below) before Step 5 sends
+	// the settle(complete) and dispatches it explicitly. Without this wait the
+	// step-2 poll loop lingers and can ALSO ingest+dispatch the complete message
+	// via pollLocalStore, emitting a SECOND exchange:consume signal that races
+	// the explicit DispatchForTest — a double count (dontguess-657). This does
+	// not relax any assertion; it removes a leaked goroutine so the consume
+	// signal is emitted exactly once, by the explicit dispatch.
+	engDone := make(chan struct{})
+	go func() { defer close(engDone); _ = eng.Start(ctx) }()
 
 	var matchMsgs []store.MessageRecord
 	deadline := time.Now().Add(2 * time.Second)
@@ -81,6 +89,7 @@ func TestConsumeSignal_RecordedAndQueryablePerEntry(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 	}
 	cancel()
+	<-engDone
 
 	if len(matchMsgs) <= len(preMatchMsgs) {
 		t.Fatal("no match message emitted by engine")
@@ -374,8 +383,8 @@ func TestConsumeCountByEntry_SkipsMalformed(t *testing.T) {
 
 	consumes := []exchange.Message{
 		{ID: "c-1", Tags: []string{exchange.TagConsume}, Payload: []byte(`{"entry_id":"entry-X","buyer_key":"b1"}`)},
-		{ID: "c-2", Tags: []string{exchange.TagConsume}, Payload: []byte(`{}`)  },             // missing entry_id
-		{ID: "c-3", Tags: []string{exchange.TagConsume}, Payload: []byte(`not-json`)},       // unparseable
+		{ID: "c-2", Tags: []string{exchange.TagConsume}, Payload: []byte(`{}`)},              // missing entry_id
+		{ID: "c-3", Tags: []string{exchange.TagConsume}, Payload: []byte(`not-json`)},        // unparseable
 		{ID: "c-4", Tags: []string{exchange.TagConsume}, Payload: []byte(`{"entry_id":""}`)}, // empty entry_id
 	}
 

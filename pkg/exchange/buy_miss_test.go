@@ -16,7 +16,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -171,11 +171,10 @@ func TestBuyMiss_StandingOfferE2E(t *testing.T) {
 	// Wire a real CampfireScripStore so we can verify scrip payments.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -280,9 +279,9 @@ func TestBuyMiss_StandingOfferE2E(t *testing.T) {
 
 	// Parse put-accept payload: price must be token_cost * BuyMissOfferRate / 100.
 	var acceptPayload struct {
-		Phase    string `json:"phase"`
-		EntryID  string `json:"entry_id"`
-		Price    int64  `json:"price"`
+		Phase   string `json:"phase"`
+		EntryID string `json:"entry_id"`
+		Price   int64  `json:"price"`
 	}
 	if err := json.Unmarshal(putAcceptMsg.Payload, &acceptPayload); err != nil {
 		t.Fatalf("parsing put-accept payload: %v", err)
@@ -552,12 +551,11 @@ func TestBuyMiss_TokenCostCapped(t *testing.T) {
 	taskHash := exchange.TaskDescriptionHash(task)
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:   h.cfID,
-		Store:        h.st,
-		ReadClient:   h.newOperatorClient(),
-		WriteClient:  h.newOperatorClient(),
-		MaxTokenCost: maxTokenCost,
-		ReadSkipSync: true,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		MaxTokenCost:      maxTokenCost,
+		ReadSkipSync:      true,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -1309,12 +1307,11 @@ func TestBuyMiss_SellerBalanceAfterStandingOfferFulfillment(t *testing.T) {
 	// Build the scrip store after the mint message is in the log.
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	task := "Translate a 3000-line C++ game engine to idiomatic Go"
@@ -1400,7 +1397,7 @@ func TestBuyMiss_SellerBalanceAfterStandingOfferFulfillment(t *testing.T) {
 	// reconstruct state from the log. A fresh store constructed from the same log
 	// must show the same seller balance. This verifies the campfire message was
 	// actually emitted and applyPutPay handles it correctly.
-	freshCS, err := scrip.NewCampfireScripStore(h.cfID, h.newOperatorClient(), h.operator.PublicKeyHex())
+	freshCS, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {
 		t.Fatalf("NewCampfireScripStore (fresh): %v", err)
 	}

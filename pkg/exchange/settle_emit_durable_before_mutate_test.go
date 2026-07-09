@@ -26,7 +26,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -41,12 +41,11 @@ func TestPerformScripSettlement_EmitsDurableRecordBeforeBalanceMutationFails(t *
 	// Phase 1: build the settle chain (put → accept → buy → match →
 	// buyer-accept → deliver) using a real, healthy CampfireScripStore.
 	eng1 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[eng1] "+format, args...) },
 	})
 	_, deliverMsg, _ := buildSettleChainForPriceTests(t, h, eng1, cs, "emit-before-mutate fixture", 4000)
 
@@ -63,12 +62,11 @@ func TestPerformScripSettlement_EmitsDurableRecordBeforeBalanceMutationFails(t *
 		err:  scrip.ErrConflict,
 	}
 	eng2 := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  failStore,
-		Logger:      func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        failStore,
+		Logger:            func(format string, args ...any) { t.Logf("[eng2] "+format, args...) },
 	})
 
 	allMsgs, _ := h.st.ListMessages(h.cfID, 0)

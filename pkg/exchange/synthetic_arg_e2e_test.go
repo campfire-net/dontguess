@@ -17,9 +17,8 @@ package exchange_test
 //     as an optional boolean arg. This test constructs buy/put message payloads
 //     with "synthetic": true in the JSON body — exactly what convention_dispatch.go
 //     puts into the message payload when the caller passes --synthetic. The test
-//     uses the REAL engine on a SCRATCH campfire (newTestHarness / exchange.Init
-//     with SkipConfigCascade=true, no ~/.cf involvement). This simultaneously proves:
-//       - the convention JSON is valid (Init loads and validates it)
+//     uses the REAL engine on the campfire-free harness event log (newTestHarness,
+//     dontguess-657). This simultaneously proves:
 //       - the engine accepts the payload field without error
 //       - the response carries the expected tag
 //
@@ -45,7 +44,7 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )

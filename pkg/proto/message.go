@@ -7,15 +7,16 @@ package proto
 
 import (
 	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 )
 
 // Message is the dontguess-owned representation of a campfire message.
 //
-// Internally all state processing and engine handlers operate on *Message
-// rather than *store.MessageRecord so that exchange logic is decoupled from
-// the cf SDK boundary type. store.MessageRecord stays at the cf boundary
-// (poll / replayAll / init); FromStoreRecord converts at that boundary.
+// Internally all state processing and engine handlers operate on *Message so
+// that exchange logic is decoupled from any transport boundary type. The
+// store->Message conversion now lives at the campfire-free dgstore boundary
+// (pkg/store.Record.ToMessage / pkg/exchange.FromStoreRecord, dontguess-657);
+// the SDK boundary conversion (FromSDKMessage) remains here because pkg/scrip
+// still ingests via the campfire SDK in the campfire code path.
 type Message struct {
 	// ID is the campfire message ID (hex-encoded public key hash).
 	ID string
@@ -33,33 +34,6 @@ type Message struct {
 	Timestamp int64
 	// Instance is the sender's self-asserted role / instance name (tainted).
 	Instance string
-}
-
-// FromStoreRecord converts a store.MessageRecord to a dontguess Message.
-// This is the only place store.MessageRecord is converted — called at the
-// campfire boundary (poll / replayAll / dispatchPendingOrders) so all internal
-// processing uses *Message.
-func FromStoreRecord(r *store.MessageRecord) *Message {
-	return &Message{
-		ID:          r.ID,
-		CampfireID:  r.CampfireID,
-		Sender:      r.Sender,
-		Payload:     r.Payload,
-		Tags:        r.Tags,
-		Antecedents: r.Antecedents,
-		Timestamp:   r.Timestamp,
-		Instance:    r.Instance,
-	}
-}
-
-// FromStoreRecords converts a slice of store.MessageRecord to []Message.
-// Convenience helper for Replay.
-func FromStoreRecords(recs []store.MessageRecord) []Message {
-	msgs := make([]Message, len(recs))
-	for i := range recs {
-		msgs[i] = *FromStoreRecord(&recs[i])
-	}
-	return msgs
 }
 
 // FromSDKMessage converts a protocol.Message (the SDK-facing type returned by
@@ -86,4 +60,3 @@ func FromSDKMessages(ms []protocol.Message) []Message {
 	}
 	return msgs
 }
-

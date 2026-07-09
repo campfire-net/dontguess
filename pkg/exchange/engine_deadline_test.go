@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/scrip"
@@ -35,12 +35,11 @@ func TestEngine_DeadlineMissRefund(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	// Seed one inventory entry. put_price = 5600; sale_price = 6720; fee = 672; hold = 7392.
@@ -71,11 +70,11 @@ func TestEngine_DeadlineMissRefund(t *testing.T) {
 
 	// Send buy with guarantee_deadline_seconds=1 (1-second guarantee window).
 	buyPayloadBytes, _ := json.Marshal(map[string]any{
-		"task":                        "find cached inference for deadline test",
-		"budget":                      salePrice + 10000,
-		"max_results":                 1,
-		"guarantee_deadline_seconds":  1,
-		"insured_amount":              insuredAmount,
+		"task":                       "find cached inference for deadline test",
+		"budget":                     salePrice + 10000,
+		"max_results":                1,
+		"guarantee_deadline_seconds": 1,
+		"insured_amount":             insuredAmount,
 	})
 	h.sendMessage(h.buyer, buyPayloadBytes, []string{exchange.TagBuy}, nil)
 
@@ -203,12 +202,11 @@ func TestEngine_DeadlineMissRefund_Idempotent(t *testing.T) {
 	h := newTestHarness(t)
 	cs := newCampfireScripStore(t, h)
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:  h.cfID,
-		Store:       h.st,
-		ReadClient:  h.newOperatorClient(),
-		WriteClient: h.newOperatorClient(),
-		ScripStore:  cs,
-		Logger:      func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator.pubKeyHex,
+		ScripStore:        cs,
+		Logger:            func(format string, args ...any) { t.Logf("[engine] "+format, args...) },
 	})
 
 	seedInventoryEntry(t, h, eng, "idempotent deadline test entry", "code", 8000, 5600)

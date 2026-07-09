@@ -653,7 +653,21 @@ func (e *Engine) fetchMessage(id string) (*Message, error) {
 	if err != nil || rec == nil {
 		return nil, err
 	}
-	return FromStoreRecord(rec), nil
+	// Legacy campfire Store fallback (LocalStore and ReadClient both nil).
+	// FromStoreRecord now converts the campfire-free dgstore.Record
+	// (dontguess-657), so the campfire store.MessageRecord is converted inline
+	// here — the last campfire ingest remnant, removed with the Store field by
+	// dontguess-b14.
+	return &Message{
+		ID:          rec.ID,
+		CampfireID:  rec.CampfireID,
+		Sender:      rec.Sender,
+		Payload:     rec.Payload,
+		Tags:        rec.Tags,
+		Antecedents: rec.Antecedents,
+		Timestamp:   rec.Timestamp,
+		Instance:    rec.Instance,
+	}, nil
 }
 
 // indexLocalMessages records each message's ID -> *Message mapping in

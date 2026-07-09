@@ -20,7 +20,7 @@ package main
 //     corresponding counter and it appears in status."
 //
 // Real net.Listen/net.Dial, real exchange.Engine, real TrustChecker, real
-// campfire-backed store. No mocks.
+// campfire-free pkg/store event log (dontguess-657). No mocks.
 
 import (
 	"context"
@@ -33,9 +33,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
+	store "github.com/campfire-net/dontguess/pkg/store"
 )
 
 // --------------------------------------------------------------------------
@@ -70,7 +69,7 @@ func TestStatus_SocketMetrics(t *testing.T) {
 		}
 		defer conn.Close()
 		var req map[string]any
-		json.NewDecoder(conn).Decode(&req) //nolint:errcheck
+		json.NewDecoder(conn).Decode(&req)           //nolint:errcheck
 		json.NewEncoder(conn).Encode(map[string]any{ //nolint:errcheck
 			"degradation": map[string]any{
 				"trust_denial_not_allowlisted": 3,
@@ -152,20 +151,18 @@ func TestOperatorSocket_Metrics_TrustDenialProbe(t *testing.T) {
 	h := newOpTestHarness(t)
 
 	// h.seller is NOT on the fleet allowlist — only the operator identity is.
-	operatorKey := h.operatorClient.PublicKeyHex()
+	operatorKey := h.operator
 	checker, err := exchange.NewTrustChecker(operatorKey, exchange.NewKeySet())
 	if err != nil {
 		t.Fatalf("NewTrustChecker: %v", err)
 	}
 
 	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:   h.cfID,
-		Store:        h.st,
-		ReadClient:   protocol.New(h.st, nil),
-		WriteClient:  h.operatorClient,
-		ReadSkipSync: true,
-		TrustChecker: checker,
-		PollInterval: 20 * time.Millisecond,
+		CampfireID:        h.cfID,
+		LocalStore:        h.st,
+		OperatorPublicKey: h.operator,
+		TrustChecker:      checker,
+		PollInterval:      20 * time.Millisecond,
 		Logger: func(format string, args ...any) {
 			t.Logf("[engine] "+format, args...)
 		},
@@ -215,7 +212,6 @@ func TestOperatorSocket_Metrics_TrustDenialProbe(t *testing.T) {
 		Tags:        []string{exchange.TagPut, "exchange:content-type:text"},
 		Antecedents: []string{},
 		Timestamp:   store.NowNano(),
-		Signature:   []byte{},
 	}
 	if _, err := h.st.AddMessage(rec); err != nil {
 		t.Fatalf("AddMessage: %v", err)

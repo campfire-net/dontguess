@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/store"
+	"github.com/campfire-net/dontguess/pkg/store"
 
 	"github.com/campfire-net/dontguess/pkg/exchange"
 )
@@ -294,7 +294,7 @@ func TestHotAndWarmCompressionAssign_Coexistence(t *testing.T) {
 	eng := h.newEngine()
 
 	const tokenCost int64 = 20000
-	const wantHotBounty int64 = tokenCost * exchange.HotCompressionBountyPct / 100  // 10000
+	const wantHotBounty int64 = tokenCost * exchange.HotCompressionBountyPct / 100   // 10000
 	const wantWarmBounty int64 = tokenCost * exchange.WarmCompressionBountyPct / 100 // 6000
 
 	contentHash := "sha256:" + fmt.Sprintf("%064x", 201)
