@@ -8,8 +8,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-
 	"github.com/campfire-net/dontguess/pkg/proto"
 	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
@@ -49,27 +47,14 @@ func (e *balanceEntry) etag() string {
 	return fmt.Sprintf("%d-%d", e.epoch, e.gen)
 }
 
-// CampfireScripStore implements SpendingStore backed by a scrip operation
-// message log. The transport that supplies that log is pluggable:
+// LocalScripStore implements SpendingStore backed by a scrip operation message
+// log read from the campfire-free local event log (pkg/store, dgstore.Store) —
+// the relay/local transport for the nostr-first migration (dontguess-203).
 //
-//   - NewCampfireScripStore reads from a live campfire (client + campfireID) —
-//     the original transport.
-//   - NewLocalScripStore reads from a campfire-free local event log
-//     (pkg/store, dgstore.Store) — the relay/local transport swap for the
-//     nostr-first migration (dontguess-203). This is the same record shape
-//     (dgstore.Record -> proto.Message) the exchange engine already replays
-//     from a campfire store (dontguess-275), so applyMessage cannot tell the
-//     difference between a message that arrived via campfire's
-//     FromSDKMessages and one that arrived via dgstore.Store.Replay.
-//
-// Whichever transport supplies it, state is derived by replaying all scrip
-// operation messages in sequence order. The in-memory balance map is a
+// State is derived by replaying all scrip operation messages in the log's
+// single-writer append (fold) order. The in-memory balance map is a
 // materialized view; it can always be rebuilt from the message log. ETags are
-// monotonic generation counters that increment on every balance mutation —
-// this scheme is transport-independent: it depends only on there being a
-// single deterministic replay order per domain, which both transports supply
-// (a campfire's message log order, or a local store's single-writer append
-// order).
+// monotonic generation counters that increment on every balance mutation.
 //
 // Reservations are stored in memory. They are ephemeral — the message log
 // contains the authoritative record of scrip movements (buy-hold messages are
@@ -77,19 +62,11 @@ func (e *balanceEntry) etag() string {
 // in-flight reservations that were not settled become stale; the escrow
 // timeout mechanism (external) handles automatic refund.
 //
-// CampfireScripStore is safe for concurrent use.
-type CampfireScripStore struct {
-	campfireID string
-	client     *protocol.Client
-
-	// localStore, when non-nil, is the campfire-free relay/local transport
-	// (dontguess-203): Replay reads from localStore.Replay() instead of
-	// issuing a campfire client.Read(). Set via NewLocalScripStore. Mutually
-	// exclusive with client/campfireID in practice (a store is constructed
-	// with exactly one transport), but Replay only inspects localStore, so
-	// having both set is harmless — localStore simply takes priority, mirroring
-	// the exchange engine's LocalStore-takes-priority-for-ingest convention
-	// (EngineOptions.LocalStore doc, pkg/exchange/engine_core.go).
+// LocalScripStore is safe for concurrent use.
+type LocalScripStore struct {
+	// localStore is the campfire-free append-only event log (pkg/store) whose
+	// single-writer append order Replay folds to build balance state. It is the
+	// sole message source.
 	localStore *dgstore.Store
 
 	// OperatorKey is the public key hex of the exchange operator. When non-empty,
@@ -150,48 +127,19 @@ type CampfireScripStore struct {
 	totalLoanPrincipal atomic.Int64
 
 	// loansMu guards loans and loansByBorrower.
-	loansMu        sync.RWMutex
-	loans          map[string]*LoanRecord // loanID -> record
-	loansByBorrower map[string][]string   // borrowerKey -> []loanID
+	loansMu         sync.RWMutex
+	loans           map[string]*LoanRecord // loanID -> record
+	loansByBorrower map[string][]string    // borrowerKey -> []loanID
 }
 
-// NewCampfireScripStore creates a CampfireScripStore and replays the campfire
-// log to build initial balance state.
-//
-// campfireID is the exchange campfire's public key hex. client is the campfire
-// protocol client used to read messages. operatorKey is the public key hex of
-// the exchange operator; only messages from this sender are accepted for scrip
-// operations. Pass an empty string to disable the check (backwards compat for tests).
-func NewCampfireScripStore(campfireID string, client *protocol.Client, operatorKey string) (*CampfireScripStore, error) {
-	s := &CampfireScripStore{
-		campfireID:      campfireID,
-		client:          client,
-		OperatorKey:     operatorKey,
-		balances:        make(map[string]*balanceEntry),
-		reservations:    make(map[string]Reservation),
-		loans:           make(map[string]*LoanRecord),
-		loansByBorrower: make(map[string][]string),
-	}
-	if err := s.Replay(); err != nil {
-		return nil, fmt.Errorf("scrip store: replay: %w", err)
-	}
-	return s, nil
-}
-
-// NewLocalScripStore creates a CampfireScripStore backed by the campfire-free
-// relay/local event log (pkg/store) instead of a live campfire, and replays
-// it to build initial balance state.
-//
-// This is the relay/local transport swap for the nostr-first migration
-// (dontguess-203): SpendingStore's signature, ETag optimistic locking, and
-// atomic ConsumeReservation are byte-for-byte identical to the
-// NewCampfireScripStore path — only the message source changes (localStore
-// instead of a campfire client.Read()). operatorKey is the public key hex of
-// the exchange operator; only messages from this sender are accepted for
-// scrip operations, exactly as in the campfire path. Pass an empty string to
-// disable the check (backwards compat for tests).
-func NewLocalScripStore(localStore *dgstore.Store, operatorKey string) (*CampfireScripStore, error) {
-	s := &CampfireScripStore{
+// NewLocalScripStore creates a LocalScripStore backed by the campfire-free
+// relay/local event log (pkg/store) and replays it to build initial balance
+// state (the nostr-first migration, dontguess-203). operatorKey is the public
+// key hex of the exchange operator; only messages from this sender are accepted
+// for scrip operations. Pass an empty string to disable the check (backwards
+// compat for tests).
+func NewLocalScripStore(localStore *dgstore.Store, operatorKey string) (*LocalScripStore, error) {
+	s := &LocalScripStore{
 		localStore:      localStore,
 		OperatorKey:     operatorKey,
 		balances:        make(map[string]*balanceEntry),
@@ -209,41 +157,21 @@ func NewLocalScripStore(localStore *dgstore.Store, operatorKey string) (*Campfir
 // It resets all balances and re-derives them from scratch.
 // Called on construction; can be called again to resync.
 //
-// The message source depends on which transport the store was constructed
-// with: localStore (dontguess-203, relay/local) takes priority when set,
-// mirroring the exchange engine's LocalStore-takes-priority-for-ingest
-// convention; otherwise Replay falls back to the original campfire
-// client.Read() path. Both sources feed the exact same applyMessage fold.
+// The message source is the campfire-free localStore (dontguess-203): its
+// single-writer append order is the deterministic fold order.
 //
 // Replay holds replayMu exclusively for the entire operation so that no
 // concurrent ApplyMessage can observe the window between map reset and
 // replaying.Store(true) with empty balances in live mode.
-func (s *CampfireScripStore) Replay() error {
+func (s *LocalScripStore) Replay() error {
 	s.replayMu.Lock()
 	defer s.replayMu.Unlock()
 
-	var msgs []proto.Message
-	if s.localStore != nil {
-		// Relay/local transport (dontguess-203): dgstore.Store.Replay already
-		// returns []proto.Message in append (fold) order — no SDK boundary
-		// conversion needed, unlike the campfire path below.
-		m, err := s.localStore.Replay()
-		if err != nil {
-			return fmt.Errorf("listing messages: %w", err)
-		}
-		msgs = m
-	} else {
-		result, err := s.client.Read(protocol.ReadRequest{
-			CampfireID:       s.campfireID,
-			AfterTimestamp:   0,
-			SkipSync:         true,
-			IncludeCompacted: true,
-		})
-		if err != nil {
-			return fmt.Errorf("listing messages: %w", err)
-		}
-		// Convert at the cf boundary before replaying into internal state.
-		msgs = proto.FromSDKMessages(result.Messages)
+	// dgstore.Store.Replay returns []proto.Message in single-writer append
+	// (fold) order — no boundary conversion needed.
+	msgs, err := s.localStore.Replay()
+	if err != nil {
+		return fmt.Errorf("listing messages: %w", err)
 	}
 
 	// Bump the replay epoch exactly once per Replay so every entry rebuilt below
@@ -274,7 +202,7 @@ func (s *CampfireScripStore) Replay() error {
 	return nil
 }
 
-// ApplyMessage applies a single campfire message to the in-memory balance state
+// ApplyMessage applies a single scrip operation message to the in-memory balance state
 // in live mode (replaying == false). It is the public entry point for processing
 // messages received after initial Replay construction. Idempotent for duplicates.
 //
@@ -284,15 +212,15 @@ func (s *CampfireScripStore) Replay() error {
 //
 // ApplyMessage holds replayMu.RLock so it blocks while a Replay is in progress.
 // Multiple concurrent ApplyMessage calls are still allowed (shared read lock).
-func (s *CampfireScripStore) ApplyMessage(msg *proto.Message) {
+func (s *LocalScripStore) ApplyMessage(msg *proto.Message) {
 	s.replayMu.RLock()
 	defer s.replayMu.RUnlock()
 	s.applyMessage(msg)
 }
 
-// applyMessage applies a single campfire message to the in-memory balance state.
+// applyMessage applies a single scrip operation message to the in-memory balance state.
 // It is idempotent for messages already in seenMsgIDs.
-func (s *CampfireScripStore) applyMessage(msg *proto.Message) {
+func (s *LocalScripStore) applyMessage(msg *proto.Message) {
 	// Idempotency guard: skip messages we've already processed.
 	if _, loaded := s.seenMsgIDs.LoadOrStore(msg.ID, struct{}{}); loaded {
 		return
@@ -338,7 +266,7 @@ func (s *CampfireScripStore) applyMessage(msg *proto.Message) {
 
 // applyMint processes a scrip:mint message.
 // Payload: { "recipient": "<pubkey>", "amount": <int64>, ... }
-func (s *CampfireScripStore) applyMint(msg *proto.Message) {
+func (s *LocalScripStore) applyMint(msg *proto.Message) {
 	var p struct {
 		Recipient string `json:"recipient"`
 		Amount    int64  `json:"amount"`
@@ -354,7 +282,7 @@ func (s *CampfireScripStore) applyMint(msg *proto.Message) {
 // Payload: { "amount": <int64>, ... }
 // Note: burn destroys scrip that was already removed from a balance (e.g. via buy-hold).
 // It only affects totalBurned, not individual balances.
-func (s *CampfireScripStore) applyBurn(msg *proto.Message) {
+func (s *LocalScripStore) applyBurn(msg *proto.Message) {
 	var p struct {
 		Amount int64 `json:"amount"`
 	}
@@ -368,7 +296,7 @@ func (s *CampfireScripStore) applyBurn(msg *proto.Message) {
 // Payload: { "seller": "<pubkey>", "amount": <int64>, ... }
 // The operator pays the seller; operator balance is decremented, seller balance incremented.
 // For the store's purpose: we track both sides. The operator key is the message sender.
-func (s *CampfireScripStore) applyPutPay(msg *proto.Message) {
+func (s *LocalScripStore) applyPutPay(msg *proto.Message) {
 	var p struct {
 		Seller string `json:"seller"`
 		Amount int64  `json:"amount"`
@@ -389,7 +317,7 @@ func (s *CampfireScripStore) applyPutPay(msg *proto.Message) {
 // applyBuyHold processes a scrip:buy-hold message.
 // Payload: { "buyer": "<pubkey>", "amount": <int64>, ... }
 // Buyer's balance is decremented (escrow hold).
-func (s *CampfireScripStore) applyBuyHold(msg *proto.Message) {
+func (s *LocalScripStore) applyBuyHold(msg *proto.Message) {
 	var p struct {
 		Buyer  string `json:"buyer"`
 		Amount int64  `json:"amount"`
@@ -412,7 +340,7 @@ func (s *CampfireScripStore) applyBuyHold(msg *proto.Message) {
 // message for the matching fee, and applyBurn is the sole source of totalBurned
 // accounting. Counting it here too would double-count after Replay.
 // The operator identity is the message sender.
-func (s *CampfireScripStore) applySettle(msg *proto.Message) {
+func (s *LocalScripStore) applySettle(msg *proto.Message) {
 	var p struct {
 		Seller          string `json:"seller"`
 		Residual        int64  `json:"residual"`
@@ -435,7 +363,7 @@ func (s *CampfireScripStore) applySettle(msg *proto.Message) {
 // applyAssignPay processes a scrip:assign-pay message.
 // Payload: { "worker": "<pubkey>", "amount": <int64>, ... }
 // Operator pays laborer; operator balance decremented, worker balance incremented.
-func (s *CampfireScripStore) applyAssignPay(msg *proto.Message) {
+func (s *LocalScripStore) applyAssignPay(msg *proto.Message) {
 	var p struct {
 		Worker string `json:"worker"`
 		Amount int64  `json:"amount"`
@@ -455,7 +383,7 @@ func (s *CampfireScripStore) applyAssignPay(msg *proto.Message) {
 // applyDisputeRefund processes a scrip:dispute-refund message.
 // Payload: { "buyer": "<pubkey>", "amount": <int64>, ... }
 // Buyer's balance is restored (escrow released).
-func (s *CampfireScripStore) applyDisputeRefund(msg *proto.Message) {
+func (s *LocalScripStore) applyDisputeRefund(msg *proto.Message) {
 	var p struct {
 		Buyer  string `json:"buyer"`
 		Amount int64  `json:"amount"`
@@ -471,7 +399,7 @@ func (s *CampfireScripStore) applyDisputeRefund(msg *proto.Message) {
 // GetBudget implements SpendingStore.
 // pk is the Ed25519 agent pubkey (hex). rk is typically BalanceKey ("scrip:balance").
 // Returns (0, "", nil) if the agent has no balance record.
-func (s *CampfireScripStore) GetBudget(_ context.Context, pk, rk string) (int64, string, error) {
+func (s *LocalScripStore) GetBudget(_ context.Context, pk, rk string) (int64, string, error) {
 	_ = rk // rk is accepted for interface compat; all balances use a single counter per pk
 	// Hold replayMu.RLock across the whole capture-and-read so a concurrent
 	// Replay() map swap cannot hand back an ETag from an entry that is about to be
@@ -494,7 +422,7 @@ func (s *CampfireScripStore) GetBudget(_ context.Context, pk, rk string) (int64,
 // Atomically subtracts amountMicro from the balance at pk if result >= 0.
 // Returns ErrBudgetExceeded if balance < amountMicro.
 // Returns ErrConflict on ETag mismatch.
-func (s *CampfireScripStore) DecrementBudget(_ context.Context, pk, rk string, amountMicro int64, etag string) (int64, string, error) {
+func (s *LocalScripStore) DecrementBudget(_ context.Context, pk, rk string, amountMicro int64, etag string) (int64, string, error) {
 	_ = rk
 	if etag == "" {
 		return 0, "", ErrConflict
@@ -533,7 +461,7 @@ func (s *CampfireScripStore) DecrementBudget(_ context.Context, pk, rk string, a
 // AddBudget implements SpendingStore.
 // Adds amountMicro to the balance at pk. Creates the balance entry if it does not exist.
 // If etag is non-empty and stale, returns ErrConflict.
-func (s *CampfireScripStore) AddBudget(_ context.Context, pk, rk string, amountMicro int64, etag string) (int64, string, error) {
+func (s *LocalScripStore) AddBudget(_ context.Context, pk, rk string, amountMicro int64, etag string) (int64, string, error) {
 	_ = rk
 
 	// Hold replayMu.RLock across the ENTIRE capture-and-mutate (and the
@@ -574,7 +502,7 @@ func (s *CampfireScripStore) AddBudget(_ context.Context, pk, rk string, amountM
 }
 
 // SaveReservation implements SpendingStore.
-func (s *CampfireScripStore) SaveReservation(_ context.Context, r Reservation) error {
+func (s *LocalScripStore) SaveReservation(_ context.Context, r Reservation) error {
 	s.resMu.Lock()
 	defer s.resMu.Unlock()
 	s.reservations[r.ID] = r
@@ -582,7 +510,7 @@ func (s *CampfireScripStore) SaveReservation(_ context.Context, r Reservation) e
 }
 
 // GetReservation implements SpendingStore.
-func (s *CampfireScripStore) GetReservation(_ context.Context, id string) (Reservation, error) {
+func (s *LocalScripStore) GetReservation(_ context.Context, id string) (Reservation, error) {
 	s.resMu.RLock()
 	defer s.resMu.RUnlock()
 	r, ok := s.reservations[id]
@@ -593,7 +521,7 @@ func (s *CampfireScripStore) GetReservation(_ context.Context, id string) (Reser
 }
 
 // DeleteReservation implements SpendingStore.
-func (s *CampfireScripStore) DeleteReservation(_ context.Context, id string) error {
+func (s *LocalScripStore) DeleteReservation(_ context.Context, id string) error {
 	s.resMu.Lock()
 	defer s.resMu.Unlock()
 	if _, ok := s.reservations[id]; !ok {
@@ -606,7 +534,7 @@ func (s *CampfireScripStore) DeleteReservation(_ context.Context, id string) err
 // ConsumeReservation implements SpendingStore.
 // Atomically retrieves and deletes a reservation under resMu, eliminating the
 // TOCTOU window between GetReservation and DeleteReservation.
-func (s *CampfireScripStore) ConsumeReservation(_ context.Context, id string) (Reservation, error) {
+func (s *LocalScripStore) ConsumeReservation(_ context.Context, id string) (Reservation, error) {
 	s.resMu.Lock()
 	defer s.resMu.Unlock()
 	r, ok := s.reservations[id]
@@ -620,18 +548,18 @@ func (s *CampfireScripStore) ConsumeReservation(_ context.Context, id string) (R
 // --- Supply stats ---
 
 // TotalSupply returns total scrip ever minted (micro-tokens).
-func (s *CampfireScripStore) TotalSupply() int64 {
+func (s *LocalScripStore) TotalSupply() int64 {
 	return s.totalSupply.Load()
 }
 
 // TotalBurned returns total scrip ever burned (micro-tokens).
-func (s *CampfireScripStore) TotalBurned() int64 {
+func (s *LocalScripStore) TotalBurned() int64 {
 	return s.totalBurned.Load()
 }
 
 // Balance returns the current balance for the given agent key (micro-tokens).
 // Returns 0 for unknown agents.
-func (s *CampfireScripStore) Balance(agentKey string) int64 {
+func (s *LocalScripStore) Balance(agentKey string) int64 {
 	// Hold replayMu.RLock across the whole capture-and-read so a concurrent
 	// Replay() swap cannot make us read a discarded entry. Lock order:
 	// replayMu -> balancesMu -> entry.mu.
@@ -652,7 +580,7 @@ func (s *CampfireScripStore) Balance(agentKey string) int64 {
 
 // addToBalance adds amount to agentKey's balance, creating the entry if needed.
 // Called only from Replay/applyMessage — no locking beyond entry-level.
-func (s *CampfireScripStore) addToBalance(agentKey string, amount int64) {
+func (s *LocalScripStore) addToBalance(agentKey string, amount int64) {
 	s.balancesMu.Lock()
 	e, ok := s.balances[agentKey]
 	if !ok {
@@ -670,14 +598,14 @@ func (s *CampfireScripStore) addToBalance(agentKey string, amount int64) {
 // subtractFromBalance subtracts amount from agentKey's balance.
 //
 // During replay (s.replaying == true) negative balances are allowed: the
-// campfire log is the authority, and if the log is consistent the balance
+// event log is the authority, and if the log is consistent the balance
 // should never go negative in practice.
 //
 // In live mode (s.replaying == false) underflow is hard-rejected: if the
 // subtraction would produce a negative balance the function returns an error
 // without writing. This enforces the A12 constraint that a balance cannot go
 // below zero via any live code path.
-func (s *CampfireScripStore) subtractFromBalance(agentKey string, amount int64) error {
+func (s *LocalScripStore) subtractFromBalance(agentKey string, amount int64) error {
 	s.balancesMu.Lock()
 	e, ok := s.balances[agentKey]
 	if !ok {
@@ -723,7 +651,7 @@ func scripOp(tags []string) string {
 //   - loan_id must not already exist (idempotency handled by seenMsgIDs above)
 //
 // Design ref: docs/design/semantic-matching-marketplace.md §8.2
-func (s *CampfireScripStore) applyLoanMint(msg *proto.Message) {
+func (s *LocalScripStore) applyLoanMint(msg *proto.Message) {
 	var p LoanMintPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return
@@ -782,7 +710,7 @@ func (s *CampfireScripStore) applyLoanMint(msg *proto.Message) {
 //   - amount must be > 0
 //
 // Design ref: docs/design/semantic-matching-marketplace.md §9
-func (s *CampfireScripStore) applyLoanRepay(msg *proto.Message) {
+func (s *LocalScripStore) applyLoanRepay(msg *proto.Message) {
 	var p LoanRepayPayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return
@@ -833,7 +761,7 @@ func (s *CampfireScripStore) applyLoanRepay(msg *proto.Message) {
 //   - amount must be > 0
 //
 // Design ref: docs/design/semantic-matching-marketplace.md §9
-func (s *CampfireScripStore) applyLoanVigAccrue(msg *proto.Message) {
+func (s *LocalScripStore) applyLoanVigAccrue(msg *proto.Message) {
 	var p LoanVigAccruePayload
 	if err := json.Unmarshal(msg.Payload, &p); err != nil {
 		return
@@ -857,14 +785,14 @@ func (s *CampfireScripStore) applyLoanVigAccrue(msg *proto.Message) {
 // TotalLoanPrincipal returns the sum of all outstanding loan principals minted
 // via scrip:loan-mint. This is tracked separately from TotalSupply to allow
 // callers to distinguish base circulating scrip from loan-expanded supply.
-func (s *CampfireScripStore) TotalLoanPrincipal() int64 {
+func (s *LocalScripStore) TotalLoanPrincipal() int64 {
 	return s.totalLoanPrincipal.Load()
 }
 
 // TotalOutstandingVig returns the sum of accrued vig (LoanRecord.Outstanding)
 // across all active loans. This is the vig_pressure signal consumed by the
 // medium loop.
-func (s *CampfireScripStore) TotalOutstandingVig() int64 {
+func (s *LocalScripStore) TotalOutstandingVig() int64 {
 	s.loansMu.RLock()
 	defer s.loansMu.RUnlock()
 	var total int64
@@ -877,7 +805,7 @@ func (s *CampfireScripStore) TotalOutstandingVig() int64 {
 }
 
 // GetLoan returns the LoanRecord for loanID, and whether it exists.
-func (s *CampfireScripStore) GetLoan(loanID string) (*LoanRecord, bool) {
+func (s *LocalScripStore) GetLoan(loanID string) (*LoanRecord, bool) {
 	s.loansMu.RLock()
 	defer s.loansMu.RUnlock()
 	r, ok := s.loans[loanID]
@@ -886,7 +814,7 @@ func (s *CampfireScripStore) GetLoan(loanID string) (*LoanRecord, bool) {
 
 // LoansByBorrower returns the slice of loan IDs for the given borrower key.
 // The returned slice must not be modified by the caller.
-func (s *CampfireScripStore) LoansByBorrower(borrowerKey string) []string {
+func (s *LocalScripStore) LoansByBorrower(borrowerKey string) []string {
 	s.loansMu.RLock()
 	defer s.loansMu.RUnlock()
 	return s.loansByBorrower[borrowerKey]

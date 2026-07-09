@@ -9,7 +9,7 @@ package scrip_test
 // campfire_store_test.go already proves (ETag optimistic locking, atomic
 // ConsumeReservation, no double-spend under concurrent access, idempotent
 // replay) hold when the message source is swapped, using the *same*
-// scrip.CampfireScripStore type and the *same* SpendingStore interface —
+// scrip.LocalScripStore type and the *same* SpendingStore interface —
 // only the constructor and the underlying dgstore.Store differ.
 import (
 	"context"

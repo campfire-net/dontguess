@@ -5,21 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/campfire"
-	cfencoding "github.com/campfire-net/campfire/cf-protocol/encoding"
-	"github.com/campfire-net/campfire/pkg/identity"
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
-	"github.com/campfire-net/campfire/cf-protocol/transport/fs"
-
 	"github.com/campfire-net/dontguess/pkg/proto"
 	"github.com/campfire-net/dontguess/pkg/scrip"
+	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
 const (
@@ -29,136 +21,65 @@ const (
 	agentBob   = "bbbb000000000000000000000000000000000000000000000000000000000002"
 )
 
-// testEnv holds a minimal filesystem campfire environment for a single test.
-// It provides two clients — opClient (operator) and atkClient (attacker) — so
-// tests can send messages from different identities to exercise the operator gate.
+// testEnv holds a campfire-free local event log for a single test, plus two
+// opaque sender-key identifiers (operatorKey, attackerKey) so tests can append
+// scrip messages as the operator or as a forger and exercise the operator gate.
+// The transport swap (dontguess-b14) replaced the former filesystem-campfire
+// environment with a dgstore.Store; the operator gate still compares message
+// Sender against operatorKey, so every gate/ETag/double-spend assertion below
+// is preserved byte-for-byte — only how messages reach the store changed.
 type testEnv struct {
-	campfireID  string          // hex campfire public key
-	operatorKey string          // hex pubkey of the operator identity
-	attackerKey string          // hex pubkey of the attacker identity
-	opClient    *protocol.Client // sends as operator
-	atkClient   *protocol.Client // sends as attacker (for forged-message tests)
-	st          store.Store     // shared SQLite store (operator's)
+	campfireID  string // opaque exchange id (kept for record fidelity; unused by the fold)
+	operatorKey string // sender key treated as the operator
+	attackerKey string // a different sender key, used for forged-message tests
+	st          *dgstore.Store
+	seq         int64 // monotonic counter for unique message IDs / timestamps
 }
 
-// newTestEnv creates a temp filesystem campfire with two member identities
-// (operator and attacker). Both are registered as "full" members so Client.Send works.
+// newTestEnv opens a fresh temp-file-backed dgstore.Store and assigns two
+// distinct opaque sender keys. No campfire, no filesystem transport, no SQLite.
 func newTestEnv(t *testing.T) *testEnv {
 	t.Helper()
-
-	transportDir := t.TempDir()
-	storeDir := t.TempDir()
-
-	// Generate two distinct identities.
-	opID, err := identity.Generate()
+	st, err := dgstore.Open(dgstore.StorePath(t.TempDir()))
 	if err != nil {
-		t.Fatalf("generate operator identity: %v", err)
+		t.Fatalf("dgstore.Open: %v", err)
 	}
-	atkID, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generate attacker identity: %v", err)
-	}
-
-	// Open a shared store (both clients will share it — fine for tests since
-	// they run sequentially and Client is not goroutine-safe).
-	st, err := store.Open(filepath.Join(storeDir, "test.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
-	t.Cleanup(func() { st.Close() })
-
-	// Create a campfire identity for the campfire itself.
-	cfID, err := identity.Generate()
-	if err != nil {
-		t.Fatalf("generate campfire identity: %v", err)
-	}
-	campfireID := cfID.PublicKeyHex()
-
-	// Set up the campfire directory structure.
-	cfDir := filepath.Join(transportDir, campfireID)
-	for _, sub := range []string{"members", "messages"} {
-		if err := os.MkdirAll(filepath.Join(cfDir, sub), 0755); err != nil {
-			t.Fatalf("mkdir %s: %v", sub, err)
-		}
-	}
-
-	// Write campfire state file.
-	state := &campfire.CampfireState{
-		PublicKey:             cfID.PublicKey,
-		PrivateKey:            cfID.PrivateKey,
-		JoinProtocol:          "open",
-		ReceptionRequirements: []string{},
-		CreatedAt:             time.Now().UnixNano(),
-	}
-	stateData, err := cfencoding.Marshal(state)
-	if err != nil {
-		t.Fatalf("marshal campfire state: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(cfDir, "campfire.cbor"), stateData, 0644); err != nil {
-		t.Fatalf("write campfire state: %v", err)
-	}
-
-	tr := fs.New(transportDir)
-
-	// Register both identities as full members on disk and in the store.
-	for _, id := range []*identity.Identity{opID, atkID} {
-		if err := tr.WriteMember(campfireID, campfire.MemberRecord{
-			PublicKey: id.PublicKey,
-			JoinedAt:  time.Now().UnixNano(),
-			Role:      campfire.RoleFull,
-		}); err != nil {
-			t.Fatalf("WriteMember(%x): %v", id.PublicKey, err)
-		}
-	}
-
-	// Add a single membership record — both clients share the same store, and the
-	// campfire membership record is keyed by campfireID (not by member pubkey), so
-	// one record is sufficient for both clients to look up the transport dir.
-	if err := st.AddMembership(store.Membership{
-		CampfireID:    campfireID,
-		TransportDir:  tr.CampfireDir(campfireID),
-		JoinProtocol:  "open",
-		Role:          campfire.RoleFull,
-		JoinedAt:      time.Now().UnixNano(),
-		Threshold:     1,
-		TransportType: "filesystem",
-	}); err != nil {
-		t.Fatalf("AddMembership: %v", err)
-	}
-
+	t.Cleanup(func() { _ = st.Close() })
 	return &testEnv{
-		campfireID:  campfireID,
-		operatorKey: opID.PublicKeyHex(),
-		attackerKey: atkID.PublicKeyHex(),
-		opClient:    protocol.New(st, opID),
-		atkClient:   protocol.New(st, atkID),
+		campfireID:  "eeee000000000000000000000000000000000000000000000000000000000000",
+		operatorKey: "0000000000000000000000000000000000000000000000000000000000000001",
+		attackerKey: "0000000000000000000000000000000000000000000000000000000000000002",
 		st:          st,
 	}
 }
 
-// addMsg sends a scrip convention message via the given client.
-// The message sender is determined by the client's identity — callers use
-// env.opClient to send operator messages and env.atkClient to send forged messages.
-func addMsg(t *testing.T, client *protocol.Client, campfireID, op string, payload any, tags ...string) {
+// addMsg appends a scrip convention message to the local event log with the
+// given sender key. Callers pass env.operatorKey to append operator messages
+// and env.attackerKey to append forged messages. Each record gets a unique ID
+// and a monotonic timestamp so the single-writer append order is deterministic.
+func addMsg(t *testing.T, env *testEnv, sender, op string, payload any, tags ...string) {
 	t.Helper()
 	rawPayload, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("marshal payload: %v", err)
 	}
+	env.seq++
 	allTags := append([]string{op}, tags...)
-	if _, err := client.Send(protocol.SendRequest{
-		CampfireID: campfireID,
+	if err := env.st.Append(dgstore.Record{
+		ID:         fmt.Sprintf("msg-%d", env.seq),
+		CampfireID: env.campfireID,
+		Sender:     sender,
 		Payload:    rawPayload,
 		Tags:       allTags,
+		Timestamp:  env.seq,
 	}); err != nil {
-		t.Fatalf("client.Send(%s): %v", op, err)
+		t.Fatalf("append(%s): %v", op, err)
 	}
 }
 
-// buildMsg constructs a proto.Message without sending it to any store.
+// buildMsg constructs a proto.Message without appending it to any store.
 // Used to test ApplyMessage (live-mode path) directly.
-// sender must be the hex pubkey of the operator (env.operatorKey) so that
-// the operator gate accepts the message.
+// sender must be the operator key (env.operatorKey) so the operator gate accepts it.
 func buildMsg(t *testing.T, campfireID, sender, op string, payload any, tags ...string) proto.Message {
 	t.Helper()
 	rawPayload, err := json.Marshal(payload)
@@ -181,15 +102,13 @@ func randomID(t *testing.T) string {
 	return time.Now().Format("20060102150405.999999999") + t.Name()
 }
 
-// newStore creates a CampfireScripStore using a read-only protocol.Client (no identity)
-// wrapping env's store. The operator key is set to env.operatorKey.
-func newStore(t *testing.T, env *testEnv) *scrip.CampfireScripStore {
+// newStore creates a LocalScripStore over env's campfire-free event log with
+// the operator key set to env.operatorKey.
+func newStore(t *testing.T, env *testEnv) *scrip.LocalScripStore {
 	t.Helper()
-	// Read-only client: pass nil identity — Replay only reads, never sends.
-	client := protocol.New(env.st, nil)
-	cs, err := scrip.NewCampfireScripStore(env.campfireID, client, env.operatorKey)
+	cs, err := scrip.NewLocalScripStore(env.st, env.operatorKey)
 	if err != nil {
-		t.Fatalf("NewCampfireScripStore: %v", err)
+		t.Fatalf("NewLocalScripStore: %v", err)
 	}
 	return cs
 }
@@ -217,7 +136,7 @@ func TestGetBudget_AfterMint(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Mint 1000 micro-tokens to Alice.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-001",
@@ -274,7 +193,7 @@ func TestAddBudget_CreatesEntry(t *testing.T) {
 func TestAddBudget_IncrementExisting(t *testing.T) {
 	env := newTestEnv(t)
 	// Seed 1000 via mint.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-002",
@@ -299,7 +218,7 @@ func TestAddBudget_IncrementExisting(t *testing.T) {
 
 func TestAddBudget_ConflictOnStalEtag(t *testing.T) {
 	env := newTestEnv(t)
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-003",
@@ -325,7 +244,7 @@ func TestAddBudget_ConflictOnStalEtag(t *testing.T) {
 
 func TestDecrementBudget_Success(t *testing.T) {
 	env := newTestEnv(t)
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(2000),
 		"x402_tx_ref": "tx-010",
@@ -353,7 +272,7 @@ func TestDecrementBudget_Success(t *testing.T) {
 
 func TestDecrementBudget_BudgetExceeded(t *testing.T) {
 	env := newTestEnv(t)
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(100),
 		"x402_tx_ref": "tx-011",
@@ -378,7 +297,7 @@ func TestDecrementBudget_BudgetExceeded(t *testing.T) {
 
 func TestDecrementBudget_ConflictOnStaleEtag(t *testing.T) {
 	env := newTestEnv(t)
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-012",
@@ -399,7 +318,7 @@ func TestDecrementBudget_ConflictOnStaleEtag(t *testing.T) {
 
 func TestDecrementBudget_EmptyEtagConflict(t *testing.T) {
 	env := newTestEnv(t)
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-013",
@@ -581,14 +500,14 @@ func TestReplay_MintAndBalance(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Mint 3000 to Alice.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(3000),
 		"x402_tx_ref": "tx-r01",
 		"rate":        int64(1000),
 	})
 	// Mint 1000 to Bob.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentBob,
 		"amount":      int64(1000),
 		"x402_tx_ref": "tx-r02",
@@ -612,14 +531,14 @@ func TestReplay_PutPay(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Seed operator balance via mint to self.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   env.operatorKey,
 		"amount":      int64(10000),
 		"x402_tx_ref": "tx-op",
 		"rate":        int64(1000),
 	})
 	// Operator pays Alice for a put.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-put-pay", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-put-pay", map[string]any{
 		"seller":       agentAlice,
 		"amount":       int64(700),
 		"token_cost":   int64(1000),
@@ -644,14 +563,14 @@ func TestReplay_BuyHoldAndDisputeRefund(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Alice minted 2000.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(2000),
 		"x402_tx_ref": "tx-r10",
 		"rate":        int64(1000),
 	})
 	// Alice buy-hold for 500 (price=450 + fee=50).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-buy-hold", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
 		"buyer":          agentAlice,
 		"amount":         int64(500),
 		"price":          int64(450),
@@ -668,7 +587,7 @@ func TestReplay_BuyHoldAndDisputeRefund(t *testing.T) {
 	}
 
 	// Dispute refund: full 500 back to Alice.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-dispute-refund", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-dispute-refund", map[string]any{
 		"buyer":          agentAlice,
 		"amount":         int64(500),
 		"reservation_id": "res-bh-001",
@@ -688,25 +607,25 @@ func TestReplay_SettleResidualAndBurn(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Seed: operator=5000, Alice=2000 (seller), Bob=1000 (buyer).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": env.operatorKey, "amount": int64(5000), "x402_tx_ref": "op-tx", "rate": int64(1000),
 	})
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(2000), "x402_tx_ref": "alice-tx", "rate": int64(1000),
 	})
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentBob, "amount": int64(1000), "x402_tx_ref": "bob-tx", "rate": int64(1000),
 	})
 
 	// Bob buys (hold 500 = price 450 + fee 50).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-buy-hold", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
 		"buyer": agentBob, "amount": int64(500), "price": int64(450), "fee": int64(50),
 		"reservation_id": "res-settle-001", "buy_msg": "buy-002",
 		"expires_at": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
 	})
 
 	// Settle: residual=90 to Alice (seller), fee_burned=50, exchange_revenue=360 to operator.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-settle", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-settle", map[string]any{
 		"reservation_id":   "res-settle-001",
 		"seller":           agentAlice,
 		"residual":         int64(90),
@@ -717,7 +636,7 @@ func TestReplay_SettleResidualAndBurn(t *testing.T) {
 	})
 	// The engine also emits a scrip-burn message for the matching fee.
 	// This is the sole source of totalBurned — applySettle does NOT double-count it.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-burn", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-burn", map[string]any{
 		"amount": int64(50),
 		"reason": "matching-fee",
 	})
@@ -747,11 +666,11 @@ func TestReplay_AssignPay(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Seed operator.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": env.operatorKey, "amount": int64(5000), "x402_tx_ref": "op2", "rate": int64(1000),
 	})
 	// Pay Bob for labor.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-assign-pay", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-assign-pay", map[string]any{
 		"worker":      agentBob,
 		"amount":      int64(300),
 		"task_type":   "validate",
@@ -773,7 +692,7 @@ func TestReplay_BurnOnly(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Burn message (no balance change — just total burned).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-burn", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-burn", map[string]any{
 		"amount": int64(200),
 		"reason": "matching-fee",
 	})
@@ -796,14 +715,14 @@ func TestReplay_SettleBurnNoDoubleCount(t *testing.T) {
 	const fee = int64(100)
 
 	// Bob buys; hold removes scrip from buyer.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-buy-hold", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
 		"buyer": agentBob, "amount": fee * 5, "price": fee * 4, "fee": fee,
 		"reservation_id": "res-double-001", "buy_msg": "buy-001",
 		"expires_at": time.Now().Add(5 * time.Minute).UTC().Format(time.RFC3339),
 	})
 
 	// Engine emits scrip-settle (contains fee_burned in payload).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-settle", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-settle", map[string]any{
 		"reservation_id":   "res-double-001",
 		"seller":           agentAlice,
 		"residual":         int64(40),
@@ -814,7 +733,7 @@ func TestReplay_SettleBurnNoDoubleCount(t *testing.T) {
 	})
 
 	// Engine also emits scrip-burn for the same matching fee.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-burn", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-burn", map[string]any{
 		"amount": fee,
 		"reason": "matching-fee",
 	})
@@ -829,7 +748,7 @@ func TestReplay_SettleBurnNoDoubleCount(t *testing.T) {
 func TestReplay_IdempotentReplay(t *testing.T) {
 	env := newTestEnv(t)
 
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(1000), "x402_tx_ref": "tx-idem", "rate": int64(1000),
 	})
 
@@ -853,7 +772,7 @@ func TestReplay_IdempotentReplay(t *testing.T) {
 func TestFullRoundTrip_PreDecrementAdjustRefund(t *testing.T) {
 	env := newTestEnv(t)
 	// Seed Alice with 5000.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(5000), "x402_tx_ref": "tx-rt", "rate": int64(1000),
 	})
 
@@ -927,7 +846,7 @@ func TestOperatorGate_ForgedMintRejected(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Forged mint: attacker tries to mint 9999 to themselves.
-	addMsg(t, env.atkClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.attackerKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   env.attackerKey,
 		"amount":      int64(9999),
 		"x402_tx_ref": "forged-tx-001",
@@ -951,7 +870,7 @@ func TestOperatorGate_LegitimateOperatorMintAccepted(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Legitimate mint from the operator.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(5000),
 		"x402_tx_ref": "legit-tx-001",
@@ -974,15 +893,15 @@ func TestOperatorGate_MixedMints(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Attacker mints to themselves (should be rejected).
-	addMsg(t, env.atkClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.attackerKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": env.attackerKey, "amount": int64(9999), "x402_tx_ref": "forged-01", "rate": int64(1000),
 	})
 	// Operator mints to Alice (should be accepted).
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(1000), "x402_tx_ref": "legit-01", "rate": int64(1000),
 	})
 	// Attacker mints to Alice (should be rejected).
-	addMsg(t, env.atkClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.attackerKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(8888), "x402_tx_ref": "forged-02", "rate": int64(1000),
 	})
 
@@ -1005,15 +924,14 @@ func TestOperatorGate_EmptyKeyDisablesCheck(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Mint from a non-operator sender — should be accepted when OperatorKey is "".
-	addMsg(t, env.atkClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.attackerKey, "dontguess:scrip-mint", map[string]any{
 		"recipient": agentAlice, "amount": int64(500), "x402_tx_ref": "any-sender", "rate": int64(1000),
 	})
 
-	// Use a read-only client with empty operator key.
-	client := protocol.New(env.st, nil)
-	cs, err := scrip.NewCampfireScripStore(env.campfireID, client, "")
+	// Empty operator key disables the operator gate.
+	cs, err := scrip.NewLocalScripStore(env.st, "")
 	if err != nil {
-		t.Fatalf("NewCampfireScripStore: %v", err)
+		t.Fatalf("NewLocalScripStore: %v", err)
 	}
 
 	if bal := cs.Balance(agentAlice); bal != 500 {
@@ -1030,7 +948,7 @@ func TestReplay_NegativeBalanceAllowed(t *testing.T) {
 	env := newTestEnv(t)
 
 	// buy-hold without a prior mint — replay must not reject it.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-buy-hold", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
 		"buyer":  agentAlice,
 		"amount": int64(500),
 	})
@@ -1050,7 +968,7 @@ func TestReplay_NegativeBalance_SubsequentDecrementBudgetFails(t *testing.T) {
 	env := newTestEnv(t)
 
 	// buy-hold without a prior mint → negative balance after replay.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-buy-hold", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-buy-hold", map[string]any{
 		"buyer":  agentAlice,
 		"amount": int64(500),
 	})
@@ -1086,7 +1004,7 @@ func TestLiveMode_SubtractFromBalance_RejectsUnderflow(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Mint 200 to Alice so she has a positive balance post-replay.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", map[string]any{
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", map[string]any{
 		"recipient":   agentAlice,
 		"amount":      int64(200),
 		"x402_tx_ref": "tx-live-reject",
@@ -1207,7 +1125,7 @@ func TestLoanMint_LoanRecordStored(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentAlice,
 		Principal:         500,
 		VigRateBPS:        200,
@@ -1263,7 +1181,7 @@ func TestLoanMint_TotalSupplyInvariant(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Regular mint for 1000 to Bob.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripMint, scrip.MintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripMint, scrip.MintPayload{
 		Recipient: agentBob,
 		Amount:    1000,
 		Rate:      1000,
@@ -1271,7 +1189,7 @@ func TestLoanMint_TotalSupplyInvariant(t *testing.T) {
 
 	// Loan mint for 500 to Alice.
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentAlice,
 		Principal:         500,
 		VigRateBPS:        200,
@@ -1300,7 +1218,7 @@ func TestLoanMint_Replay(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(12 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentAlice,
 		Principal:         300,
 		VigRateBPS:        100,
@@ -1403,7 +1321,7 @@ func TestLoanMint_DuplicateLoanID_Idempotent(t *testing.T) {
 		SettlementMsgID:   "settle-dup",
 		CommitmentTokenID: "token-dup",
 	}
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, payload)
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, payload)
 
 	// Second message — same loan_id, different message ID (seenMsgIDs won't filter it).
 	payload2 := scrip.LoanMintPayload{
@@ -1415,7 +1333,7 @@ func TestLoanMint_DuplicateLoanID_Idempotent(t *testing.T) {
 		SettlementMsgID:   "settle-dup-2",
 		CommitmentTokenID: "token-dup-2",
 	}
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, payload2)
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, payload2)
 
 	cs := newStore(t, env)
 
@@ -1438,17 +1356,17 @@ func TestLoanMint_InvalidPayload_Rejected(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Missing borrower.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, map[string]any{
 		"principal": int64(100),
 		"loan_id":   "loan-no-borrower",
 	})
 	// Missing loan_id.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, map[string]any{
 		"borrower":  agentAlice,
 		"principal": int64(100),
 	})
 	// Zero principal.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, map[string]any{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, map[string]any{
 		"borrower":  agentAlice,
 		"loan_id":   "loan-zero-principal",
 		"principal": int64(0),
@@ -1470,7 +1388,7 @@ func TestLoanMint_MultipleBorrowers(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentAlice,
 		Principal:         600,
 		VigRateBPS:        200,
@@ -1479,7 +1397,7 @@ func TestLoanMint_MultipleBorrowers(t *testing.T) {
 		SettlementMsgID:   "settle-a1",
 		CommitmentTokenID: "token-a1",
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentAlice,
 		Principal:         400,
 		VigRateBPS:        150,
@@ -1488,7 +1406,7 @@ func TestLoanMint_MultipleBorrowers(t *testing.T) {
 		SettlementMsgID:   "settle-a2",
 		CommitmentTokenID: "token-a2",
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:          agentBob,
 		Principal:         200,
 		VigRateBPS:        300,
@@ -1534,7 +1452,7 @@ func TestLoanRepay_PartialRepay(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 1000,
 		DueAt:     dueAt,
@@ -1542,7 +1460,7 @@ func TestLoanRepay_PartialRepay(t *testing.T) {
 	})
 
 	// Partial repayment: 400 of 1000.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-repay-partial",
 		Amount: 400,
 	})
@@ -1574,7 +1492,7 @@ func TestLoanRepay_FullRepay(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 800,
 		DueAt:     dueAt,
@@ -1582,7 +1500,7 @@ func TestLoanRepay_FullRepay(t *testing.T) {
 	})
 
 	// Full repayment in one message.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-repay-full",
 		Amount: 800,
 	})
@@ -1614,18 +1532,18 @@ func TestLoanRepay_TwoInstalmentsFullRepay(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 600,
 		DueAt:     dueAt,
 		LoanID:    "loan-repay-two",
 	})
 
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-repay-two",
 		Amount: 300,
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-repay-two",
 		Amount: 300,
 	})
@@ -1652,7 +1570,7 @@ func TestLoanRepay_TwoInstalmentsFullRepay(t *testing.T) {
 func TestLoanRepay_UnknownLoan_Ignored(t *testing.T) {
 	env := newTestEnv(t)
 
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "does-not-exist",
 		Amount: 500,
 	})
@@ -1670,19 +1588,19 @@ func TestLoanRepay_AlreadyRepaid_Ignored(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 200,
 		DueAt:     dueAt,
 		LoanID:    "loan-already-repaid",
 	})
 	// Full repayment.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-already-repaid",
 		Amount: 200,
 	})
 	// Attempt second repayment — must be ignored.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-already-repaid",
 		Amount: 100,
 	})
@@ -1713,14 +1631,14 @@ func TestLoanVigAccrue_AccruesToOutstanding(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 1000,
 		DueAt:     dueAt,
 		LoanID:    "loan-vig-accrue",
 	})
 
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 		LoanID: "loan-vig-accrue",
 		Amount: 50,
 	})
@@ -1749,7 +1667,7 @@ func TestLoanVigAccrue_Cumulative(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 1000,
 		DueAt:     dueAt,
@@ -1757,7 +1675,7 @@ func TestLoanVigAccrue_Cumulative(t *testing.T) {
 	})
 
 	for _, amt := range []int64{20, 30, 15} {
-		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 			LoanID: "loan-vig-cumulative",
 			Amount: amt,
 		})
@@ -1779,7 +1697,7 @@ func TestLoanVigAccrue_Cumulative(t *testing.T) {
 func TestLoanVigAccrue_UnknownLoan_Ignored(t *testing.T) {
 	env := newTestEnv(t)
 
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 		LoanID: "ghost-loan",
 		Amount: 99,
 	})
@@ -1797,18 +1715,18 @@ func TestLoanVigAccrue_RepaidLoan_Ignored(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 500,
 		DueAt:     dueAt,
 		LoanID:    "loan-vig-repaid",
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-vig-repaid",
 		Amount: 500,
 	})
 	// Try to accrue vig after repayment — must be ignored.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 		LoanID: "loan-vig-repaid",
 		Amount: 25,
 	})
@@ -1839,30 +1757,30 @@ func TestTotalOutstandingVig_AcrossLoans(t *testing.T) {
 		{"loan-vig-sum-a", 100},
 		{"loan-vig-sum-b", 200},
 	} {
-		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+		addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 			Borrower:  agentAlice,
 			Principal: 1000,
 			DueAt:     dueAt,
 			LoanID:    args.loanID,
 		})
-		addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+		addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 			LoanID: args.loanID,
 			Amount: args.amt,
 		})
 	}
 
 	// One fully-repaid loan with vig that was accrued before repayment.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentBob,
 		Principal: 300,
 		DueAt:     dueAt,
 		LoanID:    "loan-vig-sum-c",
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 		LoanID: "loan-vig-sum-c",
 		Amount: 50,
 	})
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-vig-sum-c",
 		Amount: 300,
 	})
@@ -1885,7 +1803,7 @@ func TestLoanRepay_ClearsOutstandingVig(t *testing.T) {
 	env := newTestEnv(t)
 
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: 1000,
 		DueAt:     dueAt,
@@ -1893,13 +1811,13 @@ func TestLoanRepay_ClearsOutstandingVig(t *testing.T) {
 	})
 
 	// Accrue vig before repayment.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanVigAccrue, scrip.LoanVigAccruePayload{
 		LoanID: "loan-repay-clears-vig",
 		Amount: 50,
 	})
 
 	// Full repayment.
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanRepay, scrip.LoanRepayPayload{
 		LoanID: "loan-repay-clears-vig",
 		Amount: 1000,
 	})
@@ -1939,7 +1857,7 @@ func TestStore_ReplayRaceWindow(t *testing.T) {
 	env := newTestEnv(t)
 
 	// Seed the campfire log with a mint so Replay has data to process.
-	addMsg(t, env.opClient, env.campfireID, "dontguess:scrip-mint", struct {
+	addMsg(t, env, env.operatorKey, "dontguess:scrip-mint", struct {
 		Recipient string `json:"recipient"`
 		Amount    int64  `json:"amount"`
 	}{agentAlice, 10_000})
@@ -2003,7 +1921,7 @@ func TestLoanRepay_ConcurrentPartialRepay_NoPrincipalDoubleDecrement(t *testing.
 	// Mint the loan via the campfire message log so the store can replay it.
 	const principal = 1000
 	dueAt := time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339)
-	addMsg(t, env.opClient, env.campfireID, scrip.TagScripLoanMint, scrip.LoanMintPayload{
+	addMsg(t, env, env.operatorKey, scrip.TagScripLoanMint, scrip.LoanMintPayload{
 		Borrower:  agentAlice,
 		Principal: principal,
 		DueAt:     dueAt,

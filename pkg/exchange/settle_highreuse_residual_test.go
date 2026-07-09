@@ -41,7 +41,7 @@ func buildHighReuseSettleChain(
 	t *testing.T,
 	h *testHarness,
 	eng *exchange.Engine,
-	cs *scrip.CampfireScripStore,
+	cs *scrip.LocalScripStore,
 	desc string,
 	contentType string,
 	putPrice int64,

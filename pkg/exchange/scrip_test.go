@@ -84,7 +84,7 @@ func addScripPutPayMsg(t *testing.T, h *testHarness, putMsgID, seller string, am
 // newCampfireScripStore creates a CampfireScripStore backed by the harness store.
 // Must be called after all mint messages are written so Replay sees them.
 // Uses the harness operator identity as the operator key.
-func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.CampfireScripStore {
+func newCampfireScripStore(t *testing.T, h *testHarness) *scrip.LocalScripStore {
 	t.Helper()
 	cs, err := scrip.NewLocalScripStore(h.st, h.operator.PublicKeyHex())
 	if err != nil {

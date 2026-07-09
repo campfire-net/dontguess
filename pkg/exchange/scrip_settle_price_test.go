@@ -30,7 +30,7 @@ func buildSettleChainForPriceTests(
 	t *testing.T,
 	h *testHarness,
 	eng *exchange.Engine,
-	cs *scrip.CampfireScripStore,
+	cs *scrip.LocalScripStore,
 	entryDesc string,
 	putPrice int64,
 ) (res scrip.Reservation, deliverMsg *exchange.Message, salePrice int64) {

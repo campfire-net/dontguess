@@ -1,13 +1,11 @@
 package exchange
 
 import (
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-
 	"github.com/campfire-net/dontguess/pkg/proto"
 	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
-// Message is the dontguess-owned representation of a campfire message used
+// Message is the dontguess-owned representation of an exchange message used
 // throughout the exchange engine and state machine.
 //
 // It is a type alias for proto.Message so that pkg/scrip can also use the same
@@ -39,39 +37,4 @@ func FromStoreRecords(recs []dgstore.Record) []Message {
 		msgs[i] = recs[i].ToMessage()
 	}
 	return msgs
-}
-
-// FromSDKMessage converts a protocol.Message (from the campfire SDK) to a *Message.
-// Used at the Subscribe/Read boundary when ReadClient is configured.
-func FromSDKMessage(m *protocol.Message) *Message {
-	if m == nil {
-		return nil
-	}
-	tags := m.Tags
-	if tags == nil {
-		tags = []string{}
-	}
-	antecedents := m.Antecedents
-	if antecedents == nil {
-		antecedents = []string{}
-	}
-	return &Message{
-		ID:          m.ID,
-		CampfireID:  m.CampfireID,
-		Sender:      m.Sender,
-		Payload:     m.Payload,
-		Tags:        tags,
-		Antecedents: antecedents,
-		Timestamp:   m.Timestamp,
-		Instance:    m.Instance,
-	}
-}
-
-// FromSDKMessages converts a slice of protocol.Message to []Message.
-func FromSDKMessages(msgs []protocol.Message) []Message {
-	result := make([]Message, len(msgs))
-	for i := range msgs {
-		result[i] = *FromSDKMessage(&msgs[i])
-	}
-	return result
 }

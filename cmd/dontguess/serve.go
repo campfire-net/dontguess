@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -16,13 +17,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/campfire-net/campfire/cf-protocol/protocol"
-	"github.com/campfire-net/campfire/cf-protocol/store"
 	"github.com/campfire-net/dontguess/pkg/exchange"
 	"github.com/campfire-net/dontguess/pkg/identity"
 	"github.com/campfire-net/dontguess/pkg/matching"
 	"github.com/campfire-net/dontguess/pkg/relay"
-	"github.com/campfire-net/dontguess/pkg/scrip"
 	dgstore "github.com/campfire-net/dontguess/pkg/store"
 	"github.com/spf13/cobra"
 	"gopkg.in/natefinch/lumberjack.v2"
@@ -37,10 +35,8 @@ var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
 	serveAutoAcceptMax int64
-	// serveLocal selects the standalone local-only cache mode (dontguess-275):
-	// no campfire relay, no campfire identity, no scrip network dependency.
-	// Ingest and egress both go through a local pkg/store event log instead
-	// of a campfire ReadClient/WriteClient — see runServeLocal.
+	// serveLocal is a retained no-op alias flag (dontguess-b14): the default
+	// serve path is already campfire-free/local, so --local changes nothing.
 	serveLocal bool
 
 	// operatorConnDeadline is the per-connection deadline applied both initially
@@ -48,33 +44,30 @@ var (
 	// Exposed as a package-level variable so tests can shorten it without changing
 	// production behaviour. Default is 5 seconds.
 	operatorConnDeadline = 5 * time.Second
-
-	// fleetRefreshInterval is how often the serve loop re-reads campfire
-	// membership and reconciles the fleet allowlist KeySet — admitting members
-	// who joined and revoking (de-allowlisting) members who left AFTER startup.
-	// Without this, the allowlist was a one-shot snapshot taken at serve start
-	// and never updated (dontguess-1a2). Package-level so tests can shorten it.
-	fleetRefreshInterval = 60 * time.Second
 )
 
 var serveCmd = &cobra.Command{
 	Use:   "serve",
 	Short: "Run the exchange engine",
-	Long: `Start the DontGuess exchange engine. The engine subscribes to the campfire
-for new messages (put, buy, settle) and processes them via the SDK Subscribe API.
+	Long: `Start the DontGuess exchange engine. The engine is campfire-free: ingest and
+egress both go through a local append-only event log under DG_HOME (pkg/store).
+No 'dontguess init', no campfire join, no campfire identity — the operator key
+and store file are created on first run.
 
   dontguess serve                      # default: 500ms poll, auto-accept puts
   dontguess serve --poll-interval 1s   # slower poll
   dontguess serve --no-auto-accept     # manual put approval only
-  dontguess serve --local              # standalone: no relay, no identity, no scrip network dep
 
-The SDK's sync-before-query handles filesystem transport sync automatically.
+Relay federation (optional, nostr): set DONTGUESS_RELAY_URL for a single relay,
+or DONTGUESS_RELAY_URLS (comma-separated) for several, e.g.
 
---local runs a single-agent, campfire-free cache instead: ingest and egress
-both go through a local append-only event log under DG_HOME
-(dontguess-275). No 'dontguess init' step, no campfire join, no relay
-identity is required — the operator key and store file are created on first
-run.`,
+  DONTGUESS_RELAY_URLS=ws://192.168.2.40:7777,ws://192.168.2.41:7777 dontguess serve
+
+Each relay gets its own Intake (subscribe) + Outbox (publish) leg tailing the
+same local log; both legs are off the buy/match hot path. When any relay is
+configured the operator signs with a persisted secp256k1 (nostr) identity.
+
+--local is accepted as a no-op alias (the default path is already local).`,
 	RunE: runServe,
 }
 
@@ -82,139 +75,50 @@ func init() {
 	serveCmd.Flags().DurationVar(&servePollInterval, "poll-interval", 500*time.Millisecond, "how often to poll for new messages")
 	serveCmd.Flags().BoolVar(&serveAutoAccept, "auto-accept", true, "automatically accept all puts at token cost")
 	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", DefaultAutoAcceptMax, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
-	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "standalone local-only cache: no campfire relay/identity/scrip network dependency (dontguess-275)")
+	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "no-op alias: serve is always campfire-free/local (retained for backward compatibility)")
 	rootCmd.AddCommand(serveCmd)
 }
 
 func runServe(_ *cobra.Command, _ []string) error {
-	if serveLocal {
-		return runServeLocal(resolveDGHome())
+	// serve is always campfire-free; --local is a retained no-op alias.
+	return runServeLocal(resolveDGHome())
+}
+
+// resolveRelayURLs returns the ordered, de-duplicated set of relay websocket
+// URLs the operator federates over. It reads DONTGUESS_RELAY_URLS
+// (comma-separated) followed by the legacy single DONTGUESS_RELAY_URL; empty
+// entries are skipped and duplicates collapsed, preserving first-seen order.
+func resolveRelayURLs() []string {
+	var raw []string
+	if v := strings.TrimSpace(os.Getenv("DONTGUESS_RELAY_URLS")); v != "" {
+		raw = append(raw, strings.Split(v, ",")...)
 	}
-	// Build two clients via protocol.InitWithConfig — both share the same identity and store file.
-	// ReadClient subscribes to the campfire; WriteClient sends operator messages.
-	// SDK handles CF_HOME env and ~/.cf default via config cascade.
-	// SDK sync-before-query handles filesystem transport sync automatically.
-	readClient, initResult, err := protocol.InitWithConfig()
-	if err != nil {
-		return fmt.Errorf("protocol.InitWithConfig (read client): %w", err)
+	if v := strings.TrimSpace(os.Getenv("DONTGUESS_RELAY_URL")); v != "" {
+		raw = append(raw, v)
 	}
-	defer readClient.Close() //nolint:errcheck
-
-	// Derive config directory and db path from the resolved store path.
-	cfHome := filepath.Dir(initResult.StorePath)
-	dbPath := initResult.StorePath
-	// DG_HOME is the dontguess state directory — resolved once here via the
-	// shared resolveDGHome() from dgpath.go, then passed to helpers that need
-	// it (e.g. buildLogDest) so they don't re-derive it from the environment.
-	dgHome := resolveDGHome()
-
-	cfg, err := exchange.LoadConfig(cfHome)
-	if err != nil {
-		return fmt.Errorf("load config (did you run 'dontguess init'?): %w", err)
+	seen := make(map[string]struct{})
+	out := make([]string, 0, len(raw))
+	for _, u := range raw {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if _, ok := seen[u]; ok {
+			continue
+		}
+		seen[u] = struct{}{}
+		out = append(out, u)
 	}
+	return out
+}
 
-	writeClient, _, err := protocol.InitWithConfig()
-	if err != nil {
-		return fmt.Errorf("protocol.InitWithConfig (write client): %w", err)
-	}
-	defer writeClient.Close() //nolint:errcheck
-
-	// Open a shared store for the exchange engine (Store field in EngineOptions).
-	st, err := store.Open(dbPath)
-	if err != nil {
-		return fmt.Errorf("opening store %s: %w", dbPath, err)
-	}
-	defer st.Close()
-
-	cs, err := scrip.NewCampfireScripStore(cfg.ExchangeCampfireID, readClient, cfg.OperatorKeyHex)
-	if err != nil {
-		return fmt.Errorf("creating scrip store: %w", err)
-	}
-
-	logDest, err := buildLogDest(dgHome)
-	if err != nil {
-		return fmt.Errorf("log setup: %w", err)
-	}
-	logger := log.New(logDest, "[exchange] ", log.LstdFlags|log.Lmsgprefix)
-
-	// Trust gate (replaces the former campfire provenance store):
-	//   - the operator key gets operator write authority (match/settle(put-*)/mint/burn);
-	//   - every current campfire member is admitted to the fleet allowlist so they
-	//     can put/settle-buyer/assign immediately.
-	// Campfire keys are ed25519 and do not parse as secp256k1 npubs, so the
-	// membership is a plain KeySet rather than identity.Allowlist here; the nostr
-	// transport swap re-homes this onto identity.Allowlist over fleet npubs.
-	operatorKey := writeClient.PublicKeyHex()
-	fleet := exchange.NewKeySet()
-	members, _ := writeClient.Members(cfg.ExchangeCampfireID)
-	for _, m := range members {
-		fleet.Add(m.MemberPubkey)
-	}
-	trustChecker, err := exchange.NewTrustChecker(operatorKey, fleet,
-		exchange.WithTrustLevelOverrides(cfg.TrustLevels))
-	if err != nil {
-		return fmt.Errorf("creating trust checker: %w", err)
-	}
-
-	// Use dense embeddings if the embed script is available.
-	var embedder matching.Embedder
-	embedScript := os.Getenv("DONTGUESS_EMBED_SCRIPT")
-	if embedScript == "" {
-		embedScript = "/home/baron/projects/dontguess/cmd/embed/main.py"
-	}
-	if _, err := os.Stat(embedScript); err == nil {
-		embedder = matching.NewDenseEmbedder(embedScript)
-		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
-	} else {
-		logger.Printf("  embedder:  tf-idf (set DONTGUESS_EMBED_SCRIPT for dense)")
-	}
-
-	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:   cfg.ExchangeCampfireID,
-		Store:        st,
-		ReadClient:   readClient,
-		WriteClient:  writeClient,
-		Embedder:     embedder,
-		PollInterval: servePollInterval,
-		ScripStore:   cs,
-		TrustChecker: trustChecker,
-		Logger: func(format string, args ...any) {
-			logger.Printf(format, args...)
-		},
-	})
-
-	// Reputation floor is opt-in: only wire the behavioral reputation source when
-	// the operator configured a positive floor, to avoid silently blocking sellers.
-	// Set before the poll loop starts (below) so there is no concurrent access.
-	if cfg.MinReputation > 0 {
-		trustChecker.SetReputationFloor(eng.State().SellerReputation, cfg.MinReputation)
-		logger.Printf("  reputation floor: %d (sell-side puts below this rejected)", cfg.MinReputation)
-	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer cancel()
-
-	// Keep the fleet allowlist current: re-read campfire membership on an
-	// interval and reconcile the KeySet, admitting joiners and revoking leavers
-	// at runtime (dontguess-1a2). The operator key is never revoked — it holds
-	// write authority independent of campfire membership.
-	go refreshFleetLoop(ctx, fleet, writeClient, cfg.ExchangeCampfireID, operatorKey, fleetRefreshInterval, logger)
-
-	logger.Printf("exchange serving")
-	logger.Printf("  campfire:  %s", cfg.ExchangeCampfireID[:16]+"...")
-	logger.Printf("  operator:  %s", cfg.OperatorKeyHex[:16]+"...")
-	logger.Printf("  poll:      %s", servePollInterval)
-	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
-	logger.Printf("  store:     %s", dbPath)
-	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(dgHome, "dontguess.log"))
-
-	fmt.Printf("\n--- Agent connection info ---\n")
-	fmt.Printf("EXCHANGE_CAMPFIRE=%s\n", cfg.ExchangeCampfireID)
-	fmt.Printf("OPERATOR_KEY=%s\n", cfg.OperatorKeyHex)
-	fmt.Printf("\nAgents join with:\n")
-	fmt.Printf("  cf join %s\n\n", cfg.ExchangeCampfireID[:16])
-
-	return runEngineLoop(ctx, dgHome, eng, logger)
+// relayCursorPath returns the durable Outbox publish-cursor sidecar path for a
+// relay, keyed by a hash of its URL so each configured relay tracks its own
+// publish watermark independently (multiple relays tailing one local log must
+// never share a cursor file).
+func relayCursorPath(storePath, url string) string {
+	h := sha256.Sum256([]byte(url))
+	return fmt.Sprintf("%s.pubcursor.%s", storePath, hex.EncodeToString(h[:4]))
 }
 
 // runServeLocal runs the exchange engine in standalone local-only mode
@@ -250,10 +154,10 @@ func runServeLocal(dgHome string) error {
 	// require it, and its pubkey becomes the engine's operator key so operator
 	// records' Sender matches the key the Outbox re-signs with and the Intake
 	// gates authorship on. Unset => unchanged campfire-free single-agent mode.
-	relayURL := os.Getenv("DONTGUESS_RELAY_URL")
+	relayURLs := resolveRelayURLs()
 	var relaySigner *identity.Secp256k1Identity
 	engineOperatorKey := localOperatorKey
-	if relayURL != "" {
+	if len(relayURLs) > 0 {
 		relaySigner, err = loadOrCreateNostrOperatorIdentity(dgHome)
 		if err != nil {
 			return fmt.Errorf("nostr operator identity: %w", err)
@@ -299,38 +203,49 @@ func runServeLocal(dgHome string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
-	// Attach the M2 relay transport (Intake + Outbox + restart-seed) if
-	// configured. The engine folds only from LocalStore, so the relay legs are
-	// off the buy/match hot path (docs/design/relay-transport.md §2.4); the
-	// live dial/handshake is owned by relay.Conn (dontguess-13f, infra-gated).
-	if relayURL != "" {
+	// Attach one relay transport leg (Intake + Outbox + restart-seed) per
+	// configured relay URL. Each leg tails the SAME localStore and publishes
+	// with its own durable cursor (relayCursorPath, keyed by URL) so the relays'
+	// publish watermarks never collide; every leg reads the engine's fold, which
+	// is off the buy/match hot path (docs/design/relay-transport.md §2.4).
+	type relayLeg struct {
+		conn *relay.Conn
+		stop func()
+	}
+	var legs []relayLeg
+	for _, relayURL := range relayURLs {
 		conn := relay.New(relayURL, relaySigner)
-		stop, err := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
-			localStorePath+".pubcursor", conn, conn, 5*time.Second, logger.Printf)
-		if err != nil {
-			return fmt.Errorf("attaching relay transport: %w", err)
+		stop, aerr := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
+			relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf)
+		if aerr != nil {
+			return fmt.Errorf("attaching relay transport for %s: %w", relayURL, aerr)
 		}
-		// Single combined shutdown defer (dontguess-e35): registering
-		// `defer conn.Close()` and `defer stop()` separately raced Go's LIFO
-		// defer order against attachRelayTransport's contract — stop()
-		// (wg.Wait()) blocks until the reader/outbox goroutines observe
-		// ctx.Done() and return, but the bare `defer cancel()` registered
-		// BEFORE this block runs LAST under LIFO, so stop() ran first and
-		// hung forever whenever the relay was enabled. shutdownRelayTransport
-		// cancels first, then waits, regardless of where the outer
-		// `defer cancel()` sits in the stack.
-		defer shutdownRelayTransport(cancel, conn.Close, stop)
+		legs = append(legs, relayLeg{conn: conn, stop: stop})
 		logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
 	}
+	if len(legs) > 0 {
+		// Combined shutdown in the dontguess-e35 order: cancel the context FIRST
+		// (unblocks every reader/outbox), THEN close each connection and wait for
+		// its goroutines to exit. A bare `defer cancel()` running last under LIFO
+		// would let stop() (wg.Wait()) run first and hang forever; cancel-then-wait
+		// as one defer avoids that.
+		defer func() {
+			cancel()
+			for _, leg := range legs {
+				_ = leg.conn.Close()
+				leg.stop()
+			}
+		}()
+	}
 
-	logger.Printf("exchange serving (local-only, zero campfire — dontguess-275)")
+	logger.Printf("exchange serving (campfire-free, %d relay leg(s))", len(legs))
 	logger.Printf("  operator:  %s", localOperatorKey[:16]+"...")
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
 	logger.Printf("  store:     %s", localStorePath)
 	logger.Printf("  logging to %s + stderr (rotate at 10MB, 5 backups, 28d retention, gzip)", filepath.Join(dgHome, "dontguess.log"))
 
-	fmt.Printf("\n--- Local exchange (no relay, no identity, no scrip network) ---\n")
+	fmt.Printf("\n--- DontGuess exchange (campfire-free) ---\n")
 	fmt.Printf("STORE=%s\n", localStorePath)
 	fmt.Printf("OPERATOR_KEY=%s\n\n", localOperatorKey)
 
@@ -404,87 +319,6 @@ func loadOrCreateNostrOperatorIdentity(dgHome string) (*identity.Secp256k1Identi
 // runServe (campfire-backed) and runServeLocal (dontguess-275, campfire-free)
 // so the two entrypoints differ only in how the Engine's ingest/egress are
 // wired (campfire ReadClient/WriteClient vs. LocalStore).
-// fleetMemberSource is the subset of *protocol.Client the fleet-refresh loop
-// needs. Declared as an interface so the loop can be unit-tested against a fake
-// membership source without a live campfire.
-type fleetMemberSource interface {
-	Members(campfireID string) ([]protocol.MemberRecord, error)
-}
-
-// syncFleetMembership reconciles the fleet allowlist against the desired member
-// set read from the campfire: it Adds keys present in desired but absent from
-// the set, and Removes (runtime de-allowlists) keys present in the set but no
-// longer in desired. The operatorKey is never removed even if it is absent from
-// desired — the operator retains write authority independent of campfire
-// membership. Returns the added and removed keys (lowercased) for logging.
-//
-// Comparison is done on lowercased/trimmed keys to match KeySet's normalization
-// (KeySet.Keys already returns lowercased keys).
-func syncFleetMembership(fleet *exchange.KeySet, desired []string, operatorKey string) (added, removed []string) {
-	want := make(map[string]struct{}, len(desired))
-	for _, k := range desired {
-		kk := strings.ToLower(strings.TrimSpace(k))
-		if kk == "" {
-			continue
-		}
-		want[kk] = struct{}{}
-	}
-	have := make(map[string]struct{})
-	for _, k := range fleet.Keys() {
-		have[k] = struct{}{}
-	}
-	// Admit joiners.
-	for k := range want {
-		if _, ok := have[k]; !ok {
-			fleet.Add(k)
-			added = append(added, k)
-		}
-	}
-	// Revoke leavers (never the operator).
-	opKey := strings.ToLower(strings.TrimSpace(operatorKey))
-	for k := range have {
-		if _, ok := want[k]; ok {
-			continue
-		}
-		if k == opKey {
-			continue
-		}
-		fleet.Remove(k)
-		removed = append(removed, k)
-	}
-	return added, removed
-}
-
-// refreshFleetLoop periodically re-reads campfire membership and reconciles the
-// fleet allowlist via syncFleetMembership until ctx is cancelled. A Members()
-// error is logged and the loop continues — a transient read failure must not
-// tear down the exchange, and the previous allowlist snapshot stays in effect.
-func refreshFleetLoop(ctx context.Context, fleet *exchange.KeySet, src fleetMemberSource, campfireID, operatorKey string, interval time.Duration, logger *log.Logger) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			members, err := src.Members(campfireID)
-			if err != nil {
-				logger.Printf("fleet refresh: Members(%s) error: %v", campfireID[:min(16, len(campfireID))], err)
-				continue
-			}
-			desired := make([]string, 0, len(members))
-			for _, m := range members {
-				desired = append(desired, m.MemberPubkey)
-			}
-			added, removed := syncFleetMembership(fleet, desired, operatorKey)
-			if len(added) > 0 || len(removed) > 0 {
-				logger.Printf("fleet refresh: admitted %d, revoked %d (allowlist size now %d)",
-					len(added), len(removed), fleet.Len())
-			}
-		}
-	}
-}
-
 func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, logger *log.Logger) error {
 	// Auto-accept goroutine.
 	//

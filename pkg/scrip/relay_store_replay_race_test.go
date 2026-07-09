@@ -2,7 +2,7 @@ package scrip_test
 
 // Race/correctness tests for the double-spend window between the SpendingStore
 // mutators (GetBudget/DecrementBudget/AddBudget/Balance) and Replay() on
-// CampfireScripStore (dontguess-1d8).
+// LocalScripStore (dontguess-1d8).
 //
 // Two defects are covered:
 //
@@ -21,7 +21,7 @@ package scrip_test
 //     ETag is "epoch-gen": the stale ETag carries the OLD epoch and can never
 //     match a rebuilt entry.
 //
-// These run against the real dgstore.Store + real CampfireScripStore — no
+// These run against the real dgstore.Store + real LocalScripStore — no
 // mocks. Run with -race.
 
 import (

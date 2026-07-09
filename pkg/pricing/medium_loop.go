@@ -168,7 +168,7 @@ type AssignSpec struct {
 }
 
 // VigReader is the interface MediumLoop uses to read total outstanding vig
-// across all active loans. Implemented by *scrip.CampfireScripStore.
+// across all active loans. Implemented by *scrip.LocalScripStore.
 // If nil, vig_pressure is treated as zero (useful for tests that do not
 // exercise the loan flow).
 type VigReader interface {

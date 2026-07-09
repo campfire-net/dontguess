@@ -2,10 +2,10 @@ package scrip
 
 // Message payload types for scrip convention messages.
 //
-// Each type corresponds to a campfire message parseable by CampfireScripStore.applyMessage.
+// Each type corresponds to a scrip operation message parseable by LocalScripStore.applyMessage.
 // Fields match the JSON keys the apply* methods expect.
 //
-// Tag constants are re-exported from the campfire_store.go file (unexported there,
+// Tag constants are re-exported from relay_store.go (unexported there,
 // exported here for use by the exchange engine).
 
 // Scrip convention message tags, matching docs/convention/scrip-operations.md.
