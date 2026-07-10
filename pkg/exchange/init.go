@@ -46,10 +46,30 @@ type Config struct {
 	// TrustLevels configures per-operation trust floors (serve-path concern).
 	// Left untouched by init; preserved here for the serve wiring that reads it.
 	TrustLevels TrustLevels `json:"trust_levels,omitempty"`
-	// MinReputation is the sell-side reputation floor. 0 (default) disables
-	// reputation gating.
+	// MinReputation is the sell-side reputation floor. A fresh config defaults
+	// to DefaultMinReputation (demotion-only rate-limiting); LoadConfig rejects
+	// any value above MaxMinReputation.
 	MinReputation int `json:"min_reputation,omitempty"`
+	// FleetAllowlist is the flat, operator-maintained set of admitted seller
+	// npubs (or hex pubkeys) for the team/federated tier — no vouching or
+	// transitive edges. Mutated via `dontguess allowlist add|remove`. Only
+	// consulted once a TrustChecker is constructed (relays attached); the
+	// individual tier (no relays) never reads it.
+	// See docs/design/nostr-admission-scrip-rehome-3b8.md §6.
+	FleetAllowlist []string `json:"fleet_allowlist,omitempty"`
 }
+
+// DefaultMinReputation is the sell-side reputation floor written into a fresh
+// config. Demotion-only rate-limiting per
+// docs/design/nostr-admission-scrip-rehome-3b8.md §8 D3 — the flat
+// FleetAllowlist remains the sole anti-poisoning primitive.
+const DefaultMinReputation = 40
+
+// MaxMinReputation is the highest MinReputation LoadConfig accepts. A floor
+// above DefaultReputation (a fresh seller's starting reputation, 50) is a
+// cold-start deadlock — no new seller could ever sell. Rejected loudly at
+// load, never silently clamped.
+const MaxMinReputation = 50
 
 // InitOptions controls the campfire-free Init operation.
 type InitOptions struct {
@@ -96,6 +116,9 @@ func LoadConfig(dgHome string) (*Config, error) {
 	if err := json.Unmarshal(data, &cfg); err != nil {
 		return nil, fmt.Errorf("parsing exchange config: %w", err)
 	}
+	if cfg.MinReputation > MaxMinReputation {
+		return nil, fmt.Errorf("exchange config: min_reputation %d exceeds max %d (a floor above the fresh-seller starting reputation bricks onboarding — see docs/design/nostr-admission-scrip-rehome-3b8.md §8 D3)", cfg.MinReputation, MaxMinReputation)
+	}
 	return &cfg, nil
 }
 
@@ -141,9 +164,16 @@ func Init(opts InitOptions) (*Config, error) {
 	// Force is set (a forced re-init stamps a fresh CreatedAt).
 	configPath := ConfigPath(dgHome)
 	createdAt := time.Now().UnixNano()
+	minReputation := DefaultMinReputation
+	var fleetAllowlist []string
 	if !opts.Force {
 		if existing, lerr := LoadConfig(dgHome); lerr == nil && existing.CreatedAt != 0 {
 			createdAt = existing.CreatedAt
+			// Preserve operator-mutated fields (dontguess allowlist add|remove,
+			// dontguess-b45) across an idempotent re-init — init must not clobber
+			// state it does not itself manage.
+			minReputation = existing.MinReputation
+			fleetAllowlist = existing.FleetAllowlist
 		}
 	}
 
@@ -153,8 +183,10 @@ func Init(opts InitOptions) (*Config, error) {
 		RelayURLs:      opts.RelayURLs,
 		StorePath:      storePath,
 		CreatedAt:      createdAt,
+		MinReputation:  minReputation,
+		FleetAllowlist: fleetAllowlist,
 	}
-	if err := writeConfig(configPath, cfg); err != nil {
+	if err := WriteConfig(configPath, cfg); err != nil {
 		return nil, fmt.Errorf("writing exchange config: %w", err)
 	}
 
@@ -174,8 +206,11 @@ func loadOrCreateOperatorIdentity(dgHome string) (*identity.Secp256k1Identity, e
 	return identity.LoadOrCreatePrivHexKey(filepath.Join(dgHome, operatorKeyFile))
 }
 
-// writeConfig serializes cfg to configPath (mode 0600).
-func writeConfig(configPath string, cfg *Config) error {
+// WriteConfig serializes cfg to configPath (mode 0600). Exported so
+// `dontguess allowlist add|remove` (cmd/dontguess/allowlist.go) can persist
+// mutations to the same config file `dontguess init`/LoadConfig use, without
+// duplicating the write logic.
+func WriteConfig(configPath string, cfg *Config) error {
 	if err := os.MkdirAll(filepath.Dir(configPath), 0700); err != nil {
 		return fmt.Errorf("creating config dir: %w", err)
 	}

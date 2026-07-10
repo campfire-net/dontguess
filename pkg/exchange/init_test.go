@@ -228,6 +228,100 @@ func TestInit_PreservesCreatedAt(t *testing.T) {
 	}
 }
 
+// TestInit_DefaultsMinReputation40 verifies a freshly written config gets
+// MinReputation=40 (demotion-only floor, dontguess-b45 / design §8 D3) rather
+// than the zero value, without the operator having to set anything.
+func TestInit_DefaultsMinReputation40(t *testing.T) {
+	t.Parallel()
+
+	dgHome := t.TempDir()
+	cfg, err := exchange.Init(exchange.InitOptions{DGHome: dgHome})
+	if err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	if cfg.MinReputation != exchange.DefaultMinReputation {
+		t.Errorf("MinReputation = %d, want default %d", cfg.MinReputation, exchange.DefaultMinReputation)
+	}
+
+	loaded, err := exchange.LoadConfig(dgHome)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if loaded.MinReputation != exchange.DefaultMinReputation {
+		t.Errorf("on-disk MinReputation = %d, want default %d", loaded.MinReputation, exchange.DefaultMinReputation)
+	}
+}
+
+// TestLoadConfig_RejectsMinReputationAboveMax proves the reject path (design
+// §8 D3: "any config value >50 is rejected... at load"): a hand-written
+// config with min_reputation above MaxMinReputation fails LoadConfig loudly
+// instead of being silently clamped or accepted.
+func TestLoadConfig_RejectsMinReputationAboveMax(t *testing.T) {
+	t.Parallel()
+
+	dgHome := t.TempDir()
+	if _, err := exchange.Init(exchange.InitOptions{DGHome: dgHome}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	raw, err := os.ReadFile(exchange.ConfigPath(dgHome))
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	var cfg exchange.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+	cfg.MinReputation = exchange.MaxMinReputation + 1
+	data, err := json.MarshalIndent(&cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling config: %v", err)
+	}
+	if err := os.WriteFile(exchange.ConfigPath(dgHome), data, 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	if _, err := exchange.LoadConfig(dgHome); err == nil {
+		t.Fatal("LoadConfig accepted min_reputation above MaxMinReputation — want a rejection error")
+	}
+}
+
+// TestLoadConfig_AcceptsMinReputationAtMax proves the accept path at the
+// boundary: MinReputation == MaxMinReputation (50) loads without error.
+func TestLoadConfig_AcceptsMinReputationAtMax(t *testing.T) {
+	t.Parallel()
+
+	dgHome := t.TempDir()
+	if _, err := exchange.Init(exchange.InitOptions{DGHome: dgHome}); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+
+	raw, err := os.ReadFile(exchange.ConfigPath(dgHome))
+	if err != nil {
+		t.Fatalf("reading config: %v", err)
+	}
+	var cfg exchange.Config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		t.Fatalf("parsing config: %v", err)
+	}
+	cfg.MinReputation = exchange.MaxMinReputation
+	data, err := json.MarshalIndent(&cfg, "", "  ")
+	if err != nil {
+		t.Fatalf("marshaling config: %v", err)
+	}
+	if err := os.WriteFile(exchange.ConfigPath(dgHome), data, 0600); err != nil {
+		t.Fatalf("writing config: %v", err)
+	}
+
+	loaded, err := exchange.LoadConfig(dgHome)
+	if err != nil {
+		t.Fatalf("LoadConfig at MaxMinReputation boundary: unexpected error: %v", err)
+	}
+	if loaded.MinReputation != exchange.MaxMinReputation {
+		t.Errorf("MinReputation = %d, want %d", loaded.MinReputation, exchange.MaxMinReputation)
+	}
+}
+
 // trimSpace strips surrounding ASCII whitespace/newlines from a key file read.
 func trimSpace(s string) string {
 	for len(s) > 0 {
