@@ -25,11 +25,15 @@ test/reliability/out/
 
 # Internal tooling state
 .campfire/
+.cf/
 .claude/agents/
 .claude/worktrees/
 .telemetry/
 .ready/
+.ready.fs-backup/
 .rudi/
+coverage.out
+*.coverprofile
 charts/
 test/live-fire/
 docs/findings/
