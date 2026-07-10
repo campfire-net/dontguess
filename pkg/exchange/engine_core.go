@@ -174,6 +174,23 @@ type EngineOptions struct {
 	// for single-operator deployments. When BrokeredMatchMode=true, a startup
 	// warning is emitted if this is false.
 	FederationGuardEnabled bool
+
+	// MinBuyBalance is the anonymous-buy demand-signal bound (design §8-D1,
+	// dontguess-3879). OperationBuy stays TrustAnonymous (ratified): a buy folds
+	// into the matching / demand / pricing pipeline BEFORE settlement, and the
+	// scrip hold is only taken later at buyer-accept. So the ScripStore bounds
+	// the MONEY but not the SIGNAL — a zero-scrip Sybil could send buys that
+	// surface (rank) an entry and, once driven through settle, move its
+	// demand-count / price for free. When MinBuyBalance > 0, handleBuy requires
+	// the buyer to hold at least this many scrip BEFORE the buy is allowed to
+	// contribute; an underfunded buy is dropped (loudly counted as
+	// DroppedUnderfundedBuy) before any match/demand fold.
+	//
+	// Enforced ONLY when a ScripStore is configured (team/federated tier). On the
+	// individual tier (ScripStore == nil) it is a no-op — content moves free and
+	// there are no scrip balances to check, so behavior is byte-for-byte
+	// unchanged. Zero (the default) disables the bound.
+	MinBuyBalance int64
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -385,6 +402,14 @@ type DegradationMetrics struct {
 	DroppedUnlisted      atomic.Int64
 	DroppedLowReputation atomic.Int64
 
+	// DroppedUnderfundedBuy counts anonymous buys dropped by the demand-signal
+	// bound (design §8-D1, dontguess-3879): a buyer holding less than
+	// EngineOptions.MinBuyBalance scrip had its buy dropped in handleBuy BEFORE
+	// the buy could contribute to matching / demand / pricing folding. Only
+	// enforced on the team/federated tier (ScripStore configured, MinBuyBalance
+	// > 0). Every increment is paired with a LOUD alarm (never a silent drop).
+	DroppedUnderfundedBuy atomic.Int64
+
 	// FoldDenialNotOperator counts STATE-fold rejections where an operator-only
 	// settlement fold guard (applySettlePutAccept / applySettlePutReject /
 	// applySettleDeliver in state_settle.go) dropped a message whose Sender is
@@ -428,6 +453,7 @@ type DegradationCounts struct {
 	TrustDenialOther          int64 `json:"trust_denial_other"`
 	DroppedUnlisted           int64 `json:"dropped_unlisted"`
 	DroppedLowReputation      int64 `json:"dropped_low_reputation"`
+	DroppedUnderfundedBuy     int64 `json:"dropped_underfunded_buy"`
 	FoldDenialNotOperator     int64 `json:"fold_denial_not_operator"`
 	FoldDenialBuyerIdentity   int64 `json:"fold_denial_buyer_identity"`
 	FoldDenialAssignExclusive int64 `json:"fold_denial_assign_exclusive"`
@@ -548,6 +574,7 @@ func (e *Engine) DegradationSnapshot() DegradationCounts {
 		TrustDenialOther:          e.degradation.TrustDenialOther.Load(),
 		DroppedUnlisted:           e.degradation.DroppedUnlisted.Load(),
 		DroppedLowReputation:      e.degradation.DroppedLowReputation.Load(),
+		DroppedUnderfundedBuy:     e.degradation.DroppedUnderfundedBuy.Load(),
 		FoldDenialNotOperator:     e.degradation.FoldDenialNotOperator.Load(),
 		FoldDenialBuyerIdentity:   e.degradation.FoldDenialBuyerIdentity.Load(),
 		FoldDenialAssignExclusive: e.degradation.FoldDenialAssignExclusive.Load(),

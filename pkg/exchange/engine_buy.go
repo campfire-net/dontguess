@@ -8,6 +8,7 @@ import (
 
 	"github.com/campfire-net/dontguess/pkg/demand"
 	"github.com/campfire-net/dontguess/pkg/matching"
+	"github.com/campfire-net/dontguess/pkg/scrip"
 )
 
 // handleBuy responds to an exchange:buy request with an exchange:match message.
@@ -32,6 +33,21 @@ func (e *Engine) handleBuy(msg *Message) error {
 	payload, err := parseBuyPayload(msg)
 	if err != nil {
 		return err
+	}
+
+	// D1 demand-signal bound (design §8-D1, dontguess-3879). OperationBuy stays
+	// TrustAnonymous: this buy is about to fold into matching / demand / pricing
+	// BEFORE any settlement (the scrip hold is not taken until buyer-accept). The
+	// ScripStore bounds the money but not the SIGNAL, so gate the buy on a
+	// minimum scrip balance HERE, before it can surface (rank) an entry or move
+	// its price. Bounded to the team/federated tier (ScripStore configured) and
+	// skips the operator's own key; individual tier (ScripStore == nil) is a
+	// no-op — behavior byte-for-byte unchanged.
+	if !e.buyerMeetsMinBalance(msg.Sender) {
+		e.degradation.DroppedUnderfundedBuy.Add(1)
+		e.opts.log("SECURITY ALARM: anonymous buy dropped by demand-signal bound (D1): buyer=%s min_balance=%d order=%s -- not folded into matching/demand/pricing",
+			shortKey(msg.Sender), e.opts.MinBuyBalance, shortKey(msg.ID))
+		return nil
 	}
 
 	maxResults := buyMaxResults(payload.MaxResults)
@@ -106,6 +122,33 @@ func parseBuyPayload(msg *Message) (buyPayload, error) {
 		CompressionTier: raw.CompressionTier,
 		Synthetic:       raw.Synthetic,
 	}, nil
+}
+
+// buyerMeetsMinBalance reports whether a buyer is allowed to contribute a demand
+// signal, enforcing the D1 anonymous-buy signal bound (design §8-D1,
+// dontguess-3879).
+//
+// The bound is active only when BOTH a ScripStore is configured (team/federated
+// tier) AND MinBuyBalance > 0. On the individual tier (ScripStore == nil) or
+// with the bound disabled (MinBuyBalance <= 0) it always returns true, keeping
+// behavior byte-for-byte unchanged. The operator's own key is exempt — the
+// operator is the trusted local writer, not an anonymous Sybil.
+//
+// When active, the buyer must hold at least MinBuyBalance scrip. A GetBudget
+// error (unknown key folds to a zero balance) is treated as under-funded and
+// bounds the signal (fail-closed).
+func (e *Engine) buyerMeetsMinBalance(buyerKey string) bool {
+	if e.opts.MinBuyBalance <= 0 || e.opts.ScripStore == nil {
+		return true
+	}
+	if buyerKey == e.state.OperatorKey {
+		return true
+	}
+	bal, _, err := e.opts.ScripStore.GetBudget(e.engineCtx(), buyerKey, scrip.BalanceKey)
+	if err != nil {
+		return false
+	}
+	return bal >= e.opts.MinBuyBalance
 }
 
 // buyMaxResults normalises the caller-supplied max_results to a positive integer.

@@ -71,6 +71,18 @@ const DefaultMinReputation = 40
 // load, never silently clamped.
 const MaxMinReputation = 50
 
+// DefaultMinBuyBalance is the anonymous-buy demand-signal bound applied on the
+// team/federated tier (EngineOptions.MinBuyBalance) per
+// docs/design/nostr-admission-scrip-rehome-3b8.md §8 D1. A buyer must hold at
+// least this many scrip before a buy is allowed to contribute to matching /
+// demand / pricing — closing the free-Sybil ranking-gaming lever. A value of 1
+// is the least-restrictive correct bound: it blocks only the zero-scrip Sybil
+// (the exact attack) and never a funded buyer (who necessarily holds more than
+// price+fee to complete any purchase). Scrip enters only via x402 purchase or
+// labor, so requiring a positive balance is an economic cost the Sybil cannot
+// dodge. Operators may raise it. Individual tier (ScripStore nil) never applies it.
+const DefaultMinBuyBalance int64 = 1
+
 // InitOptions controls the campfire-free Init operation.
 type InitOptions struct {
 	// DGHome is the operator home directory. If empty, it resolves to the

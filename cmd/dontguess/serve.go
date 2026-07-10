@@ -189,6 +189,11 @@ func runServeLocal(dgHome string) error {
 	// NewEngine a true nil interface, not a typed-nil (design §4/§6).
 	var scripStore scrip.SpendingStore
 	minReputation := exchange.DefaultMinReputation
+	// minBuyBalance stays 0 (disabled) on the individual/no-relay tier — there is
+	// no ScripStore, so the anonymous-buy signal bound is a no-op there. It is
+	// raised to the D1 default only on the team/federated tier below, where a
+	// ScripStore is attached and payment (hence balances) exist.
+	var minBuyBalance int64
 	if len(relayURLs) > 0 {
 		var fleet []string
 		var cfgOperatorKeyHex string
@@ -234,6 +239,12 @@ func runServeLocal(dgHome string) error {
 		}
 		scripStore = ss
 		logger.Printf("  scrip:     enabled (LocalScripStore, operator-gated) — payment enforced")
+
+		// D1 anonymous-buy demand-signal bound (design §8-D1): a buyer must hold
+		// scrip before a buy contributes to matching/demand/pricing, closing the
+		// free-Sybil ranking-gaming lever. Only meaningful with a ScripStore.
+		minBuyBalance = exchange.DefaultMinBuyBalance
+		logger.Printf("  buy-bound: anonymous-buy signal bound active — min buyer balance %d scrip", minBuyBalance)
 	}
 
 	// Use dense embeddings if the embed script is available (same as the
@@ -264,6 +275,7 @@ func runServeLocal(dgHome string) error {
 		PollInterval:      servePollInterval,
 		TrustChecker:      trustChecker,
 		ScripStore:        scripStore,
+		MinBuyBalance:     minBuyBalance,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
