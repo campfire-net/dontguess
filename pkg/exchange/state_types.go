@@ -67,8 +67,15 @@ const (
 	SettlePhaseStrPutReject   = "put-reject"
 	SettlePhaseStrBuyerAccept = "buyer-accept"
 	SettlePhaseStrBuyerReject = "buyer-reject"
-	SettlePhaseStrDeliver     = "deliver"
-	SettlePhaseStrComplete    = "complete"
+	// SettlePhaseStrBuyerAcceptReject is the operator's durable, wire-visible
+	// rejection of a buyer-accept whose scrip hold could not be reserved
+	// (ed2-D §3.6). It mirrors put-reject: emitted BEFORE the ErrBudgetExceeded
+	// return so the buyer learns *why* (reason:"insufficient_scrip") instead of
+	// only timing out. It has no state-fold handler (applySettle ignores unknown
+	// phases) — it exists purely for the buyer's per-phase settle subscription.
+	SettlePhaseStrBuyerAcceptReject = "buyer-accept-reject"
+	SettlePhaseStrDeliver           = "deliver"
+	SettlePhaseStrComplete          = "complete"
 
 	SettlePhaseStrPreviewRequest      = "preview-request"
 	SettlePhaseStrPreview             = "preview"

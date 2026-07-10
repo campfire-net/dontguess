@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"time"
 
@@ -553,7 +554,52 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 	fee := bestPrice / MatchingFeeRate
 	holdAmount := bestPrice + fee
 
-	return e.decAndSaveHold(msg, matchMsgID, holdAmount, bestPrice, fee)
+	err := e.decAndSaveHold(msg, matchMsgID, holdAmount, bestPrice, fee)
+	if err != nil && errors.Is(err, scrip.ErrBudgetExceeded) {
+		// ed2-D §3.6: the buyer had insufficient scrip — decAndSaveHold saved NO
+		// reservation (so the §3.7 deliver guard will withhold content). Emit a
+		// durable, wire-visible settle(buyer-accept-reject) BEFORE returning the
+		// error so the buyer learns *why* buyer-accept failed instead of only
+		// timing out. This is the mutually-exclusive alternative to deliver for a
+		// buyer-accept: a failed hold produces the reject and NO deliverable link
+		// (§3.7 item 2). Reached only with ScripStore != nil (handleSettle gates
+		// this handler on it), so the individual tier is untouched.
+		if rejErr := e.emitBuyerAcceptReject(msg.ID, "insufficient_scrip"); rejErr != nil {
+			e.opts.log("engine: buyer-accept: CRITICAL: failed to emit durable buyer-accept-reject for buyer-accept=%s: %v",
+				shortKey(msg.ID), rejErr)
+		}
+	}
+	return err
+}
+
+// emitBuyerAcceptReject emits the durable, wire-visible settle(buyer-accept-reject)
+// operator message (ed2-D §3.6). It mirrors rejectPutLocked's emit pattern
+// (TagSettle + phase + verdict:rejected + reason, antecedent = the rejected
+// message id) so the buyer's per-phase settle subscription receives a loud,
+// attributable reason for a failed buyer-accept rather than a bare timeout. The
+// antecedent is the buyer-accept message id — the settle chain e-tags its
+// immediate antecedent, matching applySettleDeliver's chain (state_settle.go).
+// The phase has no state-fold handler; the message is purely for wire visibility.
+func (e *Engine) emitBuyerAcceptReject(buyerAcceptMsgID, reason string) error {
+	payload, err := e.marshal(map[string]any{
+		"phase":    SettlePhaseStrBuyerAcceptReject,
+		"entry_id": buyerAcceptMsgID,
+		"reason":   reason,
+		"guide":    "Your buyer-accept was rejected: insufficient scrip to reserve the price + fee. No content was delivered and no scrip moved. Ask the operator to run: dontguess mint <your-npub> <amount>, then retry the buy.",
+	})
+	if err != nil {
+		return fmt.Errorf("engine: buyer-accept-reject: marshal payload: %w", err)
+	}
+	tags := []string{
+		TagSettle,
+		TagPhasePrefix + SettlePhaseStrBuyerAcceptReject,
+		TagVerdictPrefix + "rejected",
+	}
+	antecedents := []string{buyerAcceptMsgID}
+	if _, err := e.sendOperatorMessage(payload, tags, antecedents); err != nil {
+		return fmt.Errorf("engine: buyer-accept-reject: send operator message: %w", err)
+	}
+	return nil
 }
 
 // restoreExistingHold re-hydrates an in-memory reservation when a scrip-buy-hold
@@ -832,6 +878,24 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 	if buyerKey == "" {
 		e.opts.log("engine: settle-deliver: no buyer key for match=%s", shortKey(matchMsgID))
 		return nil
+	}
+
+	// ed2-D §3.7 (Layer-0 money integrity): on a scrip-enabled exchange, content
+	// delivery MUST be gated on a LIVE scrip reservation for this match. The
+	// buyer-accept hold (decAndSaveHold) and this deliver are SEPARATE dispatch
+	// handlers — an underfunded buyer's buyer-accept fails the hold and saves NO
+	// reservation, yet buyerAcceptToMatch is folded unconditionally
+	// (state_settle.go applySettleBuyerAccept), so the antecedent chain above
+	// still resolves. Without this guard the operator would emit the full content
+	// FREE. No live reservation ⇒ do NOT deliver. Guarded by ScripStore != nil so
+	// the individual tier (ScripStore == nil, no reservation concept, deliver runs
+	// unconditionally) is byte-for-byte unchanged.
+	if e.opts.ScripStore != nil {
+		if resID, ok := e.reservationFor(matchMsgID); !ok || resID == "" {
+			e.opts.log("engine: settle-deliver: REFUSING deliver for match=%s — no live scrip reservation (buyer-accept hold failed or buyer was never funded); content withheld (ed2-D §3.7)",
+				shortKey(matchMsgID))
+			return nil
+		}
 	}
 
 	return e.emitDeliverContent(msg, entry, buyerKey)
