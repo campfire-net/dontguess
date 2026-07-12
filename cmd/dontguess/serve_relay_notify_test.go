@@ -55,7 +55,7 @@ func TestRelayNotify_OperatorMatchPublishesOnFoldNotTick(t *testing.T) {
 	relayConn := newFakeRelayConn(true /* echo */)
 	pub := newDemuxPublisher(relayConn)
 	w, watermark, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {})
+		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {}, nil)
 	if err != nil {
 		t.Fatalf("buildRelayWiring: %v", err)
 	}

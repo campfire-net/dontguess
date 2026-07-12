@@ -118,6 +118,12 @@ type frameSender interface {
 // It performs the STARTUP RESTART-SEED before returning (seedEmittedFromStore),
 // and returns the backfill watermark (max persisted Timestamp) the subscribe REQ
 // should resume from (§2.5).
+// aliasRegistrar (dontguess-55c GAP 1), when non-nil, is the exchange State's
+// RegisterWireAlias: it is rebuilt over the persisted log by the restart-seed AND
+// wired into the Outbox so every operator record's wire→store id alias is recorded
+// both at restart and at live publish. nil (the individual/no-alias callers, and
+// the existing test callers) is a strict no-op — no wire→store alias is wired, and
+// resolveAlias stays the identity.
 func buildRelayWiring(
 	ls *dgstore.Store,
 	signer identity.Signer,
@@ -126,6 +132,7 @@ func buildRelayWiring(
 	pub relay.EventPublisher,
 	maxOrphans int,
 	alarm relay.AlarmFunc,
+	aliasRegistrar func(wire, store string),
 ) (*relayWiring, int64, error) {
 	if ls == nil {
 		return nil, 0, fmt.Errorf("relay wiring: nil local store")
@@ -138,8 +145,10 @@ func buildRelayWiring(
 
 	// RESTART-SEED (§2.2). Seed the emitted-set from the persisted log BEFORE any
 	// relay event can be accepted, so an old operator event / echo re-delivered
-	// after a restart is deduped rather than re-folded.
-	watermark, err := seedEmittedFromStore(seq, ls, signer)
+	// after a restart is deduped rather than re-folded. The same pass REBUILDS the
+	// wire→store alias (dontguess-55c GAP 1) so a wire-id settle for a pre-restart
+	// match resolves.
+	watermark, err := seedEmittedFromStore(seq, ls, signer, aliasRegistrar)
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay wiring: restart-seed: %w", err)
 	}
@@ -149,9 +158,12 @@ func buildRelayWiring(
 
 	// ECHO DEDUP (§D): seed the SIGNED content-hash id into the emitted-set
 	// STRICTLY BEFORE publish, so the relay echo of the operator's own event
-	// dedups in the concurrent Intake subscriber.
+	// dedups in the concurrent Intake subscriber. WIRE→STORE ALIAS (dontguess-55c
+	// GAP 1) is registered at the SAME pre-publish seam so a team-tier buyer's
+	// settle antecedent (which carries the wire id) resolves to the store id.
 	outbox, err := relay.NewOutbox(ls, signer, pub, cursorPath,
-		relay.WithEmittedSeeder(func(id string) { seq.MarkEmitted(id) }))
+		relay.WithEmittedSeeder(func(id string) { seq.MarkEmitted(id) }),
+		relay.WithAliasRegistrar(aliasRegistrar))
 	if err != nil {
 		return nil, 0, fmt.Errorf("relay wiring: outbox: %w", err)
 	}
@@ -187,7 +199,14 @@ func isOperatorOrigin(origin string) bool { return origin == "" || origin == "lo
 //     the Schnorr nonce), so the restart derivation matches the original publish.
 //
 // Returns the max Timestamp across the log — the backfill watermark (§2.5).
-func seedEmittedFromStore(seq *exchange.Sequencer, ls *dgstore.Store, signer identity.Signer) (int64, error) {
+//
+// aliasRegistrar (dontguess-55c GAP 1), when non-nil, is called with the derived
+// SIGNED wire id and the persisted STORE id of every operator record, rebuilding
+// the wire→store alias the live Outbox registers at publish — so a wire-id settle
+// for a match created BEFORE this restart still resolves after the seed. It reuses
+// the SAME signedID the echo-dedup seed derives (one derivation, two consumers).
+// nil is a no-op (no alias rebuild), preserving the existing callers' behavior.
+func seedEmittedFromStore(seq *exchange.Sequencer, ls *dgstore.Store, signer identity.Signer, aliasRegistrar func(wire, store string)) (int64, error) {
 	recs, err := ls.ReadAll()
 	if err != nil {
 		return 0, fmt.Errorf("read local log: %w", err)
@@ -216,6 +235,13 @@ func seedEmittedFromStore(seq *exchange.Sequencer, ls *dgstore.Store, signer ide
 			continue
 		}
 		seq.MarkEmitted(signedID)
+		// Rebuild the wire→store alias for this operator record (dontguess-55c GAP
+		// 1): signedID is its wire id, rec.ID its store id. Deterministic across
+		// restarts (content-hash id), so the alias is reconstructed identically to
+		// the live-publish registration.
+		if aliasRegistrar != nil {
+			aliasRegistrar(signedID, rec.ID)
+		}
 	}
 	return watermark, nil
 }
@@ -638,6 +664,11 @@ func (p *demuxPublisher) routeOK(eventID string, accepted bool) {
 // in as recv/send; provisioning a LIVE relay connection is dontguess-13f
 // (infra-gated) and out of scope here — this function composes the transport
 // legs and is exercised end-to-end by an in-process fake relay in the tests.
+// aliasRegistrar (dontguess-55c GAP 1) is the exchange State's RegisterWireAlias,
+// threaded to buildRelayWiring so both the restart-seed and the live Outbox record
+// the wire→store id alias a team-tier buyer's settle antecedent needs. nil is a
+// no-op (no alias wiring) — the individual tier and tests that don't exercise the
+// wire-id settle pass nil.
 func attachRelayTransport(
 	ctx context.Context,
 	ls *dgstore.Store,
@@ -649,9 +680,10 @@ func attachRelayTransport(
 	publishInterval time.Duration,
 	logf func(format string, args ...any),
 	notifier *appendNotifier,
+	aliasRegistrar func(wire, store string),
 ) (stop func(), err error) {
 	pub := newDemuxPublisher(send)
-	wiring, watermark, err := buildRelayWiring(ls, signer, operatorKeyHex, cursorPath, pub, 0, nil)
+	wiring, watermark, err := buildRelayWiring(ls, signer, operatorKeyHex, cursorPath, pub, 0, nil, aliasRegistrar)
 	if err != nil {
 		return nil, err
 	}

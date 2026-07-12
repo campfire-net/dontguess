@@ -895,6 +895,27 @@ type State struct {
 	// Not reset on Replay — externally written, not derived from the campfire log.
 	priceAdjustments map[string]PriceAdjustment
 
+	// wireToStore aliases an operator-emitted message's on-wire CONTENT-HASH id
+	// (the id a relay buyer sees and e-tags) back to its pre-signature STORE id
+	// (the id every state map is keyed by) — the read-time GAP-1 reconciliation
+	// for the team-tier settle chain (dontguess-55c, docs/design/
+	// settle-wire-id-reconciliation-55c.md). An operator match/preview/deliver is
+	// keyed in state by its random store id (sendLocalOperatorMessage), but the
+	// Outbox RE-SIGNS it on publish → a DIFFERENT content-hash wire id; a buyer can
+	// only ever e-tag that wire id, so the settle antecedent misses every store-keyed
+	// map without this alias. It is written LIVE by the Outbox at publish time
+	// (WithAliasRegistrar → RegisterWireAlias) and rebuilt on restart in
+	// seedEmittedFromStore's operator-record loop; resolveAlias consults it at every
+	// buyer-referenced-operator-id resolution. Key: wire id. Value: store id.
+	//
+	// NOT reset on Replay (precedent: priceAdjustments / brokerMatchIDs /
+	// federationProfiles) — State has no signer to re-derive the wire id, so the
+	// Outbox / restart seed repopulate it; a Replay that wiped it would strand every
+	// in-flight wire-id settle. No-Outbox paths (the ~32K in-process suite, the
+	// individual tier) never register an alias, so it stays empty and resolveAlias is
+	// the identity — behavior is byte-for-byte unchanged there.
+	wireToStore map[string]string
+
 	// matchToBuyHold indexes match message IDs to reservation IDs from
 	// scrip-buy-hold messages. Populated by applyScripBuyHold during Replay/Apply.
 	// O(1) alternative to scanning the full log in findExistingBuyerAcceptHold.

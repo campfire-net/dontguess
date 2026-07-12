@@ -118,6 +118,23 @@ func WithEmittedSeeder(seed func(id string)) OutboxOption {
 	return func(o *Outbox) { o.seedEmitted = seed }
 }
 
+// WithAliasRegistrar wires the wire→store id alias (dontguess-55c GAP 1,
+// docs/design/settle-wire-id-reconciliation-55c.md). register is invoked with the
+// SIGNED nostr event id (the content-hash WIRE id a relay buyer sees + e-tags) and
+// the pre-signature STORE id of every operator-authored record, STRICTLY BEFORE
+// that event is published — the same seam and ordering as WithEmittedSeeder.
+// Production wires it to exchange State.RegisterWireAlias so a team-tier buyer's
+// settle antecedent, which can only carry the wire id, resolves back to the store
+// id every state map is keyed by. Ordering holds by construction: the buyer cannot
+// learn the wire id until after publish, and the alias is registered before
+// publish, so it is always present before any settle referencing it can arrive.
+//
+// A nil register (the default) is exactly today's behavior — no alias wiring — so
+// the Outbox is drop-in when the alias is not needed (no-relay / individual tier).
+func WithAliasRegistrar(register func(wire, store string)) OutboxOption {
+	return func(o *Outbox) { o.aliasRegistrar = register }
+}
+
 // Outbox publishes operator-authored local records to the relay, off the hot
 // path, advancing a crash-durable cursor on each ACK. See the file doc for the
 // two load-bearing invariants (ping-pong prevention, crash-safe republish).
@@ -139,6 +156,12 @@ type Outbox struct {
 	// each operator-authored record STRICTLY BEFORE it is published (echo dedup,
 	// §D). nil = today's behavior (no seeding). See WithEmittedSeeder.
 	seedEmitted func(id string)
+
+	// aliasRegistrar, if non-nil, is called with the SIGNED content-hash WIRE id
+	// and the pre-signature STORE id of each operator-authored record STRICTLY
+	// BEFORE it is published (wire→store alias, dontguess-55c GAP 1). nil = today's
+	// behavior (no alias wiring). See WithAliasRegistrar.
+	aliasRegistrar func(wire, store string)
 
 	lagAlarm int64 // publish_lag threshold for the loud alarm (0 = disabled)
 
@@ -274,6 +297,16 @@ func (o *Outbox) Tick(ctx context.Context) error {
 		// content-hash id, so the seed still matches (never a stale/orphan seed).
 		if o.seedEmitted != nil {
 			o.seedEmitted(ev.ID)
+		}
+
+		// WIRE→STORE ALIAS (dontguess-55c GAP 1) — register STRICTLY BEFORE publish,
+		// same ordering rationale as the echo-dedup seed above: the buyer cannot
+		// learn ev.ID (the wire id) until this event reaches the relay, so recording
+		// the ev.ID→rec.ID alias before publish guarantees it is present before any
+		// settle e-tagging ev.ID can arrive. Idempotent; a republish re-derives the
+		// IDENTICAL content-hash ev.ID, so the re-register is a no-op.
+		if o.aliasRegistrar != nil {
+			o.aliasRegistrar(ev.ID, rec.ID)
 		}
 
 		if err := o.publishWithRetry(ctx, ev); err != nil {

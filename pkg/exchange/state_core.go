@@ -36,6 +36,7 @@ func NewState() *State {
 		entryConsumeCount:     make(map[string]int),
 		entryDeliverCount:     make(map[string]int),
 		priceAdjustments:      make(map[string]PriceAdjustment),
+		wireToStore:           make(map[string]string),
 		matchToBuyHold:        make(map[string]string),
 		matchToBuyHoldAmount:  make(map[string]int64),
 		settledMatches:        make(map[string]struct{}),
@@ -116,6 +117,11 @@ func (s *State) Replay(msgs []Message) {
 	// Note: priceAdjustments and brokerMatchIDs are intentionally NOT reset on
 	// Replay. They are externally written (by the fast pricing loop and engine
 	// respectively), not derived from the campfire log.
+	// wireToStore is likewise NOT reset on Replay (dontguess-55c GAP 1): the
+	// wire→store alias is a deterministic function of the operator log + the
+	// operator signer, but State has no signer to re-derive it — the Outbox
+	// (live) and seedEmittedFromStore (restart) repopulate it. Wiping it here
+	// would strand every in-flight wire-id-tagged settle until the next publish.
 	s.brokeredAcceptedOrders = 0
 	s.brokeredCompletions = 0
 	// senderHopDepth is re-derived from the campfire log on Replay.

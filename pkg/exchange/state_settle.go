@@ -88,7 +88,13 @@ func (s *State) applySettleBuyerAccept(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	antecedentID := msg.Antecedents[0]
+	// The antecedent is the operator match (or preview) the buyer accepted; the
+	// buyer e-tags its WIRE id, so map it to the store id previewToMatch /
+	// matchToBuyer are keyed by (dontguess-55c GAP 1; identity when no alias, so
+	// the in-process suite is byte-for-byte unchanged). This fold sets
+	// buyerAcceptToMatch — the mapping the operator auto-deliver (GAP 2) depends on
+	// — so it MUST resolve here, not only in the accessors.
+	antecedentID := s.resolveAlias(msg.Antecedents[0])
 
 	// Resolve the match message ID from the antecedent.
 	// Try preview path first (antecedent is a preview message).
@@ -169,7 +175,8 @@ func (s *State) applySettleBuyerReject(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	matchMsgID := msg.Antecedents[0]
+	// Buyer e-tags the operator match WIRE id → store id (dontguess-55c GAP 1).
+	matchMsgID := s.resolveAlias(msg.Antecedents[0])
 
 	// Enforce buyer identity: the sender must be the buyer who placed the
 	// original buy order that this match fulfills. An unknown match (!ok) is a
@@ -250,8 +257,9 @@ func (s *State) applySettleComplete(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	// Antecedent of complete is settle(deliver).
-	deliverMsgID := msg.Antecedents[0]
+	// Antecedent of complete is settle(deliver). The buyer e-tags the operator
+	// deliver's WIRE id → store id deliverToMatch is keyed by (dontguess-55c GAP 1).
+	deliverMsgID := s.resolveAlias(msg.Antecedents[0])
 
 	// Derive entry_id from the antecedent chain:
 	//   deliver → match (via deliverToMatch)
@@ -360,8 +368,9 @@ func (s *State) applySettleSmallContentDispute(msg *Message) {
 		return
 	}
 
-	// Antecedent must be a deliver message.
-	deliverMsgID := msg.Antecedents[0]
+	// Antecedent must be a deliver message. Buyer e-tags the operator deliver's
+	// WIRE id → store id deliverToMatch is keyed by (dontguess-55c GAP 1).
+	deliverMsgID := s.resolveAlias(msg.Antecedents[0])
 	matchMsgID, ok := s.deliverToMatch[deliverMsgID]
 	if !ok || matchMsgID == "" {
 		return
@@ -427,7 +436,8 @@ func (s *State) applySettlePreviewRequest(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	matchMsgID := msg.Antecedents[0]
+	// Buyer e-tags the operator match WIRE id → store id (dontguess-55c GAP 1).
+	matchMsgID := s.resolveAlias(msg.Antecedents[0])
 
 	// Validate that the antecedent is a match message with a known buyer.
 	expectedBuyer, ok := s.matchToBuyer[matchMsgID]

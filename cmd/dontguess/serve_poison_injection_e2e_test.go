@@ -84,7 +84,7 @@ func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, opera
 
 	relayConn := newFakeRelayConn(true /* echo */)
 	stop, err := attachRelayTransport(ctx, ls, operator, operator.PubKeyHex(),
-		storePath+".pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil)
+		storePath+".pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		cancel()
 		t.Fatalf("attachRelayTransport: %v", err)

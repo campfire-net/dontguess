@@ -536,7 +536,29 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 		return nil
 	}
 
-	// Idempotency: if a hold already exists for this match, skip.
+	// LIVE-SESSION re-accept idempotency (dontguess-55c). findExistingBuyerAcceptHold
+	// below is the RESTART guard: it reads matchToBuyHold, which is populated ONLY by
+	// folding the durable scrip-buy-hold (applyScripBuyHold) — a Replay-path index.
+	// In the live team-tier relay flow the operator's own scrip-buy-hold is appended
+	// via appendLocalRecord, which advances BOTH cursors WITHOUT folding it (operator
+	// records are never re-dispatched/re-folded), so matchToBuyHold stays EMPTY within
+	// a session until the next full rebuild. Without this guard a second buyer-accept
+	// for the same match — before its settlement — would sail past the empty
+	// restart-guard into a SECOND decAndSaveHold (a scrip double-debit) AND, with
+	// AutoDeliverOnBuyerAccept, a SECOND content deliver. The live reservation
+	// (matchToReservation, set by decAndSaveHold) is the authoritative in-session
+	// "hold already exists" signal, so short-circuit on it: a re-accept is a no-op.
+	// On RESTART matchToReservation is empty (fresh engine), so this does not fire and
+	// the durable findExistingBuyerAcceptHold path below still re-hydrates the hold.
+	if existingResID, live := e.reservationFor(matchMsgID); live && existingResID != "" {
+		e.opts.log("engine: buyer-accept scrip: match %s already has live reservation %s — ignoring re-accept (in-session idempotency)",
+			shortKey(matchMsgID), shortKey(existingResID))
+		return nil
+	}
+
+	// Idempotency (RESTART): if a durable hold was already recorded for this match on
+	// a prior run, re-hydrate it instead of decrementing again (double-charge on
+	// restart-with-pending-orders).
 	if existingResID := e.findExistingBuyerAcceptHold(matchMsgID); existingResID != "" {
 		return e.restoreExistingHold(msg, matchMsgID, existingResID)
 	}
@@ -555,21 +577,85 @@ func (e *Engine) handleSettleBuyerAcceptScrip(msg *Message) error {
 	holdAmount := bestPrice + fee
 
 	err := e.decAndSaveHold(msg, matchMsgID, holdAmount, bestPrice, fee)
-	if err != nil && errors.Is(err, scrip.ErrBudgetExceeded) {
-		// ed2-D §3.6: the buyer had insufficient scrip — decAndSaveHold saved NO
-		// reservation (so the §3.7 deliver guard will withhold content). Emit a
-		// durable, wire-visible settle(buyer-accept-reject) BEFORE returning the
-		// error so the buyer learns *why* buyer-accept failed instead of only
-		// timing out. This is the mutually-exclusive alternative to deliver for a
-		// buyer-accept: a failed hold produces the reject and NO deliverable link
-		// (§3.7 item 2). Reached only with ScripStore != nil (handleSettle gates
-		// this handler on it), so the individual tier is untouched.
-		if rejErr := e.emitBuyerAcceptReject(msg.ID, "insufficient_scrip"); rejErr != nil {
-			e.opts.log("engine: buyer-accept: CRITICAL: failed to emit durable buyer-accept-reject for buyer-accept=%s: %v",
-				shortKey(msg.ID), rejErr)
+	if err != nil {
+		if errors.Is(err, scrip.ErrBudgetExceeded) {
+			// ed2-D §3.6: the buyer had insufficient scrip — decAndSaveHold saved NO
+			// reservation (so the §3.7 deliver guard will withhold content). Emit a
+			// durable, wire-visible settle(buyer-accept-reject) BEFORE returning the
+			// error so the buyer learns *why* buyer-accept failed instead of only
+			// timing out. This is the mutually-exclusive alternative to deliver for a
+			// buyer-accept: a failed hold produces the reject and NO deliverable link
+			// (§3.7 item 2). Reached only with ScripStore != nil (handleSettle gates
+			// this handler on it), so the individual tier is untouched.
+			if rejErr := e.emitBuyerAcceptReject(msg.ID, "insufficient_scrip"); rejErr != nil {
+				e.opts.log("engine: buyer-accept: CRITICAL: failed to emit durable buyer-accept-reject for buyer-accept=%s: %v",
+					shortKey(msg.ID), rejErr)
+			}
 		}
+		return err
 	}
-	return err
+
+	// FRESH-HOLD SUCCESS (dontguess-55c GAP 2). decAndSaveHold just decremented the
+	// buyer and saved a live reservation. Reaching here at all means the
+	// IsMatchSettled guard and the restoreExistingHold idempotency short-circuit
+	// above BOTH returned early on every re-send, so this runs EXACTLY ONCE per
+	// match. On the team tier the relay buyer cannot emit the operator-gated
+	// deliver, so auto-emit it now; default-off (AutoDeliverOnBuyerAccept) leaves
+	// the frozen manual-trigger suite's single deliver untouched.
+	if e.opts.AutoDeliverOnBuyerAccept {
+		e.autoDeliverOnBuyerAccept(msg, matchMsgID)
+	}
+	return nil
+}
+
+// autoDeliverOnBuyerAccept emits the operator settle(deliver) CONTENT message
+// directly, folding it into live state so the buyer's later settle(complete)
+// resolves (dontguess-55c GAP 2, docs/design/settle-wire-id-reconciliation-55c.md).
+//
+// It is the send-then-Apply mirror of emitConsumeSignal, and deliberately does NOT
+// route through an operator-emitted deliver TRIGGER: a trigger is folded (Origin
+// == local) but NEVER dispatched (appendLocalRecord advances both cursors), so
+// handleSettleDeliverContent would never run on it and content would never move.
+// Emitting content directly with the buyer-accept as the antecedent makes the
+// deliver fold through applySettleDeliver's buyerAcceptToMatch → match chain (the
+// buyer-accept fold set that mapping earlier in this same snapshot's fold pass).
+//
+// Called only from the fresh-hold-success path (exactly once per match). Every
+// branch is a defensive no-op guard, never a scrip mutation — the only money
+// motion is emitDeliverContent's operator-authored, replay-durable deliver record.
+func (e *Engine) autoDeliverOnBuyerAccept(buyerAcceptMsg *Message, matchMsgID string) {
+	// Money-integrity guard (mirrors handleSettleDeliverContent ed2-D §3.7): deliver
+	// ONLY against a live reservation. decAndSaveHold just saved one; re-check
+	// defensively so a race can never emit content for an unfunded match.
+	if resID, ok := e.reservationFor(matchMsgID); !ok || resID == "" {
+		e.opts.log("engine: auto-deliver: no live reservation for match=%s — withholding content", shortKey(matchMsgID))
+		return
+	}
+	entryID := e.state.MatchEntryID(matchMsgID)
+	entry := e.state.GetInventoryEntry(entryID)
+	if entry == nil {
+		e.opts.log("engine: auto-deliver: entry=%s not found for match=%s — skipping", shortKey(entryID), shortKey(matchMsgID))
+		return
+	}
+	buyerKey := e.state.MatchBuyerKey(matchMsgID)
+	if buyerKey == "" {
+		e.opts.log("engine: auto-deliver: no buyer key for match=%s — skipping", shortKey(matchMsgID))
+		return
+	}
+	deliverMsg, err := e.emitDeliverContent(buyerAcceptMsg, entry, buyerKey)
+	if err != nil {
+		e.opts.log("engine: auto-deliver: emit content for match=%s: %v", shortKey(matchMsgID), err)
+		return
+	}
+	// send-then-Apply: fold the deliver into live state NOW so deliverToMatch is
+	// populated for the buyer's complete without waiting on a replay (mirrors
+	// emitConsumeSignal / stagePredictions). A nil message (content declined:
+	// missing content / oversize / missing hash) is a no-op.
+	if deliverMsg != nil {
+		e.state.Apply(deliverMsg)
+		e.opts.log("engine: auto-deliver: emitted+applied content deliver for match=%s buyer=%s",
+			shortKey(matchMsgID), shortKey(buyerKey))
+	}
 }
 
 // emitBuyerAcceptReject emits the durable, wire-visible settle(buyer-accept-reject)
@@ -898,7 +984,12 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 		}
 	}
 
-	return e.emitDeliverContent(msg, entry, buyerKey)
+	// Manual trigger path: the operator's incoming deliver TRIGGER (msg) is already
+	// the deliver-of-record (its fold populated deliverToMatch); the emitted content
+	// message is folded only when it echoes back off the relay, so the returned
+	// message is discarded here. Signature-only change from dontguess-55c GAP 2.
+	_, err := e.emitDeliverContent(msg, entry, buyerKey)
+	return err
 }
 
 // emitDeliverContent builds and sends the settle(deliver) message for entry.
@@ -923,7 +1014,17 @@ func (e *Engine) handleSettleDeliverContent(msg *Message) error {
 // than BlossomOffloadThreshold is never inlined into the outgoing message —
 // a hard boundary enforced at delivery time, independent of whatever put-time
 // policy produced the entry.
-func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKey string) error {
+//
+// It returns the emitted settle(deliver) *Message so the GAP-2 operator
+// auto-deliver (handleSettleBuyerAcceptScrip, dontguess-55c) can state.Apply it
+// send-then-Apply — populating deliverToMatch for the buyer's later complete —
+// exactly the way emitConsumeSignal applies its own emitted message. The manual
+// trigger path (handleSettleDeliverContent) discards the returned message: there
+// the operator's deliver TRIGGER is already the deliver-of-record, so the content
+// message is folded only when it echoes back off the relay (deduped there). A nil
+// message with nil error means the deliver was declined (no content / oversize /
+// missing hash) — a no-op, not an error, unchanged from before.
+func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKey string) (*Message, error) {
 	if entry.BlobPointer != "" {
 		return e.emitDeliverPointer(msg, entry, buyerKey)
 	}
@@ -931,12 +1032,12 @@ func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKe
 	content := entry.Content
 	if len(content) == 0 {
 		e.opts.log("engine: settle-deliver: entry=%s has no content — cannot emit deliver", shortKey(entry.EntryID))
-		return nil
+		return nil, nil
 	}
 	if len(content) > BlossomOffloadThreshold {
 		e.opts.log("engine: settle-deliver: entry=%s content size %d exceeds BlossomOffloadThreshold %d but has no BlobPointer — refusing to inline",
 			shortKey(entry.EntryID), len(content), BlossomOffloadThreshold)
-		return nil
+		return nil, nil
 	}
 
 	rawHash := sha256.Sum256(content)
@@ -951,7 +1052,7 @@ func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKe
 		"guide":        "Content delivered. Verify integrity: SHA-256 hash the decoded content and compare to content_hash. To confirm receipt, send settle(complete) with the content_hash. A compression task may be posted for you — completing it earns 30% of token_cost in scrip (you have the content cached, making you the ideal compressor).",
 	})
 	if err != nil {
-		return fmt.Errorf("engine: settle-deliver: marshal content payload for entry=%s: %w", shortKey(entry.EntryID), err)
+		return nil, fmt.Errorf("engine: settle-deliver: marshal content payload for entry=%s: %w", shortKey(entry.EntryID), err)
 	}
 
 	return e.sendDeliverMessage(msg, entry, buyerKey, deliverContentPayload, contentHash)
@@ -964,10 +1065,10 @@ func (e *Engine) emitDeliverContent(msg *Message, entry *InventoryEntry, buyerKe
 // trusting the content. See State.FetchAndVerifyBlob for the equivalent check
 // implemented for callers that fetch on the buyer's behalf server-side rather
 // than delivering a pointer for the buyer to resolve itself.
-func (e *Engine) emitDeliverPointer(msg *Message, entry *InventoryEntry, buyerKey string) error {
+func (e *Engine) emitDeliverPointer(msg *Message, entry *InventoryEntry, buyerKey string) (*Message, error) {
 	if entry.ContentHash == "" {
 		e.opts.log("engine: settle-deliver: entry=%s has BlobPointer but no content_hash — refusing to emit pointer deliver", shortKey(entry.EntryID))
-		return nil
+		return nil, nil
 	}
 
 	deliverPointerPayload, err := e.marshal(map[string]any{
@@ -979,7 +1080,7 @@ func (e *Engine) emitDeliverPointer(msg *Message, entry *InventoryEntry, buyerKe
 		"guide":        "Content is stored off-relay in Blossom (too large to inline). Fetch it via blob_pointer, then verify integrity YOURSELF before trusting it: SHA-256 hash the fetched bytes and compare to content_hash. A mismatch means the blob host served tampered or corrupted bytes — discard it and dispute rather than send settle(complete). To confirm receipt after a successful verify, send settle(complete) with the content_hash. A compression task may be posted for you — completing it earns 30% of token_cost in scrip (you have the content cached, making you the ideal compressor).",
 	})
 	if err != nil {
-		return fmt.Errorf("engine: settle-deliver: marshal pointer payload for entry=%s: %w", shortKey(entry.EntryID), err)
+		return nil, fmt.Errorf("engine: settle-deliver: marshal pointer payload for entry=%s: %w", shortKey(entry.EntryID), err)
 	}
 
 	return e.sendDeliverMessage(msg, entry, buyerKey, deliverPointerPayload, entry.ContentHash)
@@ -988,21 +1089,21 @@ func (e *Engine) emitDeliverPointer(msg *Message, entry *InventoryEntry, buyerKe
 // sendDeliverMessage emits the settle(deliver) convention message shared by
 // both the inline-content and pointer delivery shapes, antecedent to the
 // operator's deliver trigger (msg).
-func (e *Engine) sendDeliverMessage(msg *Message, entry *InventoryEntry, buyerKey string, payload []byte, contentHash string) error {
+func (e *Engine) sendDeliverMessage(msg *Message, entry *InventoryEntry, buyerKey string, payload []byte, contentHash string) (*Message, error) {
 	tags := []string{
 		TagSettle,
 		TagPhasePrefix + SettlePhaseStrDeliver,
 	}
 	antecedents := []string{msg.ID}
 
-	_, err := e.sendOperatorMessage(payload, tags, antecedents)
+	deliverMsg, err := e.sendOperatorMessage(payload, tags, antecedents)
 	if err != nil {
-		return fmt.Errorf("engine: settle-deliver: send content for entry=%s: %w", shortKey(entry.EntryID), err)
+		return nil, fmt.Errorf("engine: settle-deliver: send content for entry=%s: %w", shortKey(entry.EntryID), err)
 	}
 
 	e.opts.log("engine: settle-deliver: emitted content for entry=%s buyer=%s content_hash=%s",
 		shortKey(entry.EntryID), shortKey(buyerKey), contentHash[:24])
-	return nil
+	return deliverMsg, nil
 }
 
 // handleSettleSmallContentDispute processes a settle(small-content-dispute) message.

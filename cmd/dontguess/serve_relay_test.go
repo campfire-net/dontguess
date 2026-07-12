@@ -319,7 +319,7 @@ func TestRelayRoundTrip_PutBuyMatchSettle_Folds(t *testing.T) {
 
 	relayConn := newFakeRelayConn(true /* echo */)
 	stop, err := attachRelayTransport(ctx, ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil)
+		dir+"/events.jsonl.pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("attachRelayTransport: %v", err)
 	}
@@ -463,7 +463,7 @@ func TestRelayRestartReseed_NoDoubleFold(t *testing.T) {
 		// RESTART: build the wiring anew. buildRelayWiring runs the restart-seed
 		// over the persisted log (seeding the operator record's SIGNED id).
 		w, _, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-			dir+"/events.jsonl.pubcursor", &nopPublisher{}, 0, func(string, error, *nostr.Event) {})
+			dir+"/events.jsonl.pubcursor", &nopPublisher{}, 0, func(string, error, *nostr.Event) {}, nil)
 		if err != nil {
 			t.Fatalf("buildRelayWiring: %v", err)
 		}
@@ -622,7 +622,7 @@ func TestRelayHotPath_BuyMatchP99_UnderBlockedRelay(t *testing.T) {
 	// isolation assertion; run the reader + Outbox as attachRelayTransport does.
 	pub := newDemuxPublisher(relayConn)
 	w, _, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {})
+		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {}, nil)
 	if err != nil {
 		t.Fatalf("buildRelayWiring: %v", err)
 	}
@@ -787,7 +787,7 @@ func TestRelayForcedDisconnect_ReconnectResubscribeIngestPublishResume(t *testin
 	relayConn := newFakeRelayConn(true /* echo */)
 	pub := newDemuxPublisher(relayConn)
 	w, watermark, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {})
+		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {}, nil)
 	if err != nil {
 		t.Fatalf("buildRelayWiring: %v", err)
 	}
@@ -906,7 +906,7 @@ func TestRelayReconnectFlap_ReqSendFailsThenSucceeds_ReaderHeldUntilLiveSub(t *t
 	relayConn.setGateOnSub(true) // NIP-01: no delivery without a live REQ subscription
 	pub := newDemuxPublisher(relayConn)
 	w, watermark, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {})
+		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {}, nil)
 	if err != nil {
 		t.Fatalf("buildRelayWiring: %v", err)
 	}
@@ -1027,7 +1027,7 @@ func TestRelayInFlightPublishAtDrop_FailedAndRetried_NoWedge(t *testing.T) {
 	relayConn.setBlockOK(true) // never ACK -> the publish blocks IN-FLIGHT awaiting OK
 	pub := newDemuxPublisher(relayConn)
 	w, watermark, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {})
+		dir+"/events.jsonl.pubcursor", pub, 0, func(string, error, *nostr.Event) {}, nil)
 	if err != nil {
 		t.Fatalf("buildRelayWiring: %v", err)
 	}
@@ -1183,7 +1183,7 @@ func TestShutdownRelayTransport_NoHangOnCtxCancel(t *testing.T) {
 
 	relayConn := newFakeRelayConn(true /* echo */)
 	stop, err := attachRelayTransport(ctx, ls, operator, operator.PubKeyHex(),
-		dir+"/events.jsonl.pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil)
+		dir+"/events.jsonl.pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil, nil)
 	if err != nil {
 		t.Fatalf("attachRelayTransport: %v", err)
 	}

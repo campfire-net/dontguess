@@ -204,6 +204,26 @@ type EngineOptions struct {
 	// Outbox.Notify is itself non-blocking. Nil (the default — the individual tier
 	// has no outbox) is a strict no-op: behavior is byte-for-byte unchanged.
 	OnLocalAppend func()
+
+	// AutoDeliverOnBuyerAccept makes the operator auto-emit the settle(deliver)
+	// content message on a FRESH-hold-success buyer-accept (dontguess-55c GAP 2,
+	// docs/design/settle-wire-id-reconciliation-55c.md). It exists because a
+	// team-tier relay buyer CANNOT emit the operator-gated deliver themselves
+	// (applySettleDeliver is operator-only) and there is no manual operator in the
+	// loop — so without this, a funded buyer-accept holds scrip but content never
+	// moves. When set, handleSettleBuyerAcceptScrip calls emitDeliverContent
+	// DIRECTLY (send-then-Apply, mirroring emitConsumeSignal) on the one path where
+	// decAndSaveHold just succeeded — which fires EXACTLY ONCE per match because the
+	// IsMatchSettled guard and the restoreExistingHold idempotency short-circuit
+	// have already returned on every re-send.
+	//
+	// Default FALSE, and deliberately NOT gated on ScripStore: serve sets it true
+	// only on the team tier (scripStore != nil). The frozen scrip suite drives
+	// deliver via a MANUAL operator trigger and asserts exactly one deliver, so it
+	// leaves this false — auto-deliver never fires and its single manual deliver
+	// stays the sole deliver. On the individual tier (ScripStore == nil)
+	// handleSettleBuyerAcceptScrip never runs, so this is doubly inert there.
+	AutoDeliverOnBuyerAccept bool
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {

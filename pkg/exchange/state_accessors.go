@@ -255,6 +255,9 @@ func (s *State) IsMatchDelivered(matchMsgID string) bool {
 func (s *State) MatchForDeliver(deliverMsgID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// The buyer e-tags the operator deliver's WIRE id; map it to the store id the
+	// deliverToMatch index is keyed by (dontguess-55c GAP 1; identity when absent).
+	deliverMsgID = s.resolveAlias(deliverMsgID)
 	matchMsgID := s.deliverToMatch[deliverMsgID]
 	if matchMsgID == "" {
 		return "", false
@@ -265,6 +268,8 @@ func (s *State) MatchForDeliver(deliverMsgID string) (string, bool) {
 func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Buyer-supplied deliver WIRE id → store id (dontguess-55c GAP 1).
+	deliverMsgID = s.resolveAlias(deliverMsgID)
 	matchMsgID := s.deliverToMatch[deliverMsgID]
 	if matchMsgID == "" {
 		return "", false
@@ -292,6 +297,8 @@ func (s *State) SellerKeyForDeliver(deliverMsgID string) (string, bool) {
 func (s *State) EntryForDeliver(deliverMsgID string) (*InventoryEntry, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// Buyer-supplied deliver WIRE id → store id (dontguess-55c GAP 1).
+	deliverMsgID = s.resolveAlias(deliverMsgID)
 	matchMsgID := s.deliverToMatch[deliverMsgID]
 	if matchMsgID == "" {
 		return nil, false
@@ -714,6 +721,10 @@ func (s *State) GetPendingPut(msgID string) (*InventoryEntry, bool) {
 func (s *State) ResolveMatchFromAntecedent(antecedentID string) (matchMsgID string, buyerKey string, found bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// The buyer e-tags the operator match/preview WIRE id; map it to the store id
+	// the previewToMatch / matchToBuyer indexes are keyed by (dontguess-55c GAP 1;
+	// identity when no alias exists, e.g. the in-process suite / individual tier).
+	antecedentID = s.resolveAlias(antecedentID)
 	matchMsgID, found = s.previewToMatch[antecedentID]
 	if !found {
 		// Legacy/small-content path: antecedent is the match message directly.
@@ -738,6 +749,10 @@ func (s *State) MatchEntryID(matchMsgID string) string {
 func (s *State) MatchInfo(matchMsgID string, previewReqMsgID string) (buyerKey string, entryID string, matchKnown bool, previewTracked bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	// The buyer e-tags the operator match WIRE id → store id (dontguess-55c GAP 1).
+	// previewReqMsgID is the buyer's own preview-request (store == wire), so it is
+	// left as-is.
+	matchMsgID = s.resolveAlias(matchMsgID)
 	buyerKey, matchKnown = s.matchToBuyer[matchMsgID]
 	entryID = s.matchToEntry[matchMsgID]
 	_, previewTracked = s.previewRequestToMatch[previewReqMsgID]

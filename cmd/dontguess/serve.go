@@ -289,6 +289,13 @@ func runServeLocal(dgHome string) error {
 		ScripStore:        scripStore,
 		MinBuyBalance:     minBuyBalance,
 		OnLocalAppend:     onLocalAppend,
+		// Team tier (scripStore != nil): auto-emit the operator settle(deliver) on a
+		// fresh-hold-success buyer-accept (dontguess-55c GAP 2). The relay buyer
+		// cannot emit the operator-gated deliver, and there is no manual operator in
+		// the loop, so without this a funded buyer-accept holds scrip but content
+		// never moves. Individual tier (scripStore == nil) leaves it false — and
+		// handleSettleBuyerAcceptScrip never runs there anyway.
+		AutoDeliverOnBuyerAccept: scripStore != nil,
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
@@ -318,7 +325,8 @@ func runServeLocal(dgHome string) error {
 	for _, relayURL := range relayURLs {
 		conn := relay.New(relayURL, relaySigner)
 		stop, aerr := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
-			relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf, appendNotify)
+			relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf, appendNotify,
+			eng.State().RegisterWireAlias)
 		if aerr != nil {
 			return fmt.Errorf("attaching relay transport for %s: %w", relayURL, aerr)
 		}
