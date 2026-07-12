@@ -117,6 +117,7 @@ func TestRoundTrip_AllOpKinds(t *testing.T) {
 		{"assign_reject", exchange.TagAssignReject, nil, KindAssign},
 		{"assign_expire", exchange.TagAssignExpire, nil, KindAssign},
 		{"assign_auction_close", exchange.TagAssignAuctionClose, nil, KindAssign},
+		{"consume", exchange.TagConsume, nil, KindConsume},
 		{"scrip_mint", scrip.TagScripMint, nil, KindScrip},
 		{"scrip_settle", scrip.TagScripSettle, nil, KindScrip},
 	}
@@ -129,6 +130,104 @@ func TestRoundTrip_AllOpKinds(t *testing.T) {
 				if ev.Kind != tc.wantKind {
 					t.Errorf("kind: got %d want %d", ev.Kind, tc.wantKind)
 				}
+			}
+		})
+	}
+}
+
+// TestRoundTrip_EveryOperatorEmittableOp is the RECURRENCE GUARD for dontguess-d52.
+//
+// The Outbox treats a ToNostrEvent conversion failure as FATAL and kills the
+// publish loop (pkg/relay/outbox.go), stranding every later operator record at
+// RF=1. The consume signal (tagged only [exchange:consume]) had no nostr kind, so
+// ToNostrEvent returned "carries no recognised exchange operation tag" and a
+// team-tier settle(complete)->consume killed publishing. This test is the guard
+// that would have caught it: it enumerates the EXACT tag-sets the operator emits
+// via sendOperatorMessage across pkg/exchange (the AUDIT) and asserts each one
+//
+//	(a) converts (ToNostrEvent succeeds — i.e. the Outbox never FATALs on it), and
+//	(b) round-trips losslessly (kind resolves and Tags/Payload/Antecedents are
+//	    reproduced exactly, so a relay reader folds the identical proto.Message and
+//	    recomputes the same Layer-0..4 metrics).
+//
+// INVARIANT FOR FUTURE EDITS: every operator sendOperatorMessage call site in
+// pkg/exchange must have its tag-set represented here. Adding a new operator record
+// class with a tag that has no kind mapping will fail this test (ToNostrEvent
+// error) BEFORE it can strand the live Outbox.
+func TestRoundTrip_EveryOperatorEmittableOp(t *testing.T) {
+	phase := func(p string) string { return exchange.TagPhasePrefix + p }
+	verdict := func(v string) string { return exchange.TagVerdictPrefix + v }
+
+	cases := []struct {
+		name     string
+		tags     []string
+		wantKind int
+	}{
+		// --- engine_buy.go: match + buy-miss standing offer (+ synthetic variants) ---
+		{"match", []string{exchange.TagMatch}, KindMatch},
+		{"match_synthetic", []string{exchange.TagMatch, exchange.TagSynthetic}, KindMatch},
+		{"buy_miss", []string{exchange.TagBuyMiss, exchange.TagMatch}, KindMatch},
+		{"buy_miss_synthetic", []string{exchange.TagBuyMiss, exchange.TagMatch, exchange.TagSynthetic}, KindMatch},
+
+		// --- engine_pricing.go / engine_put.go: operator settle phases ---
+		{"put_accept", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrPutAccept), verdict("accepted")}, KindSettle},
+		{"put_accept_buymiss", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrPutAccept), verdict("accepted"), exchange.TagBuyMiss}, KindSettle},
+		{"put_accept_buymiss_synthetic", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrPutAccept), verdict("accepted"), exchange.TagBuyMiss, exchange.TagSynthetic}, KindSettle},
+		{"put_reject", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrPutReject), verdict("rejected")}, KindSettle},
+		{"buyer_accept_reject", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrBuyerAcceptReject), verdict("rejected")}, KindSettle},
+		{"preview", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrPreview)}, KindSettle},
+		{"deliver", []string{exchange.TagSettle, phase(exchange.SettlePhaseStrDeliver)}, KindSettle},
+
+		// --- engine_settle.go:476: the consume behavioral signal (THE d52 gap) ---
+		{"consume", []string{exchange.TagConsume}, KindConsume},
+
+		// --- engine_core.go / engine_buy.go: operator assign sub-ops ---
+		{"assign", []string{exchange.TagAssign}, KindAssign},
+		{"assign_expire", []string{exchange.TagAssignExpire}, KindAssign},
+		{"assign_auction_close", []string{exchange.TagAssignAuctionClose}, KindAssign},
+
+		// --- scrip operator records emitted by the engine ---
+		{"scrip_mint", []string{scrip.TagScripMint}, KindScrip},
+		{"scrip_settle", []string{scrip.TagScripSettle}, KindScrip},
+		{"scrip_burn", []string{scrip.TagScripBurn}, KindScrip},
+		{"scrip_buy_hold", []string{scrip.TagScripBuyHold}, KindScrip},
+		{"scrip_put_pay", []string{scrip.TagScripPutPay}, KindScrip},
+		{"scrip_assign_pay", []string{scrip.TagScripAssignPay}, KindScrip},
+		{"scrip_dispute_refund", []string{scrip.TagScripDisputeRefund}, KindScrip},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			// Exercise the operator-authored antecedent shape too (every one of these
+			// records replies to a triggering message — matchToBuyMsg, complete msg, etc).
+			for _, antes := range [][]string{nil, {sampleAnte0}, {sampleAnte0, sampleAnte1}} {
+				in := &proto.Message{
+					ID:          sampleID,
+					CampfireID:  "campfire-xyz",
+					Sender:      sampleSender, // operator key in practice
+					Payload:     []byte(`{"entry_id":"e-123","buyer_key":"` + sampleSender + `"}`),
+					Tags:        append([]string(nil), tc.tags...),
+					Antecedents: antes,
+					Timestamp:   1_717_000_000_123_456_789,
+					Instance:    "operator",
+				}
+				// (a) The Outbox never FATALs: ToNostrEvent must succeed and resolve a kind.
+				ev, err := ToNostrEvent(in)
+				if err != nil {
+					t.Fatalf("ToNostrEvent(%v): %v — this tag-set would FATAL the Outbox publish loop", tc.tags, err)
+				}
+				if ev.Kind != tc.wantKind {
+					t.Errorf("kind: got %d want %d for tags %v", ev.Kind, tc.wantKind, tc.tags)
+				}
+				// (b) Lossless round-trip: Tags(as set)/Payload/Antecedents preserved so the
+				// unchanged engine folds the identical proto.Message.
+				assertRoundTrip(t, in)
+			}
+			// The primaryOp resolver itself must recognise the record's op (the exact
+			// predicate ToNostrEvent uses) — a defense-in-depth check that no operator
+			// tag-set silently resolves to "".
+			if got := primaryOp(tc.tags); got == "" {
+				t.Errorf("primaryOp(%v) = \"\" — an operator record with no recognised op tag FATALs the Outbox", tc.tags)
 			}
 		})
 	}
@@ -288,8 +387,13 @@ func TestNoEmbeddingVectorOnTheWire(t *testing.T) {
 
 func TestLoudDegradation(t *testing.T) {
 	t.Run("to_nostr_no_op_tag", func(t *testing.T) {
-		// A consume message carries no primary operation tag — out of shape scope.
-		msg := &proto.Message{ID: sampleID, Sender: sampleSender, Tags: []string{exchange.TagConsume}}
+		// A message carrying only decorative tags (content-type/domain) and NO
+		// exchange operation tag cannot be mapped to a kind — the loud-degradation
+		// contract (hard constraint #4, dontguess-553) requires an error, never a
+		// silent kind-0 event. (exchange:consume USED to land here; it is now a
+		// first-class operator record with its own KindConsume — dontguess-d52 —
+		// and its round-trip is asserted by TestRoundTrip_EveryOperatorEmittableOp.)
+		msg := &proto.Message{ID: sampleID, Sender: sampleSender, Tags: []string{"exchange:content-type:code", "exchange:domain:go"}}
 		if _, err := ToNostrEvent(msg); err == nil {
 			t.Error("expected error converting a message with no exchange operation tag")
 		}

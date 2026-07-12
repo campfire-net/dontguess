@@ -37,15 +37,14 @@ import (
 
 const wireIDBuyerMint = int64(1_000_000)
 
-// hushRelayLogs silences the default logger for the duration of a test. The team-tier
-// Outbox tail cannot yet nostr-encode the operator's own exchange:consume behavioral
-// signal (no KindConsume in the adapter — a PRE-EXISTING gap, see the item followups),
-// so after a settle(complete) it hot-loops "outbox: FATAL cannot convert/sign …" to
-// stderr on every tick. That spam is orthogonal to the wire-id money flow under test but
-// its synchronous stderr I/O + CPU burn measurably amplifies the suite's pre-existing
-// timing-sensitive tests. Silencing it here keeps the wire-id tests from being that
-// amplifier. Sequential tests only (no t.Parallel), so the global swap is safe; restored
-// on cleanup.
+// hushRelayLogs silences the default logger for the duration of a test. It keeps
+// the team-tier wire-id tests quiet (the engine + relay legs log routine progress
+// on every tick) and independent of any incidental log volume. Historically this
+// also masked a settle(complete)->consume Outbox FATAL hot-loop (no KindConsume in
+// the adapter); that gap is CLOSED (dontguess-d52 — consume now publishes as
+// KindConsume=3406, proven by TestRelayTeamTierConsumePublishesNoOutboxFatal, which
+// deliberately does NOT hush so it can assert the FATAL is gone). Sequential tests
+// only (no t.Parallel), so the global swap is safe; restored on cleanup.
 func hushRelayLogs(t *testing.T) {
 	t.Helper()
 	prev := log.Writer()

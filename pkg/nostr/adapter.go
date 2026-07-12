@@ -33,10 +33,10 @@ const MaxAntecedents = 64
 //
 // Mapping (docs/design/nostr-first-rebuild-decision.md §Nostr Architecture):
 //   - the single exchange operation tag -> Kind (put=3401, buy=3402, match=3403,
-//     settle=3404, assign*=3405, scrip*=3411). For the four base ops the kind
-//     fully determines the op, so the op tag is consumed by the kind. Assign and
-//     scrip share a kind, so their exact sub-op is preserved in an ["op", <tag>]
-//     discriminator.
+//     settle=3404, assign*=3405, consume=3406, scrip*=3411). For the four base ops
+//     and consume the kind fully determines the op, so the op tag is consumed by
+//     the kind. Assign and scrip share a kind, so their exact sub-op is preserved
+//     in an ["op", <tag>] discriminator.
 //   - Antecedents -> ["e", <id>, "", "reply"] tags, in order. Index [0] carries
 //     the NIP-01 simple reply marker (the engine only ever reads Antecedents[0]);
 //     any further antecedents are preserved as plain ["e", <id>] tags so the

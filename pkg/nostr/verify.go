@@ -103,6 +103,12 @@ func eventPhase(ev *Event) string {
 // pure function of the event's own (kind, op, phase), never of any relay policy.
 //
 //   - match (3403): always operator-authored.
+//   - consume (3406): always operator-authored — the exchange:consume behavioral
+//     signal is emitted only by the operator (emitConsumeSignal) and feeds the
+//     per-entry consume count that drives the Layer-0..4 metrics and pricing loops
+//     (dontguess-d52). A non-operator consume would inflate that count, so it is
+//     gated here at intake with the same crypto re-verify as match/scrip, mirroring
+//     the exchange fold's own operator-sender guard on applyConsume.
 //   - scrip (3411): always operator-authored — the operator is the sole party
 //     that mints, holds, settles, pays, and burns (relay-transport.md §E).
 //   - settle (3404): operator-authored only for the operator phases
@@ -115,7 +121,7 @@ func eventPhase(ev *Event) string {
 //     operator-only; authorship is enforced by other layers, not here.
 func requiresOperatorAuthor(ev *Event) bool {
 	switch ev.Kind {
-	case KindMatch, KindScrip:
+	case KindMatch, KindConsume, KindScrip:
 		return true
 	case KindSettle:
 		_, ok := operatorSettlePhases[eventPhase(ev)]

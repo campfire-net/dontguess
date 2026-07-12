@@ -40,6 +40,7 @@ const (
 	KindMatch               = 3403  // exchange:match          (regular, immutable)
 	KindSettle              = 3404  // exchange:settle         (regular, immutable)
 	KindAssign              = 3405  // exchange:assign* (7 sub-ops, single kind)
+	KindConsume             = 3406  // exchange:consume        (regular, operator behavioral signal)
 	KindScrip               = 3411  // dontguess:scrip-*       (regular, team-tier)
 	KindInventoryProjection = 30401 // inventory+price PROJECTION (addressable, NOT source of truth)
 )
@@ -64,23 +65,29 @@ const (
 	replyMarker = "reply"
 )
 
-// baseOpToKind maps the four base exchange operations that each own a dedicated
-// kind. For these, the kind alone fully determines the op tag, so the op tag is
-// consumed by the kind (not re-emitted) and reconstructed from the kind on the
-// reverse path.
+// baseOpToKind maps the exchange operations that each own a DEDICATED kind — the
+// four base client ops (put/buy/match/settle) plus the operator-authored consume
+// behavioral signal (dontguess-d52). For all of these the kind alone fully
+// determines the op tag, so the op tag is consumed by the kind (not re-emitted)
+// and reconstructed from the kind on the reverse path. (consume rides here rather
+// than an ["op", …] discriminator because, like the base ops, it is the sole op on
+// its kind — the discriminator mechanism only exists for the SHARED assign/scrip
+// kinds where the kind cannot disambiguate the sub-op.)
 var baseOpToKind = map[string]int{
-	exchange.TagPut:    KindPut,
-	exchange.TagBuy:    KindBuy,
-	exchange.TagMatch:  KindMatch,
-	exchange.TagSettle: KindSettle,
+	exchange.TagPut:     KindPut,
+	exchange.TagBuy:     KindBuy,
+	exchange.TagMatch:   KindMatch,
+	exchange.TagSettle:  KindSettle,
+	exchange.TagConsume: KindConsume,
 }
 
 // kindToBaseOp is the inverse of baseOpToKind.
 var kindToBaseOp = map[int]string{
-	KindPut:    exchange.TagPut,
-	KindBuy:    exchange.TagBuy,
-	KindMatch:  exchange.TagMatch,
-	KindSettle: exchange.TagSettle,
+	KindPut:     exchange.TagPut,
+	KindBuy:     exchange.TagBuy,
+	KindMatch:   exchange.TagMatch,
+	KindSettle:  exchange.TagSettle,
+	KindConsume: exchange.TagConsume,
 }
 
 // assignOps is the set of the seven assign sub-op tags. They all share kind 3405;
