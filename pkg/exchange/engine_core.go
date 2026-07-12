@@ -951,6 +951,35 @@ func (e *Engine) PollLocalStoreForTest() error {
 	return e.pollLocalStore()
 }
 
+// StartupReplayForTest runs the SYNCHRONOUS startup portion of Start — the exact
+// pre-run-loop body: replayAll (fold the full LocalStore log into State AND
+// rebuildMatchIndex, the Seam D reload re-gate), seed the dispatch cursor to the
+// fold cursor, and dispatchPendingOrders — WITHOUT entering the blocking poll
+// loop. It exists so a cross-package test (cmd/dontguess) can deterministically
+// bring a fresh engine to the same post-startup state Start reaches, instead of
+// launching eng.Start in a goroutine and then racing a wall-clock waitFor against
+// it. That race is a real flake source: Start's replayAllLocal folds inventory
+// (state.Replay) and THEN re-gates the index (rebuildMatchIndex) as two steps in
+// one goroutine, so a test that polls Inventory()==1 as a "replay done" proxy can
+// observe it in the window BETWEEN the two and assert on an index/flag the re-gate
+// has not written yet (dontguess-c84). Driving the identical body synchronously
+// removes that window. It is test-support only: purely additive, it changes no
+// production behavior (production reaches this state via Start), and after it
+// returns the fold cursor, dispatch cursor, folded State, and match index are all
+// consistent — exactly as Start leaves them before its first poll tick.
+func (e *Engine) StartupReplayForTest() error {
+	if err := e.replayAll(); err != nil {
+		return fmt.Errorf("startup replay: %w", err)
+	}
+	if e.opts.LocalStore != nil {
+		e.localMu.Lock()
+		e.localDispatched = e.localSeen
+		e.localMu.Unlock()
+	}
+	e.dispatchPendingOrders()
+	return nil
+}
+
 // foldAndDispatchLocalSnapshot folds any newly-appended records in the given
 // LocalStore snapshot into State and dispatches any not-yet-dispatched records.
 // It is split out of pollLocalStore so the snapshot passed to fold/dispatch is

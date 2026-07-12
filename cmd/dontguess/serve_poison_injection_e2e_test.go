@@ -7,14 +7,25 @@ package main
 // the FULL serve stack — not the engine in isolation. It composes the exact pieces
 // runServeLocal wires together on the team/federated tier (design §6):
 //
-//   real LocalStore  →  real relay INGEST leg (attachRelayTransport / Intake)  →
-//   engine poll-loop fold  →  auto-accept TICKER (RunAutoAccept)  →  match index
+//   real LocalStore  →  real relay INGEST leg (Intake.HandleEvent)  →
+//   engine poll-loop fold  →  auto-accept promotion gate (RunAutoAccept)  →  match index
 //
 // with a live *exchange.TrustChecker (fleet allowlist + reputation floor) and a
 // live *scrip.LocalScripStore, exactly as serve.go constructs them inside the
 // `len(relayURLs) > 0` branch. Nothing is stubbed but the relay wire itself (the
 // in-process fakeRelayConn from serve_relay_test.go — a live relay is infra-gated,
 // dontguess-13f).
+//
+// Those FOUR components are the identical production types; the relayIngestPump
+// drives them SYNCHRONOUSLY (relay Intake.HandleEvent → engine PollLocalStoreForTest
+// → RunAutoAccept), and StartupReplayForTest brings a restarted engine to its
+// post-Start state deterministically. This replaces the earlier version's three
+// starved background tickers (runReader / eng.Start / auto-accept) + 10s waitFor
+// polls, which FALSE-failed under -race + full-suite CPU load — either starved past
+// the deadline, or observing one leg's partial output and racing ahead of the next
+// (the restart replay-fold-vs-index-re-gate window). Same de-flake class as
+// dontguess-c12, now closed through the async relay ingest leg (dontguess-c84).
+// Every assertion is preserved; only the async goroutines + wall-clock waits are gone.
 //
 // The attack: a validly Schnorr-SIGNED put(3401) authored by a keypair that is NOT
 // on the operator's fleet allowlist arrives over the relay ingest leg — precisely
@@ -34,7 +45,6 @@ package main
 // mutates none — the pre-existing value suite is untouched.
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -44,14 +54,80 @@ import (
 	dgstore "github.com/campfire-net/dontguess/pkg/store"
 )
 
+// relayIngestPump drives a foreign put through the EXACT three legs the team-tier
+// serve stack chains — the relay INGEST Intake, the engine poll-loop fold, and the
+// auto-accept promotion gate (Seam A) — but SYNCHRONOUSLY, so an injected put is
+// deterministically folded+promoted before the pump returns, with no ticker/
+// wall-clock wait (dontguess-c84). Each of the three legs is the identical
+// production component; only the async runReader/poll/auto-accept GOROUTINES are
+// removed. The prior version launched all three as starved goroutines and polled a
+// 10s waitFor against them: under -race + full-suite CPU saturation those
+// goroutines were scheduled past the deadline, or the test observed one leg's
+// partial output and raced ahead of the next (the restart Inventory-vs-index
+// re-gate window), FALSE-failing (dontguess-c84, same class as dontguess-c12 but
+// through the async relay ingest leg, which had no synchronous seam before this).
+type relayIngestPump struct {
+	t       *testing.T
+	eng     *exchange.Engine
+	wiring  *relayWiring
+	skipped map[string]struct{}
+}
+
+// injectSignedPut synthesizes a genuinely Schnorr-signed foreign put exactly as a
+// non-operator agent's client would publish it, then drives it through the three
+// ingest legs synchronously. Distinct descriptions keep content hashes unique so
+// the dedup gate never collides. After it returns, the engine's inventory, match
+// index, and degradation counters reflect the promotion decision deterministically.
+func (p *relayIngestPump) injectSignedPut(seller identity.Signer, desc string, tokenCost int64) {
+	p.t.Helper()
+	putEv := signExchangeEvent(p.t, seller,
+		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
+		localPutPayload(desc, tokenCost))
+
+	// LEG 1 — RELAY INGEST. HandleEvent is the SYNCHRONOUS seam runReader calls per
+	// wire frame (§2.4a): universal signature floor -> adapter -> operator-authorship
+	// gate -> Sequencer IngestLive -> Drain -> LocalStore.BatchAppend(Origin="relay").
+	// A put has no antecedents, so it drains and persists to LocalStore before this
+	// returns — driving it directly removes the async runReader goroutine from the
+	// path while exercising the identical admission pipeline.
+	if err := p.wiring.intake.HandleEvent(identityToNostrEvent(putEv)); err != nil {
+		p.t.Fatalf("relay Intake.HandleEvent: %v", err)
+	}
+
+	// LEG 2 — ENGINE POLL-LOOP FOLD. The exact body runLocal's ticker runs
+	// (pollLocalStore): Replay -> incremental fold, which stages the relay-origin
+	// put into PendingPuts (state_put.go applyPut, ZERO trust filter — Seam A is the
+	// real choke below), and dispatches it through the real dispatch path.
+	if err := p.eng.PollLocalStoreForTest(); err != nil {
+		p.t.Fatalf("poll+fold: %v", err)
+	}
+
+	// LEG 3 — AUTO-ACCEPT PROMOTION GATE (Seam A). The identical body the auto-accept
+	// ticker runs. A non-allowlisted seller is counted (dropped_unlisted) and its put
+	// durably rejected (put-reject) so it never enters matchable inventory; an
+	// allowlisted seller's put is promoted (put-accept) and indexed. autoAcceptPutLocked
+	// applies its own operator record synchronously, so State + the match index are
+	// current the instant this returns.
+	p.eng.RunAutoAccept(exchange.MaxTokenCost, time.Now(), p.skipped)
+}
+
 // teamTierServeStack stands up the team/federated-tier serve stack over store `ls`
 // with the fleet allowlist `allow` (operator is always implicitly trusted). It
-// returns a started engine, the fake relay it ingests from, and a cancel that
-// tears the whole thing down. Mirrors serve.go's relays-attached branch: a live
-// TrustChecker (with the §D3 reputation floor, default 40) + a live
-// LocalScripStore, wired into a real Engine, an attached relay INGEST leg, and the
-// auto-accept ticker — the exact promotion path Seam A guards.
-func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, operator identity.Signer, allow ...string) (*exchange.Engine, *fakeRelayConn, func()) {
+// returns the engine, a synchronous relayIngestPump over the real relay Intake, and
+// a teardown. Mirrors serve.go's relays-attached branch: a live TrustChecker (with
+// the §D3 reputation floor, default 40) + a live LocalScripStore, wired into a real
+// Engine, the real relay INGEST leg (its Intake), and the real auto-accept
+// promotion gate (RunAutoAccept) — the exact promotion path Seam A guards.
+//
+// The stack is driven SYNCHRONOUSLY (dontguess-c84): a deterministic
+// StartupReplayForTest brings the engine to the same post-Start state (folding the
+// log AND running the Seam D reload re-gate, rebuildMatchIndex) instead of racing a
+// waitFor against an eng.Start goroutine, and the pump drives ingest/fold/promote
+// inline instead of via three starved tickers. No async goroutine sits on the
+// ingest->promote path, so no wall-clock deadline can be starved past. The Outbox
+// publish leg is intentionally omitted: these tests assert only on inventory / the
+// match index / degradation counters, never on what reaches the relay wire.
+func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, operator identity.Signer, allow ...string) (*exchange.Engine, *relayIngestPump, func()) {
 	t.Helper()
 
 	ks := exchange.NewKeySet(allow...)
@@ -80,49 +156,26 @@ func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, opera
 	// wired AFTER NewEngine, BEFORE Start), at the §D3 default of 40.
 	tc.SetReputationFloor(eng.State().SellerReputation, exchange.DefaultMinReputation)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	// SYNCHRONOUS startup replay — the same pre-run-loop body Start runs: fold the
+	// full log into State AND rebuildMatchIndex (Seam D reload re-gate). On a fresh
+	// store this is a no-op; on a restart over a populated log it deterministically
+	// re-folds inventory and re-gates the index in one call, so the restart
+	// assertions below observe a fully-settled state (no replay-vs-re-gate race).
+	if err := eng.StartupReplayForTest(); err != nil {
+		t.Fatalf("StartupReplayForTest: %v", err)
+	}
 
-	relayConn := newFakeRelayConn(true /* echo */)
-	stop, err := attachRelayTransport(ctx, ls, operator, operator.PubKeyHex(),
-		storePath+".pubcursor", relayConn, relayConn, 5*time.Millisecond, nil, nil, nil)
+	// Build ONLY the relay INGEST wiring (its Intake) — the synchronous seam the
+	// pump drives. nopPublisher + no runReader/Outbox goroutines: nothing async runs.
+	wiring, _, err := buildRelayWiring(ls, operator, operator.PubKeyHex(),
+		storePath+".pubcursor", nopPublisher{}, 0, nil, nil)
 	if err != nil {
-		cancel()
-		t.Fatalf("attachRelayTransport: %v", err)
+		t.Fatalf("buildRelayWiring: %v", err)
 	}
 
-	engDone := make(chan struct{})
-	go func() { defer close(engDone); _ = eng.Start(ctx) }()
-	go func() {
-		skipped := map[string]struct{}{}
-		tk := time.NewTicker(10 * time.Millisecond)
-		defer tk.Stop()
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case now := <-tk.C:
-				eng.RunAutoAccept(exchange.MaxTokenCost, now, skipped)
-			}
-		}
-	}()
-
-	teardown := func() {
-		cancel()
-		<-engDone
-		stop()
-	}
-	return eng, relayConn, teardown
-}
-
-// injectSignedPut publishes a genuinely Schnorr-signed foreign put over the relay,
-// exactly the way a non-operator agent's client would. Distinct descriptions keep
-// content hashes unique so the dedup gate never collides.
-func injectSignedPut(t *testing.T, relayConn *fakeRelayConn, seller identity.Signer, desc string, tokenCost int64) {
-	t.Helper()
-	putEv := signExchangeEvent(t, seller,
-		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
-		localPutPayload(desc, tokenCost))
-	relayConn.inject(putEv)
+	pump := &relayIngestPump{t: t, eng: eng, wiring: wiring, skipped: map[string]struct{}{}}
+	teardown := func() {} // fully synchronous — no goroutines to stop
+	return eng, pump, teardown
 }
 
 // TestServeStackPoisonInjection_NonAllowlistedPutNeverMatchable_AcrossRestart is
@@ -147,16 +200,17 @@ func TestServeStackPoisonInjection_NonAllowlistedPutNeverMatchable_AcrossRestart
 	goodSeller, _ := identity.Generate() // on the allowlist
 	attacker, _ := identity.Generate()   // NOT on the allowlist
 
-	eng, relayConn, teardown := teamTierServeStack(t, ls, storePath, operator, goodSeller.PubKeyHex())
+	eng, pump, teardown := teamTierServeStack(t, ls, storePath, operator, goodSeller.PubKeyHex())
 
 	// (1) ATTACK: a signed put from the non-allowlisted attacker arrives over the
 	// relay. The Intake admits it on signature, the fold stages it — Seam A must
-	// block promotion. Wait for the drop counter to prove the ticker actually ran
-	// the promotion gate on it (not merely that it hasn't been promoted yet).
-	injectSignedPut(t, relayConn, attacker, "Reverse a linked list in place, iterative", 8500)
-	waitFor(t, 10*time.Second, "attacker put reaches Seam A and is dropped_unlisted", func() bool {
-		return eng.DegradationSnapshot().DroppedUnlisted >= 1
-	})
+	// block promotion. The pump drives the ingest+fold+promotion gate synchronously,
+	// so after it returns Seam A has provably run on the put; assert the drop counter
+	// deterministically (not "hasn't been promoted yet" — the gate ran and rejected).
+	pump.injectSignedPut(attacker, "Reverse a linked list in place, iterative", 8500)
+	if got := eng.DegradationSnapshot().DroppedUnlisted; got < 1 {
+		t.Fatalf("attacker put must reach Seam A and be dropped_unlisted, got DroppedUnlisted=%d", got)
+	}
 	if n := eng.MatchIndexLen(); n != 0 {
 		t.Fatalf("Seam A FAILED: non-allowlisted put entered the match index (len=%d, want 0)", n)
 	}
@@ -167,10 +221,10 @@ func TestServeStackPoisonInjection_NonAllowlistedPutNeverMatchable_AcrossRestart
 	// (2) POSITIVE CONTROL: an allowlisted seller's put over the SAME wire IS
 	// promoted into matchable inventory — proving the stack promotes real puts, so
 	// the negative assertion above is meaningful and not a broken pipeline.
-	injectSignedPut(t, relayConn, goodSeller, "Postgres partial index for soft-deleted rows", 8500)
-	waitFor(t, 10*time.Second, "allowlisted put becomes matchable", func() bool {
-		return eng.MatchIndexLen() == 1 && len(eng.State().Inventory()) == 1
-	})
+	pump.injectSignedPut(goodSeller, "Postgres partial index for soft-deleted rows", 8500)
+	if n, inv := eng.MatchIndexLen(), len(eng.State().Inventory()); n != 1 || inv != 1 {
+		t.Fatalf("allowlisted put must become matchable: match index len=%d, inventory=%d, want 1 and 1", n, inv)
+	}
 	entry := eng.State().Inventory()[0]
 	if entry.SellerKey != goodSeller.PubKeyHex() {
 		t.Fatalf("matchable entry seller = %s, want the allowlisted seller %s", entry.SellerKey, goodSeller.PubKeyHex())
@@ -193,9 +247,12 @@ func TestServeStackPoisonInjection_NonAllowlistedPutNeverMatchable_AcrossRestart
 	eng2, _, teardown2 := teamTierServeStack(t, ls, storePath, operator, goodSeller.PubKeyHex())
 	defer teardown2()
 
-	waitFor(t, 10*time.Second, "restart replays the allowlisted entry back into the index", func() bool {
-		return eng2.MatchIndexLen() == 1
-	})
+	// StartupReplayForTest (inside teamTierServeStack) already ran the full replay +
+	// Seam D re-gate synchronously, so the index is settled the instant the stack is
+	// built — assert directly rather than racing an eng2.Start goroutine.
+	if n := eng2.MatchIndexLen(); n != 1 {
+		t.Fatalf("restart must replay the allowlisted entry back into the index: match index len=%d, want 1", n)
+	}
 	// The ONLY matchable entry after restart is the allowlisted seller's — the
 	// attacker's key appears nowhere in inventory, so its content is unreachable
 	// through the whole stack across the restart boundary.
@@ -208,8 +265,10 @@ func TestServeStackPoisonInjection_NonAllowlistedPutNeverMatchable_AcrossRestart
 			t.Fatalf("Seam A/D FAILED after restart: attacker inventory resurfaced (%+v)", e)
 		}
 	}
-	// Give the restarted ticker room to run a promotion pass; the durable reject
-	// keeps the poison out of the index no matter how many ticks fire.
+	// Drive an explicit promotion pass on the restarted engine; the durable reject
+	// (re-folded on replay) leaves the attacker put non-pending, so no auto-accept
+	// tick can ever re-promote it — the poison stays out of the index.
+	eng2.RunAutoAccept(exchange.MaxTokenCost, time.Now(), map[string]struct{}{})
 	if n := eng2.MatchIndexLen(); n != 1 {
 		t.Fatalf("Seam A/D FAILED after restart: match index len=%d, want 1 (only the allowlisted entry)", n)
 	}
@@ -235,12 +294,12 @@ func TestServeStackDeAllowlist_WithheldAcrossRestart(t *testing.T) {
 	operator, _ := identity.Generate()
 	seller, _ := identity.Generate()
 
-	eng, relayConn, teardown := teamTierServeStack(t, ls, storePath, operator, seller.PubKeyHex())
+	eng, pump, teardown := teamTierServeStack(t, ls, storePath, operator, seller.PubKeyHex())
 
-	injectSignedPut(t, relayConn, seller, "Kafka consumer-group rebalance protocol deep dive", 8500)
-	waitFor(t, 10*time.Second, "seller put becomes matchable", func() bool {
-		return eng.MatchIndexLen() == 1 && len(eng.State().Inventory()) == 1
-	})
+	pump.injectSignedPut(seller, "Kafka consumer-group rebalance protocol deep dive", 8500)
+	if n, inv := eng.MatchIndexLen(), len(eng.State().Inventory()); n != 1 || inv != 1 {
+		t.Fatalf("seller put must become matchable: match index len=%d, inventory=%d, want 1 and 1", n, inv)
+	}
 	entryID := eng.State().Inventory()[0].EntryID
 	if eng.State().EntryNeedsRevalidation(entryID) {
 		t.Fatalf("precondition: entry should not need revalidation before de-allowlist")
@@ -266,9 +325,16 @@ func TestServeStackDeAllowlist_WithheldAcrossRestart(t *testing.T) {
 	eng2, _, teardown2 := teamTierServeStack(t, ls, storePath, operator /* seller NOT allowlisted */)
 	defer teardown2()
 
-	waitFor(t, 10*time.Second, "restart replays the accepted put back into inventory", func() bool {
-		return len(eng2.State().Inventory()) == 1
-	})
+	// StartupReplayForTest re-folded the accepted put back into inventory AND ran the
+	// Seam D re-gate (rebuildMatchIndex) synchronously in one call, so inventory and
+	// the index/revalidation flag are consistent the instant the stack is built. The
+	// prior async version raced a waitFor on Inventory()==1 against the eng2.Start
+	// goroutine and could observe inventory populated in the window BEFORE the re-gate
+	// flagged the entry — FALSE-failing line "entry not re-flagged NeedsRevalidation"
+	// (dontguess-c84). Assert all three facts directly now.
+	if inv := len(eng2.State().Inventory()); inv != 1 {
+		t.Fatalf("restart must replay the accepted put back into inventory: inventory=%d, want 1", inv)
+	}
 	if n := eng2.MatchIndexLen(); n != 0 {
 		t.Fatalf("Seam D FAILED (restart): de-allowlisted seller's inventory re-entered the match index (len=%d, want 0)", n)
 	}
