@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
-"""cf-embed: embedding service as a campfire convention.
+"""dg-embed: one-shot embedding CLI (all-MiniLM-L6-v2, 384-dim).
 
-Self-installs all-MiniLM-L6-v2 ONNX model on first run.
-Joins a campfire and responds to embed requests with 384-dim vectors.
+Self-installs the all-MiniLM-L6-v2 ONNX model on first run and embeds text to
+L2-normalized 384-dim vectors. Invoked by the dense embedder
+(pkg/matching/dense_embedder.go) as `python3 cmd/embed/main.py embed --json ...`
+and usable standalone for testing.
+
+Nostr-first (dontguess-ed2, design §3.10): the former campfire `serve` mode — a
+live `cf read`/`cf send` client that joined a campfire and answered embed
+requests — has been RETIRED. dontguess is campfire-free; the operator calls this
+script directly as a subprocess embedder, no message bus.
 
 Usage:
-  # Serve on a campfire (long-running):
-  python3 cmd/embed/main.py serve --campfire <id-or-alias>
-
-  # One-shot embed (for testing / CLI use):
-  python3 cmd/embed/main.py embed "migrate campfire app to SDK 0.13"
+  python3 cmd/embed/main.py embed "migrate app to SDK 0.13"
+  python3 cmd/embed/main.py embed --json "text one" "text two"
 """
 
 import argparse
 import json
-import os
 import subprocess
 import sys
-import time
 from pathlib import Path
 
 import numpy as np
@@ -117,86 +119,9 @@ def embed_batch(sess, tok, texts):
     return normalized.tolist()
 
 
-def cf(*args, input_data=None):
-    """Run a cf command and return stdout."""
-    cmd = ["cf"] + list(args)
-    result = subprocess.run(
-        cmd, capture_output=True, text=True, input=input_data
-    )
-    if result.returncode != 0:
-        print(f"cf error: {result.stderr.strip()}", file=sys.stderr)
-    return result.stdout.strip()
-
-
-def serve(campfire_id, sess, tok):
-    """Join campfire and respond to embed requests."""
-    print(f"Embedding service starting on campfire {campfire_id[:12]}...", file=sys.stderr)
-
-    # Read cursor: start from now (don't replay old messages).
-    cursor = str(int(time.time() * 1e9))
-
-    print("Listening for embed requests (tag: embed:request)...", file=sys.stderr)
-
-    while True:
-        # Poll for new messages with the embed:request tag.
-        raw = cf("read", campfire_id, "--tag", "embed:request",
-                 "--after", cursor, "--json")
-        if not raw or raw == "[]":
-            time.sleep(0.5)
-            continue
-
-        try:
-            messages = json.loads(raw)
-        except json.JSONDecodeError:
-            time.sleep(0.5)
-            continue
-
-        for msg in messages:
-            msg_id = msg.get("id", "")
-            # Update cursor to avoid reprocessing.
-            ts = msg.get("timestamp", 0)
-            if isinstance(ts, (int, float)) and str(int(ts)) > cursor:
-                cursor = str(int(ts))
-
-            try:
-                payload = msg.get("payload", {})
-                if isinstance(payload, str):
-                    payload = json.loads(payload)
-
-                texts = payload.get("texts", [])
-                text = payload.get("text", "")
-                if text and not texts:
-                    texts = [text]
-
-                if not texts:
-                    continue
-
-                vectors = embed_batch(sess, tok, texts)
-
-                response = json.dumps({
-                    "vectors": vectors,
-                    "model": "all-MiniLM-L6-v2",
-                    "dim": 384,
-                })
-
-                cf("send", campfire_id,
-                   "--tag", "embed:response",
-                   "--reply-to", msg_id,
-                   "--fulfills", msg_id,
-                   "--payload", response)
-
-                print(f"  embedded {len(texts)} text(s) for {msg_id[:8]}", file=sys.stderr)
-
-            except Exception as e:
-                print(f"  error processing {msg_id[:8]}: {e}", file=sys.stderr)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Embedding service on campfire")
+    parser = argparse.ArgumentParser(description="One-shot embedding CLI (all-MiniLM-L6-v2)")
     sub = parser.add_subparsers(dest="command")
-
-    serve_cmd = sub.add_parser("serve", help="Long-running campfire service")
-    serve_cmd.add_argument("--campfire", required=True, help="Campfire ID or alias")
 
     embed_cmd = sub.add_parser("embed", help="One-shot embed")
     embed_cmd.add_argument("text", nargs="+", help="Text(s) to embed")
@@ -226,9 +151,6 @@ def main():
             else:
                 for i, v in enumerate(vecs):
                     print(f"[{i}] [{len(v)}-dim] {v[:5]}...")
-
-    elif args.command == "serve":
-        serve(args.campfire, sess, tok)
 
 
 if __name__ == "__main__":

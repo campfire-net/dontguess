@@ -5,7 +5,7 @@
 // string-interpolated DG_HOME, DG_OP, PID_FILE, and LOG into that single-quoted
 // command text by breaking out of the quote:
 //
-//     nohup env CF_HOME="'"$DG_HOME"'" "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
+//	nohup env CF_HOME="'"$DG_HOME"'" "'"$DG_OP"'" serve >"'"$LOG"'" 2>&1 &
 //
 // A DG_HOME or DG_OP value containing a single quote (and shell metacharacters)
 // breaks out of the literal and executes injected commands at operator-launch.
@@ -15,12 +15,12 @@
 // writes to ~/.local/bin/dontguess) — no hand-written fixture, no stub of the code
 // under test. The tests:
 //
-//   1. TestInstall_FlockInjection_DGHome / _DGOp — set DG_HOME / DG_OP to a value
-//      containing a single quote plus a command-injection canary, drive the wrapper
-//      so the flock subshell runs, and assert the canary file was NOT created.
-//   2. TestInstall_FlockBenignStillWorks — drive the wrapper with a benign DG_HOME
-//      and assert the operator-start path still functions (the operator stub is
-//      exec'd with the right CF_HOME and a PID file is written).
+//  1. TestInstall_FlockInjection_DGHome / _DGOp — set DG_HOME / DG_OP to a value
+//     containing a single quote plus a command-injection canary, drive the wrapper
+//     so the flock subshell runs, and assert the canary file was NOT created.
+//  2. TestInstall_FlockBenignStillWorks — drive the wrapper with a benign DG_HOME
+//     and assert the operator-start path still functions (the operator stub is
+//     exec'd with the right CF_HOME and a PID file is written).
 package scale_test
 
 import (
@@ -80,11 +80,11 @@ func extractWrapperFromInstaller(t *testing.T) string {
 // and a DG_HOME with a valid exchange config but NO live operator PID (so the
 // wrapper tries to start one).
 type installerScene struct {
-	testDir   string
-	binDir    string
-	wrapper   string // path to the extracted wrapper, made executable
-	opLog     string // operator stub records its argv + env here
-	canary    string // file the injection payload would create
+	testDir string
+	binDir  string
+	wrapper string // path to the extracted wrapper, made executable
+	opLog   string // operator stub records its argv + env here
+	canary  string // file the injection payload would create
 }
 
 func newInstallerScene(t *testing.T) *installerScene {
@@ -99,22 +99,17 @@ func newInstallerScene(t *testing.T) *installerScene {
 	canary := filepath.Join(testDir, "PWNED_CANARY")
 
 	// Recording operator stub. The wrapper's flock body does:
-	//   nohup env CF_HOME=... <DG_OP> serve ...
-	// This stub records that it was invoked with the right CF_HOME + argv, then
-	// exits so the wrapper's start logic completes. (It does NOT stay resident as
-	// a "dontguess-operator" process, so the post-start probe path will not falsely
-	// pass — but the injection assertion does not depend on the probe.)
+	//   nohup env DG_HOME=... <DG_OP> serve ...
+	// (nostr-first: the serve process is pinned to DG_HOME, not CF_HOME — cf is
+	// gone entirely.) This stub records that it was invoked with the right DG_HOME
+	// + argv, then exits so the wrapper's start logic completes. (It does NOT stay
+	// resident as a "dontguess-operator" process, so the post-start probe path will
+	// not falsely pass — but the injection assertion does not depend on the probe.)
 	opStub := "#!/bin/sh\n" +
-		"{ echo \"OP_INVOKED cf_home=$CF_HOME\"; echo \"argv=$*\"; } >> " + shellQuote(opLog) + "\n" +
+		"{ echo \"OP_INVOKED dg_home=$DG_HOME\"; echo \"argv=$*\"; } >> " + shellQuote(opLog) + "\n" +
 		"exit 0\n"
 	if err := writeExecFile(t, filepath.Join(binDir, "dontguess-operator"), []byte(opStub)); err != nil {
 		t.Fatalf("writing operator stub: %v", err)
-	}
-
-	// cf stub: exits 0 for any call (buys/health-probe/final cf op). Harmless.
-	cfStub := "#!/bin/sh\nexit 0\n"
-	if err := writeExecFile(t, filepath.Join(binDir, "cf"), []byte(cfStub)); err != nil {
-		t.Fatalf("writing cf stub: %v", err)
 	}
 
 	// Extract and install the REAL wrapper.
@@ -145,8 +140,12 @@ func makeDGHome(t *testing.T, path string) {
 	if err := os.MkdirAll(path, 0755); err != nil {
 		t.Fatalf("mkdir DG_HOME %q: %v", path, err)
 	}
-	const fakeCFID = "aabbcc1122334455aabbcc1122334455aabbcc1122334455aabbcc1122334455"
-	cfg := fmt.Sprintf(`{"exchange_campfire_id": %q}`, fakeCFID)
+	// Nostr-first config (dontguess-ed2): the wrapper no longer parses an
+	// exchange_campfire_id — the individual-tier config check is existence-only,
+	// and the operator reads DONTGUESS_RELAY_URLS + the operator key itself. Write
+	// the current config shape (operator_key / operator_npub).
+	const fakeOpKey = "aabbcc1122334455aabbcc1122334455aabbcc1122334455aabbcc1122334455"
+	cfg := fmt.Sprintf(`{"operator_key": %q, "operator_npub": "npub1fake"}`, fakeOpKey)
 	if err := os.WriteFile(filepath.Join(path, "dontguess-exchange.json"), []byte(cfg), 0644); err != nil {
 		t.Fatalf("writing exchange config: %v", err)
 	}
@@ -251,7 +250,7 @@ func TestInstall_FlockBenignStillWorks(t *testing.T) {
 	t.Logf("wrapper output:\n%s", out)
 
 	// 1. The operator stub must have been invoked (proves the flock body ran the
-	//    nohup env ... serve line) with CF_HOME pinned to DG_HOME.
+	//    nohup env ... serve line) with DG_HOME pinned (nostr-first: CF_HOME is gone).
 	logData, err := os.ReadFile(s.opLog)
 	if err != nil {
 		t.Fatalf("operator was not invoked (no log %s): %v\nwrapper output:\n%s", s.opLog, err, out)
@@ -260,8 +259,8 @@ func TestInstall_FlockBenignStillWorks(t *testing.T) {
 	if !strings.Contains(logStr, "OP_INVOKED") {
 		t.Fatalf("operator stub not invoked; log:\n%s", logStr)
 	}
-	if !strings.Contains(logStr, "cf_home="+dgHome) {
-		t.Errorf("operator CF_HOME not pinned to DG_HOME.\nwant cf_home=%s\ngot log:\n%s", dgHome, logStr)
+	if !strings.Contains(logStr, "dg_home="+dgHome) {
+		t.Errorf("operator DG_HOME not pinned.\nwant dg_home=%s\ngot log:\n%s", dgHome, logStr)
 	}
 	if !strings.Contains(logStr, "argv=serve") {
 		t.Errorf("operator not invoked with 'serve'; got log:\n%s", logStr)

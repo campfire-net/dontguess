@@ -197,12 +197,27 @@ func runServeLocal(dgHome string) error {
 	if len(relayURLs) > 0 {
 		var fleet []string
 		var cfgOperatorKeyHex string
-		if cfg, cerr := exchange.LoadConfig(dgHome); cerr == nil {
+		cfg, cerr := exchange.LoadConfig(dgHome)
+		if cerr == nil {
 			fleet = cfg.FleetAllowlist
 			minReputation = cfg.MinReputation
 			cfgOperatorKeyHex = cfg.OperatorKeyHex
-		} else {
-			logger.Printf("  allowlist:  no exchange config (%v); empty allowlist admits only the operator key", cerr)
+		}
+
+		// §3.9 startup guard (design docs/design/nostr-first-client-ed2.md §3.9,
+		// H6 / RT-C#2) — defense-in-depth behind the wrapper's individual-tier
+		// auto-start gate. A relay-attached serve (len(relayURLs) > 0) MUST refuse
+		// to start when the persisted exchange config is absent or carries an empty
+		// OperatorKeyHex: `dontguess init` always writes the config with the
+		// operator key before the first team-tier serve, so a legitimate operator
+		// always passes. A stray/auto-started team-tier serve (the rogue competing
+		// sequencer) instead fails LOUD here instead of silently minting a fresh
+		// nostr operator key and forking the sequencer. Runs BEFORE
+		// assertAdvertiseEqualsSign because an absent config is a stricter failure
+		// than a key mismatch. The individual tier (no relay URLs) never reaches
+		// this branch — byte-for-byte unaffected.
+		if gerr := assertRelayServeHasOperatorConfig(cfgOperatorKeyHex, cerr); gerr != nil {
+			return fmt.Errorf("startup: %w", gerr)
 		}
 
 		// ed5 HARD PREREQUISITE (design §5): the advertised operator key
@@ -707,6 +722,35 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine) {
 
 func writeOperatorResp(conn net.Conn, v any) {
 	json.NewEncoder(conn).Encode(v) //nolint:errcheck
+}
+
+// assertRelayServeHasOperatorConfig implements the design §3.9 startup guard
+// (H6 / RT-C#2, docs/design/nostr-first-client-ed2.md §3.9). A relay-attached
+// serve (len(relayURLs) > 0) MUST refuse to start when the persisted exchange
+// config is absent (loadErr != nil) or carries an empty OperatorKeyHex. This is
+// defense-in-depth behind the wrapper's individual-tier auto-start gate (§3.10):
+// even if a team-tier serve is auto-started by mistake, it fails LOUD here
+// instead of silently minting a fresh nostr operator key and forking the
+// sequencer. `dontguess init` writes the config (with the operator key) before
+// the first team-tier serve, so a legitimate operator always passes. The
+// individual tier (no relay URLs) never calls this — it is byte-for-byte
+// unaffected.
+func assertRelayServeHasOperatorConfig(cfgOperatorKeyHex string, loadErr error) error {
+	if loadErr != nil {
+		return fmt.Errorf(
+			"relay-attached serve requires a persisted exchange config, but none could be loaded (%v) — "+
+				"run `dontguess init` on the operator host before serving the team tier; refusing to start "+
+				"(a config-less relay serve would mint a fresh operator key and fork the sequencer — "+
+				"docs/design/nostr-first-client-ed2.md §3.9)", loadErr)
+	}
+	if cfgOperatorKeyHex == "" {
+		return fmt.Errorf(
+			"relay-attached serve requires a persisted operator key, but the exchange config carries an " +
+				"empty operator_key — run `dontguess init` to populate it; refusing to start " +
+				"(a config without an operator key would fork the sequencer — " +
+				"docs/design/nostr-first-client-ed2.md §3.9)")
+	}
+	return nil
 }
 
 // assertAdvertiseEqualsSign fails closed (design §5, ed5) when the persisted
