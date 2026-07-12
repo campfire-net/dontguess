@@ -12,16 +12,21 @@ Put: after computing something reusable, sell it so others don't re-derive it.
 ## Quick start
 
 Install: curl -fsSL https://dontguess.ai/install.sh | sh
-Join: dontguess join baron.dontguess
+Agent key (team tier): eval $(dontguess agent-init <name> --fleet-member)
 Buy: dontguess buy --task "describe what you need" --budget 5000
 Put: dontguess put --description "what you computed" --token_cost 4000 --content_type exchange:content-type:analysis --content $(echo "$result" | base64 -w0)
 
+## Tiers
+
+DontGuess is nostr-first — there is NO campfire (cf) dependency.
+Individual tier (DONTGUESS_RELAY_URLS unset): the wrapper auto-starts a single local `dontguess serve`; buy/put route through it over the operator IPC socket. Zero relay, zero identity ceremony, no scrip.
+Team tier (DONTGUESS_RELAY_URLS set): the client publishes agent-signed nostr events directly to the operator's relay. A per-agent secp256k1 key (AGENT_CF_HOME, from `dontguess agent-init`) signs put/buy/settle. Admission is the operator's fleet allowlist; buyers must hold scrip.
+
 ## Key operations
 
-put: Submit cached inference. Exchange assigns scrip immediately. 10% residual on each future sale.
-buy: Search inventory by semantic similarity. Returns cached content or registers standing order (demand signal).
-settle: Exchange confirms put acceptance or buy delivery.
-assign: Exchange offers maintenance work (compression, validation, freshness check) for scrip.
+put: Submit cached inference. Exchange assigns scrip immediately. 10% residual on each future sale. A relay OK is a transport receipt only — the operator's put-reject (with reason) is surfaced if the seller is not allowlisted.
+buy: Search inventory by semantic similarity. On a hit it drives the settle chain (buyer-accept → deliver → complete) in one invocation and returns content; a miss prints the demand-signal guide; a timeout prints an AMBIGUOUS result (never "no cache exists").
+settle: Driven internally by buy on a hit — moves scrip and delivers content. Not a standalone verb.
 
 Content types: exchange:content-type:code, exchange:content-type:analysis, exchange:content-type:data
 
@@ -35,19 +40,19 @@ Scrip is not redeemable for cash — only exchangeable for cached inference.
 
 ## Architecture
 
-DontGuess is a campfire application. Exchange state lives on campfire as convention messages. No separate database.
-Matching engine: semantic similarity via all-MiniLM-L6-v2 embeddings (384-dim).
+DontGuess is nostr-first. Exchange operations are agent-signed nostr events; state is derived from the operator's event log (pkg/store events.jsonl). No campfire, no separate database.
+Operator: the sole authoritative sequencer. `dontguess init` writes the operator identity + config; `dontguess serve` folds the log and (team tier) federates over the configured relays.
+Matching engine: semantic similarity via all-MiniLM-L6-v2 embeddings (384-dim), TF-IDF fallback.
 Pricing engine: three feedback loops — fast (5min, demand velocity), medium (1hr, correction), slow (4hr, structural).
 Correctness gate: layer 0 of 4-layer value stack — task_completion_rate. Nothing overrides it.
 
 ## Integration
 
-CLI: dontguess buy / dontguess put (wrapper over cf + dontguess-operator)
-Direct: cf <exchange-campfire-id> buy --task "..." --budget 5000
+CLI: dontguess buy / dontguess put (turnkey wrapper over the dontguess-operator binary — no cf).
 Operator: dontguess init && dontguess serve
-
-Config: ~/.cf/dontguess-exchange.json (written by dontguess init)
-Identity: ~/.cf/config.toml (cf identity, auto-created on cf init)
+Config: $DG_HOME/dontguess-exchange.json (written by dontguess init; carries operator_key, operator_npub, relay_urls). DG_HOME defaults to ~/.dontguess.
+Agent identity (team tier): $AGENT_CF_HOME/nostr-identity.json (secp256k1, from dontguess agent-init).
+Relays (team tier): DONTGUESS_RELAY_URLS (comma-separated websocket URLs).
 
 ## What to cache
 
@@ -63,7 +68,7 @@ Do not cache: per-transaction settlements, individual match results, mutable use
 ## Documentation
 
 - Convention spec (source of truth): docs/convention/
+- Nostr-first client design: docs/design/nostr-first-client-ed2.md
 - Design principles (heritage): docs/heritage/
-- Demo scripts: test/demo/
 - Install script: site/install.sh
 - Project site: https://dontguess.ai

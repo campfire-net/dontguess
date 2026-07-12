@@ -3,17 +3,20 @@
 # Usage: curl -fsSL https://dontguess.ai/install.sh | sh
 #
 # Installs:
-#   1. cf (campfire CLI) — if not already installed
-#   2. dontguess-operator — exchange server binary
-#   3. dontguess wrapper — turnkey CLI
+#   1. dontguess-operator — the exchange binary (operator serve + client verbs
+#      put / buy / settle-driven-by-buy, all in one static Go binary)
+#   2. dontguess wrapper — turnkey CLI
 #
-# The wrapper auto-starts the exchange server, reads config from
-# ~/.cf/dontguess-exchange.json, and routes convention operations
-# (buy, put, settle) through cf.
+# Nostr-first (dontguess-ed2): there is NO campfire (cf) dependency. The client
+# publishes agent-signed events directly to the team relay (team tier) or routes
+# through the single local `serve` over the operator IPC socket (individual
+# tier). Tier is selected by DONTGUESS_RELAY_URLS: non-empty ⇒ team, empty ⇒
+# individual. The wrapper auto-starts the exchange server on the INDIVIDUAL tier
+# ONLY (H6): in team tier the client uses the provisioned operator relay and
+# never auto-starts a local operator.
 
 set -e
 
-CF_REPO="campfire-net/campfire"
 DG_REPO="campfire-net/dontguess"
 INSTALL_DIR="${HOME}/.local/bin"
 
@@ -73,20 +76,7 @@ main() {
   mkdir -p "$INSTALL_DIR"
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
 
-  # --- cf ---
-  if command -v cf >/dev/null 2>&1; then
-    success "  cf already installed ($(command -v cf))"
-  else
-    CF_VER=$(get_latest "$CF_REPO")
-    [ -z "$CF_VER" ] && die "Could not find latest cf release"
-    info "  Installing cf ${CF_VER}..."
-    fetch_and_verify "$CF_REPO" "cf" "$LABEL" "$CF_VER" "$TMP"
-    cp "${TMP}/cf_${LABEL}/cf" "${INSTALL_DIR}/cf"
-    chmod +x "${INSTALL_DIR}/cf"
-    success "  cf ${CF_VER} → ${INSTALL_DIR}/cf"
-  fi
-
-  # --- dontguess operator ---
+  # --- dontguess operator (also the client binary) ---
   DG_VER=$(get_latest "$DG_REPO")
   [ -z "$DG_VER" ] && die "Could not find latest dontguess release"
   info "  Installing dontguess ${DG_VER}..."
@@ -98,20 +88,32 @@ main() {
   # --- wrapper script ---
   cat > "${INSTALL_DIR}/dontguess" <<'ENDWRAPPER'
 #!/bin/sh
-# dontguess — turnkey wrapper (v0.6.0)
-# Hardened: DG_HOME pin, flock start, cmdline PID verify, health-probe readiness
-# Health-probe skip: only the invocation that starts the operator runs the probe.
-# CF_HOME identity pin: exchange routing uses --cf-home $DG_HOME.
-# AGENT_CF_HOME: when set, buy/put/settle use --cf-home $AGENT_CF_HOME so each
-#   agent signs with its own Ed25519 key. Unset = identical to prior behavior.
-#   Telemetry records the actual signing agent (AGENT_CF_HOME/identity.json).
-# Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL)
+# dontguess — turnkey wrapper (v0.7.0, nostr-first)
+#
+# Nostr-first (dontguess-ed2): NO campfire (cf) dependency. Every verb dispatches
+# to the single dontguess-operator binary (operator serve + client put/buy). The
+# client reads DONTGUESS_RELAY_URLS (tier), AGENT_CF_HOME (agent signing key), and
+# DG_HOME (exchange home) from the environment itself — the wrapper only sets up
+# DG_HOME, the individual-tier auto-start, synthetic tagging, and attempt logging.
+#
+# Tier detection mirrors the operator (design §3.3): DONTGUESS_RELAY_URLS non-empty
+#   ⇒ TEAM (client dials the relay directly, agent-signed); empty ⇒ INDIVIDUAL
+#   (client routes through the single local `serve` over the IPC socket).
+#
+# H6 (design §3.10): the flock serve auto-start is gated on the INDIVIDUAL tier
+#   ONLY. In team tier the client uses the provisioned operator relay and MUST
+#   NEVER auto-start a local operator — a client-spawned relay-attached serve mints
+#   its own key and becomes a rogue competing sequencer.
+#
+# DG_HOME pins all singleton exchange state (operator identity, event log, IPC
+#   socket, PID). Defaults to ~/.dontguess to match dgpath.go resolveDGHome.
+# AGENT_CF_HOME: per-agent secp256k1 signing identity for buy/put. The operator
+#   binary reads it directly; the wrapper records the signing agent for telemetry.
+# Observability: attempt log at $DG_HOME/dontguess-attempts.log (JSONL).
 # DG_SYNTHETIC: dev/CI synthetic-tag injection (dontguess-18c).
-#   Auto-enabled when DG_SYNTHETIC=1 or CI env var is set.
-#   Opt-out: DG_SYNTHETIC=0 (overrides CI detection).
+#   Auto-enabled when DG_SYNTHETIC=1 or CI env var is set. Opt-out: DG_SYNTHETIC=0.
 #   Effect: buy/put calls get --synthetic appended so the engine tags responses
 #   exchange:synthetic, excluding them from real exchange metrics/inventory.
-#   settle is NOT affected (settlement of real inventory is always real).
 set -e
 
 DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
@@ -120,26 +122,18 @@ DG_OP="${DG_OP:-${HOME}/.local/bin/dontguess-operator}"
 # can already exec arbitrary binaries through other means (PATH, aliases, etc.).
 # The override is intentional and is restricted to test use only; production
 # callers should never set DG_OP.  Accepting risk as documented.
-CF="${HOME}/.local/bin/cf"
 
-# CF_HOME controls identity only (unchanged semantics).
-CF_HOME="${CF_HOME:-${HOME}/.cf}"
-
-# DG_HOME pins all singleton exchange state, independent of CF_HOME.
-# Subagents with per-session CF_HOME still find the real exchange here.
-DG_HOME="${DG_HOME:-${HOME}/.cf}"
-
-# AGENT_CF_HOME: per-agent signing identity for buy/put/settle operations.
-# When set, signing ops use this home instead of DG_HOME. Exchange routing
-# (campfire ID, PID, health probe, operator serve) always stays on DG_HOME.
-# Generate once: cf --cf-home $AGENT_CF_HOME init && cf admit $XCFID <pubkey>
-# Unset = current behavior (all ops sign with operator key at DG_HOME).
-_SIGNING_HOME="${AGENT_CF_HOME:-${DG_HOME}}"
+# DG_HOME pins all singleton exchange state, independent of any per-session env.
+# Default matches the operator binary (cmd/dontguess/dgpath.go resolveDGHome):
+# ~/.dontguess. Subagents with a per-session AGENT_CF_HOME still find the real
+# exchange here.
+DG_HOME="${DG_HOME:-${HOME}/.dontguess}"
 
 CFG="${DG_HOME}/dontguess-exchange.json"
 PID_FILE="${DG_HOME}/dontguess.pid"
 LOG="${DG_HOME}/dontguess.log"
 LOCK="${DG_HOME}/dontguess.start.lock"
+SOCK="${DG_HOME}/ipc/dontguess.sock"
 
 # Attempt log paths (set early so all exit paths can log)
 _ATTEMPT_LOG="${DG_HOME}/dontguess-attempts.log"
@@ -148,24 +142,25 @@ _ATTEMPT_CMD="${1:-}"
 
 # Write a JSONL line to the attempt log. Args: <exit_code> <tag>
 # Fail-safe: errors are silently swallowed — observability never breaks main path.
+# Schema (consumed by status.go attemptLine): ts, pid, cmd, exit, tag, cf_home,
+# cwd, caller. The cf_home field is retained for schema stability but now carries
+# DG_HOME (the exchange home); caller is the signing agent's pubkey when known.
 _attempt_log_write() {
   local _exit="$1" _tag="$2"
   local _ts _pid _cf_home _cwd _caller _cmd _line
   _ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || true)
   _pid=$$
-  _cf_home=$(printf '%s' "${CF_HOME:-}" | sed 's/"/\\"/g')
+  _cf_home=$(printf '%s' "${DG_HOME:-}" | sed 's/"/\\"/g')
   _cwd=$(pwd 2>/dev/null | sed 's/"/\\"/g' || true)
   _cmd=$(printf '%s' "$_ATTEMPT_CMD" | sed 's/"/\\"/g')
   _caller=null
-  # Prefer AGENT_CF_HOME/identity.json (actual signing agent) over DG_HOME fallback.
+  # Prefer the AGENT_CF_HOME nostr identity (the actual signing agent).
   _id_src=""
-  if [ -n "${AGENT_CF_HOME:-}" ] && [ -f "${AGENT_CF_HOME}/identity.json" ]; then
-    _id_src="${AGENT_CF_HOME}/identity.json"
-  elif [ -n "${CF_HOME:-}" ] && [ -f "${CF_HOME}/identity.json" ]; then
-    _id_src="${CF_HOME}/identity.json"
+  if [ -n "${AGENT_CF_HOME:-}" ] && [ -f "${AGENT_CF_HOME}/nostr-identity.json" ]; then
+    _id_src="${AGENT_CF_HOME}/nostr-identity.json"
   fi
   if command -v jq >/dev/null 2>&1 && [ -n "$_id_src" ]; then
-    _pk=$(jq -r '.public_key // empty' "$_id_src" 2>/dev/null | cut -c1-8 2>/dev/null || true)
+    _pk=$(jq -r '.pub_key_hex // .public_key // empty' "$_id_src" 2>/dev/null | cut -c1-8 2>/dev/null || true)
     case "$_pk" in
       [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) _caller="\"${_pk}\"";;
     esac
@@ -183,11 +178,11 @@ _classify_tag() {
     _tag="success"
   elif printf '%s' "$_stderr" | grep -q "No exchange configured"; then
     _tag="no_exchange_configured"
-  elif printf '%s' "$_stderr" | grep -qE "operator not running|server failed"; then
+  elif printf '%s' "$_stderr" | grep -qE "operator not running|operator not reachable|server failed"; then
     _tag="operator_down"
-  elif printf '%s' "$_stderr" | grep -q "identity is wrapped"; then
-    _tag="identity_wrapped"
-  elif printf '%s' "$_stderr" | grep -qE "not admitted|not a member"; then
+  elif printf '%s' "$_stderr" | grep -qE "AGENT_CF_HOME is not set|resolve agent identity"; then
+    _tag="identity_missing"
+  elif printf '%s' "$_stderr" | grep -qE "not allowlisted|put-reject|dropped_unlisted|underfunded"; then
     _tag="not_admitted"
   else
     _tag="other"
@@ -196,25 +191,29 @@ _classify_tag() {
 }
 
 case "${1:-}" in
-  init|serve|convention) exec "$DG_OP" "$@";;
-  join)
-    shift; exec "$CF" join "$@";;
-  leave) subcmd="$1"; shift; exec "$CF" "$subcmd" "$@";;
+  # Operator / management / identity commands: dispatch straight to the binary.
+  # None of these auto-start a local serve (H6): they are operator-local actions
+  # run where the operator is already provisioned, or self-contained client setup.
+  init|serve|agent-init|allowlist|mint|status|demand|hit-rate|operator|convention)
+    exec "$DG_OP" "$@";;
   version|--version)
     echo "dontguess wrapper"
     "$DG_OP" version 2>/dev/null || true
-    "$CF" --version 2>/dev/null || true
     exit 0;;
   upgrade)
     echo "Upgrading dontguess to the latest release..."
     curl -fsSL https://dontguess.ai/install.sh | sh
     exit 0;;
   --help|-h|help|"")
-    echo "dontguess — token-work exchange for AI agents"
+    echo "dontguess — token-work exchange for AI agents (nostr-first)"
     echo ""
-    echo "Operator:   dontguess init | serve"
-    echo "Exchange:   dontguess buy | put | settle"
+    echo "Operator:   dontguess init | serve | allowlist | mint | status"
+    echo "Exchange:   dontguess buy | put    (settle is driven by buy on a hit)"
+    echo "Agent key:  eval \$(dontguess agent-init <name> --fleet-member)"
     echo "Upgrade:    dontguess upgrade"
+    echo ""
+    echo "Tier: set DONTGUESS_RELAY_URLS for the team tier (client dials the relay"
+    echo "      directly); leave it unset for the individual tier (local serve)."
     echo ""
     echo "Run 'dontguess <op> --help' for details."
     echo ""
@@ -231,16 +230,7 @@ case "${1:-}" in
     exit 0;;
 esac
 
-# Exchange config check (always from DG_HOME, not CF_HOME)
-if [ ! -f "$CFG" ]; then
-  echo "No exchange configured. Run: dontguess init" >&2
-  _attempt_log_write 1 "no_exchange_configured" 2>/dev/null || true
-  exit 1
-fi
-
-# Read campfire ID (convention operations require hex ID for routing)
-XCFID=$(sed -n 's/.*"exchange_campfire_id" *: *"\([^"]*\)".*/\1/p' "$CFG")
-[ -z "$XCFID" ] && { echo "error: cannot read exchange_campfire_id from $CFG" >&2; exit 1; }
+# --- exchange hot path (buy / put) below ---
 
 # PID verification helper
 pid_is_operator() {
@@ -259,124 +249,120 @@ pid_is_operator() {
   esac
 }
 
-# Auto-start with flock
-#
-# _i_started_operator tracks whether THIS invocation won the flock and launched
-# the operator.  Only the starter runs the full health-probe loop; all other
-# callers trust the starter's work and skip straight to the cf call.
-_i_started_operator=0
-_current_pid=""
-if [ -f "$PID_FILE" ]; then
-  _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-fi
+# H6 (design §3.10): the flock serve auto-start is gated on the INDIVIDUAL tier
+# ONLY. When DONTGUESS_RELAY_URLS is set (team tier) the client dials the relay
+# directly and this whole block is skipped — the wrapper NEVER auto-starts a local
+# operator in team tier, so a rogue competing sequencer cannot be spawned.
+if [ -z "${DONTGUESS_RELAY_URLS:-}" ]; then
+  # Individual tier: buy/put route through the single local serve over the IPC
+  # socket. The exchange must be bootstrapped first (`dontguess init`).
+  if [ ! -f "$CFG" ]; then
+    echo "No exchange configured. Run: dontguess init" >&2
+    _attempt_log_write 1 "no_exchange_configured" 2>/dev/null || true
+    exit 1
+  fi
 
-if ! pid_is_operator "$_current_pid"; then
-  # Pass all values to the flock subshell via the environment, never by
-  # string-interpolating them into the `sh -c` command text (dontguess-732).
-  # The body below is a fully single-quoted literal: the shell performs NO
-  # expansion on it, so a DG_HOME / DG_OP containing single quotes or other
-  # shell metacharacters cannot break out and inject commands. Inside the
-  # subshell the values are read back as ordinary "$VAR" references.
-  if _DG_PID_FILE="$PID_FILE" _DG_HOME="$DG_HOME" _DG_OP="$DG_OP" _DG_LOG="$LOG" \
-     flock -n "$LOCK" sh -c '
-    pid=""
-    pid_file="$_DG_PID_FILE"
-    [ -f "$pid_file" ] && pid=$(cat "$pid_file" 2>/dev/null || true)
-    _is_op() {
-      local p="$1"
-      [ -z "$p" ] && return 1
-      kill -0 "$p" 2>/dev/null || return 1
-      local c=""
-      if [ -f "/proc/${p}/comm" ]; then c=$(cat "/proc/${p}/comm" 2>/dev/null || true)
-      else c=$(ps -p "$p" -o comm= 2>/dev/null || true); fi
-      case "$c" in dontguess-oper*) return 0;; *) return 1;; esac
-    }
-    _is_op "$pid" && exit 0
-    echo "Starting exchange server..." >&2
-    # Pin CF_HOME to DG_HOME so the operator always uses the stable exchange
-    # identity, even when this wrapper was called by a subagent whose CF_HOME
-    # points at a per-session directory (e.g. /tmp/cf-session-XXX).
-    # Without this pin the operator inherits the caller'\''s CF_HOME and
-    # protocol.InitWithConfig() may fail or load the wrong identity (dontguess-b6e).
-    nohup env CF_HOME="$_DG_HOME" "$_DG_OP" serve >"$_DG_LOG" 2>&1 &
-    new_pid=$!
-    printf "%d\n" "$new_pid" > "$_DG_PID_FILE"
-    exit 0
-  ' 2>/dev/null; then
-    # We won the flock. Check if WE actually started the operator or found it
-    # already healthy inside the flock body (flock exits 0 either way).
-    _new_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-    if [ "$_new_pid" != "$_current_pid" ] && pid_is_operator "$_new_pid"; then
-      # A new PID was written — we started it (and it's already visible).
-      _i_started_operator=1
-      _current_pid="$_new_pid"
-    elif pid_is_operator "$_new_pid"; then
-      # Flock body found it already healthy (race: another starter just finished).
-      _current_pid="$_new_pid"
-    else
-      # We started it (PID written but process not yet visible as operator).
-      _i_started_operator=1
-      _current_pid="$_new_pid"
-    fi
-  else
-    # Lost the flock — another caller is starting the operator.
-    # Poll up to 5s for the PID to appear AND be verified as the operator.
-    # Once it is, trust the starter's probe and proceed without re-probing.
-    _deadline=$(( $(date +%s) + 5 ))
-    while [ "$(date +%s)" -lt "$_deadline" ]; do
-      if [ -f "$PID_FILE" ]; then
-        _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-        pid_is_operator "$_current_pid" && break
-      fi
-      sleep 0.1 2>/dev/null || sleep 1
-    done
+  # Auto-start with flock (single-writer guarantee: exactly one serve owns the
+  # event log). _i_started_operator tracks whether THIS invocation launched the
+  # operator; only the starter runs the readiness probe.
+  _i_started_operator=0
+  _current_pid=""
+  if [ -f "$PID_FILE" ]; then
     _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
   fi
-  if pid_is_operator "$_current_pid"; then
-    echo "  Exchange running (pid ${_current_pid})" >&2
-  fi
-fi
 
-# Health-probe readiness.
-#
-# Only the invocation that won the flock and launched the operator runs the
-# full health-probe loop.  This prevents 49 concurrent callers from each
-# hammering the exchange with network round-trips while the operator is still
-# cold-starting.
-#
-# Callers that found an existing, already-verified operator skip straight to
-# the cf call — the operator was already healthy before they arrived.
-#
-# Callers that waited for another starter trust that the starter's probe
-# succeeded; they only need the PID to be alive (already verified above).
-#
-# Starter probe: poll every 200ms for up to 15s.
-# Always uses --cf-home $DG_HOME so the probe uses the pinned exchange identity,
-# not whatever CF_HOME the caller's environment has set.
-
-if [ "$_i_started_operator" -eq 1 ]; then
-  _probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
-  _ready=0
-  _deadline=$(( $(date +%s) + 15 ))
-  while [ "$(date +%s)" -lt "$_deadline" ]; do
-    if pid_is_operator "$_probe_pid" && "$CF" --cf-home "$DG_HOME" "$XCFID" buys --json >/dev/null 2>&1; then
-      _ready=1
-      break
+  if ! pid_is_operator "$_current_pid"; then
+    # Pass all values to the flock subshell via the environment, never by
+    # string-interpolating them into the `sh -c` command text (dontguess-732).
+    # The body below is a fully single-quoted literal: the shell performs NO
+    # expansion on it, so a DG_HOME / DG_OP containing single quotes or other
+    # shell metacharacters cannot break out and inject commands. Inside the
+    # subshell the values are read back as ordinary "$VAR" references.
+    if _DG_PID_FILE="$PID_FILE" _DG_HOME="$DG_HOME" _DG_OP="$DG_OP" _DG_LOG="$LOG" \
+       flock -n "$LOCK" sh -c '
+      pid=""
+      pid_file="$_DG_PID_FILE"
+      [ -f "$pid_file" ] && pid=$(cat "$pid_file" 2>/dev/null || true)
+      _is_op() {
+        local p="$1"
+        [ -z "$p" ] && return 1
+        kill -0 "$p" 2>/dev/null || return 1
+        local c=""
+        if [ -f "/proc/${p}/comm" ]; then c=$(cat "/proc/${p}/comm" 2>/dev/null || true)
+        else c=$(ps -p "$p" -o comm= 2>/dev/null || true); fi
+        case "$c" in dontguess-oper*) return 0;; *) return 1;; esac
+      }
+      _is_op "$pid" && exit 0
+      echo "Starting exchange server..." >&2
+      # Pin DG_HOME so the operator always uses the stable exchange home, even
+      # when this wrapper was called by a subagent whose environment points DG_HOME
+      # elsewhere. The operator resolves DG_HOME from the environment (dgpath.go).
+      nohup env DG_HOME="$_DG_HOME" "$_DG_OP" serve >"$_DG_LOG" 2>&1 &
+      new_pid=$!
+      printf "%d\n" "$new_pid" > "$_DG_PID_FILE"
+      exit 0
+    ' 2>/dev/null; then
+      # We won the flock. Check whether WE started the operator or found it
+      # already healthy inside the flock body (flock exits 0 either way).
+      _new_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+      if [ "$_new_pid" != "$_current_pid" ] && pid_is_operator "$_new_pid"; then
+        _i_started_operator=1
+        _current_pid="$_new_pid"
+      elif pid_is_operator "$_new_pid"; then
+        _current_pid="$_new_pid"
+      else
+        _i_started_operator=1
+        _current_pid="$_new_pid"
+      fi
+    else
+      # Lost the flock — another caller is starting the operator. Poll up to 5s
+      # for the PID to appear AND be verified as the operator, then trust it.
+      _deadline=$(( $(date +%s) + 5 ))
+      while [ "$(date +%s)" -lt "$_deadline" ]; do
+        if [ -f "$PID_FILE" ]; then
+          _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+          pid_is_operator "$_current_pid" && break
+        fi
+        sleep 0.1 2>/dev/null || sleep 1
+      done
+      _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     fi
-    sleep 0.2 2>/dev/null || sleep 1
-  done
+    if pid_is_operator "$_current_pid"; then
+      echo "  Exchange running (pid ${_current_pid})" >&2
+    fi
+  fi
 
-  if [ "$_ready" -eq 0 ]; then
-    echo "server failed (not ready in 15s). See $LOG" >&2
-    _attempt_log_write 1 "operator_down" 2>/dev/null || true
-    exit 1
+  # Readiness: only the invocation that started the operator waits for it. The
+  # serve creates its IPC socket just before it begins folding (serve.go
+  # listenOperatorSocket), so the socket appearing is the readiness signal. This
+  # is campfire-free — no network probe. If the operator PID dies, stop waiting
+  # and fail LOUD rather than hang the full window.
+  if [ "$_i_started_operator" -eq 1 ]; then
+    _probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    _ready=0
+    _deadline=$(( $(date +%s) + 15 ))
+    while [ "$(date +%s)" -lt "$_deadline" ]; do
+      if ! pid_is_operator "$_probe_pid"; then
+        break
+      fi
+      if [ -S "$SOCK" ]; then
+        _ready=1
+        break
+      fi
+      sleep 0.2 2>/dev/null || sleep 1
+    done
+
+    if [ "$_ready" -eq 0 ]; then
+      echo "server failed (operator socket not ready in 15s). See $LOG" >&2
+      _attempt_log_write 1 "operator_down" 2>/dev/null || true
+      exit 1
+    fi
   fi
 fi
 
 # Synthetic-tag injection (dontguess-18c).
 # Detect dev/CI context and inject --synthetic into buy/put calls so the engine
 # tags its responses exchange:synthetic, excluding them from real metrics.
-# Logic:
 #   DG_SYNTHETIC=0 → always off (explicit opt-out, strongest signal)
 #   DG_SYNTHETIC=1 → always on (explicit opt-in)
 #   CI non-empty  → on (common CI env var set by GitHub Actions, CircleCI, etc.)
@@ -387,11 +373,9 @@ case "${DG_SYNTHETIC:-}" in
   0) _DG_INJECT_SYNTHETIC=0 ;;
   1) _DG_INJECT_SYNTHETIC=1 ;;
   *)
-    # Check CI env var (set by most CI platforms: GitHub Actions, CircleCI, etc.)
     if [ -n "${CI:-}" ]; then
       _DG_INJECT_SYNTHETIC=1
     fi
-    # Check if --synthetic already in args (caller passed it; honor it, avoid dup)
     for _a in "$@"; do
       if [ "$_a" = "--synthetic" ]; then
         _DG_INJECT_SYNTHETIC=0  # already present; don't double-inject
@@ -409,11 +393,10 @@ if [ "$_DG_INJECT_SYNTHETIC" -eq 1 ]; then
   esac
 fi
 
-# Run cf, tee stderr to both terminal and capture file, classify, log, exit.
-# Signing operations (buy, put, settle) use --cf-home $_SIGNING_HOME so each
-# agent signs with its own key when AGENT_CF_HOME is set. Exchange routing
-# (campfire ID, PID, health probe, operator serve) always uses DG_HOME.
-# When AGENT_CF_HOME is unset, _SIGNING_HOME == DG_HOME: identical to prior behavior.
+# Dispatch to the dontguess binary subcommand (NOT cf). The binary reads
+# DONTGUESS_RELAY_URLS (tier), AGENT_CF_HOME (agent key), and DG_HOME from the
+# environment itself. Tee stderr to both the terminal and a capture file,
+# classify, attempt-log, exit.
 _STDERR_TMP=$(mktemp 2>/dev/null) || _STDERR_TMP=""
 if [ -n "$_STDERR_TMP" ]; then
   # POSIX-compatible stderr tee via named pipe.
@@ -423,22 +406,22 @@ if [ -n "$_STDERR_TMP" ]; then
   if [ -n "$_STDERR_FIFO" ]; then
     tee "$_STDERR_TMP" >&2 < "$_STDERR_FIFO" &
     _TEE_PID=$!
-    "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@" 2>"$_STDERR_FIFO"
-    _CF_EXIT=$?
+    "$DG_OP" "$@" 2>"$_STDERR_FIFO"
+    _DG_EXIT=$?
     wait "$_TEE_PID" 2>/dev/null || true
   else
     # Fallback: capture only, replay after
-    "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@" 2>"$_STDERR_TMP"
-    _CF_EXIT=$?
+    "$DG_OP" "$@" 2>"$_STDERR_TMP"
+    _DG_EXIT=$?
     cat "$_STDERR_TMP" >&2
   fi
   _stderr_content=$(cat "$_STDERR_TMP" 2>/dev/null || true)
-  _tag=$(_classify_tag "$_CF_EXIT" "$_stderr_content")
-  _attempt_log_write "$_CF_EXIT" "$_tag" 2>/dev/null || true
-  exit "$_CF_EXIT"
+  _tag=$(_classify_tag "$_DG_EXIT" "$_stderr_content")
+  _attempt_log_write "$_DG_EXIT" "$_tag" 2>/dev/null || true
+  exit "$_DG_EXIT"
 else
   # mktemp failed; run without logging (fail-safe)
-  exec "$CF" --cf-home "$_SIGNING_HOME" "$XCFID" "$@"
+  exec "$DG_OP" "$@"
 fi
 ENDWRAPPER
   chmod +x "${INSTALL_DIR}/dontguess"
