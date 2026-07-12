@@ -98,19 +98,29 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 	h := newTestHarness(t)
 	bs := newBlockingScripStore()
 
-	eng := exchange.NewEngine(exchange.EngineOptions{
-		CampfireID:        h.cfID,
-		LocalStore:        h.st,
-		OperatorPublicKey: h.operator.pubKeyHex,
-		ScripStore:        bs,
-		// Fast poll so the buyer-accept is dispatched promptly under a saturated
-		// -race scheduler; the production 500ms default gives the 3s wait below
-		// too few cycles under load. Observation latency only — no assertion
-		// depends on the cadence (dontguess-657).
-		PollInterval: 25 * time.Millisecond,
-		Logger: func(format string, args ...any) {
-			t.Logf("[engine] "+format, args...)
-		},
+	// Build via the harness so the engine gets the finished-GUARDED logger
+	// (newEngineWithOpts): a straggler dispatch goroutine that logs after the test
+	// completes must not call t.Logf — that panics the whole suite (dontguess-fe9f).
+	// A bare `Logger: t.Logf` here (as this test used to have) is exactly that
+	// landmine: the post-cancel "dispatch error: context canceled" line fires from
+	// a goroutine after the test returns.
+	//
+	// The whole ingest is driven DETERMINISTICALLY via DispatchForTest (below) — the
+	// canonical synchronous fold→dispatch path ~40 other engine tests use — instead
+	// of racing the background poll ticker against a wall-clock deadline. The former
+	// ticker-driven shape FALSE-failed under full-suite -race + CPU saturation with
+	// "timed out waiting for GetBudget" whenever the 25ms poll goroutine was starved
+	// past the deadline (the "times out under load" symptom, dontguess-fe9f). Two
+	// facts make the deterministic drive safe: (1) OnStarted gives a real
+	// startup-complete barrier, so DispatchForTest cannot race Start's startup fold /
+	// cursor seed; (2) PollInterval is effectively-infinite so the background poll
+	// loop never concurrently dispatches from the store — DispatchForTest is the sole
+	// dispatcher, coupling claim+execute in one goroutine.
+	started := make(chan struct{})
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.ScripStore = bs
+		o.PollInterval = time.Hour
+		o.OnStarted = func() { close(started) }
 	})
 
 	// Seed one inventory entry so handleBuy finds a candidate and emits a match.
@@ -134,7 +144,8 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 	}
 	entryID := inv[0].EntryID
 
-	// Engine context — will be cancelled to trigger shutdown.
+	// Engine context — will be cancelled to trigger shutdown. Start stores it, so
+	// engineCtx() (the ctx handlers use for scrip ops) is this cancellable ctx.
 	engineCtx, cancelEngine := context.WithCancel(context.Background())
 	defer cancelEngine()
 
@@ -144,43 +155,51 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		engineDone <- eng.Start(engineCtx)
 	}()
 
-	// Give engine time to start.
-	time.Sleep(20 * time.Millisecond)
+	// Barrier: block until Start has completed its startup fold, cursor seed, and
+	// dispatchPendingOrders (OnStarted fires the instant before the poll loop). After
+	// this, DispatchForTest cannot race the startup cursor writes.
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("engine did not signal startup within 5s")
+	}
 
-	// Send a buy message. handleBuy no longer calls GetBudget — it just emits a match.
+	// Dispatch the buy SYNCHRONOUSLY via replayAndDispatch (the canonical fold→
+	// dispatch helper): it folds the full log into state — so the buy is present
+	// for applyMatch to bind matchToBuyer — THEN runs handleBuy, which emits (and
+	// applies to state) the match. handleBuy does not call GetBudget, so this does
+	// not block. The poll loop (hour interval) never dispatches from the store, so
+	// this synchronous path is the sole dispatch.
 	buyPayloadBytes, _ := json.Marshal(map[string]any{
 		"task":        "cancellation test task",
 		"budget":      int64(100_000),
 		"max_results": 3,
 	})
-	h.sendMessage(h.buyer, buyPayloadBytes,
-		[]string{exchange.TagBuy}, nil,
-	)
-
-	// Wait for the match message to appear (engine processed the buy without blocking).
-	var matchMsgID string
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) {
-		matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
-		if len(matchMsgs) > 0 {
-			matchMsgID = matchMsgs[len(matchMsgs)-1].ID
-			break
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	if matchMsgID == "" {
-		t.Fatal("timed out waiting for match message — engine did not dispatch the buy")
+	buyMsg := h.sendMessage(h.buyer, buyPayloadBytes, []string{exchange.TagBuy}, nil)
+	if err := replayAndDispatch(t, h, eng, buyMsg); err != nil {
+		t.Fatalf("dispatching buy: %v", err)
 	}
 
-	// Post a buyer-accept referencing the match. When the engine's poll loop picks
-	// this up, it calls handleSettleBuyerAcceptScrip → GetBudget, which will block
-	// because bs.unblock is never closed.
+	// The match handleBuy emitted is now durably on the log and bound in state.
+	matchMsgs, _ := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagMatch}})
+	if len(matchMsgs) == 0 {
+		t.Fatal("expected a match message after dispatching the buy")
+	}
+	matchMsgID := matchMsgs[len(matchMsgs)-1].ID
+
+	// Build the buyer-accept referencing the match and FOLD it into state (Replay),
+	// so its dispatch resolves the match exactly as the poll loop's fold→dispatch
+	// would. Dispatching it calls handleSettleBuyerAcceptScrip → GetBudget, which
+	// BLOCKS because bs.unblock is never closed, so dispatch runs in a goroutine.
+	// Its DispatchForTest uses engineCtx() (the ctx Start stored) — exactly what
+	// this test asserts gets cancelled. (Fold in the MAIN goroutine; a t.Fatalf
+	// from replayAndDispatch inside the spawned goroutine would be illegal.)
 	buyerAcceptPayloadBytes, _ := json.Marshal(map[string]any{
 		"phase":    "buyer-accept",
 		"entry_id": entryID,
 		"accepted": true,
 	})
-	h.sendMessage(h.buyer, buyerAcceptPayloadBytes,
+	buyerAcceptMsg := h.sendMessage(h.buyer, buyerAcceptPayloadBytes,
 		[]string{
 			exchange.TagSettle,
 			exchange.TagPhasePrefix + exchange.SettlePhaseStrBuyerAccept,
@@ -188,6 +207,15 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		},
 		[]string{matchMsgID},
 	)
+	allMsgs, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(allMsgs))
+	driverDone := make(chan struct{})
+	go func() {
+		defer close(driverDone)
+		// Returns (with a context.Canceled dispatch error) once the engine ctx is
+		// cancelled below; until then it is blocked inside GetBudget.
+		_ = eng.DispatchForTest(buyerAcceptMsg)
+	}()
 
 	// Wait for GetBudget to be called (the handler is now blocked inside GetBudget).
 	var capturedCtx context.Context
@@ -222,6 +250,15 @@ func TestEngine_HandlerCancellationOnShutdown(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("engine did not exit after context cancellation")
+	}
+
+	// Join the buyer-accept dispatch goroutine so it cannot outlive the test and
+	// log from a straggler goroutine (dontguess-fe9f). Its blocked DispatchForTest
+	// returns the instant GetBudget observes the cancelled ctx above.
+	select {
+	case <-driverDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("buyer-accept dispatch goroutine did not exit after context cancellation")
 	}
 }
 

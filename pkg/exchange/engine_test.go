@@ -65,20 +65,31 @@ type testHarness struct {
 	localStore *store.Store
 
 	// finished guards the engine Logger against the "Log in goroutine after test
-	// has completed" panic. It is flipped true by a cleanup registered FIRST in
-	// newTestHarness (so, being LIFO, it runs LAST — after every other cleanup,
-	// including startEngine's cancel+wait). The real fix is the explicit
-	// wait-for-exit at each engine start site; this is defense-in-depth so a
-	// straggler goroutine that still logs after the test body can never panic
-	// the whole suite. See the Logger in newEngineWithOpts.
+	// has completed" panic. It is flipped true by a cleanup that runs
+	// immediately BEFORE st.Close() (see newTestHarness): st.Close is registered
+	// first and the finished cleanup second, so — LIFO — finished flips true,
+	// THEN the store closes. That ordering is load-bearing (dontguess-fe9f): a
+	// straggler poll-loop goroutine that appends AFTER st.Close now gets a clean
+	// store.ErrStoreClosed and, when it logs that as a dispatch error, sees
+	// finished==true and skips t.Logf instead of panicking the whole suite.
+	// (Previously finished ran LAST, after st.Close, leaving a window in which a
+	// post-close append error was logged via t.Logf and panicked a random
+	// parallel test.) The explicit wait-for-exit at each startEngine site is the
+	// primary fix for tests that use it; this guard covers the raw
+	// `go eng.Start(ctx)` sites that intentionally do not join. See the Logger in
+	// newEngineWithOpts.
 	finished *atomic.Bool
 }
 
 func newTestHarness(t *testing.T) *testHarness {
 	t.Helper()
-	// Registered first → runs last (LIFO). See testHarness.finished.
+	// finished is flipped true by a cleanup registered AFTER st.Close below, so
+	// — LIFO — it runs immediately BEFORE the store is closed. That ordering is
+	// the teardown-race fix (dontguess-fe9f): a leaked poll-loop goroutine that
+	// appends after the store closes gets store.ErrStoreClosed and, seeing
+	// finished==true, skips its t.Logf dispatch-error line instead of panicking
+	// a random parallel test. See testHarness.finished.
 	finished := &atomic.Bool{}
-	t.Cleanup(func() { finished.Store(true) })
 
 	// Campfire-free identity: the operator is a plain ed25519 keypair (no
 	// campfire membership). Its public-key hex is wired into
@@ -96,7 +107,10 @@ func newTestHarness(t *testing.T) *testHarness {
 	if err != nil {
 		t.Fatalf("opening local store: %v", err)
 	}
+	// Register st.Close FIRST, then the finished flip, so LIFO runs finished
+	// true BEFORE the store closes (dontguess-fe9f — see testHarness.finished).
 	t.Cleanup(func() { st.Close() }) //nolint:errcheck
+	t.Cleanup(func() { finished.Store(true) })
 
 	return &testHarness{
 		t:          t,

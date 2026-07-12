@@ -224,6 +224,18 @@ type EngineOptions struct {
 	// stays the sole deliver. On the individual tier (ScripStore == nil)
 	// handleSettleBuyerAcceptScrip never runs, so this is doubly inert there.
 	AutoDeliverOnBuyerAccept bool
+
+	// OnStarted, when non-nil, is invoked exactly once by Start AFTER the startup
+	// replay, dispatch-cursor seed, and dispatchPendingOrders have all completed —
+	// i.e. the instant before Start enters its steady-state poll loop. It is the
+	// startup-complete readiness signal, symmetric with OnLocalAppend's post-emit
+	// hook: an embedder or test that must not interact with the engine until its
+	// full log is folded and its cursors are seeded can block on it instead of
+	// racing a wall-clock sleep against Start's background goroutine. Firing it
+	// only after dispatchPendingOrders guarantees no post-barrier caller can race
+	// the startup fold's cursor writes (dontguess-fe9f). Nil (the default) is a
+	// strict no-op — behavior is byte-for-byte unchanged.
+	OnStarted func()
 }
 
 func (o *EngineOptions) pollInterval() time.Duration {
@@ -769,6 +781,12 @@ func (e *Engine) Start(ctx context.Context) error {
 	}
 	// Dispatch pending unmatched orders that were already in the log at startup.
 	e.dispatchPendingOrders()
+	// Startup-complete readiness signal (dontguess-fe9f): fired after the fold,
+	// cursor seed, and dispatchPendingOrders, immediately before the steady-state
+	// poll loop. A nil hook is a strict no-op.
+	if e.opts.OnStarted != nil {
+		e.opts.OnStarted()
+	}
 	return e.run(ctx)
 }
 
@@ -1109,8 +1127,8 @@ func (e *Engine) rebuildAndDispatchGapLocal() error {
 		// atomically under localMu, from this (fresher-than-localSeen) snapshot.
 		e.indexLocalMessages(msgs) // FULL msgs slice — not a tail slice
 		e.localSeen = total
-		e.state.Replay(msgs)   // under localMu + inside the grow guard (5f0)
-		e.rebuildMatchIndex()  // under localMu + inside the grow guard (5f0)
+		e.state.Replay(msgs)  // under localMu + inside the grow guard (5f0)
+		e.rebuildMatchIndex() // under localMu + inside the grow guard (5f0)
 	}
 	// Claim the dispatch gap monotonically (same discipline as the poll loop):
 	// a rebuild holding a stale snapshot must not regress a dispatch cursor a

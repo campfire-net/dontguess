@@ -23,6 +23,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -30,6 +31,19 @@ import (
 
 	"github.com/campfire-net/dontguess/pkg/proto"
 )
+
+// ErrStoreClosed is returned by Append/BatchAppend when the Store has already
+// been Closed. It is a deterministic, identifiable shutdown signal that
+// replaces the racy, OS-level "write ...: file already closed" error a write
+// to a closed *os.File would otherwise produce.
+//
+// It exists because Close and a concurrent Append can race during teardown:
+// an engine writer goroutine (the poll loop / a dispatch handler emitting an
+// operator record) can reach Append after Close has already run. Returning a
+// sentinel — instead of writing to a closed fd — lets the caller distinguish a
+// benign "we are shutting down" append from a real write failure and handle it
+// gracefully (dontguess-fe9f). Callers test for it with errors.Is.
+var ErrStoreClosed = errors.New("store: append after close")
 
 // Record is the on-disk representation of one exchange event. Field names
 // and types are a 1:1 mirror of proto.Message (itself a mirror of
@@ -107,6 +121,10 @@ type Store struct {
 	mu   sync.Mutex
 	path string
 	w    fileSyncer
+	// closed is set by Close under mu. Once set, Append/BatchAppend fail fast
+	// with ErrStoreClosed instead of writing to the closed fd, making the
+	// Close/Append teardown race deterministic (dontguess-fe9f).
+	closed bool
 }
 
 // Open opens (creating if necessary) the append-only log at path for
@@ -136,6 +154,9 @@ func (s *Store) Append(rec Record) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("store: append record %s: %w", rec.ID, ErrStoreClosed)
+	}
 	if _, err := s.w.Write(line); err != nil {
 		return fmt.Errorf("store: write record %s: %w", rec.ID, err)
 	}
@@ -174,6 +195,9 @@ func (s *Store) BatchAppend(recs []Record) error {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return fmt.Errorf("store: batch append %d records: %w", len(recs), ErrStoreClosed)
+	}
 	if _, err := s.w.Write(buf.Bytes()); err != nil {
 		return fmt.Errorf("store: batch append: write %d records: %w", len(recs), err)
 	}
@@ -263,8 +287,17 @@ func (s *Store) Replay() ([]proto.Message, error) {
 
 // Close closes the writer handle. It does not affect ReadAll, which opens
 // its own handle.
+//
+// Close is idempotent and flips the closed flag under mu, so any Append that
+// races Close during teardown fails fast with ErrStoreClosed (a deterministic
+// shutdown signal) instead of writing to a closed fd (dontguess-fe9f). A
+// second Close is a no-op that returns nil.
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.closed {
+		return nil
+	}
+	s.closed = true
 	return s.w.Close()
 }

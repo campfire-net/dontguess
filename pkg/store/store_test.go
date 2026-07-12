@@ -1,6 +1,7 @@
 package store_test
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -455,5 +456,52 @@ func TestStore_Replay_ReturnsMessagesInAppendOrder(t *testing.T) {
 	}
 	if msgs[1].Antecedents[0] != "a" {
 		t.Fatalf("Replay msgs[1].Antecedents = %v, want [a]", msgs[1].Antecedents)
+	}
+}
+
+// TestStore_AppendAfterClose_ReturnsErrStoreClosed verifies the teardown-race
+// contract (dontguess-fe9f): once Close has run, Append and BatchAppend fail
+// fast with store.ErrStoreClosed instead of writing to a closed fd (which
+// produces a racy, non-deterministic "file already closed" OS error). This is
+// the deterministic shutdown signal the exchange engine relies on so a leaked
+// writer goroutine racing teardown degrades gracefully rather than corrupting
+// the log or panicking.
+func TestStore_AppendAfterClose_ReturnsErrStoreClosed(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.Open(filepath.Join(dir, "events.jsonl"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	if err := s.Append(store.Record{ID: "a", Sender: "s1", Tags: []string{"exchange:put"}, Timestamp: 10}); err != nil {
+		t.Fatalf("Append(a) before close: %v", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	// Single Append after Close: a clean ErrStoreClosed, not an fd error.
+	err = s.Append(store.Record{ID: "b", Sender: "s2", Tags: []string{"exchange:buy"}, Timestamp: 20})
+	if !errors.Is(err, store.ErrStoreClosed) {
+		t.Fatalf("Append after Close = %v, want ErrStoreClosed", err)
+	}
+	// BatchAppend after Close: same contract.
+	err = s.BatchAppend([]store.Record{{ID: "c", Sender: "s3", Tags: []string{"exchange:match"}, Timestamp: 30}})
+	if !errors.Is(err, store.ErrStoreClosed) {
+		t.Fatalf("BatchAppend after Close = %v, want ErrStoreClosed", err)
+	}
+	// Close is idempotent: a second Close is a no-op returning nil.
+	if err := s.Close(); err != nil {
+		t.Fatalf("second Close = %v, want nil (idempotent)", err)
+	}
+
+	// The post-close appends must not have landed: ReadAll (own fd) still sees
+	// only the pre-close record.
+	got, err := s.ReadAll()
+	if err != nil {
+		t.Fatalf("ReadAll after close: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != "a" {
+		t.Fatalf("ReadAll after close = %v, want exactly [a]", got)
 	}
 }
