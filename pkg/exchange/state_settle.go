@@ -72,6 +72,23 @@ func (s *State) applySettlePutReject(msg *Message) {
 		return
 	}
 	putMsgID := msg.Antecedents[0]
+	// dontguess-327: honor the SEAM-A trust-gate purge signal. applyPut registers
+	// EVERY put's content hash in contentHashIndex ZERO-TRUST during the fold, and
+	// a QUALITY-gate reject deliberately KEEPS that hash (anti-respam,
+	// state_put.go dedup §2). But a TRUST-gate reject of a non-allowlisted /
+	// below-floor sender must NOT leave the hash squatting: doing so permanently
+	// blocks a later ALLOWLISTED seller's byte-identical put (the exchange's
+	// designed high-reuse happy path) with a silent bare return. The trust-gate
+	// reject path sets purge_content_hash=true; QUALITY-gate rejects omit it.
+	// Replay-safe: message-content-driven, idempotent delete, no live TrustChecker.
+	var payload struct {
+		PurgeContentHash bool `json:"purge_content_hash"`
+	}
+	if entry, ok := s.pendingPuts[putMsgID]; ok {
+		if err := json.Unmarshal(msg.Payload, &payload); err == nil && payload.PurgeContentHash {
+			delete(s.contentHashIndex, entry.ContentHash)
+		}
+	}
 	delete(s.pendingPuts, putMsgID)
 }
 

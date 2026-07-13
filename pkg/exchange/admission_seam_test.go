@@ -223,6 +223,100 @@ func TestAdmissionSeamCD_DeAllowlistWithheldAcrossRestart(t *testing.T) {
 	}
 }
 
+// TestAdmissionSeamA_TrustRejectPurgesContentHashPoison: the dontguess-327 gap.
+//
+// applyPut registers EVERY put's content hash in contentHashIndex ZERO-TRUST
+// during the fold, BEFORE the SEAM-A trust gate ever runs. Before the fix, a
+// non-allowlisted seller's put was trust-rejected at promotion but its content
+// hash was left squatting the index — so a later ALLOWLISTED seller putting the
+// BYTE-IDENTICAL content (the exchange's designed high-reuse happy path) hit the
+// dedup collision in applyPut and was silently dropped forever. This is a real
+// griefing lever: an attacker squats the hash of content they can never sell to
+// permanently block the seller who can.
+//
+// This test drives the REAL fold + REAL auto-accept ticker over a REAL
+// TrustChecker (no mock of the gate) and proves: (1) the anon reject purges the
+// poison so the allowlisted identical-content put becomes matchable inventory,
+// and (2) the new dropped_dedup_poison counter increments on the purge.
+func TestAdmissionSeamA_TrustRejectPurgesContentHashPoison(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	anon := newTestAgent(t)
+
+	// Allowlist the legitimate seller only; anon is NOT admitted.
+	ks := exchange.NewKeySet(h.seller.pubKeyHex)
+	tc, err := exchange.NewTrustChecker(h.operator.pubKeyHex, ks)
+	if err != nil {
+		t.Fatalf("NewTrustChecker: %v", err)
+	}
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) { o.TrustChecker = tc })
+
+	// Byte-identical content across both puts: same description AND same content
+	// size → putPayload emits identical content bytes → identical SHA-256 hash.
+	// This is the exact collision the dedup index keys on.
+	const desc = "gRPC deadline propagation across service boundaries with worked examples"
+	const tokenCost = 8500
+	const contentSize = 24576
+
+	// 1) Non-allowlisted anon seller puts the content. The fold stages it into
+	//    pendingPuts AND registers its content hash zero-trust.
+	anonPut := h.sendMessage(anon,
+		putPayload(desc, "", "code", tokenCost, contentSize),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	replayAll(t, h, eng)
+	if len(eng.State().PendingPuts()) != 1 {
+		t.Fatalf("precondition: expected anon put staged by the fold, got %d pending", len(eng.State().PendingPuts()))
+	}
+
+	// 2) Auto-accept ticker: SEAM-A trust-rejects the anon put. With the fix, the
+	//    reject purges the poisoned content hash from contentHashIndex.
+	eng.RunAutoAccept(exchange.MaxTokenCost, time.Now(), map[string]struct{}{})
+
+	if inv := eng.State().Inventory(); len(inv) != 0 {
+		t.Fatalf("anon put must not enter inventory, got %d entries", len(inv))
+	}
+	d := eng.DegradationSnapshot()
+	if d.DroppedUnlisted != 1 {
+		t.Errorf("dropped_unlisted=%d, want 1", d.DroppedUnlisted)
+	}
+	if d.DroppedDedupPoison != 1 {
+		t.Errorf("dropped_dedup_poison=%d, want 1 (trust reject must purge + count the poisoned hash)", d.DroppedDedupPoison)
+	}
+	_ = anonPut
+
+	// 3) ALLOWLISTED seller puts the BYTE-IDENTICAL content. Before the fix this
+	//    hit the still-squatting hash and was silently dropped by applyPut. After
+	//    the fix the hash was purged, so the put stages into pendingPuts.
+	goodPut := h.sendMessage(h.seller,
+		putPayload(desc, "", "code", tokenCost, contentSize),
+		[]string{exchange.TagPut, "exchange:content-type:code"},
+		nil,
+	)
+	replayAll(t, h, eng)
+
+	foundGood := false
+	for _, e := range eng.State().PendingPuts() {
+		if e.PutMsgID == goodPut.ID {
+			foundGood = true
+		}
+	}
+	if !foundGood {
+		t.Fatalf("REGRESSION (dontguess-327): allowlisted seller's identical-content put was blocked by the " +
+			"non-purged poison hash — it never reached pendingPuts")
+	}
+
+	// 4) The allowlisted identical-content put promotes into matchable inventory.
+	eng.RunAutoAccept(exchange.MaxTokenCost, time.Now(), map[string]struct{}{})
+	if n := eng.MatchIndexLen(); n != 1 {
+		t.Errorf("allowlisted identical-content put not matchable after poison purge: match index len=%d, want 1", n)
+	}
+	if inv := eng.State().Inventory(); len(inv) != 1 {
+		t.Errorf("allowlisted identical-content put not accepted into inventory: %d entries, want 1", len(inv))
+	}
+}
+
 // TestAdmissionIndividualTier_NilCheckerUnchanged: the individual / no-relay tier
 // (TrustChecker=nil) is byte-for-byte unchanged — a put from ANY seller is
 // promoted into matchable inventory (fail-open is correct there: the operator is

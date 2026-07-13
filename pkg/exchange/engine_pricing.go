@@ -259,7 +259,17 @@ func (e *Engine) autoAcceptPutLocked(putMsgID string, price int64, expiresAt tim
 			}
 			e.opts.log("SECURITY ALARM: auto-accept promotion BLOCKED for non-admitted seller: put=%s sender=%s reason=%s: %v",
 				shortKey(putMsgID), shortKey(putSellerKey), reason, terr)
-			if rerr := e.rejectPutLocked(putMsgID, "trust-gate: "+reason); rerr != nil {
+			// dontguess-327: a SEAM-A trust reject must PURGE the put's content hash
+			// from contentHashIndex. applyPut (state_put.go) registered that hash
+			// ZERO-TRUST during the fold; left in place it permanently squats the
+			// hash and silently blocks a later ALLOWLISTED seller's byte-identical
+			// put (the exchange's designed high-reuse happy path) with a bare return
+			// at state_put.go dedup §2. Signal the fold to purge (purgeContentHash=
+			// true, TRUST-gate path ONLY — QUALITY-gate rejects keep their anti-respam
+			// hash persistence) and count the purge so the previously silent
+			// squat-and-block lever is observable.
+			e.degradation.DroppedDedupPoison.Add(1)
+			if rerr := e.rejectPutLocked(putMsgID, "trust-gate: "+reason, true); rerr != nil {
 				e.opts.log("engine: put-reject after trust block failed put=%s err=%v", shortKey(putMsgID), rerr)
 			}
 			return fmt.Errorf("auto-accept trust-gate rejected put %s (%s): %w", putMsgID, reason, terr)
@@ -340,7 +350,10 @@ func (e *Engine) RejectPut(putMsgID string, reason string) error {
 	if err := e.refreshBeforeOperatorOp(); err != nil {
 		return fmt.Errorf("refresh before put-reject: %w", err)
 	}
-	return e.rejectPutLocked(putMsgID, reason)
+	// QUALITY / operator-initiated reject: purgeContentHash=false so the put's
+	// content hash stays registered (anti-respam persistence, state_put.go dedup
+	// §2). Only the SEAM-A trust-gate path (autoAcceptPutLocked) purges the hash.
+	return e.rejectPutLocked(putMsgID, reason, false)
 }
 
 // rejectPutLocked emits a settle(put-reject) for a pending put and applies it.
@@ -349,17 +362,30 @@ func (e *Engine) RejectPut(putMsgID string, reason string) error {
 // promotion gate in autoAcceptPutLocked calls this directly (it has already
 // refreshed and holds opMu) so a trust-blocked put is removed from pendingPuts
 // without a nested opMu acquisition or a redundant second refresh.
-func (e *Engine) rejectPutLocked(putMsgID string, reason string) error {
+//
+// purgeContentHash threads the SEAM-A trust-gate purge signal into the emitted
+// settle(put-reject) payload (dontguess-327). When true, the fold
+// (applySettlePutReject) additionally deletes the rejected put's content hash
+// from contentHashIndex — undoing the zero-trust registration applyPut made
+// during the fold. It is set ONLY by the trust-gate reject path; QUALITY-gate /
+// operator rejects pass false so their anti-respam hash persistence is unchanged.
+func (e *Engine) rejectPutLocked(putMsgID string, reason string, purgeContentHash bool) error {
 	_, pending := e.state.GetPendingPut(putMsgID)
 	if !pending {
 		return fmt.Errorf("put %s is not pending", putMsgID)
 	}
 
-	payload, err := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"phase":    SettlePhaseStrPutReject,
 		"entry_id": putMsgID,
 		"reason":   reason,
-	})
+	}
+	if purgeContentHash {
+		// Emitted ONLY on the trust-gate path so QUALITY-gate reject payloads are
+		// byte-unchanged and their dedup persistence stays intact.
+		fields["purge_content_hash"] = true
+	}
+	payload, err := json.Marshal(fields)
 	if err != nil {
 		return fmt.Errorf("encoding put-reject payload: %w", err)
 	}

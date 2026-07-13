@@ -447,6 +447,18 @@ type DegradationMetrics struct {
 	DroppedUnlisted      atomic.Int64
 	DroppedLowReputation atomic.Int64
 
+	// DroppedDedupPoison counts SEAM-A trust-gate rejects (dontguess-327) that
+	// purged a zero-trust-registered content hash out of contentHashIndex. applyPut
+	// registers EVERY put's content hash during the fold with no trust filter; a
+	// non-allowlisted / below-floor sender's rejected put would otherwise leave that
+	// hash squatting the index, permanently blocking a later ALLOWLISTED seller's
+	// byte-identical put (the exchange's designed high-reuse happy path) via a silent
+	// bare return in applyPut. Purging the hash on the trust reject closes that
+	// griefing lever; this counter makes the purge — previously an invisible
+	// squat-and-block — observable. Incremented once per SEAM-A trust reject,
+	// alongside DroppedUnlisted / DroppedLowReputation.
+	DroppedDedupPoison atomic.Int64
+
 	// DroppedUnderfundedBuy counts anonymous buys dropped by the demand-signal
 	// bound (design §8-D1, dontguess-3879): a buyer holding less than
 	// EngineOptions.MinBuyBalance scrip had its buy dropped in handleBuy BEFORE
@@ -498,6 +510,7 @@ type DegradationCounts struct {
 	TrustDenialOther          int64 `json:"trust_denial_other"`
 	DroppedUnlisted           int64 `json:"dropped_unlisted"`
 	DroppedLowReputation      int64 `json:"dropped_low_reputation"`
+	DroppedDedupPoison        int64 `json:"dropped_dedup_poison"`
 	DroppedUnderfundedBuy     int64 `json:"dropped_underfunded_buy"`
 	FoldDenialNotOperator     int64 `json:"fold_denial_not_operator"`
 	FoldDenialBuyerIdentity   int64 `json:"fold_denial_buyer_identity"`
@@ -713,6 +726,7 @@ func (e *Engine) DegradationSnapshot() DegradationCounts {
 		TrustDenialOther:          e.degradation.TrustDenialOther.Load(),
 		DroppedUnlisted:           e.degradation.DroppedUnlisted.Load(),
 		DroppedLowReputation:      e.degradation.DroppedLowReputation.Load(),
+		DroppedDedupPoison:        e.degradation.DroppedDedupPoison.Load(),
 		DroppedUnderfundedBuy:     e.degradation.DroppedUnderfundedBuy.Load(),
 		FoldDenialNotOperator:     e.degradation.FoldDenialNotOperator.Load(),
 		FoldDenialBuyerIdentity:   e.degradation.FoldDenialBuyerIdentity.Load(),
