@@ -122,6 +122,52 @@ func relayCursorPath(storePath, url string) string {
 	return fmt.Sprintf("%s.pubcursor.%s", storePath, hex.EncodeToString(h[:4]))
 }
 
+// defaultEmbedScriptPath locates cmd/embed/main.py relative to the running
+// binary instead of a hardcoded dev-machine absolute path (dontguess-740).
+// It walks up from the executable's directory looking for a
+// "cmd/embed/main.py" sibling, which holds for both `go run` (binary lives
+// under a temp build dir but the repo checkout is still discoverable via
+// os.Getwd as a fallback) and an installed binary sitting at the repo root
+// or in a bin/ subdirectory. Returns "" if no candidate exists, in which
+// case the caller must warn loudly rather than silently degrade.
+func defaultEmbedScriptPath() string {
+	const rel = "cmd/embed/main.py"
+
+	candidates := []string{}
+	if exe, err := os.Executable(); err == nil {
+		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
+			exe = resolved
+		}
+		dir := filepath.Dir(exe)
+		for i := 0; i < 6; i++ {
+			candidates = append(candidates, filepath.Join(dir, rel))
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+	if wd, err := os.Getwd(); err == nil {
+		dir := wd
+		for i := 0; i < 6; i++ {
+			candidates = append(candidates, filepath.Join(dir, rel))
+			parent := filepath.Dir(dir)
+			if parent == dir {
+				break
+			}
+			dir = parent
+		}
+	}
+
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c
+		}
+	}
+	return ""
+}
+
 // runServeLocal runs the exchange engine in standalone local-only mode
 // (dontguess-275): no campfire relay, no campfire identity, no scrip network
 // dependency. Ingest and egress both go through a local pkg/store event log
@@ -268,13 +314,17 @@ func runServeLocal(dgHome string) error {
 	var embedder matching.Embedder
 	embedScript := os.Getenv("DONTGUESS_EMBED_SCRIPT")
 	if embedScript == "" {
-		embedScript = "/home/baron/projects/dontguess/cmd/embed/main.py"
+		embedScript = defaultEmbedScriptPath()
 	}
-	if _, err := os.Stat(embedScript); err == nil {
-		embedder = matching.NewDenseEmbedder(embedScript)
-		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
+	if embedScript != "" {
+		if _, err := os.Stat(embedScript); err == nil {
+			embedder = matching.NewDenseEmbedder(embedScript)
+			logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
+		} else {
+			logger.Printf("  WARNING: embedder falling back to tf-idf — dense embed script not found at %q. Set DONTGUESS_EMBED_SCRIPT to the absolute path of cmd/embed/main.py to restore dense matching quality.", embedScript)
+		}
 	} else {
-		logger.Printf("  embedder:  tf-idf (set DONTGUESS_EMBED_SCRIPT for dense)")
+		logger.Printf("  WARNING: embedder falling back to tf-idf — could not locate cmd/embed/main.py relative to the running binary. Set DONTGUESS_EMBED_SCRIPT to restore dense matching quality.")
 	}
 
 	// OnLocalAppend fan-out (design §3.8, H1): on the team/federated tier the
