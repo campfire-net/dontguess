@@ -45,4 +45,26 @@ type Signer interface {
 	// 32-byte hash. Nostr event signatures are a signature over the event id,
 	// which is itself a sha256 — hence a fixed 32-byte input.
 	SignHash(hash [32]byte) ([]byte, error)
+
+	// ECDH performs secp256k1 elliptic-curve Diffie-Hellman key agreement with a
+	// counterparty and returns the RAW 32-byte big-endian X coordinate of the
+	// shared point (our_scalar · their_point). This is the shared secret NIP-44
+	// v2 feeds into its HKDF-extract — it is deliberately NOT sha256(X) (the
+	// NIP-04/ECIES convention that btcec.GenerateSharedSecret returns), which
+	// would be the wrong input for NIP-44.
+	//
+	// counterpartyXOnlyHex is the counterparty's 32-byte BIP-340 x-only public
+	// key as lowercase hex (the nostr "pubkey"). It is lifted to its even-Y
+	// (0x02) point before the multiplication; every party must lift identically
+	// or the derived secret diverges and the counterparty's decryption silently
+	// fails. That lift is centralized in exactly one place behind this port.
+	//
+	// The one secp256k1 keypair both Schnorr-signs (SignHash) and performs this
+	// key agreement — nostr convention. A hardware-backed Signer must therefore
+	// implement key agreement, not only signing.
+	//
+	// This accessor delivers ONLY the raw ECDH shared secret. NIP-44's KDF,
+	// padding, ChaCha20-Poly1305, and HMAC live in a separate package that calls
+	// this method.
+	ECDH(counterpartyXOnlyHex string) ([32]byte, error)
 }
