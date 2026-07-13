@@ -207,6 +207,20 @@ const (
 	HighReuseResidualDenominator = int64(5)
 )
 
+// LegacyGrandfatherTTL bounds how long a pre-migration plaintext entry that was
+// GRANDFATHERED during Replay under the team-tier encrypted-required cutover
+// survives before it ages out (docs/design/content-confidentiality-envelope-541.md
+// §7 Migration, dontguess-3ab1). The migration is a HARD cutover: every NEW put
+// must be a v2 confidential envelope, but already-broadcast legacy plaintext
+// (permanently public on the append-only relay — no claw-back is possible) is
+// grandfathered rather than fail-closed-dropped, so the operator keeps its
+// pre-migration inventory across the first restart instead of losing all of it.
+// This bounded TTL is applied as the entry's default expiry at grandfather time
+// (PutTimestamp + LegacyGrandfatherTTL) so the plaintext corpus drains from live
+// inventory over time instead of lingering forever; a historical put-accept that
+// carried an explicit expires_at still overrides it via applySettlePutAccept.
+const LegacyGrandfatherTTL = 30 * 24 * time.Hour
+
 // InventoryEntry is a single cache entry in the exchange inventory.
 // An entry is live when a put-accept has settled it and it has not expired.
 type InventoryEntry struct {
@@ -308,6 +322,19 @@ type InventoryEntry struct {
 	// matching key; Teaser is the richer human abstract). Empty when the seller
 	// authored no teaser or its coherence check failed.
 	Teaser string
+
+	// LegacyPlaintext marks an entry that was GRANDFATHERED during Replay of a
+	// MIXED historical log: a pre-migration plaintext put (v<2, no "enc" envelope)
+	// that was already accepted+broadcast before the team-tier encrypted-required
+	// cutover (docs/design/content-confidentiality-envelope-541.md §6.3, §7,
+	// dontguess-3ab1). Such an entry is folded — not fail-closed-dropped — so the
+	// operator does not lose all pre-migration inventory on the first restart; the
+	// plaintext is already permanently public, so grandfathering only lets it age
+	// out gracefully via ExpiresAt (defaulted to PutTimestamp + LegacyGrandfatherTTL
+	// at grandfather time). A LIVE plaintext put is NEVER grandfathered — it stays
+	// fail-closed dropped (dontguess-4bed) so new plaintext injection is blocked.
+	// Always false for v2 confidential entries and for individual-tier entries.
+	LegacyPlaintext bool
 }
 
 // IsExpired returns true if the entry has passed its expiry time.

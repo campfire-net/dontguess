@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/3dl-dev/dontguess/pkg/matching"
 	"github.com/3dl-dev/dontguess/pkg/nip44"
@@ -612,6 +613,23 @@ func encWellFormed(e *encEnvelope) bool {
 	return hasInline != hasBlob // exactly one
 }
 
+// isLegacyPlaintextPut reports whether a put payload is a genuine PRE-MIGRATION
+// legacy plaintext put — v<2, no "enc" envelope, and a base64 "content" field —
+// i.e. the historical wire shape that predates the §3.3 v2 confidential envelope.
+//
+// This is the NARROW class that Replay grandfathers under the team-tier
+// encrypted-required cutover (§6.3, §7, dontguess-3ab1). It deliberately EXCLUDES:
+//   - a v2-declared put (v>=2) carrying a smuggled plaintext "content" field — a
+//     downgrade-smuggling attack, never a pre-migration entry;
+//   - a put with a present-but-malformed "enc" envelope (Enc != nil) — a broken/
+//     rogue v2 put, not legacy.
+//
+// Anything this predicate rejects stays fail-closed DROPPED in BOTH replay and
+// live fold; only a true legacy plaintext put is ever grandfathered.
+func isLegacyPlaintextPut(v int, enc *encEnvelope, content string) bool {
+	return v < 2 && enc == nil && content != ""
+}
+
 // decryptV2Put unwraps the CEK to the operator and AEAD-opens the INLINE
 // ciphertext, returning the recovered plaintext for the quality/dedup gates to
 // run on (§3.1(2)/§3.6). Every failure path returns ok=false so applyPut DROPS
@@ -695,16 +713,45 @@ func (s *State) applyPut(msg *Message) {
 
 	isV2 := payload.V >= 2 && payload.Enc != nil
 
+	// grandfathered marks a pre-migration LEGACY plaintext put that is being
+	// GRANDFATHERED during Replay (set in the §6 fail-closed block below). It
+	// carries the legacy marker + a bounded TTL onto the folded entry.
+	grandfathered := false
+
 	// §6 FAIL-CLOSED (team tier only): a downgrade must not reopen the content
-	// leak. Drop any 3401 that carries a legacy plaintext "content" field, lacks
-	// a well-formed v2 "enc" envelope, or has v<2. Dropping = not folding into
-	// pendingPuts, so the operator's put-accept finds nothing (the same silent-
-	// drop pattern the tainted-field guards below use). Individual tier
-	// (encryptedRequired == false, local socket, already confidential) keeps the
-	// legacy plaintext path legal and unchanged.
+	// leak. Any 3401 that carries a legacy plaintext "content" field, lacks a
+	// well-formed v2 "enc" envelope, or has v<2 is NOT a well-formed confidential
+	// put. What happens to it depends on replay-vs-live — the crux of this item
+	// (§6.3, §7 Migration, dontguess-3ab1):
+	//
+	//   LIVE fold (dontguess-4bed): fail-closed DROP. A downgrade (a rogue or
+	//   pre-upgrade allowlisted client publishing plaintext) must never inject new
+	//   cleartext into inventory. Dropping = not folding into pendingPuts, so the
+	//   operator's put-accept finds nothing (the same silent-drop pattern the
+	//   tainted-field guards below use). This enforcement is UNCHANGED.
+	//
+	//   REPLAY of a MIXED historical log (s.replaying): a genuine pre-migration
+	//   LEGACY plaintext put (isLegacyPlaintextPut: v<2, a base64 "content" field,
+	//   no "enc") was already accepted+broadcast BEFORE the cutover. Dropping it on
+	//   the rebuild path would make the operator lose ALL pre-migration inventory
+	//   on the first restart, and the plaintext is already permanently public on
+	//   the append-only relay (no claw-back is possible). GRANDFATHER it instead:
+	//   fold it as legacy inventory carrying a bounded TTL (LegacyGrandfatherTTL)
+	//   so it ages out gracefully rather than vanishing or lingering forever.
+	//
+	// The grandfather path is NARROW: only a true legacy plaintext put qualifies.
+	// A v2-shaped put with a smuggled "content" field, or a present-but-malformed
+	// "enc", is NOT a pre-migration entry and stays fail-closed DROPPED in BOTH
+	// replay and live fold. Individual tier (encryptedRequired == false, local
+	// socket, already confidential) keeps the legacy plaintext path legal and
+	// unchanged — it never reaches this block.
 	if s.encryptedRequired {
 		if !isV2 || payload.Content != "" || !encWellFormed(payload.Enc) {
-			return
+			if s.replaying && isLegacyPlaintextPut(payload.V, payload.Enc, payload.Content) {
+				grandfathered = true
+			} else {
+				return
+			}
 		}
 	}
 
@@ -725,7 +772,10 @@ func (s *State) applyPut(msg *Message) {
 		wrappedCEKOperator = payload.Enc.KeyWrap.Wrapped
 		ciphertextHash = payload.Enc.CiphertextHash
 	} else {
-		// Legacy plaintext path (individual tier — team tier already dropped above).
+		// Legacy plaintext path: individual tier (unencrypted, unchanged) OR a
+		// pre-migration legacy plaintext put GRANDFATHERED during Replay on team
+		// tier (grandfathered == true). A LIVE team-tier plaintext put was already
+		// fail-closed dropped above and never reaches here.
 		if payload.Content == "" {
 			return
 		}
@@ -872,6 +922,16 @@ func (s *State) applyPut(msg *Message) {
 		blobPointer = pointer
 	}
 
+	// Grandfathered legacy plaintext entries carry a bounded default expiry so the
+	// pre-migration plaintext corpus drains from live inventory over time (§7).
+	// A historical put-accept that carried an explicit expires_at still overrides
+	// this in applySettlePutAccept; when it did not (empty expires_at → zero, i.e.
+	// "never expires"), this TTL is what guarantees the entry ages out.
+	var legacyExpiresAt time.Time
+	if grandfathered {
+		legacyExpiresAt = time.Unix(0, msg.Timestamp).Add(LegacyGrandfatherTTL)
+	}
+
 	entry := &InventoryEntry{
 		EntryID:            msg.ID,
 		PutMsgID:           msg.ID,
@@ -889,6 +949,8 @@ func (s *State) applyPut(msg *Message) {
 		WrappedCEKOperator: wrappedCEKOperator,
 		CiphertextHash:     ciphertextHash,
 		Teaser:             validatedTeaser,
+		LegacyPlaintext:    grandfathered,
+		ExpiresAt:          legacyExpiresAt,
 	}
 	s.pendingPuts[msg.ID] = entry
 	s.putToEntry[msg.ID] = msg.ID
