@@ -24,6 +24,17 @@ jobs:
         # and pkg/scrip run concurrent goroutines with shared state (M2 nostr surface).
         run: go test -race ./...
 
+      - name: E2E acceptance gate (cache-immune)
+        # ed2-G (dontguess-392) / design nostr-first-client-ed2.md §7.3, H7: the
+        # package-main round-trip e2e drives the real client cobra RunE (put/buy)
+        # against a full team-tier serve stack, so any cmd/dontguess source edit
+        # invalidates its cache. -count=1 disables the test cache UNCONDITIONALLY so
+        # a client regression can never ship cached-green; -race keeps the concurrent
+        # serve goroutines honest. This is the explicit named gate the acceptance
+        # requires — NOT a doc comment. (./test/... is included per the spec; it has
+        # no TestE2E today, which passes cleanly.)
+        run: go test -race -count=1 -run TestE2E ./cmd/dontguess/... ./test/...
+
       - name: Build check
         run: go build ./cmd/dontguess
 
