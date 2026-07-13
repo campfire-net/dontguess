@@ -547,8 +547,20 @@ func WriteSettleOutcome(w io.Writer, buyID string, r *SettleResult) {
 		fmt.Fprintf(w, "buy %s: PRICE EXCEEDS BUDGET — match price %d scrip is above your budget; NOT accepting (no scrip spent).\n", shortID(buyID), r.Price)
 		fmt.Fprintln(w, "  Re-run with a higher --budget to purchase, or preview first with --preview.")
 	case SettleOutcomeAmbiguous:
-		fmt.Fprintf(w, "buy %s: AMBIGUOUS — matched, but the settle chain timed out before content or a reject arrived.\n", shortID(buyID))
-		fmt.Fprintln(w, "  This is NOT a decline: the operator may be slow or the relay may not have replayed the response. Retry with a larger --timeout.")
+		// Enumerated causes (dontguess-980), mirroring the pattern in
+		// pkg/relayclient/buy.go's ambiguousResult(). A per-phase settle await can
+		// time out for reasons besides operator/relay slowness: buyer-side settle
+		// phases (buyer-accept, complete, ...) require TrustAllowlisted
+		// (pkg/exchange/trust.go defaultSettlePhaseLevels), while OperationBuy
+		// itself is only TrustAnonymous — so a buyer who was minted but never
+		// fleet-allowlisted matches fine and then has their buyer-accept silently
+		// dropped pre-fold at the dispatch trust gate (no reject is emitted; it
+		// looks identical to a slow operator). Team onboarding requires BOTH
+		// `dontguess allowlist add` and `dontguess mint` for a buyer
+		// (docs/design/nostr-first-client-ed2.md §3.4).
+		fmt.Fprintf(w, "buy %s: AMBIGUOUS — matched, but the settle chain timed out before content or a reject arrived. Possible causes:\n", shortID(buyID))
+		fmt.Fprintln(w, "  - operator may be slow, or the relay may not have replayed the response — this is NOT a decline; retry with a larger --timeout")
+		fmt.Fprintln(w, "  - buyer may not be fleet-allowlisted — settle(buyer-accept) requires fleet-member trust and is silently dropped for an unallowlisted buyer, even if minted — ask the operator to run: dontguess allowlist add <your-npub>")
 	default:
 		fmt.Fprintf(w, "buy %s: unknown settle outcome\n", shortID(buyID))
 	}

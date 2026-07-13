@@ -13,11 +13,22 @@ import (
 
 // allowlist.go — dontguess-b45 (design §6/§9-item2): `dontguess allowlist
 // add|remove|list <npub>` mutates the persisted operator config's
-// Config.FleetAllowlist — the flat, operator-maintained seller npub set
+// Config.FleetAllowlist — the flat, operator-maintained fleet npub set
 // consulted once a TrustChecker is constructed (team/federated tier, relays
 // attached). No vouching or transitive edges (design §2). This item ONLY
 // mutates the config file on disk; wiring the live TrustChecker/KeySet at
 // serve-time (Seam A/B/C/D) is a separate item (dontguess-3b8 §9-item3).
+//
+// NOT seller-only (dontguess-980): pkg/exchange/trust.go's TrustChecker.Level()
+// consults this SAME allowlist for every sender regardless of role. A put
+// (sell-side) requires TrustAllowlisted, but so do every buyer-side settle
+// phase — buyer-accept, complete, dispute, preview-request,
+// small-content-dispute (defaultSettlePhaseLevels, trust.go). A team-tier
+// buyer who is minted (`dontguess mint`) but never allowlisted here has their
+// settle(buyer-accept) silently dropped at the dispatch trust gate — see
+// docs/design/nostr-first-client-ed2.md §3.4. `dontguess allowlist add
+// <npub>` is required for BOTH sellers and buyers before their first
+// put/settle succeeds.
 //
 // Validation reuses identity.NewAllowlist (pkg/identity/allowlist.go) so a
 // malformed npub is a hard, loud error — nothing is read or written to the

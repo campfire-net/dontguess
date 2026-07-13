@@ -115,7 +115,14 @@ type wireIDStack struct {
 // restart) with the given operator signer. It attaches the relay with the engine
 // State's RegisterWireAlias, runs the engine + auto-accept loop, and returns a
 // teardown closure. AutoDeliverOnBuyerAccept is on (the team-tier serve setting).
-func newWireIDStack(t *testing.T, ctx context.Context, ls *dgstore.Store, operator identity.Signer, cursorPath string) *wireIDStack {
+//
+// trustChecker is an optional trailing arg (dontguess-980): when a non-nil
+// *exchange.TrustChecker is passed, it is wired into EngineOptions.TrustChecker
+// so a test can reproduce the live dispatch-gate gap where a minted-but-NOT-
+// fleet-allowlisted buyer's settle(buyer-accept) is silently dropped pre-fold
+// (engine_core.go dispatch). Every pre-existing call site passes none, so
+// EngineOptions.TrustChecker stays nil and behavior is byte-for-byte unchanged.
+func newWireIDStack(t *testing.T, ctx context.Context, ls *dgstore.Store, operator identity.Signer, cursorPath string, trustChecker ...*exchange.TrustChecker) *wireIDStack {
 	t.Helper()
 
 	ss, err := scrip.NewLocalScripStore(ls, operator.PubKeyHex())
@@ -123,11 +130,17 @@ func newWireIDStack(t *testing.T, ctx context.Context, ls *dgstore.Store, operat
 		t.Fatalf("NewLocalScripStore: %v", err)
 	}
 
+	var tc *exchange.TrustChecker
+	if len(trustChecker) > 0 {
+		tc = trustChecker[0]
+	}
+
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:               "local",
 		LocalStore:               ls,
 		OperatorPublicKey:        operator.PubKeyHex(),
 		ScripStore:               ss,
+		TrustChecker:             tc,
 		AutoDeliverOnBuyerAccept: true,
 		PollInterval:             10 * time.Millisecond,
 		Logger:                   func(string, ...any) {},
