@@ -57,7 +57,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net/http"
@@ -69,11 +72,65 @@ import (
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
+	"github.com/3dl-dev/dontguess/pkg/nip44"
 	"github.com/3dl-dev/dontguess/pkg/nostr"
 	"github.com/3dl-dev/dontguess/pkg/relay"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	dgstore "github.com/3dl-dev/dontguess/pkg/store"
+	"golang.org/x/crypto/chacha20poly1305"
 )
+
+// knownV2PutPayload builds a §3.3 v2 content-confidentiality envelope for the
+// SAME plaintext knownPutPayload carries, so a team-tier E2E fixture whose put
+// is fail-closed-dropped as legacy plaintext (dontguess-4bed §6) can inject a
+// well-formed encrypted put instead. It mirrors buildPutMessage byte-for-byte:
+// a fresh CEK, ChaCha20-Poly1305(nonce||ct), a ciphertext_hash OVER the
+// ciphertext, and the CEK NIP-44-wrapped from seller→operator so the operator
+// unwraps it at fold time. The operator stores the decrypted plaintext in
+// entry.Content, so the existing (pre-9e8) deliver path still returns the exact
+// bytes the buyer asserts on.
+func knownV2PutPayload(t *testing.T, seller identity.Signer, operatorPubHex, desc string, content []byte, tokenCost int64) []byte {
+	t.Helper()
+	cek := make([]byte, chacha20poly1305.KeySize)
+	if _, err := rand.Read(cek); err != nil {
+		t.Fatalf("gen CEK: %v", err)
+	}
+	aead, err := chacha20poly1305.New(cek)
+	if err != nil {
+		t.Fatalf("init AEAD: %v", err)
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("gen nonce: %v", err)
+	}
+	ciphertext := aead.Seal(nonce, nonce, content, nil)
+	sum := sha256.Sum256(ciphertext)
+	wrapped, err := nip44.Seal(seller, operatorPubHex, cek)
+	if err != nil {
+		t.Fatalf("wrap CEK to operator: %v", err)
+	}
+	p, err := json.Marshal(map[string]any{
+		"v":            2,
+		"description":  desc,
+		"token_cost":   tokenCost,
+		"content_type": "exchange:content-type:code",
+		"domains":      []string{"go"},
+		"enc": map[string]any{
+			"content_alg":     "chacha20poly1305",
+			"ciphertext_hash": "sha256:" + hex.EncodeToString(sum[:]),
+			"ciphertext":      base64.StdEncoding.EncodeToString(ciphertext),
+			"key_wrap": map[string]any{
+				"alg":       "nip44-v2-secp256k1",
+				"recipient": operatorPubHex,
+				"wrapped":   wrapped,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal v2 put payload: %v", err)
+	}
+	return p
+}
 
 // e2eLongPublishInterval is far larger than any buy timeout below, so the Outbox
 // periodic tick provably cannot be the publisher of an operator match/deliver/
@@ -139,6 +196,7 @@ func newE2EStack(t *testing.T, ctx context.Context, ls *dgstore.Store, operator 
 		CampfireID:               "local",
 		LocalStore:               ls,
 		OperatorPublicKey:        operator.PubKeyHex(),
+		OperatorSigner:           operator,
 		TrustChecker:             tc,
 		ScripStore:               ss,
 		MinBuyBalance:            exchange.DefaultMinBuyBalance,
@@ -591,7 +649,7 @@ func TestE2E_UnderfundedBuyerAccept_ReceivesLoudReject_ClientRunE(t *testing.T) 
 	// is proven in test 1; this test's subject is the underfunded buyer).
 	putEv := signExchangeEvent(t, seller,
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
-		knownPutPayload(ed2cPutDesc, ed2cContent, ed2cTokenCost))
+		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
@@ -674,7 +732,7 @@ func TestE2E_UnderfundedDeliver_NoFreeContent_ThroughServeStack(t *testing.T) {
 	// put → buy → operator match.
 	putEv := signExchangeEvent(t, seller,
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
-		knownPutPayload(ed2cPutDesc, ed2cContent, ed2cTokenCost))
+		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
@@ -777,7 +835,7 @@ func TestE2E_ConnDropMidAwait_RecoversMatch_ClientRunE(t *testing.T) {
 	// Seed inventory.
 	putEv := signExchangeEvent(t, seller,
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
-		knownPutPayload(ed2cPutDesc, ed2cContent, ed2cTokenCost))
+		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
@@ -859,7 +917,7 @@ func TestE2E_PreviewFlag_SettlesContentByteExact_ClientRunE(t *testing.T) {
 
 	putEv := signExchangeEvent(t, seller,
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
-		knownPutPayload(ed2cPutDesc, ed2cContent, ed2cTokenCost))
+		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1

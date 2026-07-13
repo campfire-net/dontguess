@@ -8,7 +8,9 @@ import (
 	"strings"
 
 	"github.com/3dl-dev/dontguess/pkg/matching"
+	"github.com/3dl-dev/dontguess/pkg/nip44"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // validCompressionTiers is the set of accepted compression_tier values.
@@ -575,20 +577,169 @@ func tokensMatchAt(tokens []string, start int, seq []string) bool {
 	return true
 }
 
+// encEnvelope is the §3.3 v2 content-confidentiality envelope carried in a
+// 3401 put's "enc" object. Exactly one of Ciphertext / BlobPointer is present.
+// The operator (and only the operator) unwraps KeyWrap.Wrapped to recover the
+// CEK and AEAD-decrypts the ciphertext at fold time
+// (docs/design/content-confidentiality-envelope-541.md §3.1(2), dontguess-4bed).
+type encEnvelope struct {
+	ContentAlg     string `json:"content_alg"`
+	CiphertextHash string `json:"ciphertext_hash"`
+	Ciphertext     string `json:"ciphertext"`   // base64(nonce||AEAD) — present IFF inline (≤32 KiB)
+	BlobPointer    string `json:"blob_pointer"` // present IFF offloaded (>32 KiB, Phase 4)
+	KeyWrap        struct {
+		Alg       string `json:"alg"`
+		Recipient string `json:"recipient"`
+		Wrapped   string `json:"wrapped"`
+	} `json:"key_wrap"`
+}
+
+// encWellFormed reports whether e carries every §6 required field with exactly
+// one of ciphertext / blob_pointer set. A malformed envelope on team tier is
+// fail-closed dropped (never folded), so a downgrade cannot reopen the leak.
+func encWellFormed(e *encEnvelope) bool {
+	if e == nil {
+		return false
+	}
+	if e.ContentAlg == "" || e.CiphertextHash == "" {
+		return false
+	}
+	if e.KeyWrap.Alg == "" || e.KeyWrap.Recipient == "" || e.KeyWrap.Wrapped == "" {
+		return false
+	}
+	hasInline := e.Ciphertext != ""
+	hasBlob := e.BlobPointer != ""
+	return hasInline != hasBlob // exactly one
+}
+
+// decryptV2Put unwraps the CEK to the operator and AEAD-opens the INLINE
+// ciphertext, returning the recovered plaintext for the quality/dedup gates to
+// run on (§3.1(2)/§3.6). Every failure path returns ok=false so applyPut DROPS
+// the put — an undecryptable, tampered, or blob-only (Phase-4-deferred) team-
+// tier put never folds. Fail-closed by construction: it can only ever yield
+// verified plaintext or nothing. sellerPubHex is msg.Sender (the seller wrapped
+// the CEK to the operator, so we open FROM the seller's key).
+func (s *State) decryptV2Put(sellerPubHex string, enc *encEnvelope) (plaintext []byte, ok bool) {
+	if s.operatorSigner == nil {
+		return nil, false // no operator key to unwrap with — cannot gate, drop
+	}
+	if enc.ContentAlg != "chacha20poly1305" {
+		return nil, false
+	}
+	// Phase 1 is inline-only: the buyer-side Blossom ciphertext fetch (and the
+	// operator-side fetch to gate an offloaded put) is deferred (Phase 4,
+	// dontguess-640). A blob-only put on team tier is well-formed but
+	// undecryptable here → dropped, never leaked.
+	if enc.Ciphertext == "" {
+		return nil, false
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(enc.Ciphertext)
+	if err != nil {
+		return nil, false
+	}
+	// Verify ciphertext_hash == sha256(ciphertext) FIRST — reject a tampered
+	// ciphertext before spending an ECDH + AEAD open on it (§3.1(6)/§4.4 A7).
+	sum := sha256.Sum256(ciphertext)
+	if "sha256:"+hex.EncodeToString(sum[:]) != enc.CiphertextHash {
+		return nil, false
+	}
+	// Unwrap CEK = NIP-44.Open(operatorPriv, sellerPub, wrapped).
+	cek, err := nip44.Open(s.operatorSigner, sellerPubHex, enc.KeyWrap.Wrapped)
+	if err != nil {
+		return nil, false
+	}
+	if len(cek) != chacha20poly1305.KeySize {
+		return nil, false
+	}
+	aead, err := chacha20poly1305.New(cek)
+	if err != nil {
+		return nil, false
+	}
+	ns := aead.NonceSize()
+	if len(ciphertext) < ns {
+		return nil, false
+	}
+	nonce, sealed := ciphertext[:ns], ciphertext[ns:]
+	pt, err := aead.Open(nil, nonce, sealed, nil)
+	if err != nil {
+		return nil, false
+	}
+	return pt, true
+}
+
 // applyPut processes an exchange:put message.
+//
+// It dispatches on the explicit "v" tag (§6.3, never implicit field sniffing):
+// v>=2 with an "enc" object is the §3.3 confidential envelope — decode, decrypt
+// to plaintext, then run ALL quality/dedup/plausibility gates on the DECRYPTED
+// plaintext (the gates move INSIDE the operator's decrypt boundary, §3.6).
+// Legacy plaintext (v<2 or no enc) keeps the base64 "content" path. On team
+// tier (encryptedRequired) the fail-closed §6 guard DROPS any legacy-plaintext
+// or malformed-enc put before it can fold — a downgrade cannot reopen the leak.
 func (s *State) applyPut(msg *Message) {
 	var payload struct {
-		Description     string   `json:"description"`
-		Content         string   `json:"content"` // base64-encoded content bytes (TAINTED)
-		TokenCost       int64    `json:"token_cost"`
-		ContentType     string   `json:"content_type"`
-		Domains         []string `json:"domains"`
-		ContentSize     int64    `json:"content_size"`
-		CompressionTier string   `json:"compression_tier"`
+		V               int          `json:"v"`
+		Description     string       `json:"description"`
+		Content         string       `json:"content"` // base64-encoded plaintext (LEGACY / TAINTED)
+		TokenCost       int64        `json:"token_cost"`
+		ContentType     string       `json:"content_type"`
+		Domains         []string     `json:"domains"`
+		ContentSize     int64        `json:"content_size"`
+		CompressionTier string       `json:"compression_tier"`
+		Enc             *encEnvelope `json:"enc"`
 	}
 	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 		return
 	}
+
+	isV2 := payload.V >= 2 && payload.Enc != nil
+
+	// §6 FAIL-CLOSED (team tier only): a downgrade must not reopen the content
+	// leak. Drop any 3401 that carries a legacy plaintext "content" field, lacks
+	// a well-formed v2 "enc" envelope, or has v<2. Dropping = not folding into
+	// pendingPuts, so the operator's put-accept finds nothing (the same silent-
+	// drop pattern the tainted-field guards below use). Individual tier
+	// (encryptedRequired == false, local socket, already confidential) keeps the
+	// legacy plaintext path legal and unchanged.
+	if s.encryptedRequired {
+		if !isV2 || payload.Content != "" || !encWellFormed(payload.Enc) {
+			return
+		}
+	}
+
+	// Obtain the plaintext content bytes. v2 decrypts inside the operator
+	// boundary; legacy decodes base64. Both converge on contentBytes, on which
+	// every existing gate then runs.
+	var (
+		contentBytes       []byte
+		wrappedCEKOperator string
+		ciphertextHash     string
+	)
+	if isV2 {
+		pt, ok := s.decryptV2Put(msg.Sender, payload.Enc)
+		if !ok {
+			return // undecryptable / tampered / blob-only → drop (fail-closed)
+		}
+		contentBytes = pt
+		wrappedCEKOperator = payload.Enc.KeyWrap.Wrapped
+		ciphertextHash = payload.Enc.CiphertextHash
+	} else {
+		// Legacy plaintext path (individual tier — team tier already dropped above).
+		if payload.Content == "" {
+			return
+		}
+		// Pre-decode size guard: base64 expands ~4/3x, reject early to avoid heap allocation
+		if len(payload.Content) > MaxContentBytes*4/3+4 {
+			return
+		}
+		// Decode content from base64. Drop silently on decode failure.
+		decoded, err := base64.StdEncoding.DecodeString(payload.Content)
+		if err != nil {
+			return
+		}
+		contentBytes = decoded
+	}
+
 	// Validate TAINTED fields. Drop silently — the message is already on the
 	// campfire log; we cannot remove it. By not adding it to pendingPuts the
 	// operator's put-accept will find nothing to accept.
@@ -601,17 +752,8 @@ func (s *State) applyPut(msg *Message) {
 	if payload.TokenCost <= 0 || payload.TokenCost > MaxTokenCost {
 		return
 	}
-	// Content is required. Reject puts with no content.
-	if payload.Content == "" {
-		return
-	}
-	// Pre-decode size guard: base64 expands ~4/3x, reject early to avoid heap allocation
-	if len(payload.Content) > MaxContentBytes*4/3+4 {
-		return
-	}
-	// Decode content from base64. Drop silently on decode failure.
-	contentBytes, err := base64.StdEncoding.DecodeString(payload.Content)
-	if err != nil {
+	// Decrypted/decoded content is required. Reject puts with no content.
+	if len(contentBytes) == 0 {
 		return
 	}
 	// Enforce size limit on decoded content (TAINTED).
@@ -675,9 +817,14 @@ func (s *State) applyPut(msg *Message) {
 	//
 	// If no blob store is configured, or content is at/below the threshold,
 	// behavior is unchanged from before this change: full bytes stored inline.
+	// v2 confidential entries never take the legacy Blossom preview-slice
+	// offload: the ciphertext (not a plaintext preview slice) is the public
+	// artifact under encryption, and buildPutMessage caps inline v2 plaintext at
+	// ≤32 KiB so this branch cannot trigger for it anyway. The legacy plaintext
+	// (individual-tier) path keeps the existing offload behavior unchanged.
 	entryContent := contentBytes
 	blobPointer := ""
-	if s.blobStore != nil && len(contentBytes) > BlossomOffloadThreshold {
+	if !isV2 && s.blobStore != nil && len(contentBytes) > BlossomOffloadThreshold {
 		previewBytes, err := buildInlinePreviewBytes(contentBytes, contentType, msg.ID)
 		if err != nil {
 			// Cannot produce a safe inline preview — drop the put rather than
@@ -696,19 +843,21 @@ func (s *State) applyPut(msg *Message) {
 	}
 
 	entry := &InventoryEntry{
-		EntryID:         msg.ID,
-		PutMsgID:        msg.ID,
-		SellerKey:       msg.Sender,
-		Description:     payload.Description,
-		ContentHash:     contentHash,
-		ContentType:     contentType,
-		Domains:         stripDomainPrefixes(payload.Domains),
-		TokenCost:       payload.TokenCost,
-		ContentSize:     int64(len(contentBytes)),
-		PutTimestamp:    msg.Timestamp,
-		CompressionTier: tier,
-		Content:         entryContent,
-		BlobPointer:     blobPointer,
+		EntryID:            msg.ID,
+		PutMsgID:           msg.ID,
+		SellerKey:          msg.Sender,
+		Description:        payload.Description,
+		ContentHash:        contentHash,
+		ContentType:        contentType,
+		Domains:            stripDomainPrefixes(payload.Domains),
+		TokenCost:          payload.TokenCost,
+		ContentSize:        int64(len(contentBytes)),
+		PutTimestamp:       msg.Timestamp,
+		CompressionTier:    tier,
+		Content:            entryContent,
+		BlobPointer:        blobPointer,
+		WrappedCEKOperator: wrappedCEKOperator,
+		CiphertextHash:     ciphertextHash,
 	}
 	s.pendingPuts[msg.ID] = entry
 	s.putToEntry[msg.ID] = msg.ID

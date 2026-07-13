@@ -203,6 +203,14 @@ func runServeLocal(dgHome string) error {
 	// gates authorship on. Unset => unchanged campfire-free single-agent mode.
 	relayURLs := resolveRelayURLs()
 	var relaySigner *identity.Secp256k1Identity
+	// operatorSigner is the SAME operator identity as a TRUE nil interface when
+	// no relays are attached (individual tier). Passing the typed-nil
+	// *Secp256k1Identity straight into the identity.Signer field would make a
+	// non-nil interface holding a nil pointer (the dontguess-4bed / TrustChecker
+	// typed-nil trap), which would arm encryptedRequired on the individual tier
+	// and break the confidential-only guard's tier gating. Keep it untyped-nil
+	// unless a real relay signer is loaded.
+	var operatorSigner identity.Signer
 	engineOperatorKey := localOperatorKey
 	if len(relayURLs) > 0 {
 		relaySigner, err = loadOrCreateNostrOperatorIdentity(dgHome)
@@ -210,6 +218,7 @@ func runServeLocal(dgHome string) error {
 			return fmt.Errorf("nostr operator identity: %w", err)
 		}
 		engineOperatorKey = relaySigner.PubKeyHex()
+		operatorSigner = relaySigner
 	}
 
 	logDest, err := buildLogDest(dgHome)
@@ -348,6 +357,7 @@ func runServeLocal(dgHome string) error {
 		CampfireID:        "local",
 		LocalStore:        localStore,
 		OperatorPublicKey: engineOperatorKey,
+		OperatorSigner:    operatorSigner,
 		Embedder:          embedder,
 		PollInterval:      servePollInterval,
 		TrustChecker:      trustChecker,

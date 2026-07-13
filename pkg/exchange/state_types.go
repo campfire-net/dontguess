@@ -10,6 +10,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
 )
 
@@ -266,6 +267,23 @@ type InventoryEntry struct {
 	// fetched via BlobStore.Fetch(BlobPointer) and verified against
 	// ContentHash before delivery.
 	BlobPointer string
+
+	// WrappedCEKOperator is the seller's NIP-44 wrap of the content-encryption
+	// key (CEK) to the OPERATOR's key, carried verbatim from the v2 put's
+	// enc.key_wrap.wrapped (docs/design/content-confidentiality-envelope-541.md
+	// §3.3/§3.5, dontguess-4bed). It is Replay-safe (folded from the put event),
+	// and is NOT the raw CEK — the operator re-derives the CEK on demand via
+	// NIP-44(operatorPriv, sellerPub, WrappedCEKOperator). The Phase-2 deliver
+	// (dontguess-9e8) re-wraps that same CEK to the buyer, so it MUST persist on
+	// the entry. Empty for legacy plaintext (individual-tier) entries.
+	WrappedCEKOperator string
+
+	// CiphertextHash is "sha256:"+hex(sha256(ciphertext)) — the hash over the
+	// AEAD CIPHERTEXT (not plaintext), carried from the v2 put's
+	// enc.ciphertext_hash. It is the buyer/Blossom integrity-verify value (§4.4
+	// A7) and is DISTINCT from ContentHash, which is the operator-local
+	// sha256(plaintext) dedup key. Empty for legacy plaintext entries.
+	CiphertextHash string
 }
 
 // IsExpired returns true if the entry has passed its expiry time.
@@ -759,6 +777,25 @@ type State struct {
 	// rejected when their Sender does not match this key. Those rejections are
 	// counted + alarmed via onFoldDenial (dontguess-9ed), not dropped silently.
 	OperatorKey string
+
+	// operatorSigner is the operator's secp256k1 identity (private, does ECDH).
+	// It is the ONLY key that can NIP-44-unwrap a v2 put's wrapped_cek_operator,
+	// so applyPut needs it to decrypt-then-gate on team tier
+	// (docs/design/content-confidentiality-envelope-541.md §3.1(2)/§3.6,
+	// dontguess-4bed). Set at engine construction (NewEngine) from
+	// EngineOptions.OperatorSigner, BEFORE Replay, so both live-fold and Replay
+	// can decrypt. nil on the individual tier (ScripStore == nil, local socket,
+	// already confidential) — the legacy plaintext path never needs it.
+	operatorSigner identity.Signer
+
+	// encryptedRequired is the §6 team-tier fail-closed flag. When true, applyPut
+	// DROPS any 3401 that carries a legacy plaintext "content" field, lacks a
+	// well-formed v2 "enc" envelope, or has v<2 — a downgrade cannot reopen the
+	// content-confidentiality leak. Set true by NewEngine only when BOTH a
+	// ScripStore (team tier) AND an operatorSigner are present (production serve
+	// wires the two together inside its relays-attached branch). false on the
+	// individual tier keeps the plaintext path legal and byte-for-byte unchanged.
+	encryptedRequired bool
 
 	// onFoldDenial, when non-nil, is invoked when a security-relevant fold guard
 	// (operator-only settlement guard, or the buyer-identity gate) rejects a

@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	dgstore "github.com/3dl-dev/dontguess/pkg/store"
@@ -81,6 +82,19 @@ type EngineOptions struct {
 	// records (match/put-accept/settle/…) are attributed to it. The engine has
 	// no signing client of its own — egress is a direct append into LocalStore.
 	OperatorPublicKey string
+
+	// OperatorSigner is the operator's secp256k1 identity (private, does ECDH).
+	// It is threaded into State.operatorSigner so applyPut can NIP-44-unwrap a
+	// v2 put's wrapped_cek_operator and decrypt-then-gate on team tier
+	// (docs/design/content-confidentiality-envelope-541.md §3.1(2)/§6,
+	// dontguess-4bed). REQUIRED alongside ScripStore to arm the §6 fail-closed
+	// ciphertext-only enforcement — production serve wires it from the relay
+	// operator identity in the SAME relays-attached branch that sets ScripStore.
+	// Must be a TRUE nil interface (not a typed-nil) on the individual tier, so
+	// callers pass an untyped nil when no operator identity is loaded (mirrors
+	// the TrustChecker typed-nil precedent). nil ⇒ the legacy plaintext path
+	// stays legal and byte-for-byte unchanged.
+	OperatorSigner identity.Signer
 	// LocalStore is the campfire-free append-only event log (pkg/store) that is
 	// the engine's SOLE ingest and egress path.
 	//
@@ -584,6 +598,16 @@ func NewEngine(opts EngineOptions) *Engine {
 	if opts.OperatorPublicKey != "" {
 		st.OperatorKey = opts.OperatorPublicKey
 	}
+	// Thread the operator signer into State BEFORE any Replay so applyPut can
+	// decrypt-then-gate v2 puts during both live-fold and startup replay
+	// (dontguess-4bed, §3.1(2)/§3.6). Arm the §6 fail-closed ciphertext-only
+	// enforcement only when this is a team tier (ScripStore set) that also HAS an
+	// operator key to unwrap with — an encrypted-required exchange with no signer
+	// could not decrypt anything, so requiring both keeps unit tests that set a
+	// ScripStore but no signer on the legacy plaintext path (no fixture churn)
+	// while production serve (which sets both together) is fail-closed.
+	st.operatorSigner = opts.OperatorSigner
+	st.encryptedRequired = opts.ScripStore != nil && opts.OperatorSigner != nil
 	e := &Engine{
 		opts:               opts,
 		state:              st,
