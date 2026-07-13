@@ -251,6 +251,22 @@ func (s *State) applySettleDeliver(msg *Message) {
 	// trusting any payload field.
 	if entryID := s.matchToEntry[matchMsgID]; entryID != "" {
 		s.entryDeliverCount[entryID]++
+
+		// dontguess-1856: also track per-buyer deliver counts (global,
+		// keyed by buyer pubkey) and per-entry-per-buyer deliver counts, so
+		// entryDeliverAbandonWeight can later distinguish a chronic
+		// never-completer (griefer) hammering this entry from a broad set
+		// of otherwise-healthy buyers each abandoning once. Buyer identity
+		// is resolved from matchToBuyer (set when the match was created),
+		// not from any buyer-supplied field — consistent with the
+		// buyer-identity gates used elsewhere in this file.
+		if buyer := s.matchToBuyer[matchMsgID]; buyer != "" {
+			s.buyerDeliverCount[buyer]++
+			if s.entryDeliverBuyerCount[entryID] == nil {
+				s.entryDeliverBuyerCount[entryID] = make(map[string]int)
+			}
+			s.entryDeliverBuyerCount[entryID][buyer]++
+		}
 	}
 }
 
@@ -330,6 +346,26 @@ func (s *State) applySettleComplete(msg *Message) {
 
 	buyerKey := msg.Sender
 	s.completedEntries[deliverMsgID] = buyerKey
+
+	// dontguess-1856: track per-buyer completion count (global, keyed by
+	// buyer pubkey) alongside the existing per-entry entryConsumeCount signal
+	// (which is populated separately by applyConsume on the operator-attested
+	// exchange:consume message). This settle(complete) event is buyer-identity
+	// verified above, so it is a trustworthy source for the buyer's personal
+	// completion rate used by entryDeliverAbandonWeight. entryConsumeBuyerCount
+	// records the SAME event scoped to (entryID, buyer) so the weighting
+	// function can compute a buyer's EXTERNAL completion rate — i.e. their
+	// track record on OTHER entries, excluding this one. This is what lets a
+	// single-episode abandonment (no track record elsewhere) still flag
+	// normally (dontguess-659's griefing regression test requires this),
+	// while a buyer with an ESTABLISHED chronic near-zero completion rate on
+	// OTHER entries has that pattern discounted from — not built out of —
+	// the very entry being judged.
+	s.buyerConsumeCount[buyerKey]++
+	if s.entryConsumeBuyerCount[entryID] == nil {
+		s.entryConsumeBuyerCount[entryID] = make(map[string]int)
+	}
+	s.entryConsumeBuyerCount[entryID][buyerKey]++
 
 	entry, ok := s.inventory[entryID]
 	if !ok {

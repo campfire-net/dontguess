@@ -18,6 +18,7 @@ package exchange
 
 import (
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
@@ -233,30 +234,49 @@ func TestExpiryCandidates_PastThresholdReported(t *testing.T) {
 	st.OperatorKey = "op-key"
 
 	// Seed 10 deliveries, 0 consumes for entry-FP → ratio=10 >> threshold=5.
-	for i := 0; i < 10; i++ {
-		d := seedDeliverChain(st,
-			"match-fp-"+string(rune('a'+i)),
-			"entry-FP",
-			"ba-fp-"+string(rune('a'+i)),
-			"deliver-fp-"+string(rune('a'+i)),
-			"buyer",
-		)
-		d.Sender = "op-key"
-		st.Apply(d)
+	//
+	// dontguess-1856: the delivering buyers are 5 DISTINCT identities, each with
+	// an established, mostly-completed personal history (8 warm-up
+	// deliver+complete pairs on a private per-buyer warm-up entry, via real
+	// settle:complete — buyer-identity verified) BEFORE abandoning entry-FP
+	// twice each. This models the "broad set of otherwise-healthy buyers"
+	// scenario the griefer-aware weighting must still flag at full strength —
+	// as opposed to a lone low-activity buyer, which the weighting now
+	// (correctly) treats as inconclusive. See griefer_weighted_expiry_test.go
+	// for the head-to-head griefer-vs-healthy-buyers proof.
+	for b := 0; b < 5; b++ {
+		buyer := "buyer-fp-" + string(rune('a'+b))
+		for w := 0; w < 8; w++ {
+			idPrefix := buyer + "-warmup-" + string(rune('0'+w))
+			deliverAndComplete(t, st, idPrefix, "entry-fp-warmup-"+buyer, buyer)
+		}
+		for a := 0; a < 2; a++ {
+			d := seedDeliverChain(st,
+				"match-fp-"+buyer+"-"+string(rune('0'+a)),
+				"entry-FP",
+				"ba-fp-"+buyer+"-"+string(rune('0'+a)),
+				"deliver-fp-"+buyer+"-"+string(rune('0'+a)),
+				buyer,
+			)
+			d.Sender = "op-key"
+			st.Apply(d)
+		}
 	}
 
 	// Seed 4 deliveries + 4 consumes for entry-OK → ratio=1.0 (well consumed).
+	// Uses a buyer identity ("buyer-ok") that never touches entry-FP, so it
+	// cannot perturb entry-FP's per-buyer weighting (dontguess-1856).
 	for i := 0; i < 4; i++ {
 		d := seedDeliverChain(st,
 			"match-ok-"+string(rune('0'+i)),
 			"entry-OK",
 			"ba-ok-"+string(rune('0'+i)),
 			"deliver-ok-"+string(rune('0'+i)),
-			"buyer",
+			"buyer-ok",
 		)
 		d.Sender = "op-key"
 		st.Apply(d)
-		cOK := makeConsumeMessage("consume-ok-"+string(rune('0'+i)), "entry-OK", "buyer")
+		cOK := makeConsumeMessage("consume-ok-"+string(rune('0'+i)), "entry-OK", "buyer-ok")
 		cOK.Sender = "op-key" // operator-sender gate requires operator key
 		st.Apply(cOK)
 	}
@@ -307,17 +327,28 @@ func TestExpiryCandidates_ReadOnly(t *testing.T) {
 		TokenCost:   5000,
 	}
 
-	// Seed delivers that would trigger expiry flag.
-	for i := 0; i < 10; i++ {
-		d := seedDeliverChain(st,
-			"match-fp-"+string(rune('a'+i)),
-			"entry-FP",
-			"ba-fp-"+string(rune('a'+i)),
-			"deliver-fp-"+string(rune('a'+i)),
-			"buyer",
-		)
-		d.Sender = "op-key"
-		st.Apply(d)
+	// Seed delivers that would trigger expiry flag. Distinct, otherwise-healthy
+	// buyers (per-buyer warm-up completion history via real settle:complete),
+	// same pattern as TestExpiryCandidates_PastThresholdReported — a lone
+	// low-activity buyer is no longer sufficient to trigger the flag under the
+	// griefer-aware weighting (dontguess-1856).
+	for b := 0; b < 5; b++ {
+		buyer := "buyer-ro-" + string(rune('a'+b))
+		for w := 0; w < 8; w++ {
+			idPrefix := buyer + "-warmup-" + string(rune('0'+w))
+			deliverAndComplete(t, st, idPrefix, "entry-ro-warmup-"+buyer, buyer)
+		}
+		for a := 0; a < 2; a++ {
+			d := seedDeliverChain(st,
+				"match-fp-"+buyer+"-"+string(rune('0'+a)),
+				"entry-FP",
+				"ba-fp-"+buyer+"-"+string(rune('0'+a)),
+				"deliver-fp-"+buyer+"-"+string(rune('0'+a)),
+				buyer,
+			)
+			d.Sender = "op-key"
+			st.Apply(d)
+		}
 	}
 
 	// Call ExpiryCandidates.
@@ -449,32 +480,48 @@ func TestExpiryCandidates_ExactRatioThreshold(t *testing.T) {
 	st.OperatorKey = "op-key"
 
 	// Seed entry-AT: 5 delivers, 0 consumes → ratio=5.0 == threshold → should appear.
+	//
+	// dontguess-1856: the delivering buyer ("buyer-at") has an established,
+	// near-perfect personal completion history (95 warm-up deliver+complete
+	// pairs via real settle:complete) BEFORE abandoning entry-AT 5 times, so
+	// its griefer-aware weight stays high (~0.95) — comfortably above the
+	// ~0.9 needed to keep the weighted effective deliver count at 5, so the
+	// boundary (ratio exactly 5.0) is preserved under weighting.
+	const buyerAT = "buyer-at"
+	for w := 0; w < 95; w++ {
+		idPrefix := buyerAT + "-warmup-" + fmt.Sprintf("%02d", w)
+		deliverAndComplete(t, st, idPrefix, "entry-at-warmup", buyerAT)
+	}
 	for i := 0; i < 5; i++ {
 		d := seedDeliverChain(st,
 			"match-at-"+string(rune('0'+i)),
 			"entry-AT",
 			"ba-at-"+string(rune('0'+i)),
 			"deliver-at-"+string(rune('0'+i)),
-			"buyer",
+			buyerAT,
 		)
 		d.Sender = "op-key"
 		st.Apply(d)
 	}
 
 	// Seed entry-BELOW: 5 delivers, 2 consumes → ratio=2.5 < threshold → should NOT appear.
+	// Uses a distinct buyer ("buyer-below") so it cannot perturb buyer-at's
+	// weighting (dontguess-1856). Below-threshold entries stay below
+	// threshold regardless of weighting (weighting can only scale the
+	// effective ratio down, never up).
 	for i := 0; i < 5; i++ {
 		d := seedDeliverChain(st,
 			"match-bl-"+string(rune('0'+i)),
 			"entry-BELOW",
 			"ba-bl-"+string(rune('0'+i)),
 			"deliver-bl-"+string(rune('0'+i)),
-			"buyer",
+			"buyer-below",
 		)
 		d.Sender = "op-key"
 		st.Apply(d)
 	}
 	for i := 0; i < 2; i++ {
-		cBL := makeConsumeMessage("consume-bl-"+string(rune('0'+i)), "entry-BELOW", "buyer")
+		cBL := makeConsumeMessage("consume-bl-"+string(rune('0'+i)), "entry-BELOW", "buyer-below")
 		cBL.Sender = "op-key" // operator-sender gate requires operator key
 		st.Apply(cBL)
 	}

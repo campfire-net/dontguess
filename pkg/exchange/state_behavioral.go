@@ -111,8 +111,21 @@ func (s *State) ExpiryCandidates() []ExpiryCandidateReport {
 
 	var candidates []ExpiryCandidateReport
 	for entryID, c := range combined {
+		// dontguess-1856: scale the effective deliver count fed into the
+		// false-positive-expiry criterion by the personal completion rate of
+		// the buyers who actually abandoned THIS entry. A low weight (buyers
+		// are chronic near-zero-completion griefers) shrinks the effective
+		// deliver-without-consume ratio so a funded griefer hammering one
+		// entry cannot poison an otherwise-good entry's signal. A weight near
+		// 1.0 (abandoning buyers otherwise complete normally elsewhere)
+		// leaves the ratio at full strength — that pattern is real signal
+		// that the entry itself is stale/bad. entryConsumeCount (the
+		// existing per-entry aggregate) is untouched; only the value handed
+		// to IsFalsePositiveExpiry is scaled.
+		weight := s.entryDeliverAbandonWeightLocked(entryID)
+		effectiveDeliver := int(float64(c.deliver)*weight + 0.5)
 		sig := matching.BehavioralSignals{
-			DeliverCount: c.deliver,
+			DeliverCount: effectiveDeliver,
 			ConsumeCount: c.consume,
 		}
 		if matching.IsFalsePositiveExpiry(sig) {
@@ -130,6 +143,77 @@ func (s *State) ExpiryCandidates() []ExpiryCandidateReport {
 	}
 
 	return candidates
+}
+
+// entryDeliverAbandonWeightLocked returns, in [0.0, 1.0], the weight used to
+// scale entryID's effective deliver-without-consume ratio for the
+// false-positive-expiry criterion (dontguess-1856).
+//
+// It is the deliver-count-weighted average, across every buyer who received a
+// settle(deliver) for entryID, of that buyer's EXTERNAL personal completion
+// rate: (buyerConsumeCount[buyer] - entryConsumeBuyerCount[entryID][buyer]) /
+// (buyerDeliverCount[buyer] - entryDeliverBuyerCount[entryID][buyer]) — i.e.
+// the buyer's track record on every OTHER entry, deliberately excluding this
+// entry's own contribution. A buyer with NO external deliveries recorded
+// (their entire footprint is this one entry — e.g. a single-episode
+// abandonment, or a first-time buyer) contributes a neutral rate of 1.0: with
+// zero external observations there is no basis to call them a "chronic"
+// never-completer, so the entry's own signal is judged unweighted. This
+// self-exclusion is deliberate — without it, a lone, single-episode
+// abandoner would always compute an inclusive rate of 0 (delivered here,
+// completed nowhere) and every such entry would suppress itself, which would
+// break the dontguess-659 griefing regression (a single-episode attacker
+// hammering ONE competitor entry must still surface the entry as an
+// operator-facing expiry candidate — only an ESTABLISHED pattern across
+// OTHER entries should discount the signal).
+//
+// Intuition:
+//   - If entryID's abandons are dominated by a buyer who has an ESTABLISHED
+//     track record of never completing anything on OTHER entries (a chronic
+//     griefer), that external rate is near 0, so the weight is near 0 and the
+//     effective deliver count — and thus the ratio — is scaled down,
+//     preventing a false-positive-expiry flag.
+//   - If entryID's abandons come from a broad set of buyers who otherwise
+//     complete normally on OTHER entries, their external rate is near 1, so
+//     the weight stays near 1 and the entry's ratio is judged at full
+//     strength — that is real signal the entry itself is stale/low quality.
+//   - If a buyer has no external track record at all, the weight for their
+//     contribution is neutral (1.0) — absence of evidence is not evidence of
+//     chronic abandonment.
+//
+// No data (entry has no recorded deliver-buyer association, e.g. it predates
+// this fold or was replayed from an older log) returns 1.0 — no scaling,
+// falling back to the pre-existing unweighted behavior.
+//
+// Caller must hold s.mu (read lock is sufficient) — invoked from
+// ExpiryCandidates, which holds s.mu.RLock() for its whole body.
+func (s *State) entryDeliverAbandonWeightLocked(entryID string) float64 {
+	buyers := s.entryDeliverBuyerCount[entryID]
+	if len(buyers) == 0 {
+		return 1.0
+	}
+	var weightedSum, totalCount float64
+	for buyer, cnt := range buyers {
+		extDeliver := s.buyerDeliverCount[buyer] - cnt
+		extConsume := s.buyerConsumeCount[buyer] - s.entryConsumeBuyerCount[entryID][buyer]
+
+		rate := 1.0
+		if extDeliver > 0 {
+			rate = float64(extConsume) / float64(extDeliver)
+			if rate > 1.0 {
+				rate = 1.0
+			}
+			if rate < 0 {
+				rate = 0
+			}
+		}
+		weightedSum += rate * float64(cnt)
+		totalCount += float64(cnt)
+	}
+	if totalCount == 0 {
+		return 1.0
+	}
+	return weightedSum / totalCount
 }
 
 // UpdateCoOccurrence records that entryA and entryB co-occurred in the same

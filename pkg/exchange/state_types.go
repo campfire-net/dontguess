@@ -900,6 +900,43 @@ type State struct {
 	// Reset on Replay — rebuilt from the campfire log.
 	entryDeliverCount map[string]int
 
+	// buyerDeliverCount tracks, per buyer pubkey (GLOBAL across all entries),
+	// the number of settle(deliver) events addressed to that buyer.
+	// buyerConsumeCount tracks, per buyer pubkey, the number of settle(complete)
+	// events that buyer successfully closed.
+	// Together these give a buyer's personal completion rate
+	// (buyerConsumeCount[k] / buyerDeliverCount[k]), used by
+	// entryDeliverAbandonWeight (dontguess-1856) to distinguish a chronic
+	// never-completer (funded griefer) hammering one entry from a broad set of
+	// otherwise-healthy buyers each abandoning once. This is ADDED ALONGSIDE the
+	// existing per-entry entryDeliverCount/entryConsumeCount aggregates above —
+	// those are left untouched.
+	// Populated at the SAME call sites as the entry-level counters
+	// (applySettleDeliver / applySettleComplete in state_settle.go).
+	// Reset on Replay — rebuilt from the campfire log.
+	buyerDeliverCount map[string]int
+	buyerConsumeCount map[string]int
+
+	// entryDeliverBuyerCount tracks, per entry, per buyer, how many
+	// settle(deliver) events that buyer received for that entry. Key: entryID
+	// -> buyerKey -> count. This is what lets ExpiryCandidates identify WHICH
+	// buyers' personal completion rates are relevant to a given entry's
+	// deliver-without-consume signal (dontguess-1856).
+	// Reset on Replay — rebuilt from the campfire log.
+	entryDeliverBuyerCount map[string]map[string]int
+
+	// entryConsumeBuyerCount is the settle(complete) counterpart of
+	// entryDeliverBuyerCount: per entry, per buyer, how many settle(complete)
+	// events that buyer closed for that entry. Key: entryID -> buyerKey ->
+	// count. Together with entryDeliverBuyerCount, this lets
+	// entryDeliverAbandonWeightLocked compute a buyer's EXTERNAL completion
+	// rate (buyerDeliverCount/buyerConsumeCount MINUS this entry's own
+	// contribution) rather than a self-referential one, so a single-episode
+	// abandonment (no track record on any other entry) is not mistaken for
+	// an established chronic griefer (dontguess-1856).
+	// Reset on Replay — rebuilt from the campfire log.
+	entryConsumeBuyerCount map[string]map[string]int
+
 	// priceAdjustments holds dynamic price multipliers written by the fast pricing loop.
 	// Key: entryID. The multiplier is applied on top of computePrice's base result.
 	// Stale adjustments (past ExpiresAt) are treated as 1.0x by computePrice.
