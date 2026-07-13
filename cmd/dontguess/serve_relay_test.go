@@ -663,7 +663,16 @@ func TestRelayHotPath_BuyMatchP99_UnderBlockedRelay(t *testing.T) {
 		if err := eng.PollLocalStoreForTest(); err != nil {
 			t.Fatalf("poll+fold buy %d: %v", i, err)
 		}
-		latencies = append(latencies, time.Since(start))
+		// Skip the very first buy from the latency sample: it pays for the
+		// cold-start Replay+fold path (first full local-log scan, lazy engine
+		// state warm-up) — a one-time cost unrelated to steady-state hot-path
+		// isolation. On a slow/cold CI runner this cold-start spike could push a
+		// bare ms ceiling over the edge and false-fail the isolation gate even
+		// though every subsequent buy stays in the normal single/low-double-digit
+		// ms regime (dontguess-3ab).
+		if i > 0 {
+			latencies = append(latencies, time.Since(start))
+		}
 		// The synchronous fold guarantees the match is emitted before the poll
 		// returns, so assert it deterministically rather than waiting on a ticker.
 		recs, _ := ls.ReadAll()
