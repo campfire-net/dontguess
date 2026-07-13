@@ -1,6 +1,7 @@
 package relayclient
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -8,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/nip44"
 	"golang.org/x/crypto/chacha20poly1305"
@@ -177,10 +179,12 @@ func TestBuildPutMessage_RejectsMissingOperatorPubKey(t *testing.T) {
 	}
 }
 
-// TestBuildPutMessage_OversizeContentFailsClosed proves large content is a loud
-// error (deferred to dontguess-640), never an inline plaintext or plaintext-blob
-// leak.
-func TestBuildPutMessage_OversizeContentFailsClosed(t *testing.T) {
+// TestBuildPutMessage_OversizeContentFailsClosedWithoutBlobStore proves large
+// content with NO seller BlobStore is a loud error (dontguess-640) — never an
+// inline plaintext or plaintext-blob leak. This is the migrated form of the old
+// "oversize is always deferred" test: oversize is now offloadable, but STILL
+// fails closed when there is no store to hold the ciphertext.
+func TestBuildPutMessage_OversizeContentFailsClosedWithoutBlobStore(t *testing.T) {
 	seller, err := identity.Generate()
 	if err != nil {
 		t.Fatalf("generate seller: %v", err)
@@ -196,9 +200,109 @@ func TestBuildPutMessage_OversizeContentFailsClosed(t *testing.T) {
 		TokenCost:      100,
 		ContentType:    "exchange:content-type:text",
 		OperatorPubKey: operator.PubKeyHex(),
+		// No BlobStore → must fail closed.
 	})
 	if err == nil {
-		t.Fatalf("expected fail-closed error for content > %d bytes, got nil", maxInlineCiphertextPlaintext)
+		t.Fatalf("expected fail-closed error for oversize content with no BlobStore, got nil")
+	}
+}
+
+// TestBuildPutMessage_OversizeContentOffloadsCiphertext proves large content WITH
+// a seller BlobStore is AEAD-encrypted and its CIPHERTEXT (never plaintext) is
+// offloaded to Blossom: the wire carries enc.blob_pointer (not enc.ciphertext),
+// the stored blob is exactly the ciphertext (sha256(blob)==ciphertext_hash), and
+// the blob does NOT contain the plaintext. This is the seller half of the
+// dontguess-640 round-trip (§3.2/§4.4 C1).
+func TestBuildPutMessage_OversizeContentOffloadsCiphertext(t *testing.T) {
+	seller, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate seller: %v", err)
+	}
+	operator, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate operator: %v", err)
+	}
+	store := exchange.NewMemoryBlobStore()
+
+	// Distinctive, compressible-but-searchable plaintext > 32 KiB.
+	plaintext := bytes.Repeat([]byte("OVERSIZE-SECRET-MARKER-0123456789 "), 2000) // ~68 KiB
+	if len(plaintext) <= maxInlineCiphertextPlaintext {
+		t.Fatalf("test setup: plaintext %d must exceed inline limit %d", len(plaintext), maxInlineCiphertextPlaintext)
+	}
+
+	msg, err := buildPutMessage(seller, PutRequest{
+		Description:    "an oversize reusable artifact offloaded to Blossom",
+		Content:        plaintext,
+		TokenCost:      50000,
+		ContentType:    "exchange:content-type:code",
+		OperatorPubKey: operator.PubKeyHex(),
+		BlobStore:      store,
+	})
+	if err != nil {
+		t.Fatalf("buildPutMessage (oversize with store): %v", err)
+	}
+
+	var payload map[string]any
+	if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal wire payload: %v", err)
+	}
+	enc, ok := payload["enc"].(map[string]any)
+	if !ok {
+		t.Fatalf("payload.enc missing: %T", payload["enc"])
+	}
+	// Wire carries blob_pointer, NOT inline ciphertext (exactly one).
+	pointer, _ := enc["blob_pointer"].(string)
+	if pointer == "" {
+		t.Fatalf("oversize put must carry enc.blob_pointer, got %v", enc["blob_pointer"])
+	}
+	if _, hasInline := enc["ciphertext"]; hasInline {
+		t.Fatalf("oversize put must NOT carry inline enc.ciphertext — exactly one of ciphertext/blob_pointer")
+	}
+	ctHash, _ := enc["ciphertext_hash"].(string)
+	if !strings.HasPrefix(ctHash, "sha256:") {
+		t.Fatalf("enc.ciphertext_hash = %q, want sha256:<hex>", ctHash)
+	}
+
+	// The WIRE payload must not leak plaintext (no oversize bytes on the relay).
+	if strings.Contains(string(msg.Payload), "OVERSIZE-SECRET-MARKER") {
+		t.Fatalf("wire payload contains the plaintext marker — oversize plaintext leaked onto the relay")
+	}
+
+	// The stored blob holds CIPHERTEXT, never plaintext.
+	blob, err := store.Fetch(pointer)
+	if err != nil {
+		t.Fatalf("fetch offloaded blob: %v", err)
+	}
+	if bytes.Contains(blob, []byte("OVERSIZE-SECRET-MARKER")) {
+		t.Fatalf("BLOSSOM BLOB CONTAINS PLAINTEXT — the blob must hold AEAD ciphertext only (§4.4 C1)")
+	}
+	sum := sha256.Sum256(blob)
+	if got := "sha256:" + hex.EncodeToString(sum[:]); got != ctHash {
+		t.Fatalf("sha256(blob) %q != enc.ciphertext_hash %q — blob is not the committed ciphertext", got, ctHash)
+	}
+
+	// And the operator can still recover the ORIGINAL plaintext from the blob:
+	// unwrap CEK, AEAD-open the blob ciphertext byte-for-byte.
+	keyWrap, _ := enc["key_wrap"].(map[string]any)
+	wrapped, _ := keyWrap["wrapped"].(string)
+	cek, err := nip44.Open(operator, seller.PubKeyHex(), wrapped)
+	if err != nil {
+		t.Fatalf("operator unwrap CEK: %v", err)
+	}
+	aead, err := chacha20poly1305.New(cek)
+	if err != nil {
+		t.Fatalf("init AEAD: %v", err)
+	}
+	ns := aead.NonceSize()
+	if len(blob) < ns {
+		t.Fatalf("blob %d shorter than nonce %d", len(blob), ns)
+	}
+	recovered, err := aead.Open(nil, blob[:ns], blob[ns:], nil)
+	if err != nil {
+		t.Fatalf("AEAD open blob ciphertext: %v", err)
+	}
+	if !bytes.Equal(recovered, plaintext) {
+		t.Fatalf("oversize round-trip mismatch: recovered %d bytes != original %d bytes", len(recovered), len(plaintext))
 	}
 }
 

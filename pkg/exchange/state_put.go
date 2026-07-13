@@ -630,13 +630,15 @@ func isLegacyPlaintextPut(v int, enc *encEnvelope, content string) bool {
 	return v < 2 && enc == nil && content != ""
 }
 
-// decryptV2Put unwraps the CEK to the operator and AEAD-opens the INLINE
-// ciphertext, returning the recovered plaintext for the quality/dedup gates to
-// run on (§3.1(2)/§3.6). Every failure path returns ok=false so applyPut DROPS
-// the put — an undecryptable, tampered, or blob-only (Phase-4-deferred) team-
-// tier put never folds. Fail-closed by construction: it can only ever yield
-// verified plaintext or nothing. sellerPubHex is msg.Sender (the seller wrapped
-// the CEK to the operator, so we open FROM the seller's key).
+// decryptV2Put unwraps the CEK to the operator and AEAD-opens the ciphertext —
+// inline (enc.ciphertext) or FETCHED from the operator's Blossom store
+// (enc.blob_pointer, dontguess-640) — returning the recovered plaintext for the
+// quality/dedup gates to run on (§3.1(2)/§3.6). Every failure path returns
+// ok=false so applyPut DROPS the put — an undecryptable, tampered, or (for a
+// blob_pointer put) un-fetchable/no-blob-store team-tier put never folds.
+// Fail-closed by construction: it can only ever yield verified plaintext or
+// nothing. sellerPubHex is msg.Sender (the seller wrapped the CEK to the
+// operator, so we open FROM the seller's key).
 func (s *State) decryptV2Put(sellerPubHex string, enc *encEnvelope) (plaintext []byte, ok bool) {
 	if s.operatorSigner == nil {
 		return nil, false // no operator key to unwrap with — cannot gate, drop
@@ -644,19 +646,37 @@ func (s *State) decryptV2Put(sellerPubHex string, enc *encEnvelope) (plaintext [
 	if enc.ContentAlg != "chacha20poly1305" {
 		return nil, false
 	}
-	// Phase 1 is inline-only: the buyer-side Blossom ciphertext fetch (and the
-	// operator-side fetch to gate an offloaded put) is deferred (Phase 4,
-	// dontguess-640). A blob-only put on team tier is well-formed but
-	// undecryptable here → dropped, never leaked.
-	if enc.Ciphertext == "" {
-		return nil, false
+	// Resolve the ciphertext bytes. Exactly one of ciphertext / blob_pointer is
+	// set (encWellFormed enforced this). Inline: base64-decode. Offloaded
+	// (dontguess-640, Phase 4): FETCH the CIPHERTEXT from the operator's Blossom
+	// store so the quality/dedup/plausibility gates run on the same plaintext the
+	// inline path would produce — only the ciphertext SOURCE differs. Access
+	// s.blobStore DIRECTLY (not via s.BlobStore()): applyPut already holds s.mu
+	// (State.Apply), so the RLock accessor would deadlock.
+	var ciphertext []byte
+	if enc.BlobPointer != "" {
+		// FAIL-CLOSED: a blob_pointer put with no operator blob store cannot be
+		// fetched, so it cannot be gated. Drop it rather than fold un-gated
+		// content — never trust a blob we could not verify+decrypt (§6).
+		if s.blobStore == nil {
+			return nil, false
+		}
+		fetched, ferr := s.blobStore.Fetch(enc.BlobPointer)
+		if ferr != nil {
+			return nil, false // blob unavailable at fold time → drop (see replay caveat)
+		}
+		ciphertext = fetched
+	} else {
+		decoded, derr := base64.StdEncoding.DecodeString(enc.Ciphertext)
+		if derr != nil {
+			return nil, false
+		}
+		ciphertext = decoded
 	}
-	ciphertext, err := base64.StdEncoding.DecodeString(enc.Ciphertext)
-	if err != nil {
-		return nil, false
-	}
-	// Verify ciphertext_hash == sha256(ciphertext) FIRST — reject a tampered
-	// ciphertext before spending an ECDH + AEAD open on it (§3.1(6)/§4.4 A7).
+	// Verify ciphertext_hash == sha256(ciphertext) FIRST — reject a tampered or
+	// wrong blob before spending an ECDH + AEAD open on it (§3.1(6)/§4.4 A7). For
+	// the offloaded path this ALSO authenticates the fetched blob against the hash
+	// the seller committed to on the (signed) put.
 	sum := sha256.Sum256(ciphertext)
 	if "sha256:"+hex.EncodeToString(sum[:]) != enc.CiphertextHash {
 		return nil, false
@@ -903,7 +923,16 @@ func (s *State) applyPut(msg *Message) {
 	// (individual-tier) path keeps the existing offload behavior unchanged.
 	entryContent := contentBytes
 	blobPointer := ""
-	if !isV2 && s.blobStore != nil && len(contentBytes) > BlossomOffloadThreshold {
+	if isV2 && payload.Enc.BlobPointer != "" {
+		// v2 offloaded put (dontguess-640): the CIPHERTEXT lives in the Blossom
+		// blob (addressed by CiphertextHash); entry.Content holds NOTHING (the
+		// bytes live in the blob only, per dontguess-4059). decryptV2Put already
+		// fetched+verified+decrypted that blob to gate it; here we only record the
+		// pointer so emitDeliverEnvelope references it and the buyer re-fetches the
+		// same blob. The plaintext is discarded from the entry — never inlined.
+		entryContent = nil
+		blobPointer = payload.Enc.BlobPointer
+	} else if !isV2 && s.blobStore != nil && len(contentBytes) > BlossomOffloadThreshold {
 		pointer, err := s.blobStore.Put(contentBytes)
 		if err != nil {
 			// Upload failed — drop the put. Do not fall back to inlining, and

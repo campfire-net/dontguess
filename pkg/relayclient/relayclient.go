@@ -41,10 +41,12 @@ import (
 // maxInlineCiphertextPlaintext is the plaintext-size ceiling for the inline
 // ciphertext path. Content at or below this size is AEAD-encrypted and carried
 // inline in the put payload (§3.2: len(content) ≤ 32 KiB → inline). Larger
-// content requires the Blossom CIPHERTEXT offload + blob_pointer path, which is
-// item dontguess-640 (Phase 4). buildPutMessage fails CLOSED on oversize
-// content — it NEVER falls back to a plaintext blob or an inline plaintext
-// leak. Mirrors the engine's BlossomOffloadThreshold (state_types.go:138).
+// content is AEAD-encrypted the SAME way, then its CIPHERTEXT is offloaded to a
+// Blossom blob (enc.blob_pointer replaces enc.ciphertext) via PutRequest.BlobStore
+// (dontguess-640, Phase 4). If oversize content is put with NO BlobStore,
+// buildPutMessage fails CLOSED — it NEVER falls back to a plaintext blob or an
+// inline plaintext leak, and it NEVER stores plaintext in a blob (the blob always
+// holds ciphertext). Mirrors the engine's BlossomOffloadThreshold (state_types.go:138).
 const maxInlineCiphertextPlaintext = 32 * 1024
 
 // DefaultBackoff is the client's bounded reconnect schedule. It deliberately
@@ -86,6 +88,16 @@ type PutRequest struct {
 	// ""); the teaser length cap + operator coherence check is item
 	// dontguess-4059 — 58f only carries the field on the wire.
 	Teaser string
+	// BlobStore is the OPTIONAL seller-side Blossom client used to offload the
+	// CIPHERTEXT (never plaintext) of oversize content (> maxInlineCiphertextPlaintext,
+	// 32 KiB of plaintext). When Content fits inline, this is unused. When Content
+	// is oversize:
+	//   - BlobStore != nil: the AEAD ciphertext is stored via BlobStore.Put and the
+	//     returned pointer is emitted as enc.blob_pointer INSTEAD OF enc.ciphertext
+	//     (§3.2/§4.4 C1 — the blob holds ciphertext addressed by sha256(ciphertext)).
+	//   - BlobStore == nil: buildPutMessage FAILS CLOSED with a loud error. Oversize
+	//     content is NEVER inlined and NEVER stored as a plaintext blob (dontguess-640).
+	BlobStore exchange.BlobStore
 }
 
 // PutResult is the outcome of a Put call.
@@ -385,12 +397,13 @@ func buildPutMessage(signer identity.Signer, req PutRequest) (*proto.Message, er
 	if req.OperatorPubKey == "" {
 		return nil, fmt.Errorf("empty operator pubkey: a team-tier put must wrap its content key to the operator (§3.1)")
 	}
-	// Fail CLOSED on oversize content: the Blossom CIPHERTEXT offload
-	// (blob_pointer) + buyer-side fetch is item dontguess-640 (Phase 4). We must
-	// NEVER degrade to an inline plaintext leak or a plaintext blob, so oversize
-	// content is a loud error, not a silent fallback.
-	if len(req.Content) > maxInlineCiphertextPlaintext {
-		return nil, fmt.Errorf("content is %d bytes (> %d inline limit): large-content Blossom ciphertext offload is deferred to dontguess-640", len(req.Content), maxInlineCiphertextPlaintext)
+	// Inline-vs-offload is decided on the PLAINTEXT size (§3.2). Oversize content
+	// requires a seller BlobStore to hold the CIPHERTEXT: without one we fail
+	// CLOSED rather than inline oversize bytes or store plaintext. The blob NEVER
+	// holds plaintext — only the AEAD ciphertext computed below (dontguess-640).
+	offload := len(req.Content) > maxInlineCiphertextPlaintext
+	if offload && req.BlobStore == nil {
+		return nil, fmt.Errorf("content is %d bytes (> %d inline limit) but no BlobStore configured: refusing to inline oversize content or store plaintext — supply PutRequest.BlobStore to offload the CIPHERTEXT to Blossom (dontguess-640)", len(req.Content), maxInlineCiphertextPlaintext)
 	}
 
 	// (1) Per-entry CEK from the CSPRNG — never derived from content.
@@ -421,6 +434,35 @@ func buildPutMessage(signer identity.Signer, req PutRequest) (*proto.Message, er
 		return nil, fmt.Errorf("wrap CEK to operator: %w", err)
 	}
 
+	// The "enc" envelope carries the CEK wrap + integrity hash unchanged in both
+	// cases; only WHERE the ciphertext lives differs (§3.2). Exactly one of
+	// ciphertext / blob_pointer is ever set.
+	enc := map[string]any{
+		"content_alg":     "chacha20poly1305",
+		"ciphertext_hash": ciphertextHash,
+		"key_wrap": map[string]any{
+			"alg":       "nip44-v2-secp256k1",
+			"recipient": req.OperatorPubKey,
+			"wrapped":   wrapped,
+		},
+	}
+	if offload {
+		// Offload the CIPHERTEXT (nonce||AEAD) — never plaintext — to Blossom and
+		// carry only the pointer. The operator fetches+verifies+decrypts this blob
+		// at put-accept to gate it (state_put.go decryptV2Put); the buyer fetches
+		// the same blob at deliver (settle.go fetchBlobCiphertext).
+		pointer, perr := req.BlobStore.Put(ciphertext)
+		if perr != nil {
+			return nil, fmt.Errorf("offload ciphertext to Blossom: %w", perr)
+		}
+		if pointer == "" {
+			return nil, fmt.Errorf("offload ciphertext to Blossom: store returned an empty pointer")
+		}
+		enc["blob_pointer"] = pointer
+	} else {
+		enc["ciphertext"] = base64.StdEncoding.EncodeToString(ciphertext)
+	}
+
 	payload, err := json.Marshal(map[string]any{
 		"v":            2,
 		"description":  req.Description,
@@ -428,16 +470,7 @@ func buildPutMessage(signer identity.Signer, req PutRequest) (*proto.Message, er
 		"token_cost":   req.TokenCost,
 		"content_type": req.ContentType,
 		"domains":      req.Domains,
-		"enc": map[string]any{
-			"content_alg":     "chacha20poly1305",
-			"ciphertext_hash": ciphertextHash,
-			"ciphertext":      base64.StdEncoding.EncodeToString(ciphertext),
-			"key_wrap": map[string]any{
-				"alg":       "nip44-v2-secp256k1",
-				"recipient": req.OperatorPubKey,
-				"wrapped":   wrapped,
-			},
-		},
+		"enc":          enc,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("encode put payload: %w", err)

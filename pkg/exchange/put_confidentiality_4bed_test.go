@@ -189,6 +189,122 @@ func TestApplyPut_V2_DecryptsGatesFoldsAndStoresCEK(t *testing.T) {
 	}
 }
 
+// buildEncObjectBlob mirrors buildEncObject but OFFLOADS the ciphertext to store
+// and returns a blob_pointer envelope (no inline ciphertext) — the seller's
+// oversize offload shape (dontguess-640). Returns the enc object plus the pointer
+// so a test can assert the entry references it.
+func buildEncObjectBlob(t *testing.T, seller identity.Signer, wrapRecipientHex string, plaintext []byte, store BlobStore) (enc map[string]any, pointer string) {
+	t.Helper()
+	cek := make([]byte, chacha20poly1305.KeySize)
+	if _, err := rand.Read(cek); err != nil {
+		t.Fatalf("gen CEK: %v", err)
+	}
+	aead, err := chacha20poly1305.New(cek)
+	if err != nil {
+		t.Fatalf("init AEAD: %v", err)
+	}
+	nonce := make([]byte, aead.NonceSize())
+	if _, err := rand.Read(nonce); err != nil {
+		t.Fatalf("gen nonce: %v", err)
+	}
+	ciphertext := aead.Seal(nonce, nonce, plaintext, nil)
+	sum := sha256.Sum256(ciphertext)
+	pointer, err = store.Put(ciphertext)
+	if err != nil {
+		t.Fatalf("offload ciphertext: %v", err)
+	}
+	wrapped, err := nip44.Seal(seller, wrapRecipientHex, cek)
+	if err != nil {
+		t.Fatalf("wrap CEK: %v", err)
+	}
+	return map[string]any{
+		"content_alg":     "chacha20poly1305",
+		"ciphertext_hash": "sha256:" + hex.EncodeToString(sum[:]),
+		"blob_pointer":    pointer, // no inline "ciphertext"
+		"key_wrap": map[string]any{
+			"alg":       "nip44-v2-secp256k1",
+			"recipient": wrapRecipientHex,
+			"wrapped":   wrapped,
+		},
+	}, pointer
+}
+
+// (a2) a v2 BLOB_POINTER put with an operator blob store: the operator FETCHES the
+// ciphertext, verifies sha256==ciphertext_hash, decrypts, runs the gates, and folds
+// with entry.BlobPointer set + entry.Content nil (dontguess-640 operator leg).
+func TestApplyPut_V2Blob_FetchesVerifiesDecryptsGatesFolds(t *testing.T) {
+	seller, _ := identity.Generate()
+	operator, _ := identity.Generate()
+	s := teamTierState(t, operator)
+	store := NewMemoryBlobStore()
+	s.SetBlobStore(store)
+
+	plaintext := []byte("a genuinely reusable distilled artifact offloaded to Blossom; the wire never carries it")
+	enc, pointer := buildEncObjectBlob(t, seller, operator.PubKeyHex(), plaintext, store)
+	msg := marshalV2Put(t, seller, "reusable go flock contention test pattern", 4242, enc)
+	s.Apply(msg)
+
+	entry, ok := s.GetPendingPut(msg.ID)
+	if !ok {
+		t.Fatal("v2 blob_pointer put did NOT fold — operator fetch+verify+decrypt+gate failed")
+	}
+	if entry.BlobPointer != pointer {
+		t.Fatalf("entry.BlobPointer = %q, want %q", entry.BlobPointer, pointer)
+	}
+	if entry.Content != nil {
+		t.Fatalf("entry.Content non-nil (%d bytes) — offloaded entry must keep bytes in the blob only", len(entry.Content))
+	}
+	if entry.ContentSize != int64(len(plaintext)) {
+		t.Fatalf("entry.ContentSize = %d, want plaintext size %d", entry.ContentSize, len(plaintext))
+	}
+	plainSum := sha256.Sum256(plaintext)
+	if entry.ContentHash != "sha256:"+hex.EncodeToString(plainSum[:]) {
+		t.Fatalf("entry.ContentHash = %q, want sha256(plaintext) (operator-local dedup key)", entry.ContentHash)
+	}
+	if entry.CiphertextHash == "" || entry.CiphertextHash == entry.ContentHash {
+		t.Fatalf("entry.CiphertextHash must be stored and distinct from ContentHash; got %q vs %q", entry.CiphertextHash, entry.ContentHash)
+	}
+	if entry.WrappedCEKOperator == "" {
+		t.Fatal("entry.WrappedCEKOperator not stored")
+	}
+}
+
+// (a3) FAIL-CLOSED: a team-tier v2 blob_pointer put with NO operator blob store
+// (cannot fetch to gate) is DROPPED — never folded un-gated.
+func TestApplyPut_V2Blob_NoOperatorBlobStore_Dropped(t *testing.T) {
+	seller, _ := identity.Generate()
+	operator, _ := identity.Generate()
+	s := teamTierState(t, operator) // NO SetBlobStore
+
+	// Build the ciphertext against a throwaway store just to mint a valid pointer;
+	// the operator's own store is nil, so it cannot fetch to gate.
+	enc, _ := buildEncObjectBlob(t, seller, operator.PubKeyHex(), []byte("secret oversize bytes"), NewMemoryBlobStore())
+	msg := marshalV2Put(t, seller, "a substantive reusable description", 4242, enc)
+	s.Apply(msg)
+
+	if _, ok := s.GetPendingPut(msg.ID); ok {
+		t.Fatal("v2 blob_pointer put FOLDED with no operator blob store — un-gated content admitted (fail-closed broken)")
+	}
+}
+
+// (a4) FAIL-CLOSED: a team-tier v2 blob_pointer put whose blob is MISSING from the
+// operator's store (fetch fails) is DROPPED — never folded.
+func TestApplyPut_V2Blob_MissingBlob_Dropped(t *testing.T) {
+	seller, _ := identity.Generate()
+	operator, _ := identity.Generate()
+	s := teamTierState(t, operator)
+	s.SetBlobStore(NewMemoryBlobStore()) // operator store is EMPTY
+
+	// ciphertext offloaded to a DIFFERENT store, so the operator's store cannot resolve it.
+	enc, _ := buildEncObjectBlob(t, seller, operator.PubKeyHex(), []byte("bytes the operator cannot fetch"), NewMemoryBlobStore())
+	msg := marshalV2Put(t, seller, "a substantive reusable description two", 4242, enc)
+	s.Apply(msg)
+
+	if _, ok := s.GetPendingPut(msg.ID); ok {
+		t.Fatal("v2 blob_pointer put FOLDED despite an un-fetchable blob — must drop, cannot gate what it cannot fetch")
+	}
+}
+
 // (b) team-tier legacy plaintext "content" put is DROPPED (fail-closed §6).
 func TestApplyPut_TeamTier_LegacyPlaintext_Dropped(t *testing.T) {
 	seller, _ := identity.Generate()
