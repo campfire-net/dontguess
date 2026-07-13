@@ -316,8 +316,10 @@ if [ -z "${DONTGUESS_RELAY_URLS:-}" ]; then
       fi
     else
       # Lost the flock — another caller is starting the operator. Poll up to 5s
-      # for the PID to appear AND be verified as the operator, then trust it.
-      _deadline=$(( $(date +%s) + 5 ))
+      # (overridable via DONTGUESS_HEALTH_PROBE_DEADLINE for tests) for the PID
+      # to appear AND be verified as the operator, then trust it.
+      _probe_secs="${DONTGUESS_HEALTH_PROBE_DEADLINE:-5}"
+      _deadline=$(( $(date +%s) + _probe_secs ))
       while [ "$(date +%s)" -lt "$_deadline" ]; do
         if [ -f "$PID_FILE" ]; then
           _current_pid=$(cat "$PID_FILE" 2>/dev/null || true)
@@ -340,7 +342,10 @@ if [ -z "${DONTGUESS_RELAY_URLS:-}" ]; then
   if [ "$_i_started_operator" -eq 1 ]; then
     _probe_pid=$(cat "$PID_FILE" 2>/dev/null || true)
     _ready=0
-    _deadline=$(( $(date +%s) + 15 ))
+    # Deadline for the socket-readiness poll (overridable via
+    # DONTGUESS_HEALTH_PROBE_DEADLINE for tests; production default is 15s).
+    _ready_secs="${DONTGUESS_HEALTH_PROBE_DEADLINE:-15}"
+    _deadline=$(( $(date +%s) + _ready_secs ))
     while [ "$(date +%s)" -lt "$_deadline" ]; do
       if ! pid_is_operator "$_probe_pid"; then
         break
