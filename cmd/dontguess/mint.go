@@ -5,6 +5,7 @@ import (
 	"io"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/campfire-net/dontguess/pkg/identity"
 	"github.com/spf13/cobra"
@@ -69,6 +70,19 @@ func runMint(recipient, amountStr string, out io.Writer) error {
 		return fmt.Errorf("mint: amount must be > 0, got %d", amount)
 	}
 
+	// dontguess-f91 (RT-B#3): prove possession of the operator key. The server
+	// rejects an OpMint that is not signed by the persisted operator key, so a
+	// local process merely reaching the socket can no longer trigger a mint.
+	// Load the operator identity and sign an auth event binding recipient+amount.
+	signer, err := loadOperatorSigner(resolveDGHome())
+	if err != nil {
+		return fmt.Errorf("mint: %w", err)
+	}
+	authEv := buildMintAuthEvent(hexKey, amount, time.Now().Unix())
+	if err := identity.SignEvent(signer, authEv); err != nil {
+		return fmt.Errorf("mint: signing authorization: %w", err)
+	}
+
 	conn := dialSocket()
 	defer conn.Close()
 
@@ -77,6 +91,7 @@ func runMint(recipient, amountStr string, out io.Writer) error {
 		"op":        OpMint,
 		"recipient": hexKey,
 		"amount":    amount,
+		"mint_auth": authEv,
 	}, &resp); err != nil {
 		return err
 	}
