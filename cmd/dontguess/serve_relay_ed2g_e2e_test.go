@@ -66,6 +66,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -292,6 +293,18 @@ type e2eHub struct {
 	opConn    *fakeRelayConn
 	dropOnBuy int32 // atomic one-shot: close the client ws after the next buy EVENT
 	connCount int32 // atomic: websocket connections served (>=2 proves a re-dial)
+
+	// storedMu/storedPuts model the relay's PERSISTENCE of client-published put
+	// events (kind 3401): a real NIP-01 relay stores every event and serves it to
+	// any later REQ, but opConn.events only captures OPERATOR publishes (what the
+	// operator Sends), not client injects. The dontguess-5db buyer REQ-fetches the
+	// ciphertext from the referenced 3401 put event AFTER receiving the deliver, so
+	// the hub must retain client puts and replay them to that fetch subscription —
+	// exactly what a real relay does. (Only puts are retained: the buyer-fetch path
+	// is the only reader of stored client events, so retaining more would only add
+	// churn without exercising anything.)
+	storedMu   sync.Mutex
+	storedPuts []*identity.Event
 }
 
 func newE2EHub(t *testing.T, opConn *fakeRelayConn) *e2eHub {
@@ -302,6 +315,16 @@ func newE2EHub(t *testing.T, opConn *fakeRelayConn) *e2eHub {
 	h.srv = httptest.NewServer(mux)
 	t.Cleanup(h.srv.Close)
 	return h
+}
+
+// storePut records a put event as if the relay had persisted it, so a later
+// buyer REQ-fetch of its ciphertext (dontguess-5db) is served. Tests that inject
+// a put DIRECTLY into the operator conn (bypassing serveWS) call this to model the
+// relay's retention of that put.
+func (h *e2eHub) storePut(ev *identity.Event) {
+	h.storedMu.Lock()
+	h.storedPuts = append(h.storedPuts, ev)
+	h.storedMu.Unlock()
 }
 
 func (h *e2eHub) wsURL() string          { return wsURL(h.srv.URL) }
@@ -344,6 +367,14 @@ func (h *e2eHub) serveWS(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			h.opConn.inject(f.Event)
+			// Persist client-published puts so a later buyer REQ-fetch of the
+			// referenced ciphertext (dontguess-5db) is served by the relay, as a
+			// real NIP-01 relay would.
+			if f.Event.Kind == nostr.KindPut {
+				h.storedMu.Lock()
+				h.storedPuts = append(h.storedPuts, f.Event)
+				h.storedMu.Unlock()
+			}
 			ok, _ := relay.EncodeOK(f.Event.ID, true, "")
 			c.write(ok)
 			// H5: one-shot drop right after the buy is injected+ACKed. The operator
@@ -387,6 +418,11 @@ func (h *e2eHub) pump(c *ed2cClientConn) {
 		evs := make([]*identity.Event, len(h.opConn.events))
 		copy(evs, h.opConn.events)
 		h.opConn.mu.Unlock()
+		// Include persisted client puts so a buyer's REQ-fetch of the referenced
+		// 3401 ciphertext (dontguess-5db) is replayed to it, as a real relay would.
+		h.storedMu.Lock()
+		evs = append(evs, h.storedPuts...)
+		h.storedMu.Unlock()
 
 		c.mu.Lock()
 		filters := make(map[string]relay.Filter, len(c.filters))
@@ -651,6 +687,10 @@ func TestE2E_UnderfundedBuyerAccept_ReceivesLoudReject_ClientRunE(t *testing.T) 
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
 		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
+	// This put is injected DIRECTLY into the operator conn (bypassing the ws
+	// serveWS store hook). Retain it in the hub as a real relay would, so any later
+	// buyer REQ-fetch of its ciphertext (dontguess-5db) is served.
+	hub.storePut(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
 	})
@@ -734,6 +774,9 @@ func TestE2E_UnderfundedDeliver_NoFreeContent_ThroughServeStack(t *testing.T) {
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
 		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
+	// No hub.storePut here: this test drives the buy DIRECTLY over the operator
+	// conn (no ws client) and asserts the operator emits ZERO deliver (no live
+	// reservation), so the buyer never REQ-fetches a ciphertext.
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
 	})
@@ -837,6 +880,10 @@ func TestE2E_ConnDropMidAwait_RecoversMatch_ClientRunE(t *testing.T) {
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
 		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
+	// This put is injected DIRECTLY into the operator conn (bypassing the ws
+	// serveWS store hook). Retain it in the hub as a real relay would, so any later
+	// buyer REQ-fetch of its ciphertext (dontguess-5db) is served.
+	hub.storePut(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
 	})
@@ -919,6 +966,10 @@ func TestE2E_PreviewFlag_SettlesContentByteExact_ClientRunE(t *testing.T) {
 		[]string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:go"}, nil,
 		knownV2PutPayload(t, seller, operator.PubKeyHex(), ed2cPutDesc, ed2cContent, ed2cTokenCost))
 	st.conn.inject(putEv)
+	// This put is injected DIRECTLY into the operator conn (bypassing the ws
+	// serveWS store hook). Retain it in the hub as a real relay would, so any later
+	// buyer REQ-fetch of its ciphertext (dontguess-5db) is served.
+	hub.storePut(putEv)
 	waitFor(t, 8*time.Second, "seller put auto-accepts into inventory", func() bool {
 		return len(st.eng.State().Inventory()) == 1
 	})

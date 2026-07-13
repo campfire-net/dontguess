@@ -94,7 +94,7 @@ func TestVerifyDeliver_HashMismatch_FailsLoud(t *testing.T) {
 	})
 	ev := &identity.Event{ID: "deliver-wire", Content: string(payload)}
 
-	_, _, err := verifyDeliver(ev, 0)
+	_, _, err := verifyDeliver(context.Background(), nil, nil, ev, 0)
 	if err == nil {
 		t.Fatalf("expected a LOUD content-hash mismatch error, got nil")
 	}
@@ -117,7 +117,7 @@ func TestVerifyDeliver_Match_ReturnsContent(t *testing.T) {
 	})
 	ev := &identity.Event{ID: "deliver-wire", Content: string(payload)}
 
-	got, gotHash, err := verifyDeliver(ev, 0)
+	got, gotHash, err := verifyDeliver(context.Background(), nil, nil, ev, 0)
 	if err != nil {
 		t.Fatalf("verifyDeliver: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestVerifyDeliver_BlossomPointer_FailsLoud(t *testing.T) {
 	})
 	ev := &identity.Event{ID: "deliver-wire", Content: string(payload)}
 
-	_, _, err := verifyDeliver(ev, 0)
+	_, _, err := verifyDeliver(context.Background(), nil, nil, ev, 0)
 	if err == nil {
 		t.Fatalf("expected a LOUD Blossom-pointer error, got nil")
 	}
@@ -167,7 +167,7 @@ func TestVerifyDeliver_Oversize_FailsLoud(t *testing.T) {
 	})
 	ev := &identity.Event{ID: "deliver-wire", Content: string(payload)}
 
-	_, _, err := verifyDeliver(ev, 10) // ceiling far below the 200-byte body
+	_, _, err := verifyDeliver(context.Background(), nil, nil, ev, 10) // ceiling far below the 200-byte body
 	if err == nil {
 		t.Fatalf("expected a LOUD oversize error, got nil")
 	}

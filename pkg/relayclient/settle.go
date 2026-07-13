@@ -53,9 +53,11 @@ import (
 
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
+	"github.com/3dl-dev/dontguess/pkg/nip44"
 	"github.com/3dl-dev/dontguess/pkg/nostr"
 	"github.com/3dl-dev/dontguess/pkg/proto"
 	"github.com/3dl-dev/dontguess/pkg/relay"
+	"golang.org/x/crypto/chacha20poly1305"
 )
 
 // MaxInlineContentBytes is the hard ceiling on inline delivered content the client
@@ -274,7 +276,7 @@ func Settle(ctx context.Context, conn *relay.Conn, signer identity.Signer, buy *
 		return res, nil
 
 	case exchange.SettlePhaseStrDeliver:
-		content, contentHash, err := verifyDeliver(ev, opts.MaxInlineBytes)
+		content, contentHash, err := verifyDeliver(ctx, conn, signer, ev, opts.MaxInlineBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -413,24 +415,86 @@ func awaitSettle(
 	}
 }
 
-// verifyDeliver validates an operator settle(deliver) event and returns the decoded,
-// hash-verified content. It FAILS LOUD on: a Blossom-pointer deliver (Blossom fetch
-// is deferred — gate G-blossom, NOT implemented here); oversize inline content; a
-// content_hash mismatch (possible tampering — abort BEFORE settle(complete)); or a
-// missing/undecodable body. Mirrors the operator's own sha256("sha256:"+hex) shape
-// (engine_settle.go emitDeliverContent).
-func verifyDeliver(ev *identity.Event, maxInlineBytes int) (content []byte, contentHash string, err error) {
-	var payload struct {
-		Phase       string `json:"phase"`
-		EntryID     string `json:"entry_id"`
-		Content     string `json:"content"`
-		ContentHash string `json:"content_hash"`
+// deliverConn is the minimal relay-transport surface verifyDeliver needs to
+// REQ-fetch the already-public ciphertext referenced by a §3.4 v2 deliver. The
+// production *relay.Conn satisfies it; a unit test supplies a fake so the decrypt
+// path is exercised without a live relay (the REAL relay fetch is exercised by
+// the cmd/dontguess TeamRoundTrip E2E).
+type deliverConn interface {
+	Send(ctx context.Context, frame []byte) error
+	Recv(ctx context.Context) ([]byte, error)
+}
+
+// deliverPayload is the superset of BOTH settle(deliver) wire shapes:
+//   - the LEGACY individual-tier plaintext deliver ({content, content_hash,
+//     blob_pointer}); and
+//   - the §3.4 v2 confidential envelope ({v:2, ciphertext_ref, ciphertext_hash,
+//     key_wrap}) the operator now emits for a team-tier encrypted entry
+//     (dontguess-9e8 emitDeliverEnvelope).
+//
+// verifyDeliver dispatches on shape (§3.1(6)): a v2 payload carries a key_wrap;
+// the legacy payload carries a plaintext content field.
+type deliverPayload struct {
+	Phase string `json:"phase"`
+	V     int    `json:"v"`
+
+	// legacy individual-tier plaintext deliver
+	Content     string `json:"content"`
+	ContentHash string `json:"content_hash"`
+	BlobPointer string `json:"blob_pointer"`
+
+	// §3.4 v2 confidential envelope
+	EntryID       string `json:"entry_id"`
+	ContentAlg    string `json:"content_alg"`
+	CiphertextRef struct {
+		PutEvent    string `json:"put_event"`
 		BlobPointer string `json:"blob_pointer"`
-	}
+	} `json:"ciphertext_ref"`
+	CiphertextHash string `json:"ciphertext_hash"`
+	KeyWrap        struct {
+		Alg       string `json:"alg"`
+		Recipient string `json:"recipient"`
+		Wrapped   string `json:"wrapped"`
+	} `json:"key_wrap"`
+}
+
+// verifyDeliver validates an operator settle(deliver) event and returns the
+// decoded, integrity-verified PLAINTEXT the buyer pipes to stdout. It dispatches
+// on the deliver wire shape (§3.1(6)):
+//
+//   - §3.4 v2 confidential envelope (key_wrap present, team tier): unwrap the CEK
+//     (NIP-44 from the operator = the deliver author), REQ-fetch the already-public
+//     ciphertext referenced by ciphertext_ref.put_event, verify
+//     sha256(ciphertext)==ciphertext_hash BEFORE decrypting, then AEAD-decrypt
+//     (dontguess-5db). This is the paying buyer's end-to-end decrypt.
+//   - LEGACY individual-tier plaintext deliver (content field present): the
+//     unchanged decode+hash-verify path (backward compat — individual tier is
+//     already confidential and stays byte-for-byte unchanged, design §Scope).
+//
+// It FAILS LOUD (returns err, never settle(complete)) on: a Blossom-pointer/-ref
+// deliver (Blossom buyer fetch is DEFERRED — dontguess-640); oversize content; a
+// hash mismatch (possible tampering); a misrouted/undecryptable wrap; or a
+// missing/undecodable body.
+func verifyDeliver(ctx context.Context, conn deliverConn, signer identity.Signer, ev *identity.Event, maxInlineBytes int) (content []byte, contentHash string, err error) {
+	var payload deliverPayload
 	if uerr := json.Unmarshal([]byte(ev.Content), &payload); uerr != nil {
 		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: parse payload: %w", shortID(ev.ID), uerr)
 	}
 
+	// Dispatch on shape. A v2 confidential deliver is identified by v>=2 OR a
+	// present key_wrap.wrapped (the operator always emits both together); the
+	// legacy plaintext deliver has neither.
+	if payload.V >= 2 || payload.KeyWrap.Wrapped != "" {
+		return decryptDeliverV2(ctx, conn, signer, ev, &payload, maxInlineBytes)
+	}
+	return verifyLegacyDeliver(ev, &payload, maxInlineBytes)
+}
+
+// verifyLegacyDeliver is the unchanged individual-tier plaintext deliver path:
+// decode the inline base64 content and verify its sha256 against content_hash
+// (mirrors the operator's sha256("sha256:"+hex) shape). conn/signer are unused on
+// this path — an individual-tier deliver carries its content inline.
+func verifyLegacyDeliver(ev *identity.Event, payload *deliverPayload, maxInlineBytes int) (content []byte, contentHash string, err error) {
 	if payload.BlobPointer != "" {
 		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: operator delivered a BLOSSOM POINTER (%s) for oversized content, but Blossom fetch is DEFERRED in this client (ed2 gate G-blossom, NOT implemented) — cannot fetch/verify; ask the operator for an inline-sized entry or track the deferred Blossom fetch item",
 			shortID(ev.ID), payload.BlobPointer)
@@ -468,6 +532,206 @@ func verifyDeliver(ev *identity.Event, maxInlineBytes int) (content []byte, cont
 			shortID(ev.ID), got, payload.ContentHash)
 	}
 	return content, payload.ContentHash, nil
+}
+
+// decryptDeliverV2 is the paying buyer's end-to-end decrypt of a §3.4 v2
+// confidential deliver (dontguess-5db). Steps (§3.1(6)):
+//  1. Unwrap the CEK: cek = NIP-44.Open(buyerSigner, operatorPub, key_wrap.wrapped).
+//     The operator key IS the deliver's AUTHOR (ev.PubKey): the one secp256k1
+//     keypair both Schnorr-signs the deliver and performs the NIP-44 ECDH wrap
+//     (§4.5.5), and awaitSettle already verified ev's signature (and, when set,
+//     that the author is opts.OperatorPubKey) upstream — so ev.PubKey is the
+//     operator's wrap key, no separate operator-pubkey plumbing needed.
+//  2. Fetch the already-public ciphertext from ciphertext_ref.put_event (the 3401
+//     put event id), reading its enc.ciphertext.
+//  3. Verify sha256(ciphertext)==ciphertext_hash BEFORE decrypting (integrity;
+//     mismatch ⇒ abort, do NOT settle(complete)).
+//  4. AEAD-decrypt: nonce = first NonceSize bytes of the ciphertext; plaintext =
+//     ChaCha20-Poly1305(cek).Open(nonce, rest).
+//
+// Anti-replay binding (§4.5.4): the wrap is sealed to the antecedent-chain buyer
+// key, so a captured deliver replayed toward a DIFFERENT buyer is simply
+// undecryptable by them (their key cannot unwrap). We also fail fast if
+// key_wrap.recipient is present and is not our key (a misrouted deliver).
+func decryptDeliverV2(ctx context.Context, conn deliverConn, signer identity.Signer, ev *identity.Event, p *deliverPayload, maxInlineBytes int) (content []byte, contentHash string, err error) {
+	if signer == nil {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: v2 confidential deliver requires a buyer signer to unwrap the CEK, got nil", shortID(ev.ID))
+	}
+	// A blob-pointer ciphertext reference ⇒ Blossom buyer fetch, which is DEFERRED
+	// (dontguess-640, NOT implemented here). Loud-fail — never silently skip.
+	if p.CiphertextRef.BlobPointer != "" {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: v2 deliver references a BLOSSOM blob (%s) but buyer-side Blossom fetch is DEFERRED (dontguess-640, NOT implemented) — cannot fetch/verify; track the deferred Blossom fetch item",
+			shortID(ev.ID), p.CiphertextRef.BlobPointer)
+	}
+	if p.KeyWrap.Alg != "" && p.KeyWrap.Alg != "nip44-v2-secp256k1" {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: unsupported key_wrap.alg %q (want nip44-v2-secp256k1)", shortID(ev.ID), p.KeyWrap.Alg)
+	}
+	if p.KeyWrap.Wrapped == "" {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: v2 deliver has no key_wrap.wrapped — nothing to unwrap; refusing to settle(complete)", shortID(ev.ID))
+	}
+	if p.CiphertextHash == "" {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: v2 deliver supplied no ciphertext_hash — cannot verify integrity; refusing to settle(complete)", shortID(ev.ID))
+	}
+	if p.CiphertextRef.PutEvent == "" {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: v2 deliver has no ciphertext_ref.put_event — nowhere to fetch the ciphertext from; refusing to settle(complete)", shortID(ev.ID))
+	}
+	// Fail fast on a misrouted deliver: the wrap MUST be addressed to OUR key. (The
+	// cryptographic binding is the real defense — a forged recipient label still
+	// cannot make our key unwrap a CEK sealed to someone else — but this is a
+	// cheaper, clearer error for the honest-misroute case.)
+	if p.KeyWrap.Recipient != "" && p.KeyWrap.Recipient != signer.PubKeyHex() {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: key_wrap.recipient %s is not our key %s — this deliver was wrapped for a different buyer; cannot unwrap",
+			shortID(ev.ID), shortID(p.KeyWrap.Recipient), shortID(signer.PubKeyHex()))
+	}
+
+	// (1) Unwrap the CEK from the operator (= the signed deliver's author).
+	cek, uerr := nip44.Open(signer, ev.PubKey, p.KeyWrap.Wrapped)
+	if uerr != nil {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: unwrap CEK (NIP-44 open from operator %s) failed: %w — this buyer key cannot decrypt the wrap (a deliver sealed to a different buyer is undecryptable here, §4.5.4)",
+			shortID(ev.ID), shortID(ev.PubKey), uerr)
+	}
+	if len(cek) != chacha20poly1305.KeySize {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: unwrapped CEK is %d bytes, want %d", shortID(ev.ID), len(cek), chacha20poly1305.KeySize)
+	}
+
+	// (2) Fetch the already-public ciphertext from the referenced 3401 put event.
+	ciphertext, ferr := fetchPutCiphertext(ctx, conn, p.CiphertextRef.PutEvent, maxInlineBytes)
+	if ferr != nil {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: %w", shortID(ev.ID), ferr)
+	}
+
+	// (3) Verify sha256(ciphertext)==ciphertext_hash BEFORE decrypting.
+	sum := sha256.Sum256(ciphertext)
+	got := "sha256:" + hex.EncodeToString(sum[:])
+	if got != p.CiphertextHash {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: CIPHERTEXT HASH MISMATCH — computed %s but the deliver claimed %s (possible tampering); NOT sending settle(complete)",
+			shortID(ev.ID), got, p.CiphertextHash)
+	}
+
+	// (4) AEAD-decrypt: nonce = first NonceSize bytes; rest = sealed || tag.
+	aead, aerr := chacha20poly1305.New(cek)
+	if aerr != nil {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: init content AEAD: %w", shortID(ev.ID), aerr)
+	}
+	ns := aead.NonceSize()
+	if len(ciphertext) < ns {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: ciphertext %d bytes is shorter than the %d-byte nonce", shortID(ev.ID), len(ciphertext), ns)
+	}
+	nonce, sealed := ciphertext[:ns], ciphertext[ns:]
+	plaintext, oerr := aead.Open(nil, nonce, sealed, nil)
+	if oerr != nil {
+		return nil, "", fmt.Errorf("relayclient: settle: deliver %s: AEAD open failed: %w — ciphertext or CEK corrupt", shortID(ev.ID), oerr)
+	}
+	// Return the ciphertext_hash as the "contentHash": it is what the operator
+	// tracks for this entry and what the buyer's settle(complete) echoes. (The
+	// operator's complete handler derives everything from the antecedent chain and
+	// does not re-validate this value — engine_settle.go handleSettleComplete.)
+	return plaintext, p.CiphertextHash, nil
+}
+
+// fetchPutCiphertext REQ-fetches the 3401 put event by id over conn and returns
+// its decoded inline enc.ciphertext bytes. It verifies the put event's signature
+// (never trust a forged/unsigned put) and fails loud on a blob-only put (Blossom
+// buyer fetch DEFERRED — dontguess-640). It re-subscribes after a mid-fetch conn
+// drop (mirrors awaitSettle's H5 discipline) and terminates on EOSE-for-our-subID
+// (put not found) or ctx expiry.
+func fetchPutCiphertext(ctx context.Context, conn deliverConn, putEventID string, maxInlineBytes int) ([]byte, error) {
+	if conn == nil {
+		return nil, fmt.Errorf("fetch put %s: nil conn — cannot fetch the referenced ciphertext", shortID(putEventID))
+	}
+	subID := "dg-fetch-ct-" + shortID(putEventID)
+	filter := relay.Filter{
+		Kinds: []int{nostr.KindPut},
+		IDs:   []string{putEventID},
+	}
+	sendFetchReq := func(f relay.Filter) error {
+		reqFrame, encErr := relay.EncodeReq(subID, f)
+		if encErr != nil {
+			return fmt.Errorf("encode put-fetch REQ: %w", encErr)
+		}
+		return conn.Send(ctx, reqFrame)
+	}
+	if err := sendFetchReq(filter); err != nil {
+		return nil, fmt.Errorf("fetch put %s: subscribe #ids:[put_event]: %w", shortID(putEventID), err)
+	}
+
+	max := MaxInlineContentBytes
+	if maxInlineBytes > 0 {
+		max = maxInlineBytes
+	}
+
+	for {
+		raw, recvErr := conn.Recv(ctx)
+		if recvErr != nil {
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("fetch put %s: timed out before the ciphertext arrived: %w", shortID(putEventID), ctx.Err())
+			}
+			if errors.Is(recvErr, relay.ErrConnDropped) {
+				resub := filter
+				since := time.Now().Add(-resubscribeSlackSeconds * time.Second).Unix()
+				resub.Since = &since
+				if err := sendFetchReq(resub); err != nil {
+					if ctx.Err() != nil {
+						return nil, fmt.Errorf("fetch put %s: timed out on re-subscribe: %w", shortID(putEventID), ctx.Err())
+					}
+					return nil, fmt.Errorf("fetch put %s: re-subscribe after conn drop: %w", shortID(putEventID), err)
+				}
+				continue
+			}
+			return nil, fmt.Errorf("fetch put %s: recv: %w", shortID(putEventID), recvErr)
+		}
+
+		f, perr := relay.ParseFrame(raw)
+		if perr != nil {
+			continue // malformed frame: loud-skip, never panic
+		}
+		if f.Type == relay.LabelEOSE && f.SubID == subID {
+			return nil, fmt.Errorf("fetch put %s: relay signalled end-of-stored-events (EOSE) with no matching put — the referenced ciphertext is not retrievable", shortID(putEventID))
+		}
+		if f.Type != relay.LabelEVENT || f.Event == nil {
+			continue
+		}
+		pev := f.Event
+		if pev.ID != putEventID || pev.Kind != nostr.KindPut {
+			continue
+		}
+		// Never trust an unsigned/forged put: its ciphertext hash is the integrity
+		// anchor, so the event carrying it must be authentic.
+		if identity.VerifyEvent(pev) != nil {
+			continue
+		}
+		return extractPutCiphertext(pev, max)
+	}
+}
+
+// extractPutCiphertext decodes the inline enc.ciphertext (base64) from a fetched
+// 3401 put event. It fails loud on a blob-only put (Blossom deferred) and guards
+// the base64 length before decoding so a hostile relay cannot OOM the client.
+func extractPutCiphertext(pev *identity.Event, max int) ([]byte, error) {
+	var put struct {
+		Enc struct {
+			Ciphertext  string `json:"ciphertext"`
+			BlobPointer string `json:"blob_pointer"`
+		} `json:"enc"`
+	}
+	if err := json.Unmarshal([]byte(pev.Content), &put); err != nil {
+		return nil, fmt.Errorf("parse referenced put %s payload: %w", shortID(pev.ID), err)
+	}
+	if put.Enc.Ciphertext == "" {
+		return nil, fmt.Errorf("referenced put %s carries no inline enc.ciphertext (blob-only) — Blossom buyer fetch is DEFERRED (dontguess-640)", shortID(pev.ID))
+	}
+	// decoded size <= encoded length; guard before allocating.
+	if len(put.Enc.Ciphertext) > max*2+64 {
+		return nil, fmt.Errorf("referenced put %s ciphertext (%d base64 bytes) exceeds the max-inline guard (%d bytes) — oversized content travels as a Blossom blob (DEFERRED, dontguess-640)", shortID(pev.ID), len(put.Enc.Ciphertext), max)
+	}
+	ciphertext, err := base64.StdEncoding.DecodeString(put.Enc.Ciphertext)
+	if err != nil {
+		return nil, fmt.Errorf("referenced put %s enc.ciphertext is not valid base64: %w", shortID(pev.ID), err)
+	}
+	if len(ciphertext) == 0 {
+		return nil, fmt.Errorf("referenced put %s has an empty ciphertext body", shortID(pev.ID))
+	}
+	return ciphertext, nil
 }
 
 // parseRejectPayload extracts the reason + guide from a settle(buyer-accept-reject)
