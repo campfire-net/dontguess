@@ -3,6 +3,7 @@ package relay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -286,6 +287,184 @@ func TestReconnectGivesUpAfterMaxAttempts(t *testing.T) {
 	}
 	if m := c.Metrics(); m.ReconnectFails != 1 {
 		t.Fatalf("metrics.ReconnectFails=%d, want 1", m.ReconnectFails)
+	}
+}
+
+// --- Unit: Send-triggered silent redial race (dontguess-6df) ----------------
+
+// raceWSConn is a scripted WSConn for TestRecvDetectsSendTriggeredSilentRedial.
+// WriteMessage fails exactly once if writeFail is set (simulating an Outbox
+// publish write failure), then succeeds. ReadMessage returns queued frames in
+// order; once exhausted it blocks on blockRead if set (never delivering — the
+// way a real NIP-01 relay never would on a socket with no REQ replayed).
+type raceWSConn struct {
+	writeFail bool
+
+	mu        sync.Mutex
+	wrote     bool
+	reads     [][]byte
+	readIdx   int
+	blockRead chan struct{}
+	closed    bool
+}
+
+func (c *raceWSConn) WriteMessage(_ int, _ []byte) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.writeFail && !c.wrote {
+		c.wrote = true
+		return errors.New("raceWSConn: simulated write failure")
+	}
+	c.wrote = true
+	return nil
+}
+
+func (c *raceWSConn) ReadMessage() (int, []byte, error) {
+	c.mu.Lock()
+	if c.readIdx < len(c.reads) {
+		b := c.reads[c.readIdx]
+		c.readIdx++
+		c.mu.Unlock()
+		return websocket.TextMessage, b, nil
+	}
+	block := c.blockRead
+	c.mu.Unlock()
+	if block != nil {
+		<-block
+	}
+	return 0, nil, errors.New("raceWSConn: no more scripted reads")
+}
+
+func (c *raceWSConn) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	return nil
+}
+
+// raceDialer hands out conns from a fixed script, one per Dial call.
+type raceDialer struct {
+	conns []*raceWSConn
+	idx   int32
+}
+
+func (d *raceDialer) Dial(_ context.Context, _ string) (WSConn, error) {
+	n := atomic.AddInt32(&d.idx, 1)
+	if int(n) > len(d.conns) {
+		return nil, fmt.Errorf("raceDialer: exhausted (call %d, have %d)", n, len(d.conns))
+	}
+	return d.conns[n-1], nil
+}
+
+// TestRecvDetectsSendTriggeredSilentRedial reproduces the dontguess-6df race:
+// *Conn multiplexes one shared c.ws between Recv (the single reader loop) and
+// Send (the Outbox's publish, or the resubscriber's REQ). If a concurrent
+// Send() write fails while the reader is BETWEEN Recv calls (not blocked
+// inside ReadMessage), Send's own internal drop()+reconnect() (conn.go) redials
+// a fresh socket and installs it as c.ws WITHOUT ever sending a REQ frame —
+// Send only replays its own publish frame. Pre-fix, the reader's next Recv call
+// fetched this fresh, unsubscribed-but-healthy socket and blocked reading on it
+// FOREVER: no read error occurs (the socket is fine, just never subscribed), so
+// nothing ever surfaces ErrConnDropped and the caller's resubscribe-before-read
+// loop never fires — silent ingest death with no alarm.
+//
+// This test drives that exact sequence with two scripted connections and a
+// fake dialer (no network): connection 1 delivers one frame then fails a
+// Send() write (as an Outbox publish would); connection 2 is the fresh socket
+// Send's internal redial installs, and its ReadMessage blocks forever (proving
+// nothing was ever subscribed on it). The fix (Recv's generation guard) must
+// make the reader's next Recv call return an error wrapping ErrConnDropped
+// immediately, WITHOUT ever calling connection 2's ReadMessage — not hang.
+func TestRecvDetectsSendTriggeredSilentRedial(t *testing.T) {
+	t.Parallel()
+	member, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+
+	frame1, err := EncodeNotice("frame-1")
+	if err != nil {
+		t.Fatalf("EncodeNotice: %v", err)
+	}
+	conn1 := &raceWSConn{writeFail: true, reads: [][]byte{frame1}}
+	blockRead := make(chan struct{})
+	conn2 := &raceWSConn{blockRead: blockRead}
+	t.Cleanup(func() { close(blockRead) })
+
+	d := &raceDialer{conns: []*raceWSConn{conn1, conn2}}
+	c := New("ws://fake", member,
+		WithDialer(d),
+		WithoutClientAuth(), // skip NIP-42; the race is at the transport layer, not auth
+		WithBackoff(Backoff{Initial: time.Millisecond, Max: 2 * time.Millisecond, MaxAttempts: 0}),
+		WithLogf(func(string, ...interface{}) {}),
+	)
+	t.Cleanup(func() { _ = c.Close() })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Reader iteration N: connects (dial #1 -> conn1), reads the queued frame.
+	// This is the call that establishes the reader's claim on conn1's generation.
+	raw, err := c.Recv(ctx)
+	if err != nil {
+		t.Fatalf("first Recv (connect+read): %v", err)
+	}
+	if f, perr := ParseFrame(raw); perr != nil || f.Message != "frame-1" {
+		t.Fatalf("first frame: parsed=%v err=%v, want NOTICE frame-1", f, perr)
+	}
+
+	// Between Recv calls (the reader is not blocked inside ReadMessage): an
+	// Outbox-style Send() publish fails its write on conn1, triggers Conn's OWN
+	// internal drop+reconnect (dials conn2), and retries the publish frame on
+	// conn2 — never touching the reader's subscription. Send must still report
+	// success (its own retry succeeded) — this is the "silent" half of the bug.
+	if err := c.Send(ctx, []byte(`["EVENT",{}]`)); err != nil {
+		t.Fatalf("Send should have recovered via its own internal redial: %v", err)
+	}
+	if got := atomic.LoadInt32(&d.idx); got != 2 {
+		t.Fatalf("dialer calls=%d, want 2 (conn1 then the Send-triggered redial to conn2)", got)
+	}
+
+	// Reader iteration N+1: Recv must detect that the live socket (conn2) is a
+	// different generation than the one it last read from (conn1) and report the
+	// drop loudly — NOT block forever inside conn2.ReadMessage() (which never
+	// delivers: blockRead only closes at test teardown, proving this call never
+	// reached it).
+	done := make(chan error, 1)
+	go func() {
+		_, rerr := c.Recv(ctx)
+		done <- rerr
+	}()
+	select {
+	case rerr := <-done:
+		if !errors.Is(rerr, ErrConnDropped) {
+			t.Fatalf("expected ErrConnDropped from the generation-mismatch guard, got %v", rerr)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Recv hung reading the unsubscribed socket Send silently redialed to — the dontguess-6df race reproduced (fix not effective)")
+	}
+
+	// Recovery: the caller (runReaderReconnect in production) now re-subscribes
+	// over the SAME live socket (conn2) via a plain Send. That does not trigger
+	// another redial (conn2's write succeeds), so the next Recv proceeds
+	// normally on the now-claimed generation instead of mismatching again.
+	if err := c.Send(ctx, []byte(`["REQ","dg-exchange",{}]`)); err != nil {
+		t.Fatalf("resubscribe Send: %v", err)
+	}
+	frame2, err := EncodeNotice("frame-2")
+	if err != nil {
+		t.Fatalf("EncodeNotice: %v", err)
+	}
+	conn2.mu.Lock()
+	conn2.reads = append(conn2.reads, frame2)
+	conn2.mu.Unlock()
+
+	raw2, err := c.Recv(ctx)
+	if err != nil {
+		t.Fatalf("Recv after resubscribe: %v", err)
+	}
+	if f, perr := ParseFrame(raw2); perr != nil || f.Message != "frame-2" {
+		t.Fatalf("post-resubscribe frame: parsed=%v err=%v, want NOTICE frame-2", f, perr)
 	}
 }
 

@@ -134,7 +134,16 @@ type Conn struct {
 
 	mu      sync.Mutex // guards ws + reconnection + metrics
 	ws      WSConn
+	gen     uint64 // bumped every time reconnectLocked installs a fresh ws (dontguess-6df)
 	writeMu sync.Mutex // serialises writes to the current ws
+
+	// readerGen is Recv-only state: the generation of the connection Recv last
+	// claimed as its own (0 = unclaimed, i.e. no Recv call has happened yet).
+	// Recv is documented as single-reader-goroutine-only, but this is still
+	// guarded by mu (alongside ws/gen) for visibility across the goroutine that
+	// last wrote it and whichever goroutine reads it next — see Recv's
+	// generation guard (dontguess-6df).
+	readerGen uint64
 
 	metrics Metrics
 }
@@ -178,6 +187,32 @@ func (c *Conn) current() WSConn {
 	return c.ws
 }
 
+// currentGen returns the live websocket (or nil) alongside its connection
+// generation. The generation increments every time reconnectLocked installs a
+// fresh ws — whether that reconnect was driven by Recv's own drop-detection or
+// by a completely independent Send() (the Outbox's publish, or the
+// resubscriber's REQ) redialing underneath the reader. Recv uses it to detect
+// the latter case (dontguess-6df): see Recv's generation guard.
+func (c *Conn) currentGen() (WSConn, uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.ws, c.gen
+}
+
+// getReaderGen/setReaderGen track the generation Recv has claimed as its own
+// across calls. Guarded by mu for the same reason readerGen's field doc gives.
+func (c *Conn) getReaderGen() uint64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readerGen
+}
+
+func (c *Conn) setReaderGen(gen uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readerGen = gen
+}
+
 // Send writes a frame to the relay, connecting first if necessary. On a write
 // failure it drops the dead connection, reconnects once (with backoff), and
 // retries the write a single time. A persistent failure is returned loudly.
@@ -213,13 +248,39 @@ func (c *Conn) Send(ctx context.Context, frame []byte) error {
 // rather than swallowing it and auto-replaying the read — is deliberate: the
 // relay has no memory of the old REQ, so the caller must re-subscribe
 // (relay-transport.md §2.5).
+//
+// GENERATION GUARD (dontguess-6df). A concurrent Send() (the Outbox's
+// demuxPublisher, or the resubscriber's REQ) can itself hit a write failure
+// BETWEEN two Recv calls — i.e. while this reader is NOT blocked inside
+// ReadMessage — and silently drop+redial via its OWN internal retry path
+// (Send, lines above). That redial installs a live, healthy, but completely
+// UNSUBSCRIBED c.ws: Send only replays its own frame (a publish EVENT, not the
+// reader's REQ). Without this guard, the next Recv call would fetch that fresh
+// socket via current() and block reading on it forever — NIP-01 delivers
+// nothing without a REQ, so no read error ever occurs and the caller's
+// resubscribe-before-read reconnect loop never fires: silent ingest death with
+// no alarm. Recv instead tracks the generation of the connection it last
+// claimed (readerGen) and, if the live connection's generation has advanced
+// without THIS Recv call having driven that reconnect itself, treats it
+// exactly like ErrConnDropped — reporting the drop loudly instead of blocking
+// on a read that will never deliver — so the caller re-subscribes before the
+// next read.
 func (c *Conn) Recv(ctx context.Context) ([]byte, error) {
-	ws := c.current()
+	ws, gen := c.currentGen()
 	if ws == nil {
 		if err := c.reconnect(ctx); err != nil {
 			return nil, err
 		}
-		ws = c.current()
+		ws, gen = c.currentGen()
+		c.setReaderGen(gen)
+	} else if last := c.getReaderGen(); last != 0 && gen != last {
+		// A concurrent Send() redialed underneath us. Claim this generation now
+		// (so the retry after resubscribe reads normally instead of mismatching
+		// again) and report the drop instead of blocking on ReadMessage.
+		c.setReaderGen(gen)
+		return nil, fmt.Errorf("relay recv: %w: connection was replaced by a concurrent send-triggered reconnect (no subscription replayed on it)", ErrConnDropped)
+	} else if last == 0 {
+		c.setReaderGen(gen) // first-ever Recv call on a connection Send already established
 	}
 	_, data, err := ws.ReadMessage()
 	if err != nil {
@@ -284,6 +345,7 @@ func (c *Conn) reconnectLocked(ctx context.Context) error {
 		ws, err := c.dialAndAuth(ctx)
 		if err == nil {
 			c.ws = ws
+			c.gen++
 			c.metrics.Connects++
 			return nil
 		}
