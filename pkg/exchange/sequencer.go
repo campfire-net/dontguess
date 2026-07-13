@@ -652,8 +652,42 @@ func (s *Sequencer) firstMissingAntecedentLocked(m *Message) string {
 // released order is a pure function of the event set and its antecedent DAG, any
 // permutation or duplication of a causally-closed set produces the byte-identical
 // returned slice, and therefore a byte-identical fold.
+//
+// DECISION (dontguess-e181) — capacity widening for the batch path: the whole
+// msgs slice is ALREADY RESIDENT in memory, so the buffer can never grow past
+// len(msgs); the unbounded-growth DoS that the ingest-time true-orphan bound
+// (Ingest, dontguess-afb fix-1) defends against is a property of the LIVE
+// STREAMING path (IngestLive) only, where events arrive one at a time with no a
+// priori size. Enforcing the caller's maxOrphans PER-INSERT here therefore buys
+// no memory safety the resident slice does not already give — and it BREAKS the
+// permutation-invariance this function documents: a causally-closed set whose
+// worst permutation front-loads more than maxOrphans concurrent orphans (e.g. a
+// reverse-delivered chain, or a fan-out whose common antecedent is delivered
+// last) would abort MID-LOOP with ErrOrphanBufferOverflow, from which Seal
+// cannot be called safely (Seal requires "no further events will arrive", which
+// is false mid-load). So SequenceForFold sizes the sequencer's ingest capacity
+// at max(maxOrphans, len(msgs)): the load phase never trips on batch shape, and
+// the SOLE loud-failure gate becomes Seal once the whole batch is known. Seal
+// fails iff the causal set does not close — i.e. a genuinely pruned (never-
+// arriving) antecedent — which is the only unrecoverable condition for a
+// resident batch. The caller's maxOrphans is thus not a per-insert admission
+// bound on this path; it is a floor under the auto-sizing (a caller asking for a
+// bound LARGER than the batch still gets it). This is a deliberate semantics
+// change to EngineOptions.MaxOrphans for the replay path (engine_core.go
+// replayAllLocal, the sole real consumer): a batch of never-arriving orphans no
+// longer fails as ErrOrphanBufferOverflow at ingest but as the more precise
+// ErrUnrecoverableAntecedent at Seal (which names the pruned antecedents). Both
+// are loud, both return nil output — there is never a silent truncated fold. The
+// LIVE path's occupancy bound (IngestLive) is untouched.
 func SequenceForFold(msgs []Message, maxOrphans int) ([]Message, error) {
-	seq := NewSequencer(maxOrphans)
+	// Auto-size the ingest capacity to the resident batch so the load phase never
+	// aborts on batch shape; Seal remains the sole causal-closure gate. See the
+	// DECISION note above.
+	capacity := maxOrphans
+	if len(msgs) > capacity {
+		capacity = len(msgs)
+	}
+	seq := NewSequencer(capacity)
 	for i := range msgs {
 		if err := seq.Ingest(msgs[i]); err != nil {
 			return nil, err

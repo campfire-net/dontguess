@@ -199,6 +199,77 @@ func TestSequencer_Property_ByteIdenticalFoldUnderReorderAndDups(t *testing.T) {
 	}
 }
 
+// TestSequencer_Property_ClosedBatchBelowMaxOrphansStillFolds is the
+// dontguess-e181 regression driven through the REAL fold. It takes the same
+// realistic causally-closed set (two put→put-accept edges + a buy) and delivers
+// it in the permutation that maximizes concurrent orphans — every put-accept
+// BEFORE its put — then sequences it with maxOrphans = 1, deliberately below the
+// orphan peak (2, one per put-accept edge). BEFORE the capacity-widening fix this
+// aborted mid-load with ErrOrphanBufferOverflow the instant the second put-accept
+// pushed the true-orphan count to 2 over the bound of 1, even though the whole
+// set is resident and closes cleanly. AFTER the fix it must sequence to the
+// byte-identical fold order the canonical delivery produces — proving the widened
+// batch path is not just non-erroring but still deterministic.
+func TestSequencer_Property_ClosedBatchBelowMaxOrphansStillFolds(t *testing.T) {
+	canonical, _ := buildCausalLog(t)
+	sellerKeys := sendersOf(canonical)
+
+	// Reference: canonical-order sequencing (huge bound → never near it).
+	ref, err := exchange.SequenceForFold(canonical, 0)
+	if err != nil {
+		t.Fatalf("SequenceForFold(canonical): %v", err)
+	}
+	refState := exchange.NewState()
+	refState.Replay(ref)
+	refSnap := stateSnapshot(t, refState, sellerKeys)
+
+	// Front-load every dependent (an event whose antecedent is another event in
+	// the set) ahead of the events it depends on — the worst case for orphan
+	// occupancy. Stable within each group so the order is deterministic.
+	idset := make(map[string]struct{}, len(canonical))
+	for _, m := range canonical {
+		idset[m.ID] = struct{}{}
+	}
+	var dependents, roots []exchange.Message
+	for _, m := range canonical {
+		isDep := false
+		for _, a := range m.Antecedents {
+			if _, ok := idset[a]; ok {
+				isDep = true
+				break
+			}
+		}
+		if isDep {
+			dependents = append(dependents, m)
+		} else {
+			roots = append(roots, m)
+		}
+	}
+	if len(dependents) < 2 {
+		t.Fatalf("test needs >=2 dependents to exceed maxOrphans=1; got %d", len(dependents))
+	}
+	frontLoaded := append(append([]exchange.Message{}, dependents...), roots...)
+
+	// maxOrphans=1 is strictly below the orphan peak (>=2) of this permutation.
+	ordered, err := exchange.SequenceForFold(frontLoaded, 1)
+	if err != nil {
+		t.Fatalf("SequenceForFold(front-loaded, maxOrphans=1): unexpected error: %v (the capacity-widening fix must let a resident closed batch through even below the caller's bound)", err)
+	}
+	if len(ordered) != len(canonical) {
+		t.Fatalf("sequenced %d events, want %d", len(ordered), len(canonical))
+	}
+	for i := range ref {
+		if ordered[i].ID != ref[i].ID {
+			t.Fatalf("sequenced order diverged at %d: got %s want %s (must equal canonical fold order)", i, ordered[i].ID, ref[i].ID)
+		}
+	}
+	st := exchange.NewState()
+	st.Replay(ordered)
+	if got := stateSnapshot(t, st, sellerKeys); !bytes.Equal(got, refSnap) {
+		t.Fatalf("front-loaded low-bound fold diverged from canonical reference:\n ref=%s\n got=%s", refSnap, got)
+	}
+}
+
 // TestSequencer_Property_EngineIngestByteIdentical drives the property through
 // the REAL engine ingest path: a fresh Engine with SequencedIngest=true over a
 // real pkg/store.Store loaded with a permuted+duped event set must fold to the

@@ -316,12 +316,21 @@ func TestSequenceForFold_LargeCausallyInOrderBatchDoesNotTripBound(t *testing.T)
 	}
 }
 
-// TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest proves the actual
-// DoS-shaped attack — many events each referencing a DISTINCT antecedent that
-// never arrives — is rejected loud, and rejected EARLY (at ingest, not after
-// the whole flood has already been buffered): SequenceForFold must return
-// ErrOrphanBufferOverflow without ever reaching Drain/Seal for the excess.
-func TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest(t *testing.T) {
+// TestSequenceForFold_NeverArrivingAntecedentsFailLoudViaSeal is the
+// dontguess-e181 semantics change. A batch where every event references a
+// DISTINCT antecedent that never arrives is a broken causal closure. On the
+// BATCH path the whole slice is resident (memory is already bounded by
+// len(msgs)), so SequenceForFold auto-sizes its ingest capacity to the batch and
+// does NOT abort mid-load with ErrOrphanBufferOverflow — instead the FULL batch
+// loads and Seal condemns it as unrecoverable, naming the pruned antecedents.
+// The guarantee that matters is preserved and sharpened: it still FAILS LOUD
+// (error non-nil) and still returns nil output (no silent truncated fold); the
+// diagnosis is now ErrUnrecoverableAntecedent, which is strictly more precise
+// than a generic buffer overflow. (The per-insert ErrOrphanBufferOverflow bound
+// still exists and is exercised directly at the sequencer level by
+// TestSequencer_OverflowFailsLoudAtIngest; it governs the LIVE streaming path,
+// not the resident-batch replay path.)
+func TestSequenceForFold_NeverArrivingAntecedentsFailLoudViaSeal(t *testing.T) {
 	const bound = 50
 	msgs := make([]Message, 0, bound+1)
 	for i := 0; i < bound+1; i++ {
@@ -330,13 +339,69 @@ func TestSequenceForFold_TrueOrphanFloodTripsBoundAtIngest(t *testing.T) {
 	}
 	out, err := SequenceForFold(msgs, bound)
 	if err == nil {
-		t.Fatalf("SequenceForFold over %d true orphans with bound %d returned nil error; must fail loud", len(msgs), bound)
+		t.Fatalf("SequenceForFold over %d never-arriving orphans with bound %d returned nil error; must fail loud", len(msgs), bound)
 	}
-	if !errors.Is(err, ErrOrphanBufferOverflow) {
-		t.Fatalf("error = %v, want ErrOrphanBufferOverflow", err)
+	if !errors.Is(err, ErrUnrecoverableAntecedent) {
+		t.Fatalf("error = %v, want ErrUnrecoverableAntecedent (loud, precise failure via Seal)", err)
 	}
 	if out != nil {
-		t.Fatalf("SequenceForFold returned a partial ordering %v on overflow; must return nil", idsOfMsgs(out))
+		t.Fatalf("SequenceForFold returned a partial ordering %v on a broken closure; must return nil", idsOfMsgs(out))
+	}
+}
+
+// TestSequenceForFold_ClosedBatchExceedingMaxOrphansSucceeds is the dontguess-e181
+// bug-fix demonstration. A fan-out — many events all referencing a single common
+// antecedent — delivered with that antecedent LAST forces the concurrent-orphan
+// count to peak at (fan size) before the antecedent lands and resolves them all.
+// The set is perfectly causally closed. BEFORE the capacity-widening fix,
+// SequenceForFold enforced the caller's maxOrphans on every insert, so this batch
+// aborted MID-LOOP with ErrOrphanBufferOverflow the instant the orphan peak
+// crossed the (deliberately small) bound — even though the whole slice was
+// already in memory and the set closes cleanly. AFTER the fix it must complete:
+// every event released, the common antecedent first (causally), all dependents
+// after, in canonical (Timestamp, ID) order.
+func TestSequenceForFold_ClosedBatchExceedingMaxOrphansSucceeds(t *testing.T) {
+	const fan = 60
+	const bound = 10 // deliberately far below the fan's orphan peak of `fan`
+
+	// Children first (each orphaned on "root"), the common antecedent LAST — the
+	// permutation that maximizes concurrent orphans. Timestamps set so canonical
+	// order among the children is well-defined and distinct from delivery order.
+	msgs := make([]Message, 0, fan+1)
+	for i := 0; i < fan; i++ {
+		id := fmt.Sprintf("child-%02d", i)
+		msgs = append(msgs, seqMsg(id, int64(fan-i), "root")) // descending ts on purpose
+	}
+	msgs = append(msgs, seqMsg("root", 0)) // common antecedent delivered last
+
+	out, err := SequenceForFold(msgs, bound)
+	if err != nil {
+		t.Fatalf("SequenceForFold over a closed %d-fan (orphan peak %d) with bound %d: unexpected error: %v (the capacity-widening fix must let a resident closed batch through)", fan, fan, bound, err)
+	}
+	if len(out) != fan+1 {
+		t.Fatalf("SequenceForFold released %d events, want all %d", len(out), fan+1)
+	}
+	if out[0].ID != "root" {
+		t.Fatalf("first released event = %s, want root (the common antecedent must fold before its dependents)", out[0].ID)
+	}
+	// Every child present exactly once, and the children (out[1:]) are in
+	// canonical (Timestamp, ID) order — proving the widened batch still produces
+	// the deterministic fold order, not merely "some" order.
+	seen := make(map[string]struct{}, fan)
+	for _, m := range out[1:] {
+		if _, dup := seen[m.ID]; dup {
+			t.Fatalf("event %s released twice", m.ID)
+		}
+		seen[m.ID] = struct{}{}
+	}
+	if len(seen) != fan {
+		t.Fatalf("released %d distinct children, want %d", len(seen), fan)
+	}
+	for i := 1; i+1 < len(out); i++ {
+		a, b := out[i], out[i+1]
+		if a.Timestamp > b.Timestamp || (a.Timestamp == b.Timestamp && a.ID > b.ID) {
+			t.Fatalf("children not in canonical (ts,id) order at %d: (%d,%s) before (%d,%s)", i, a.Timestamp, a.ID, b.Timestamp, b.ID)
+		}
 	}
 }
 
