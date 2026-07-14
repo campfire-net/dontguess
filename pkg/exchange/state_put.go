@@ -677,10 +677,41 @@ func (s *State) decryptV2Put(sellerPubHex string, enc *encEnvelope) (plaintext [
 		if ferr != nil {
 			return nil, false // blob unavailable at fold time → drop (see replay caveat)
 		}
+		// FIX 2 (dontguess-00d): cap a fetched blob at MaxContentBytes BEFORE it
+		// is sha256'd/decrypted. A hostile Blossom store can return gigabytes for
+		// a valid-looking pointer; hashing+decrypting that unbounded under the
+		// State write lock is an alloc/CPU DoS. The plaintext is size-limited to
+		// MaxContentBytes downstream anyway, so a ciphertext exceeding it can
+		// never yield an admissible put — drop it here rather than process it.
+		if len(fetched) > MaxContentBytes {
+			return nil, false
+		}
 		ciphertext = fetched
 	} else {
+		// FIX 2 (dontguess-00d): pre-decode size guard, mirroring the legacy
+		// plaintext path (applyPut: len(payload.Content) > MaxContentBytes*4/3+4).
+		// base64 expands ~4/3x, so an attacker-supplied enc.ciphertext this long
+		// decodes to > MaxContentBytes — reject BEFORE the base64 decode + the
+		// immediate sha256 of the full decoded bytes (an unbounded alloc/CPU
+		// vector under the State write lock).
+		if len(enc.Ciphertext) > MaxContentBytes*4/3+4 {
+			return nil, false
+		}
 		decoded, derr := base64.StdEncoding.DecodeString(enc.Ciphertext)
 		if derr != nil {
+			return nil, false
+		}
+		// FIX 3 (dontguess-00d): reject an inline ciphertext whose plaintext would
+		// have exceeded BlossomOffloadThreshold — such a put MUST have offloaded
+		// (the >32 KiB-must-offload rule, enforced client-side in
+		// relayclient.buildPutMessage). A non-compliant seller inlining oversize
+		// ciphertext straight into the replicated message log bypasses the
+		// storage/bloat invariant (blossom.go: the fold never inlines oversize
+		// bytes). decoded == nonce||AEAD(plaintext), so plaintext size ==
+		// len(decoded) - NonceSize - Overhead; the inline ceiling is therefore
+		// BlossomOffloadThreshold + those two AEAD overheads. Not a confidentiality
+		// issue (the ciphertext is public either way) — a storage invariant.
+		if len(decoded) > BlossomOffloadThreshold+chacha20poly1305.NonceSize+chacha20poly1305.Overhead {
 			return nil, false
 		}
 		ciphertext = decoded
@@ -777,9 +808,26 @@ func (s *State) applyPut(msg *Message) {
 	// replay and live fold. Individual tier (encryptedRequired == false, local
 	// socket, already confidential) keeps the legacy plaintext path legal and
 	// unchanged — it never reaches this block.
+	//
+	// GRANDFATHER GATE (dontguess-00d FIX 1): grandfathering additionally
+	// requires that THIS put was PREVIOUSLY ACCEPTED — i.e. an operator
+	// put-accept referencing it exists somewhere in the replayed log
+	// (s.replayPutAccepts, populated by the Replay pre-scan). Rationale: a
+	// genuine PRE-cutover plaintext put was accepted+broadcast before the
+	// encrypted-required cutover, so it HAS a put-accept; a POST-cutover
+	// plaintext put was fail-closed dropped by live applyPut and NEVER received
+	// one. Without this gate, an allowlisted seller who published a v1 plaintext
+	// put AFTER the cutover — correctly dropped live — would have that same
+	// message GRANDFATHERED into live inventory (30d TTL) on the next operator
+	// restart's Replay, violating the §6 invariant that "a plaintext put is
+	// dropped by applyPut and never appears in inventory". Gating on the
+	// put-accept leaves the post-cutover put dropped on replay too (no
+	// put-accept → not grandfathered → falls through to the drop), while genuine
+	// pre-cutover inventory (which has a put-accept) still folds.
 	if s.encryptedRequired {
 		if !isV2 || payload.Content != "" || !encWellFormed(payload.Enc) {
-			if s.replaying && isLegacyPlaintextPut(payload.V, payload.Enc, payload.Content) {
+			_, hadPutAccept := s.replayPutAccepts[msg.ID]
+			if s.replaying && hadPutAccept && isLegacyPlaintextPut(payload.V, payload.Enc, payload.Content) {
 				grandfathered = true
 			} else {
 				return

@@ -877,6 +877,20 @@ type State struct {
 	// Apply (not replaying) is the only path that counts.
 	replaying bool
 
+	// replayPutAccepts is the set of put message IDs that have a matching
+	// operator put-accept SOMEWHERE in the log being replayed. It is populated
+	// by a pre-scan at the top of Replay (before the fold loop) and consulted
+	// ONLY by the §6 legacy-plaintext grandfather block in applyPut (dontguess-00d
+	// FIX 1). A pre-migration plaintext put was accepted+broadcast before the
+	// cutover, so it HAS a put-accept; a post-cutover plaintext put was
+	// fail-closed dropped live and NEVER got a put-accept. Grandfathering only
+	// when a put-accept exists therefore folds genuine pre-cutover inventory while
+	// leaving a post-cutover downgrade dropped on replay — closing the §6
+	// invariant hole where replay would re-admit a plaintext put that live-fold
+	// correctly rejected. Nil outside Replay (never consulted live, since
+	// grandfathering requires s.replaying).
+	replayPutAccepts map[string]struct{}
+
 	// Inventory is keyed by EntryID (= put message ID).
 	// Includes only accepted, non-expired entries.
 	inventory map[string]*InventoryEntry

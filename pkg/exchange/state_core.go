@@ -77,6 +77,38 @@ func (s *State) Replay(msgs []Message) {
 	s.replaying = true
 	defer func() { s.replaying = false }()
 
+	// Pre-scan the log for operator put-accepts (dontguess-00d FIX 1). The §6
+	// legacy-plaintext grandfather block in applyPut only fires for a put that
+	// was PREVIOUSLY ACCEPTED — a genuine pre-cutover plaintext put has an
+	// operator put-accept in the log; a post-cutover plaintext put was
+	// fail-closed dropped live and has none. applyPut runs during the fold loop
+	// BELOW, but a put-accept always folds AFTER its put (it e-tags the put as
+	// its antecedent), so applyPut cannot learn "was accepted?" from live fold
+	// order. This pre-scan resolves it: collect the put IDs that any operator
+	// put-accept references so applyPut can gate grandfathering on membership.
+	// The operator-sender guard mirrors applySettlePutAccept exactly (an empty
+	// OperatorKey accepts any sender; a set key requires a match) so a forged
+	// non-operator put-accept cannot bait a post-cutover plaintext put into
+	// inventory. Cleared on exit — meaningful only for this replay's duration.
+	s.replayPutAccepts = make(map[string]struct{}, len(msgs))
+	defer func() { s.replayPutAccepts = nil }()
+	for i := range msgs {
+		m := &msgs[i]
+		if exchangeOp(m.Tags) != TagSettle {
+			continue
+		}
+		if settlePhaseFromTags(m.Tags) != SettlePhaseStrPutAccept {
+			continue
+		}
+		if s.OperatorKey != "" && m.Sender != s.OperatorKey {
+			continue
+		}
+		if len(m.Antecedents) == 0 {
+			continue
+		}
+		s.replayPutAccepts[m.Antecedents[0]] = struct{}{}
+	}
+
 	// Reset.
 	s.inventory = make(map[string]*InventoryEntry)
 	s.pendingPuts = make(map[string]*InventoryEntry)
