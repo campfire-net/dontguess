@@ -32,6 +32,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
@@ -253,14 +254,29 @@ func climbWatermarkPath(dgHome string) string {
 }
 
 // establishClimbWatermark returns the durable climb watermark, creating it on the
-// FIRST relay-attached serve as the current count of operator-authored records in
-// ls. It is IDEMPOTENT: once written it is never recomputed, so (a) restarts reuse
-// the original climb point instead of drifting upward as post-climb inventory
-// grows, and (b) a relay added to an already-fleet operator later fences the SAME
-// pre-climb corpus and correctly backfills the post-climb (encrypted) inventory
-// created above the watermark. A born-fleet operator's first start has an empty
-// log ⇒ watermark 0 ⇒ nothing fenced. The write uses temp→fsync→rename so the
-// fence survives a crash immediately after the climb.
+// FIRST relay-attached serve by RECONSTRUCTING the true climb point from ls (see
+// below). It is IDEMPOTENT: once written it is never recomputed, so (a) restarts
+// reuse the original climb point instead of drifting upward as post-climb
+// inventory grows, and (b) a relay added to an already-fleet operator later fences
+// the SAME pre-climb corpus and correctly backfills the post-climb (encrypted)
+// inventory created above the watermark. A born-fleet operator's first start has an
+// empty log ⇒ watermark 0 ⇒ nothing fenced. The write uses temp→fsync→rename so
+// the fence survives a crash immediately after the climb.
+//
+// SIDECAR-LOSS RECONSTRUCTION (dontguess-897): the sidecar-absent branch is reached
+// on the genuine climb AND on a sidecar loss/corruption of an ALREADY-fleet
+// operator. It must NOT simply count the current operator-record total: that total
+// DRIFTS UPWARD as post-climb v2-ciphertext inventory accumulates, so on a loss it
+// would over-fence — a SECOND relay added afterward seeds its fresh cursor to the
+// inflated count and never backfills the encrypted inventory (a replication gap on
+// the new relay; no plaintext leak, since every over-fenced record is ciphertext).
+// Instead it reconstructs the TRUE climb point: the position, in the Outbox's
+// local-origin subsequence, PAST the last operator record carrying INLINE PLAINTEXT
+// content (a solo/individual-tier put or settle(deliver), §541 §6). Post-climb
+// content records are v2 envelopes and protocol metadata carries no content, so
+// both sit ABOVE this point and republish freely. The reconstructed value is STABLE
+// under post-climb growth (the last plaintext-content position never moves), so a
+// recompute-after-loss yields the SAME fence the original climb wrote.
 func establishClimbWatermark(path string, ls *dgstore.Store) (int64, error) {
 	b, rerr := os.ReadFile(path)
 	if rerr == nil {
@@ -289,22 +305,63 @@ func establishClimbWatermark(path string, ls *dgstore.Store) (int64, error) {
 		return 0, fmt.Errorf("climb watermark %s: read: %w", path, rerr)
 	}
 
-	// First relay attach for this home = the climb. The current operator-authored
-	// record count is the watermark: everything already persisted is pre-climb.
+	// No sidecar yet — reconstruct the true climb point (see the doc comment). Walk
+	// the log; for every operator-authored record advance the local-origin position,
+	// and remember the position of the last one carrying inline plaintext content.
+	// That position (records fenced up to and including the last plaintext put/
+	// deliver) is the watermark: it fences every plaintext-content record while
+	// leaving post-climb v2 inventory and protocol metadata above the fence.
 	recs, err := ls.ReadAll()
 	if err != nil {
 		return 0, fmt.Errorf("climb watermark: read store: %w", err)
 	}
-	var w int64
+	var localPos, w int64
 	for i := range recs {
-		if isOperatorOrigin(recs[i].Origin) {
-			w++
+		if !isOperatorOrigin(recs[i].Origin) {
+			continue
+		}
+		localPos++ // 1-indexed position within the Outbox's local-origin subsequence
+		if recordCarriesInlinePlaintextContent(recs[i].Payload) {
+			w = localPos
 		}
 	}
 	if err := writeClimbWatermarkFile(path, w); err != nil {
 		return 0, err
 	}
 	return w, nil
+}
+
+// recordCarriesInlinePlaintextContent reports whether a persisted operator
+// record's payload inlines PLAINTEXT content that the climb egress fence must keep
+// local-only (ADV-18, §541 §6). It is the reconstruction signal
+// establishClimbWatermark uses to find the true climb point after a sidecar loss
+// (dontguess-897).
+//
+// A §3.3 v2 confidential envelope (v>=2 with a non-null "enc" object) carries NO
+// plaintext — its content travels only as AEAD ciphertext, so it is safe to
+// republish. Everything else is inspected for a non-empty base64 "content" field:
+// a solo/individual-tier put or settle(deliver) inlines cleartext there, while
+// protocol metadata (match/buy/settle-complete) has no "content" field and is not
+// fenced.
+//
+// Conservative on a payload it cannot parse: an operator record that fails to
+// decode is treated as content-bearing (fenced), favouring no-leak over backfill —
+// though in a healthy log every operator record is valid JSON (the Outbox re-signs
+// each one to publish), so this branch is not reached in practice.
+func recordCarriesInlinePlaintextContent(payload []byte) bool {
+	var p struct {
+		V       int             `json:"v"`
+		Content string          `json:"content"`
+		Enc     json.RawMessage `json:"enc"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return true
+	}
+	enc := strings.TrimSpace(string(p.Enc))
+	if p.V >= 2 && enc != "" && enc != "null" {
+		return false
+	}
+	return p.Content != ""
 }
 
 // writeClimbWatermarkFile durably persists the watermark (temp→fsync→rename +
