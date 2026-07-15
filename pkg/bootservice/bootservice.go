@@ -1,10 +1,21 @@
-// Package bootservice installs a systemd --user unit that runs
-// `dontguess serve` and enables `loginctl enable-linger` so the operator
-// process survives logout (ADV-6, design §1 "up --relay" bullet + §9 Gate
-// B/P7).
+// Package bootservice installs a platform boot service that runs
+// `dontguess serve` and persists across logout (ADV-6, design §1 "up
+// --relay" bullet + §9 Gate B/P7, operator ruling 2026-07-15 §10 Q5:
+// cross-platform from day one).
 //
-// Linux/systemd-only (dontguess-748, Gate B/P7-linux). macOS/launchd is a
-// separate, unscoped item.
+// The composition — Options/Result types, absolute-path validation,
+// render-then-probe-then-install flow, DryRun fallback when the platform
+// tool is unavailable — is shared across backends. Only the platform
+// backend differs:
+//
+//   - Linux: systemd --user unit + `loginctl enable-linger` (this file,
+//     dontguess-748, Gate B/P7-linux).
+//   - macOS: launchd LaunchAgent (bootservice_launchd.go, dontguess-aa4,
+//     Gate B/P7-mac). RunAtLoad+KeepAlive is the launchd analog of
+//     enable+linger — no separate "linger" step exists on launchd.
+//
+// Install() dispatches by runtime.GOOS. Callers that want a specific
+// backend directly (e.g. tests) may call installSystemd/InstallLaunchAgent.
 package bootservice
 
 import (
@@ -15,6 +26,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"text/template"
 )
@@ -74,6 +86,26 @@ RestartSec=5
 WantedBy=default.target
 `
 
+// validateOptions checks the absolute-path invariants shared by every
+// backend's render step (RenderUnit for systemd, RenderPlist for launchd) —
+// callers must resolve ServeBinary/DGHome themselves; this package never
+// hardcodes either.
+func validateOptions(opts Options) error {
+	if strings.TrimSpace(opts.ServeBinary) == "" {
+		return errors.New("bootservice: ServeBinary is required")
+	}
+	if !filepath.IsAbs(opts.ServeBinary) {
+		return fmt.Errorf("bootservice: ServeBinary must be an absolute path, got %q", opts.ServeBinary)
+	}
+	if strings.TrimSpace(opts.DGHome) == "" {
+		return errors.New("bootservice: DGHome is required")
+	}
+	if !filepath.IsAbs(opts.DGHome) {
+		return fmt.Errorf("bootservice: DGHome must be an absolute path, got %q", opts.DGHome)
+	}
+	return nil
+}
+
 // DefaultUnitDir returns the systemd --user unit directory for the current
 // user: $XDG_CONFIG_HOME/systemd/user, falling back to
 // ~/.config/systemd/user.
@@ -92,17 +124,8 @@ func DefaultUnitDir() (string, error) {
 // function — no filesystem or systemctl calls — so templating can be tested
 // without a systemd --user runtime.
 func RenderUnit(opts Options) (string, error) {
-	if strings.TrimSpace(opts.ServeBinary) == "" {
-		return "", errors.New("bootservice: ServeBinary is required")
-	}
-	if !filepath.IsAbs(opts.ServeBinary) {
-		return "", fmt.Errorf("bootservice: ServeBinary must be an absolute path, got %q", opts.ServeBinary)
-	}
-	if strings.TrimSpace(opts.DGHome) == "" {
-		return "", errors.New("bootservice: DGHome is required")
-	}
-	if !filepath.IsAbs(opts.DGHome) {
-		return "", fmt.Errorf("bootservice: DGHome must be an absolute path, got %q", opts.DGHome)
+	if err := validateOptions(opts); err != nil {
+		return "", err
 	}
 
 	tmpl, err := template.New("dontguess.service").Parse(unitTemplate)
@@ -158,17 +181,31 @@ func currentUsername() (string, error) {
 	return u.Username, nil
 }
 
-// Install writes the systemd --user unit for opts, reloads the user
+// Install installs the boot service backend for the current platform: the
+// launchd LaunchAgent on darwin (InstallLaunchAgent, dontguess-aa4), the
+// systemd --user unit everywhere else (installSystemd, dontguess-748). This
+// is the single entry point callers (e.g. `up`) should use — it is the
+// composition that shares Options/Result across backends and platform-guards
+// which one actually runs.
+func Install(opts Options) (*Result, error) {
+	if runtime.GOOS == "darwin" {
+		return InstallLaunchAgent(opts)
+	}
+	return installSystemd(opts)
+}
+
+// installSystemd writes the systemd --user unit for opts, reloads the user
 // manager, enables the unit, and enables linger (loginctl enable-linger) so
 // the operator survives logout (ADV-6).
 //
 // If systemd --user is genuinely unavailable in this session (no bus, no
-// systemctl/loginctl), Install falls back to a DRY RUN: it still renders
-// and writes the unit file (so the templating is exercised and inspectable)
-// but skips daemon-reload/enable/linger and reports Result.DryRun=true with
-// a DryRunNote explaining why. Callers/tests must assert the unavailability
-// explicitly via the returned note — never assume dry run silently.
-func Install(opts Options) (*Result, error) {
+// systemctl/loginctl), installSystemd falls back to a DRY RUN: it still
+// renders and writes the unit file (so the templating is exercised and
+// inspectable) but skips daemon-reload/enable/linger and reports
+// Result.DryRun=true with a DryRunNote explaining why. Callers/tests must
+// assert the unavailability explicitly via the returned note — never assume
+// dry run silently.
+func installSystemd(opts Options) (*Result, error) {
 	content, err := RenderUnit(opts)
 	if err != nil {
 		return nil, err
