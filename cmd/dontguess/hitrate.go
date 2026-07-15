@@ -155,7 +155,16 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 		// Non-fatal: log and continue with zero convergence rather than failing.
 		fmt.Fprintf(os.Stderr, "warning: could not resolve local operator key: %v\n", err)
 	}
-	convergenceMap := buildConvergenceMap(allMsgs, operatorKey)
+	// P3 migration (design §6, ADV-17): a pre-P3 solo home authored operator records
+	// under the opaque local-operator.key. Read it (if present) so buildConvergenceMap
+	// re-attributes those historical records to the stable nostr key via a wire-alias,
+	// matching how `serve` folds them — otherwise the sender-must-be-operator guards
+	// drop them and undercount convergence.
+	legacyOperatorKey, lerr := loadLegacyLocalOperatorKey(dgHome)
+	if lerr != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not read legacy local operator key: %v\n", lerr)
+	}
+	convergenceMap := buildConvergenceMap(allMsgs, operatorKey, legacyOperatorKey)
 
 	// Build quality-weighted options (M-rebaseline, dontguess-af8).
 	// MinSimilarity references the M1 floor constant — does NOT hardcode 0.16.
@@ -181,30 +190,32 @@ func runHitRate(_ *cobra.Command, _ []string) error {
 // same key the local operator authored match/settle messages with (see
 // resolveLocalOperatorKey) or State.Replay's sender-must-be-operator checks
 // reject them, undercounting convergence.
-func buildConvergenceMap(msgs []exchange.Message, operatorKeyHex string) map[string]map[string]struct{} {
+func buildConvergenceMap(msgs []exchange.Message, operatorKeyHex, legacyOperatorKey string) map[string]map[string]struct{} {
 	st := exchange.NewState()
 	st.OperatorKey = operatorKeyHex
+	// P3 migration (design §6, ADV-17): register the pre-P3 opaque operator key as a
+	// wire-alias BEFORE Replay so historical solo operator records re-attribute to the
+	// nostr key during the fold, exactly as serve's applyLegacyOperatorAlias does.
+	if legacyOperatorKey != "" && legacyOperatorKey != operatorKeyHex {
+		st.RegisterWireAlias(legacyOperatorKey, operatorKeyHex)
+	}
 	st.Replay(msgs)
 	return exchange.BuildConvergenceMap(st)
 }
 
 // resolveLocalOperatorKey returns the key the local (campfire-free) operator
-// authors match/settle messages with, mirroring runServeLocal's own
-// resolution (serve.go's engineOperatorKey): the persisted nostr operator
-// identity's pubkey when the M2 relay transport is enabled
-// (DONTGUESS_RELAY_URL set), otherwise the opaque local operator key. A
-// read-only command replaying the local store needs the SAME key the engine
-// used when it wrote those messages, or exchange.State's sender-must-be-
-// operator checks would reject genuine operator messages during replay.
+// authors match/settle messages with, mirroring runServeLocal's own resolution
+// (serve.go's engineOperatorKey). Since P3 (design §6, ADV-17) that is ALWAYS the
+// persisted secp256k1 nostr operator key — solo and relay share one identity, so a
+// read-only command replaying the local store uses the same key the engine wrote
+// with. Pre-P3 solo-era records signed under the opaque local key are re-attributed
+// separately via the wire-alias in buildConvergenceMap (loadLegacyLocalOperatorKey).
 func resolveLocalOperatorKey(dgHome string) (string, error) {
-	if os.Getenv("DONTGUESS_RELAY_URL") != "" {
-		id, err := loadOrCreateNostrOperatorIdentity(dgHome)
-		if err != nil {
-			return "", fmt.Errorf("nostr operator identity: %w", err)
-		}
-		return id.PubKeyHex(), nil
+	id, err := loadOrCreateNostrOperatorIdentity(dgHome)
+	if err != nil {
+		return "", fmt.Errorf("nostr operator identity: %w", err)
 	}
-	return loadOrCreateLocalOperatorKey(dgHome)
+	return id.PubKeyHex(), nil
 }
 
 func printHitRate(rep exchange.HitRateReport, since time.Duration, asJSON bool) {

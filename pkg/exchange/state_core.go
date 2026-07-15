@@ -100,7 +100,11 @@ func (s *State) Replay(msgs []Message) {
 		if settlePhaseFromTags(m.Tags) != SettlePhaseStrPutAccept {
 			continue
 		}
-		if s.OperatorKey != "" && m.Sender != s.OperatorKey {
+		// resolveAlias canonicalizes a pre-P3 legacy operator sender to the stable
+		// nostr operator key (design §6, ADV-17) so a solo-era put-accept still
+		// grandfathers its plaintext put; identity for every non-aliased sender, so
+		// the forged-non-operator rejection below is unchanged where no alias exists.
+		if s.OperatorKey != "" && s.resolveAlias(m.Sender) != s.OperatorKey {
 			continue
 		}
 		if len(m.Antecedents) == 0 {
@@ -192,6 +196,23 @@ func (s *State) Apply(msg *Message) {
 
 // applyLocked applies a message to state. Caller must hold s.mu.
 func (s *State) applyLocked(msg *Message) {
+	// P3 operator-identity migration (design §6, ADV-17): a pre-P3 solo home signed
+	// its operator records under an opaque local operator key that serve registers
+	// as a wire-alias of the stable nostr operator key (RegisterWireAlias). Canonicalize
+	// the sender through that alias BEFORE any operator-sender gate or attribution so
+	// historical solo operator records fold under State.OperatorKey instead of being
+	// dropped by the sender-must-be-operator guards. resolveAlias is the identity for
+	// every non-aliased sender — participant keys, the operator's own nostr key, and
+	// every sender on a fresh home / the in-process suite where no operator-key alias
+	// is registered — so this is byte-for-byte unchanged wherever the migration did
+	// not run. (Namespaces never collide: an operator wire-alias key is a pubkey; the
+	// message-id aliases in the same map are content-hash event ids.)
+	if canon := s.resolveAlias(msg.Sender); canon != msg.Sender {
+		c := *msg
+		c.Sender = canon
+		msg = &c
+	}
+
 	// Track provenance hop depth for every message from a known sender.
 	// Hop depth is approximated from the Antecedents chain length.
 	// This populates senderHopDepth for the slow loop's trust_score computation.

@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -174,17 +175,39 @@ func defaultEmbedScriptPath() string {
 // under dgHome instead of a campfire ReadClient/WriteClient — see
 // exchange.EngineOptions.LocalStore.
 //
-// No 'dontguess init' step is required: the local operator key and the event
-// log file are created on first run (loadOrCreateLocalOperatorKey), inside
-// dgHome, which this function creates if missing.
+// No 'dontguess init' step is required: the secp256k1 nostr operator key
+// (loadOrCreateNostrOperatorIdentity, the single stable P3 identity) and the
+// event log file are created on first run inside dgHome, which this function
+// creates if missing.
 func runServeLocal(dgHome string) error {
 	if err := os.MkdirAll(dgHome, 0700); err != nil {
 		return fmt.Errorf("creating DG_HOME %s: %w", dgHome, err)
 	}
 
-	localOperatorKey, err := loadOrCreateLocalOperatorKey(dgHome)
+	// P3 — ONE secp256k1 operator identity from solo onward (design §6, ADV-17).
+	// The nostr operator key is minted at the FIRST `up` (solo OR relay) and its
+	// PubKeyHex is State.OperatorKey from day one, so every operator record's Sender
+	// is stable across the solo→relay climb: zero operator-record re-sign, no Sender
+	// mismatch, no migration hang. This replaces the pre-P3 two-identity swap (opaque
+	// local key solo / nostr key on relay attach). The individual tier stays
+	// byte-identical in behavior — operatorSigner is a TRUE nil interface (no relay
+	// signing, encryptedRequired off), ScripStore nil, plaintext-local — only the
+	// operator IDENTITY is now permanent from the first solo run.
+	operatorIdentity, err := loadOrCreateNostrOperatorIdentity(dgHome)
 	if err != nil {
-		return fmt.Errorf("local operator key: %w", err)
+		return fmt.Errorf("nostr operator identity: %w", err)
+	}
+	engineOperatorKey := operatorIdentity.PubKeyHex()
+
+	// Legacy migration (design §6, ADV-17): a pre-P3 solo home signed its operator
+	// records under an opaque 16-byte local-operator.key (non-secp256k1). Read it if
+	// it exists so applyLegacyOperatorAlias below re-attributes those historical
+	// records to the stable nostr key. A fresh home has no such file (loadLegacy
+	// returns "") → no alias, individual tier byte-for-byte unchanged. We NEVER
+	// create this file anymore — the opaque local key is a read-only migration input.
+	legacyOperatorKey, err := loadLegacyLocalOperatorKey(dgHome)
+	if err != nil {
+		return fmt.Errorf("legacy local operator key: %w", err)
 	}
 
 	localStorePath := filepath.Join(dgHome, "events.jsonl")
@@ -194,30 +217,23 @@ func runServeLocal(dgHome string) error {
 	}
 	defer localStore.Close() //nolint:errcheck
 
-	// M2 relay transport (dontguess-4bd) is opt-in: when DONTGUESS_RELAY_URL is
-	// set, the local operator additionally federates over a single NIP-42 relay.
-	// The relay operator identity is a persisted secp256k1 (nostr) key — NOT the
-	// opaque local key — because the Outbox signs events and the NIP-42 handshake
-	// require it, and its pubkey becomes the engine's operator key so operator
-	// records' Sender matches the key the Outbox re-signs with and the Intake
-	// gates authorship on. Unset => unchanged campfire-free single-agent mode.
+	// M2 relay transport (dontguess-4bd) is opt-in: when DONTGUESS_RELAY_URL is set,
+	// the local operator additionally federates over NIP-42 relays. The SAME nostr
+	// operator identity minted above signs the Outbox events and drives the NIP-42
+	// handshake — there is no second identity and no engineOperatorKey swap. Unset =>
+	// unchanged campfire-free single-agent mode.
+	//
+	// operatorSigner is the SAME operator identity as a TRUE nil interface when no
+	// relays are attached (individual tier). Assigning the typed-nil
+	// *Secp256k1Identity into the identity.Signer field would make a non-nil interface
+	// holding a nil pointer (the dontguess-4bed / TrustChecker typed-nil trap), which
+	// would arm encryptedRequired on the individual tier and break the confidential-
+	// only guard's tier gating. Keep it untyped-nil unless a real relay is attached.
 	relayURLs := resolveRelayURLs()
 	var relaySigner *identity.Secp256k1Identity
-	// operatorSigner is the SAME operator identity as a TRUE nil interface when
-	// no relays are attached (individual tier). Passing the typed-nil
-	// *Secp256k1Identity straight into the identity.Signer field would make a
-	// non-nil interface holding a nil pointer (the dontguess-4bed / TrustChecker
-	// typed-nil trap), which would arm encryptedRequired on the individual tier
-	// and break the confidential-only guard's tier gating. Keep it untyped-nil
-	// unless a real relay signer is loaded.
 	var operatorSigner identity.Signer
-	engineOperatorKey := localOperatorKey
 	if len(relayURLs) > 0 {
-		relaySigner, err = loadOrCreateNostrOperatorIdentity(dgHome)
-		if err != nil {
-			return fmt.Errorf("nostr operator identity: %w", err)
-		}
-		engineOperatorKey = relaySigner.PubKeyHex()
+		relaySigner = operatorIdentity
 		operatorSigner = relaySigner
 	}
 
@@ -384,6 +400,15 @@ func runServeLocal(dgHome string) error {
 		trustChecker.SetReputationFloor(eng.State().SellerReputation, minReputation)
 	}
 
+	// Legacy operator-key migration fold (design §6, ADV-17): register the opaque
+	// pre-P3 local operator key as a wire-alias of the stable nostr operator key
+	// BEFORE the engine's startup Replay (runEngineLoop → eng.Start), so historical
+	// solo operator records (Sender == legacyOperatorKey) re-attribute to
+	// State.OperatorKey during the fold instead of being dropped by the sender-must-
+	// be-operator gate. Local only — no relay IO. No-op on a fresh home (no legacy
+	// key), keeping the individual tier byte-for-byte unchanged.
+	applyLegacyOperatorAlias(eng.State(), legacyOperatorKey, engineOperatorKey, logger.Printf)
+
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
@@ -429,7 +454,7 @@ func runServeLocal(dgHome string) error {
 	}
 
 	logger.Printf("exchange serving (campfire-free, %d relay leg(s))", len(legs))
-	logger.Printf("  operator:  %s", localOperatorKey[:16]+"...")
+	logger.Printf("  operator:  %s", engineOperatorKey[:16]+"...")
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
 	logger.Printf("  store:     %s", localStorePath)
@@ -437,20 +462,57 @@ func runServeLocal(dgHome string) error {
 
 	fmt.Printf("\n--- DontGuess exchange (campfire-free) ---\n")
 	fmt.Printf("STORE=%s\n", localStorePath)
-	fmt.Printf("OPERATOR_KEY=%s\n\n", localOperatorKey)
+	fmt.Printf("OPERATOR_KEY=%s\n\n", engineOperatorKey)
 
 	return runEngineLoop(ctx, dgHome, eng, logger)
 }
 
-// loadOrCreateLocalOperatorKey returns the persisted local operator key under
-// dgHome, generating and persisting a fresh random one on first run. This is
-// an opaque local identifier only (no cryptographic identity, no campfire
-// relay involved) — it exists so exchange.State.OperatorKey (and therefore
-// Sender on every locally-emitted match/put-accept/settle message) stays
-// stable across restarts. Without persistence, a restart would pick a new
-// key, and replayAllLocal replaying the prior run's log would see historical
-// operator messages attributed to a Sender that no longer matches
-// state.OperatorKey.
+// loadLegacyLocalOperatorKey reads the opaque pre-P3 local-operator.key under
+// dgHome WITHOUT creating it, returning "" when the file does not exist (design
+// §6, ADV-17). Since P3, `serve` mints a single secp256k1 nostr operator key and
+// uses its pubkey as State.OperatorKey from the first solo run, so this opaque key
+// is no longer created; it survives only in homes bootstrapped by pre-P3 binaries,
+// where it is a read-only migration input (registered as a wire-alias of the nostr
+// key so historical solo operator records re-attribute — see applyLegacyOperatorAlias).
+func loadLegacyLocalOperatorKey(dgHome string) (string, error) {
+	path := filepath.Join(dgHome, "local-operator.key")
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return "", nil
+	}
+	if err != nil {
+		return "", fmt.Errorf("reading %s: %w", path, err)
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// applyLegacyOperatorAlias registers the opaque pre-P3 local operator key as a
+// wire-alias of the stable nostr operator key on the engine State (design §6,
+// ADV-17), so the engine's startup Replay re-attributes historical solo operator
+// records (whose Sender is the legacy key) to State.OperatorKey instead of dropping
+// them at the sender-must-be-operator gate. MUST be called BEFORE eng.Start (the
+// alias must be in place for the fold). Local only — no relay IO. A no-op when
+// there is no legacy key or it already equals the nostr key, which keeps a fresh
+// home's individual tier byte-for-byte unchanged.
+func applyLegacyOperatorAlias(st *exchange.State, legacyOperatorKey, operatorKey string, logf func(string, ...any)) {
+	if legacyOperatorKey == "" || legacyOperatorKey == operatorKey {
+		return
+	}
+	st.RegisterWireAlias(legacyOperatorKey, operatorKey)
+	if logf != nil {
+		logf("  migration: legacy operator key %s… re-attributed to nostr operator identity (wire-alias, no re-sign)", legacyOperatorKey[:16])
+	}
+}
+
+// loadOrCreateLocalOperatorKey returns the persisted opaque local operator key
+// under dgHome, generating and persisting a fresh random one on first run.
+//
+// SINCE P3 (design §6, ADV-17) this is NO LONGER on the `serve` path: serve mints a
+// single secp256k1 nostr operator key and uses its pubkey as State.OperatorKey from
+// the first solo run (see runServeLocal + loadLegacyLocalOperatorKey). This helper
+// is retained only for the individual-tier engine tests that build an engine with an
+// arbitrary opaque operator key. It is an opaque local identifier only (no
+// cryptographic identity, no relay).
 func loadOrCreateLocalOperatorKey(dgHome string) (string, error) {
 	// Atomic create-or-load (dontguess-ed5): concurrent first-runs converge on
 	// ONE local operator key instead of racing WriteFile (last-writer-wins).
