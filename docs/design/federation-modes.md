@@ -23,7 +23,7 @@ ladder — **treat `onboarding-tiered-scaling-federation.md` as authoritative wh
 | Mode 1: Project (filesystem-local campfire) | **SOLO** (`dontguess up`, local, no relay) | Shipped, nostr-native, no campfire |
 | Mode 2: Individual (center campfire, cross-project) | Folded into SOLO — one local operator identity covers all projects on a machine | Shipped |
 | Mode 3: Team (hosted/self-hosted/direct-P2P campfire) | **FLEET** (`dontguess up --relay`, strfry relay, roster-gated allowlist) | Shipped, nostr relay replaces all three campfire hosting options |
-| Mode 4: Organization (campfire peering + `federation:*` messages) | **FEDERATION, router mode** | Trust model RULED (`federation.md` §3.1/§3.3), wire protocol OPEN (P9), code NOT started (P10 blocked on P9) |
+| Mode 4: Organization (campfire peering + `federation:*` messages) | **FEDERATION, router mode** | Trust model RULED (`federation.md` §3.1/§3.3), wire protocol RULED (`federation-infra-p9-router-decision.md`, P9 closed), code = P10 (unblocked) |
 | Mode 5: Global (agentic-internet directory + routing + portable trust) | **FEDERATION, open/global** | DEFERRED — `onboarding-tiered-scaling-federation.md` §10 open question 3; do not promise this while agent-level web-of-trust is explicitly rejected (see `federation.md` §3.3) |
 
 ---
@@ -58,11 +58,10 @@ via bilateral, revocable agreements — never a shared campfire, never transitiv
 - **Settlement:** scrip stays local (no cross-operator mint); un-graduated operators settle via
   pre-funded x402 escrow, never trailing bilateral credit (ADV-12).
 - **Wire protocol (`federation:*` nostr event kinds for propose/accept/inventory-offer/
-  match-request/match-confirm/revoke/reconcile):** **OPEN.** The campfire-message versions of these
-  operations from the pre-nostr design are retired (transport doesn't exist anymore); their nostr-
-  event replacements are P9 design work (`onboarding-tiered-scaling-federation.md` §9, Gate C) —
-  not yet specified field-by-field. **Do not implement `dontguess federate` (P10) against this
-  document; P10 is explicitly blocked on P9 closing.**
+  match-request/match-confirm/revoke/reconcile):** **RULED** in `federation-infra-p9-router-decision.md`
+  (P9 closed) — one shared `KindFederation=3420` + `["op",…]` sub-ops, addressable beacon
+  `KindExchangeBeacon=30402`, each op specified field-by-field. **P10 (`dontguess federate`, router
+  mode) may now build against the P9 doc.**
 
 **Infrastructure required:** Always-on relay-attached hosting for each exchange (same as FLEET) —
 federation cannot run from a laptop that sleeps.

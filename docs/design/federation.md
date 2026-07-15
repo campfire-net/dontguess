@@ -2,10 +2,12 @@
 
 **Date:** 2026-03-28 (original) / **rewritten 2026-07-15** for nostr-first infra
 **Author:** Convention Designer (Opus) / doc-cascade rewrite per dontguess-fd8
-**Status:** PARTIALLY RULED. Router-mode federation is decision-complete on paper (§1). Custodial-mode
-integrity, sybil-trust weighting mechanics, and the full `federation:*` nostr event schemas are **OPEN**
-pending Gate C / P9 (`docs/design/onboarding-tiered-scaling-federation.md` §5, §9). **Do not implement
-`dontguess federate` code from this document alone — P9 is the design item that must close first.**
+**Status:** RULED. Router-mode federation is decision-complete on paper (§1). The `federation:*` nostr
+event schemas, the `resell` put field, custodial-mode integrity (ADV-9), the ADV-11 trust-signal
+weighting, and x402-escrow settlement are now **all ruled in the P9 decision doc**
+(`docs/design/federation-infra-p9-router-decision.md`) — P10 (router mode) may build against it. Custodial
+*implementation* remains a separate later item. **For the wire protocol, the P9 doc is authoritative
+over this document** (this doc left it OPEN and deferred it to P9).
 **Depends on:** `docs/design/content-confidentiality-envelope-541.md` (§541), `onboarding-tiered-scaling-federation.md` §5/§9
 
 ---
