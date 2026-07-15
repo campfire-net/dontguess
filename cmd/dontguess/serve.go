@@ -746,7 +746,12 @@ func resolveOperatorSocketPath(dgHome string) string {
 		runtimeDir = os.TempDir()
 	}
 	hash := sha256.Sum256([]byte(dgHome))
-	return filepath.Join(runtimeDir, fmt.Sprintf("dontguess-%x.sock", hash[:8]))
+	// dontguess-f8f: route through a dedicated per-operator subdirectory so the
+	// 0700 chmod applied by listenOperatorSocket lands on a directory this
+	// operator owns, never on the shared runtimeDir (or /tmp when
+	// XDG_RUNTIME_DIR is unset).
+	subdir := fmt.Sprintf("dontguess-%x", hash[:8])
+	return filepath.Join(runtimeDir, subdir, "dontguess.sock")
 }
 
 // recordOperatorSocketPath persists the resolved socket path into the

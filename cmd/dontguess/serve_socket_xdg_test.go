@@ -19,6 +19,18 @@ package main
 //     then greps the returned error text plus this file's production code to
 //     prove no WARN-and-continue path survives: bindOperatorSocket must
 //     return (nil, error), never (nil, nil).
+//
+//  3. TestBindOperatorSocket_UnsetXDGRuntimeDir_DoesNotTouchTempDirPerms
+//     (dontguess-f8f, review dontguess-b07 MEDIUM) is the ground-source test
+//     for the os.TempDir() fallback branch — the two tests above ALWAYS set
+//     XDG_RUNTIME_DIR to a fresh 0700 dir, which masked the real regression:
+//     an unset XDG_RUNTIME_DIR falls back to os.TempDir() (real /tmp outside
+//     the test sandbox on most CI/dev boxes), and the pre-fix code chmod
+//     0700'd os.TempDir() itself. This test genuinely unsets the env var,
+//     records os.TempDir()'s real permission bits before and after a real
+//     bindOperatorSocket call, and asserts they are byte-for-byte unchanged —
+//     while also asserting the bound socket lives inside a dedicated,
+//     actually-0700 subdirectory one level under os.TempDir().
 
 import (
 	"context"
@@ -199,4 +211,110 @@ func TestBindOperatorSocket_BindFailure_IsHardError(t *testing.T) {
 		t.Fatalf("bindOperatorSocket returned a non-nil cleanup alongside an error — caller could still treat this as success")
 	}
 	t.Logf("bindOperatorSocket correctly failed loud: %v", err)
+}
+
+// TestBindOperatorSocket_UnsetXDGRuntimeDir_DoesNotTouchTempDirPerms is the
+// dontguess-f8f ground-source test: with XDG_RUNTIME_DIR genuinely UNSET
+// (not just empty-set, and not a fresh 0700 test dir), resolveOperatorSocketPath
+// falls back to the REAL os.TempDir() (e.g. /tmp). Before this fix,
+// listenOperatorSocket chmod'd the socket's parent directory — which, for the
+// pre-fix bare "<runtimeDir>/dontguess-<hash>.sock" path, WAS os.TempDir()
+// itself, so a long-DG_HOME deployment with no XDG_RUNTIME_DIR set (any bare
+// systemd service, container, or minimal shell) silently chmod'd /tmp to
+// 0700, breaking every other process on the box that depends on /tmp being
+// world-writable/sticky. This test proves that regression is fixed: it reads
+// os.TempDir()'s real permission bits before and after a genuine bind, and
+// requires byte-identical output, while independently confirming the bound
+// socket lives inside its own private 0700 subdirectory rather than directly
+// under os.TempDir().
+func TestBindOperatorSocket_UnsetXDGRuntimeDir_DoesNotTouchTempDirPerms(t *testing.T) {
+	// Genuinely UNSET XDG_RUNTIME_DIR — t.Setenv cannot express "unset", and
+	// setting it to "" is observationally identical to unset for
+	// os.Getenv/this code path, but we go further and actually unset it so
+	// this test also guards against any future os.LookupEnv-based check.
+	prevVal, prevSet := os.LookupEnv("XDG_RUNTIME_DIR")
+	if err := os.Unsetenv("XDG_RUNTIME_DIR"); err != nil {
+		t.Fatalf("Unsetenv XDG_RUNTIME_DIR: %v", err)
+	}
+	t.Cleanup(func() {
+		if prevSet {
+			_ = os.Setenv("XDG_RUNTIME_DIR", prevVal)
+		} else {
+			_ = os.Unsetenv("XDG_RUNTIME_DIR")
+		}
+	})
+
+	tempDir := os.TempDir()
+	beforeInfo, serr := os.Stat(tempDir)
+	if serr != nil {
+		t.Fatalf("stat os.TempDir() %q before bind: %v", tempDir, serr)
+	}
+	beforePerm := beforeInfo.Mode().Perm()
+
+	base := t.TempDir()
+	longSegment := strings.Repeat("c", 120)
+	dgHome := filepath.Join(base, longSegment)
+	if err := os.MkdirAll(dgHome, 0700); err != nil {
+		t.Fatalf("mkdir dgHome: %v", err)
+	}
+	defaultPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
+	if len(defaultPath) <= maxUnixSocketPathLen {
+		t.Fatalf("test setup bug: default path %d bytes, want > %d", len(defaultPath), maxUnixSocketPathLen)
+	}
+
+	resolved := resolveOperatorSocketPath(dgHome)
+	if !strings.HasPrefix(resolved, tempDir) {
+		t.Fatalf("resolved socket path %q not under os.TempDir() %q — fallback did not happen", resolved, tempDir)
+	}
+	// The resolved path must NOT be a bare file directly under tempDir — it
+	// must be nested one level deeper, in a dedicated subdirectory, so the
+	// 0700 chmod in listenOperatorSocket (which targets filepath.Dir(path))
+	// never lands on tempDir itself.
+	socketParent := filepath.Dir(resolved)
+	if socketParent == filepath.Clean(tempDir) {
+		t.Fatalf("resolved socket %q has os.TempDir() itself as its parent — chmod 0700 would hit os.TempDir(), not a private subdir", resolved)
+	}
+	if filepath.Dir(socketParent) != filepath.Clean(tempDir) {
+		t.Fatalf("resolved socket parent %q is not exactly one level under os.TempDir() %q", socketParent, tempDir)
+	}
+
+	eng := newXDGTestEngine(t, dgHome)
+	logger := log.New(os.Stderr, "[test-f8f] ", 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cleanup, err := bindOperatorSocket(ctx, dgHome, eng, logger)
+	if err != nil {
+		t.Fatalf("bindOperatorSocket with unset XDG_RUNTIME_DIR: %v", err)
+	}
+	defer cleanup()
+	defer func() { _ = os.RemoveAll(socketParent) }()
+
+	// Real bind must actually be listening — dial it.
+	conn, derr := net.Dial("unix", resolved)
+	if derr != nil {
+		t.Fatalf("dialing resolved socket %q: %v", resolved, derr)
+	}
+	conn.Close() //nolint:errcheck
+
+	// The private subdirectory holding the socket must itself be 0700 —
+	// the TOCTOU-closing guarantee from dontguess-33a, now proven to apply
+	// to the os.TempDir()-fallback relocation path too.
+	parentInfo, perr := os.Stat(socketParent)
+	if perr != nil {
+		t.Fatalf("stat socket parent dir %q after bind: %v", socketParent, perr)
+	}
+	if got := parentInfo.Mode().Perm(); got != 0700 {
+		t.Fatalf("socket parent dir %q has perm %o, want 0700", socketParent, got)
+	}
+
+	// The load-bearing assertion: os.TempDir()'s own permission bits must be
+	// byte-for-byte unchanged by the bind.
+	afterInfo, aerr := os.Stat(tempDir)
+	if aerr != nil {
+		t.Fatalf("stat os.TempDir() %q after bind: %v", tempDir, aerr)
+	}
+	if afterPerm := afterInfo.Mode().Perm(); afterPerm != beforePerm {
+		t.Fatalf("os.TempDir() %q permissions changed by bindOperatorSocket: before=%o after=%o — the exact dontguess-f8f regression (shared /tmp chmod'd to 0700)", tempDir, beforePerm, afterPerm)
+	}
 }
