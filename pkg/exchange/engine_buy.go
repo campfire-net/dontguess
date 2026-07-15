@@ -648,6 +648,16 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 	if entry.WrappedCEKOperator != "" {
 		return nil // v2 confidential entry: see skipCompressionForV2.
 	}
+	if entry.LegacyPlaintext {
+		// Defense-in-depth (dontguess-751): a GRANDFATHERED pre-climb entry's
+		// ContentHash is sha256(plaintext) — the same A1/P1 hash oracle
+		// skipCompressionForV2 guards against for v2 confidential entries.
+		// findCandidates already fences these out of the match candidate set
+		// and emitMatchResponse independently skips them (dontguess-9d1), but
+		// this helper must not rely on those upstream gates never being
+		// reordered: never embed content_hash for a grandfathered entry.
+		return nil
+	}
 	bounty := entry.TokenCost * HotCompressionBountyPct / 100
 	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
 	payload, err := json.Marshal(map[string]any{
@@ -685,6 +695,11 @@ func (e *Engine) sendCompressionAssign(entry *InventoryEntry) error {
 func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey string) error {
 	if entry.WrappedCEKOperator != "" {
 		return nil // v2 confidential entry: see skipCompressionForV2.
+	}
+	if entry.LegacyPlaintext {
+		// Defense-in-depth (dontguess-751): see sendCompressionAssign above —
+		// same ContentHash=sha256(plaintext) oracle for a grandfathered entry.
+		return nil
 	}
 	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
 	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
