@@ -416,6 +416,12 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 	// keys that a non-nil allowlist would brick). Config is best-effort: an absent
 	// config yields an empty allowlist that admits only the operator key.
 	var trustChecker *exchange.TrustChecker
+	// rosterFold folds operator-signed kind-30078 fleet roster events into the SAME
+	// KeySet the TrustChecker enforces, making the roster event the KeySet's source
+	// of truth (design §2/P5, dontguess-c06). nil on the individual tier (no relay,
+	// no roster). Built in the team-tier block below over ks, then handed to
+	// attachRelayLegsAsync so every relay leg's reader routes rosters into it.
+	var rosterFold *rosterFolder
 	// scripStore stays a nil scrip.SpendingStore interface on the individual/
 	// no-relay tier (content moves free — correct: the operator is the sole local
 	// writer and local puts use random per-call sender keys). Declared here (not
@@ -476,6 +482,12 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 			return fmt.Errorf("trust checker: %w", terr)
 		}
 		trustChecker = tc
+		// Fold operator-signed fleet roster events (kind 30078) into THIS ks — the
+		// same KeySet the TrustChecker/SEAM A/B gates enforce — so an operator-signed
+		// roster on the relay log is the KeySet's source of truth (design §2/P5). The
+		// static config allowlist above seeds the initial set; the relay backfill's
+		// latest roster then reconciles it via ReplaceAll on fold.
+		rosterFold = newRosterFolder(engineOperatorKey, ks, logger.Printf)
 		logger.Printf("  admission:  team tier — %d fleet npub(s) allowlisted, reputation floor %d", ks.Len(), minReputation)
 
 		// Scrip accounting (design §4): payment is enforced on the team/federated
@@ -643,7 +655,7 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 			logger.Printf("  climb-fence: %d pre-climb local record(s) fenced local-only (never republished in cleartext, ADV-18)", climbWatermark)
 		}
 		attachRelayLegsAsync(ctx, &relayWG, &legsMu, &legs, relayURLs, localStore, relaySigner,
-			localStorePath, appendNotify, eng, logger, climbWatermark)
+			localStorePath, appendNotify, eng, logger, climbWatermark, rosterFold)
 		// Combined shutdown in the dontguess-e35 order: cancel the context FIRST
 		// (unblocks every reader/outbox and every in-flight dial/attach retry),
 		// THEN wait for the attach goroutines to exit, THEN close each attached

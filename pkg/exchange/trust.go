@@ -280,6 +280,31 @@ func (k *KeySet) Remove(hexKey string) {
 	k.mu.Unlock()
 }
 
+// ReplaceAll atomically sets the admitted members to EXACTLY keys, discarding the
+// prior membership. This is the fleet-roster fold's replace semantics (design
+// §2/P5): an operator-signed kind-30078 roster event is AUTHORITATIVE FULL
+// membership (a parameterized-replaceable event, latest-wins), so folding a fresher
+// roster REPLACES the KeySet rather than unioning into it — an operator's removal
+// of a key takes effect because the new roster simply omits it. Empty/whitespace
+// entries are ignored; keys are lowercased (case-insensitive membership). The swap
+// is a single locked assignment, so a concurrent Allowed sees either the whole old
+// set or the whole new set, never a partially-applied roster. It never touches the
+// operator key — operator authority comes from TrustChecker.operatorKey, not
+// membership, so a roster can never lock the operator out of its own exchange.
+func (k *KeySet) ReplaceAll(keys ...string) {
+	next := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		key = strings.ToLower(strings.TrimSpace(key))
+		if key == "" {
+			continue
+		}
+		next[key] = struct{}{}
+	}
+	k.mu.Lock()
+	k.members = next
+	k.mu.Unlock()
+}
+
 // Allowed reports whether the hex key is admitted. Safe for concurrent use.
 func (k *KeySet) Allowed(hexKey string) bool {
 	hexKey = strings.ToLower(strings.TrimSpace(hexKey))

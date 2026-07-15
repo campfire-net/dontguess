@@ -66,6 +66,12 @@ type relayWiring struct {
 	// buildRelayWiring (WithIntakeCursorPath) — callers that omit it get the
 	// bounded-kinds fix only, matching every pre-fix test call site unchanged.
 	intakeCursor *relay.IntakeCursor
+	// roster folds operator-signed kind-30078 fleet roster events into the live
+	// TrustChecker KeySet (design §2/P5). nil when no roster folder was supplied
+	// (WithRosterFolder) — the individual tier and every pre-existing test call
+	// site, where a roster event (if one ever arrived) is simply ignored, not
+	// misrouted into the exchange Intake pipeline.
+	roster *rosterFolder
 }
 
 // relayWiringOption customises buildRelayWiring beyond its required core
@@ -79,6 +85,18 @@ type relayWiringOption func(*relayWiringConfig)
 type relayWiringConfig struct {
 	intakeCursorPath string
 	climbWatermark   int64
+	rosterFolder     *rosterFolder
+}
+
+// WithRosterFolder wires the operator-signed fleet-roster fold (design §2/P5) into
+// this relay leg's reader: a received kind-30078 roster event is routed to rf,
+// which re-verifies the operator signature and folds the roster into the live
+// TrustChecker KeySet. Every fleet-attached leg shares ONE rosterFolder (built in
+// serve.go from the same *KeySet the TrustChecker enforces), so the created_at
+// latest-wins guard is consistent across relays. nil (individual tier, tests that
+// do not exercise roster admission) is a strict no-op — a roster event is ignored.
+func WithRosterFolder(rf *rosterFolder) relayWiringOption {
+	return func(c *relayWiringConfig) { c.rosterFolder = rf }
 }
 
 // WithClimbWatermark threads the solo→fleet CLIMB egress fence (ADV-18, design
@@ -235,7 +253,73 @@ func buildRelayWiring(
 		return nil, 0, fmt.Errorf("relay wiring: outbox: %w", err)
 	}
 
-	return &relayWiring{seq: seq, intake: intake, outbox: outbox, metrics: metrics, intakeCursor: intakeCursor}, watermark, nil
+	return &relayWiring{seq: seq, intake: intake, outbox: outbox, metrics: metrics, intakeCursor: intakeCursor, roster: cfg.rosterFolder}, watermark, nil
+}
+
+// rosterFolder folds operator-signed kind-30078 fleet roster events into the live
+// TrustChecker KeySet — the EXCHANGE-side projection of the ONE signed roster and
+// the KeySet's SOURCE OF TRUTH (design §2/P5). It is the exchange half of the two
+// gates; the relay writePolicy half is dontguess-ef1 (optional, out-of-repo). The
+// two gates enforce DIFFERENT properties and must NEVER collapse into "relay write
+// == exchange trust" (ADV-2): this fold re-verifies the operator signature on every
+// roster ITSELF (nostr.ParseFleetRoster), so a dumb/compromised relay that forwarded
+// a FORGED roster changes the KeySet by exactly nothing.
+type rosterFolder struct {
+	operatorKey string           // pinned roster authority (npub or hex)
+	keys        *exchange.KeySet // the live enforcement KeySet the TrustChecker reads
+	logf        func(format string, args ...any)
+
+	mu          sync.Mutex
+	lastCreated int64 // latest applied roster created_at (parameterized-replaceable latest-wins)
+}
+
+// newRosterFolder builds a rosterFolder over the TrustChecker's live KeySet. A nil
+// logf defaults to a no-op sink.
+func newRosterFolder(operatorKey string, keys *exchange.KeySet, logf func(format string, args ...any)) *rosterFolder {
+	if logf == nil {
+		logf = func(string, ...any) {}
+	}
+	return &rosterFolder{operatorKey: operatorKey, keys: keys, logf: logf}
+}
+
+// fold applies one received roster event to the KeySet. A non-roster event, a
+// FORGED roster (author != the pinned operator, or a bad signature), or a STALE
+// replaceable event (created_at older than the last applied roster) changes the
+// KeySet by EXACTLY NOTHING. On a valid, fresher operator-signed roster it REPLACES
+// the KeySet with the roster's exact membership (authoritative full set,
+// latest-wins). Every rejection is logged LOUD (LOCKED-5) — a forged roster reaching
+// the fold is security-relevant and never a silent drop.
+func (rf *rosterFolder) fold(ev *nostr.Event) {
+	if rf == nil || rf.keys == nil || ev == nil {
+		return
+	}
+	members, err := nostr.ParseFleetRoster(ev, rf.operatorKey)
+	if err != nil {
+		// A non-roster kind never reaches here (runReader routes strictly by kind);
+		// so this is a claimed-roster that FAILED verification — a forged/unsigned
+		// roster. Loud, never silent.
+		rf.logf("SECURITY: fleet-roster fold REJECTED event %s: %v", shortRosterID(ev.ID), err)
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if ev.CreatedAt < rf.lastCreated {
+		rf.logf("relay/roster: ignoring stale roster %s (created_at %d < last applied %d)",
+			shortRosterID(ev.ID), ev.CreatedAt, rf.lastCreated)
+		return
+	}
+	rf.lastCreated = ev.CreatedAt
+	rf.keys.ReplaceAll(members...)
+	rf.logf("relay/roster: fleet allowlist folded from operator-signed roster %s — %d member(s) admitted",
+		shortRosterID(ev.ID), len(members))
+}
+
+// shortRosterID abbreviates an event id for log readability.
+func shortRosterID(id string) string {
+	if len(id) <= 12 {
+		return id
+	}
+	return id[:12] + "…"
 }
 
 // isOperatorOrigin reports whether a persisted record is operator-authored
@@ -558,7 +642,19 @@ func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *de
 			if f.Event == nil {
 				continue
 			}
-			if herr := w.intake.HandleEvent(identityToNostrEvent(f.Event)); herr != nil {
+			if f.Event.Kind == nostr.KindFleetRoster {
+				// FLEET ROSTER (design §2/P5). The roster is a SEPARATE projection —
+				// NOT an exchange message — so it must NEVER enter the Intake fold
+				// pipeline (FromNostrEvent would reject it as dropped_smuggled). Fold
+				// it directly into the live TrustChecker KeySet, re-verifying the
+				// operator signature on the roster ITSELF (rosterFolder.fold →
+				// nostr.ParseFleetRoster) so a dumb/forged relay changes nothing
+				// (ADV-2: applyPut never trusts a relay gate). A nil folder (individual
+				// tier / tests) ignores the roster rather than misrouting it.
+				if w.roster != nil {
+					w.roster.fold(identityToNostrEvent(f.Event))
+				}
+			} else if herr := w.intake.HandleEvent(identityToNostrEvent(f.Event)); herr != nil {
 				// Counted + alarmed inside the Intake already; log and keep going.
 				log.Printf("relay/reader: intake dropped event %s: %v", f.Event.ID, herr)
 			}
@@ -1084,6 +1180,7 @@ func attachRelayLegsAsync(
 	eng *exchange.Engine,
 	logger *log.Logger,
 	climbWatermark int64,
+	roster *rosterFolder,
 ) {
 	for _, relayURL := range relayURLs {
 		relayURL := relayURL
@@ -1106,7 +1203,8 @@ func attachRelayLegsAsync(
 					relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf, appendNotify,
 					eng.State().RegisterWireAlias,
 					WithIntakeCursorPath(intakeCursorPath(localStorePath, relayURL)),
-					WithClimbWatermark(climbWatermark))
+					WithClimbWatermark(climbWatermark),
+					WithRosterFolder(roster))
 				if aerr != nil {
 					_ = conn.Close()
 					if ctx.Err() != nil {
