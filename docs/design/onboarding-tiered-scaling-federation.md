@@ -240,11 +240,11 @@ Structure (RPT: the docs ARE the onboarding program — an agent executes the sa
 
 ## 10. Open questions (need a human decision)
 
-1. **ADV-8 / dontguess-640:** land buyer-side Blossom fetch (FLEET delivers large content) vs document the ≤32 KiB inline ceiling in QUICKSTART for now? (Affects whether "works at every rung" is literally true for large content.)
+1. **ADV-8 / dontguess-640:** ~~land buyer-side Blossom fetch vs document the ≤32 KiB ceiling?~~ **RULED (operator, 2026-07-15): FOLD dontguess-640 (buyer-side Blossom fetch) INTO the ladder (Gate B)** — FLEET delivers any-size content from day one; "works at every rung" is literally true for all content.
 2. **ADV-9 custodial integrity:** which rebuild — seller-signed plaintext commitment revealed post-purchase, or operator-B-signed provenance chain? (Gates custodial federation; router unaffected.)
 3. **Mode 5 open global liquidity:** confirm it stays DEFERRED (bilateral + x402-stake only for v1), or is there appetite to design the sybil economics for open federation now?
 4. **`operator export/import` custody:** 1Password-backed only, or also an HSM path? (Ties to §541 §4.2 timeline.)
-5. **macOS/launchd boot service:** in scope for `up`, or Linux/systemd-only for v1?
+5. **macOS/launchd boot service:** ~~in scope, or Linux-only v1?~~ **RULED (operator, 2026-07-15): CROSS-PLATFORM — `up` supports systemd --user + linger AND macOS launchd from day one.**
 6. **Roster event kind + writePolicy mechanism:** confirm `kind 30078` d-tag=`fleet` and that per-write operator-signature verification inside `writePolicy.py` (subscribe+cache, not per-write round-trip) is cheap enough against strfry's plugin API.
 
 <!-- adversarial-design (Workflow, structured-return): adversary+creative(opus)+systems-pragmatist(sonnet)+domain-purist(opus)+architect(opus); 2026-07-15 -->
