@@ -46,14 +46,20 @@ const (
 	KindInventoryProjection = 30401 // inventory+price PROJECTION (addressable, NOT source of truth)
 )
 
-// DontguessKinds is the full set of nostr kinds the dontguess protocol emits or
-// consumes as regular (non-projection) exchange messages. It bounds every relay
-// Intake subscribe REQ to ONLY these kinds so a fresh operator's backfill (and
-// the periodic resync audit) reads the exchange's own event stream instead of
-// the relay's entire firehose across every kind any client has ever published
-// there (dontguess-61a — the dropped_smuggled flood). It deliberately excludes
-// KindInventoryProjection (30401): that is an addressable projection the
-// operator PUBLISHES from derived state, never something Intake backfills.
+// DontguessKinds is the full set of nostr kinds the dontguess protocol subscribes
+// to. It bounds every relay subscribe REQ to ONLY these kinds so a fresh operator's
+// backfill (and the periodic resync audit) reads the exchange's own event stream
+// instead of the relay's entire firehose across every kind any client has ever
+// published there (dontguess-61a — the dropped_smuggled flood).
+//
+// KindFleetRoster (30078) is included because the operator-signed fleet roster is
+// the KeySet's source of truth and MUST be backfilled to rebuild the live fleet
+// allowlist after a restart (design §2/P5). Unlike the exchange message kinds it is
+// NOT routed through the Intake fold — the relay reader intercepts it by kind and
+// folds it into the TrustChecker KeySet directly (the roster projection), never
+// through FromNostrEvent. It deliberately EXCLUDES KindInventoryProjection (30401):
+// that is an addressable projection the operator PUBLISHES from derived state and
+// never re-ingests.
 var DontguessKinds = []int{
 	KindPut,
 	KindBuy,
@@ -63,6 +69,7 @@ var DontguessKinds = []int{
 	KindConsume,
 	KindInvite,
 	KindScrip,
+	KindFleetRoster,
 }
 
 // Nostr tag names used by the adapter.
