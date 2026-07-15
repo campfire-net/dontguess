@@ -850,3 +850,99 @@ func shutdownRelayTransport(cancel context.CancelFunc, closeConn func() error, s
 // watermark on (re)subscribe so no event straddling the cursor is missed; the
 // Sequencer dedups the redelivered overlap (§2.5).
 const reconnectSlackSeconds = int64(60)
+
+// relayLeg is one successfully-attached relay transport leg's shutdown
+// handles: the live connection (closed first so in-flight IO unblocks) and
+// the stop func attachRelayTransport returned (waits for its goroutines).
+type relayLeg struct {
+	conn *relay.Conn
+	stop func()
+}
+
+// relayAttachInitialBackoff / relayAttachMaxBackoff bound the retry schedule
+// attachRelayLegsAsync uses when a leg's attachRelayTransport call fails
+// (typically the initial REQ Send / dial+auth against an unreachable relay).
+// Package vars so tests can shrink them for deterministic, fast retry
+// coverage without touching production behavior.
+var (
+	relayAttachInitialBackoff = 2 * time.Second
+	relayAttachMaxBackoff     = 30 * time.Second
+)
+
+// attachRelayLegsAsync attaches one relay transport leg per URL in relayURLs,
+// each in its OWN background retry goroutine (dontguess-347, design §4/§9 Gate
+// A/P1). This is what keeps a dead/slow relay from blocking serve startup: the
+// operator socket (bound by bindOperatorSocket, BEFORE this is called) and the
+// engine loop come up immediately, while each leg's dial + NIP-42 handshake +
+// restart-seed (seedEmittedFromStore) + migration guard
+// (guardOperatorKeyMigration) + initial REQ Send run off the startup path. A
+// leg that fails to attach (attachRelayTransport returns an error — most
+// commonly the initial REQ Send blocking/failing against an unreachable
+// relay) is retried with exponential backoff, bounded by
+// relayAttachInitialBackoff/relayAttachMaxBackoff, until it succeeds or ctx is
+// cancelled. wg is incremented once per relay URL and Done exactly once when
+// that URL's goroutine exits (success or ctx cancellation) — callers wait on
+// it during shutdown, AFTER cancelling ctx, so no goroutine is left running
+// past the caller's cleanup. Successfully-attached legs are appended to
+// *legs under legsMu (the slice may be read concurrently by the caller's
+// shutdown path once wg.Wait() returns, so all writes happen only under the
+// lock and all appends happen-before the corresponding wg.Done()).
+func attachRelayLegsAsync(
+	ctx context.Context,
+	wg *sync.WaitGroup,
+	legsMu *sync.Mutex,
+	legs *[]relayLeg,
+	relayURLs []string,
+	localStore *dgstore.Store,
+	relaySigner *identity.Secp256k1Identity,
+	localStorePath string,
+	appendNotify *appendNotifier,
+	eng *exchange.Engine,
+	logger *log.Logger,
+) {
+	for _, relayURL := range relayURLs {
+		relayURL := relayURL
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			backoff := relayAttachInitialBackoff
+			for {
+				if ctx.Err() != nil {
+					return
+				}
+				// WithoutClientAuth: match the client side (relayclient.go DEFAULT)
+				// and the production strfry relays, which gate writes by a
+				// signed-author allowlist and never push a NIP-42 AUTH challenge.
+				// Without this the leg blocks forever in dialAndAuth on a challenge
+				// that never arrives (conn.go §WithoutClientAuth) — now confined to
+				// this async retry goroutine, never the startup path.
+				conn := relay.New(relayURL, relaySigner, relay.WithoutClientAuth())
+				stop, aerr := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
+					relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf, appendNotify,
+					eng.State().RegisterWireAlias,
+					WithIntakeCursorPath(intakeCursorPath(localStorePath, relayURL)))
+				if aerr != nil {
+					_ = conn.Close()
+					if ctx.Err() != nil {
+						return
+					}
+					logger.Printf("  relay:     %s attach failed (retrying in %s): %v", relayURL, backoff, aerr)
+					select {
+					case <-ctx.Done():
+						return
+					case <-time.After(backoff):
+					}
+					if backoff *= 2; backoff > relayAttachMaxBackoff {
+						backoff = relayAttachMaxBackoff
+					}
+					continue
+				}
+				legsMu.Lock()
+				*legs = append(*legs, relayLeg{conn: conn, stop: stop})
+				legsMu.Unlock()
+				logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
+				return
+			}
+		}()
+	}
+}

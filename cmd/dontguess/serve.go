@@ -21,7 +21,6 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
-	"github.com/3dl-dev/dontguess/pkg/relay"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	dgstore "github.com/3dl-dev/dontguess/pkg/store"
 	"github.com/spf13/cobra"
@@ -426,41 +425,42 @@ func runServeLocal(dgHome string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer cancel()
 
+	// Bind the operator IPC socket BEFORE the relay-attach loop (dontguess-347,
+	// design §4/§9 Gate A/P1). status/accept-put/mint must respond within 1s of
+	// serve start even with a dead/slow relay attached; attachRelayTransport's
+	// initial REQ Send (and, transitively, Conn.dialAndAuth) can block for
+	// seconds against an unreachable relay, so the socket cannot wait behind it.
+	socketCleanup := bindOperatorSocket(ctx, dgHome, eng, logger)
+	if socketCleanup != nil {
+		defer socketCleanup()
+	}
+
 	// Attach one relay transport leg (Intake + Outbox + restart-seed) per
-	// configured relay URL. Each leg tails the SAME localStore and publishes
-	// with its own durable cursor (relayCursorPath, keyed by URL) so the relays'
-	// publish watermarks never collide; every leg reads the engine's fold, which
-	// is off the buy/match hot path (docs/design/relay-transport.md §2.4).
-	type relayLeg struct {
-		conn *relay.Conn
-		stop func()
-	}
+	// configured relay URL, ASYNCHRONOUSLY (dontguess-347): each leg's dial +
+	// NIP-42 handshake + restart-seed + initial REQ Send runs in its own retry
+	// goroutine, off the startup path, so a dead/slow relay never blocks the
+	// operator socket (bound above) or the engine loop from coming up. Each leg
+	// tails the SAME localStore and publishes with its own durable cursor
+	// (relayCursorPath, keyed by URL) so the relays' publish watermarks never
+	// collide; every leg reads the engine's fold, which is off the buy/match hot
+	// path (docs/design/relay-transport.md §2.4).
+	var legsMu sync.Mutex
 	var legs []relayLeg
-	for _, relayURL := range relayURLs {
-		// WithoutClientAuth: match the client side (relayclient.go DEFAULT) and the
-		// production strfry relays, which gate writes by a signed-author allowlist
-		// and never push a NIP-42 AUTH challenge. Without this the operator's leg
-		// blocks forever in dialAndAuth on a challenge that never arrives (conn.go
-		// §WithoutClientAuth), hanging serve startup before the operator socket binds.
-		conn := relay.New(relayURL, relaySigner, relay.WithoutClientAuth())
-		stop, aerr := attachRelayTransport(ctx, localStore, relaySigner, relaySigner.PubKeyHex(),
-			relayCursorPath(localStorePath, relayURL), conn, conn, 5*time.Second, logger.Printf, appendNotify,
-			eng.State().RegisterWireAlias,
-			WithIntakeCursorPath(intakeCursorPath(localStorePath, relayURL)))
-		if aerr != nil {
-			return fmt.Errorf("attaching relay transport for %s: %w", relayURL, aerr)
-		}
-		legs = append(legs, relayLeg{conn: conn, stop: stop})
-		logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
-	}
-	if len(legs) > 0 {
+	var relayWG sync.WaitGroup
+	if len(relayURLs) > 0 {
+		attachRelayLegsAsync(ctx, &relayWG, &legsMu, &legs, relayURLs, localStore, relaySigner,
+			localStorePath, appendNotify, eng, logger)
 		// Combined shutdown in the dontguess-e35 order: cancel the context FIRST
-		// (unblocks every reader/outbox), THEN close each connection and wait for
-		// its goroutines to exit. A bare `defer cancel()` running last under LIFO
-		// would let stop() (wg.Wait()) run first and hang forever; cancel-then-wait
-		// as one defer avoids that.
+		// (unblocks every reader/outbox and every in-flight dial/attach retry),
+		// THEN wait for the attach goroutines to exit, THEN close each attached
+		// connection and wait for its goroutines to exit. A bare `defer cancel()`
+		// running last under LIFO would let stop() (wg.Wait()) run first and hang
+		// forever; cancel-then-wait as one defer avoids that.
 		defer func() {
 			cancel()
+			relayWG.Wait()
+			legsMu.Lock()
+			defer legsMu.Unlock()
 			for _, leg := range legs {
 				_ = leg.conn.Close()
 				leg.stop()
@@ -468,7 +468,7 @@ func runServeLocal(dgHome string) error {
 		}()
 	}
 
-	logger.Printf("exchange serving (campfire-free, %d relay leg(s))", len(legs))
+	logger.Printf("exchange serving (campfire-free, %d relay URL(s) configured)", len(relayURLs))
 	logger.Printf("  operator:  %s", engineOperatorKey[:16]+"...")
 	logger.Printf("  poll:      %s", servePollInterval)
 	logger.Printf("  auto-accept: %v (max %d)", serveAutoAccept, serveAutoAcceptMax)
@@ -556,12 +556,41 @@ func loadOrCreateNostrOperatorIdentity(dgHome string) (*identity.Secp256k1Identi
 	return identity.LoadOrCreatePrivHexKey(filepath.Join(dgHome, "nostr-operator.key"))
 }
 
+// bindOperatorSocket binds the operator IPC unix socket and starts serving
+// requests over it in the background (dontguess-347). Extracted out of
+// runEngineLoop so runServeLocal can call it BEFORE the relay-attach loop:
+// status/accept-put/mint must respond within 1s of serve start even with a
+// dead/slow relay attached, and attachRelayTransport's dial + NIP-42 handshake
+// (Conn.dialAndAuth) can block for seconds against an unreachable relay — the
+// socket cannot be left waiting behind it. The socket lives inside a 0700
+// subdirectory so the parent-level permissions bound the TOCTOU window at the
+// directory level (dontguess-33a, post-sec-regression fix). Returns a cleanup
+// func that closes the listener and removes the socket file; nil if the
+// socket could not be bound (non-fatal — matches the prior warning-only
+// behavior, an operator without IPC still runs the engine loop).
+func bindOperatorSocket(ctx context.Context, dgHome string, eng *exchange.Engine, logger *log.Logger) func() {
+	sockPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
+	ln, err := listenOperatorSocket(sockPath)
+	if err != nil {
+		logger.Printf("warning: operator socket unavailable: %v", err)
+		return nil
+	}
+	logger.Printf("  operator socket: %s", sockPath)
+	go serveOperatorSocket(ctx, ln, eng)
+	return func() {
+		ln.Close()
+		os.Remove(sockPath)
+	}
+}
+
 // runEngineLoop wires the operator-facing plumbing shared by both serve
-// paths — the auto-accept ticker, the operator IPC socket, and the engine
-// event loop itself — around an already-configured Engine. Used by both
-// runServe (campfire-backed) and runServeLocal (dontguess-275, campfire-free)
-// so the two entrypoints differ only in how the Engine's ingest/egress are
-// wired (campfire ReadClient/WriteClient vs. LocalStore).
+// paths — the auto-accept ticker and the engine event loop itself — around an
+// already-configured Engine. Used by both runServe (campfire-backed) and
+// runServeLocal (dontguess-275, campfire-free) so the two entrypoints differ
+// only in how the Engine's ingest/egress are wired (campfire
+// ReadClient/WriteClient vs. LocalStore). The operator IPC socket is bound
+// separately by bindOperatorSocket (dontguess-347, called BEFORE the
+// relay-attach loop) rather than here.
 func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, logger *log.Logger) error {
 	// Auto-accept goroutine.
 	//
@@ -596,22 +625,6 @@ func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, log
 					eng.RunAutoAccept(serveAutoAcceptMax, t, skippedPuts)
 				}
 			}
-		}()
-	}
-
-	// Unix socket IPC for operator CLI commands. The socket lives inside a
-	// 0700 subdirectory so the parent-level permissions bound the TOCTOU
-	// window at the dir level (dontguess-33a, post-sec-regression fix).
-	sockPath := filepath.Join(dgHome, "ipc", "dontguess.sock")
-	ln, err := listenOperatorSocket(sockPath)
-	if err != nil {
-		logger.Printf("warning: operator socket unavailable: %v", err)
-	} else {
-		logger.Printf("  operator socket: %s", sockPath)
-		go serveOperatorSocket(ctx, ln, eng)
-		defer func() {
-			ln.Close()
-			os.Remove(sockPath)
 		}()
 	}
 
