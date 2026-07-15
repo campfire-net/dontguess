@@ -1228,6 +1228,28 @@ type State struct {
 	//   - Reset on Replay — rebuilt from the log by re-running applyPut for all msgs.
 	contentHashIndex map[string]struct{}
 
+	// foldDenialCounted, hopDepthCounted, consumeCounted, and disputeCounted
+	// (dontguess-f86) are per-message-ID dedup guards for fold-path accumulators
+	// that are raw counter/slice increments with no natural existing
+	// per-message-ID map to dedup against (unlike completedSettlements,
+	// deliverToMatch, or buyerAcceptToMatch, which already double as such
+	// guards for their respective handlers). They close a real, reachable
+	// double-apply window: foldAndDispatchLocalSnapshot (engine_core.go) claims
+	// its fold gap under localMu, then calls state.Apply for each message
+	// UNLOCKED; if a concurrent rebuildAndDispatchGapLocal's full state.Replay
+	// (which itself takes s.mu, so it does not race any SINGLE Apply call) runs
+	// between two iterations of that unlocked loop, the messages the loop has
+	// not yet reached get folded once by Replay and then AGAIN by the stale
+	// loop's own remaining Apply calls — silently double-counting whichever
+	// accumulator has no per-ID guard. All four are reset on Replay (a full
+	// rebuild starts fresh) and repopulated in log order as Replay's fold loop
+	// runs, so a message already counted by Replay is correctly skipped by any
+	// Apply call for the identical ID that lands afterward.
+	foldDenialCounted map[string]struct{}
+	hopDepthCounted   map[string]struct{}
+	consumeCounted    map[string]struct{}
+	disputeCounted    map[string]struct{}
+
 	// blobStore is the optional Blossom client seam (dontguess-7783). When set,
 	// applyPut offloads oversize content (> BlossomOffloadThreshold bytes) to the
 	// blob store instead of retaining the full raw bytes inline in the entry's

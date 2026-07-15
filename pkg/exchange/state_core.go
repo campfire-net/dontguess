@@ -61,6 +61,10 @@ func NewState() *State {
 		federationProfiles:     make(map[string]*FederationNodeProfile),
 		heldForReview:          make(map[string]struct{}),
 		contentHashIndex:       make(map[string]struct{}),
+		foldDenialCounted:      make(map[string]struct{}),
+		hopDepthCounted:        make(map[string]struct{}),
+		consumeCounted:         make(map[string]struct{}),
+		disputeCounted:         make(map[string]struct{}),
 	}
 }
 
@@ -175,6 +179,12 @@ func (s *State) Replay(msgs []Message) {
 	// The replay loop re-runs applyPut for every exchange:put message, which
 	// repopulates the index from the canonical log.
 	s.contentHashIndex = make(map[string]struct{})
+	// Fold-accumulator dedup guards (dontguess-f86) are reset so a full rebuild
+	// starts fresh and repopulates them in log order as the fold loop below runs.
+	s.foldDenialCounted = make(map[string]struct{})
+	s.hopDepthCounted = make(map[string]struct{})
+	s.consumeCounted = make(map[string]struct{})
+	s.disputeCounted = make(map[string]struct{})
 	// federationProfiles is NOT reset on Replay. The trust_score values written
 	// by the slow loop (via SetFederationTrustScore) are externally managed and
 	// must survive engine restarts. The HopDepth and FirstSeenAt fields will be
@@ -272,10 +282,24 @@ func (s *State) applyLocked(msg *Message) {
 // re-inflate the counters) and when no callback is wired (State built directly
 // in tests). Caller must hold s.mu — the callback only touches atomic counters
 // and the logger, so holding s.mu across it introduces no lock-ordering hazard.
+//
+// Per-message-ID dedup guard (dontguess-f86): foldDenialCounted ensures a given
+// message's denial is counted at most once even if the SAME message is folded
+// twice — e.g. once inside a concurrent rebuildAndDispatchGapLocal's full
+// state.Replay and again by a poll-loop foldAndDispatchLocalSnapshot's stale,
+// unlocked in-flight Apply loop (see State.foldDenialCounted doc). Previously
+// this guard was ONLY s.replaying, which suppresses counting for the entire
+// duration of a Replay call but does nothing once Replay returns — so a
+// message re-applied via a standalone Apply after Replay finished still
+// double-counted its denial reason.
 func (s *State) recordFoldDenial(reason foldDenialReason, msg *Message) {
 	if s.replaying || s.onFoldDenial == nil {
 		return
 	}
+	if _, seen := s.foldDenialCounted[msg.ID]; seen {
+		return
+	}
+	s.foldDenialCounted[msg.ID] = struct{}{}
 	s.onFoldDenial(reason, msg)
 }
 
@@ -389,11 +413,22 @@ func (s *State) applyConsume(msg *Message) {
 		s.recordFoldDenial(foldDenialNotOperator, msg)
 		return
 	}
+	// Per-message-ID dedup guard (dontguess-f86, consumeCounted): entryConsumeCount++
+	// is a raw counter increment with no natural per-message-ID map to dedup
+	// against. Without this guard a concurrent rebuildAndDispatchGapLocal
+	// state.Replay racing foldAndDispatchLocalSnapshot's unlocked incremental
+	// Apply loop double-counts the consume signal (see State.foldDenialCounted
+	// doc for the exact interleave), skewing the M5 consume signal
+	// (dontguess-860) the pricing/behavioral-signal layer reads.
+	if _, dup := s.consumeCounted[msg.ID]; dup {
+		return
+	}
 	var p struct {
 		EntryID string `json:"entry_id"`
 	}
 	if err := json.Unmarshal(msg.Payload, &p); err != nil || p.EntryID == "" {
 		return
 	}
+	s.consumeCounted[msg.ID] = struct{}{}
 	s.entryConsumeCount[p.EntryID]++
 }

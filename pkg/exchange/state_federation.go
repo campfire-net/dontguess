@@ -13,7 +13,19 @@ import "time"
 // design limitation (see §4A F4 permanent constraint): hop depth is weighted at
 // 0.15 and serves as a corroborating signal only. The primary trust signal is
 // behavioral history (0.70 weight). Do not rely on hop depth alone for access control.
+//
+// Per-message-ID dedup guard (dontguess-f86, hopDepthCounted): this is called
+// unconditionally from applyLocked for EVERY message, with no existing
+// per-message idempotency check. A concurrent rebuildAndDispatchGapLocal
+// state.Replay racing foldAndDispatchLocalSnapshot's unlocked incremental
+// Apply loop can fold the same message twice (see State.foldDenialCounted
+// doc for the exact interleave), appending a duplicate hop-depth sample and
+// skewing the median-based FederationNodeProfile.TrustScore hop-depth term.
 func (s *State) trackSenderHopDepth(msg *Message) {
+	if _, dup := s.hopDepthCounted[msg.ID]; dup {
+		return
+	}
+	s.hopDepthCounted[msg.ID] = struct{}{}
 	hopDepth := len(msg.Antecedents)
 	key := msg.Sender
 	prof, ok := s.federationProfiles[key]

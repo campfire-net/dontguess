@@ -137,6 +137,20 @@ func (s *State) applySettleBuyerAccept(msg *Message) {
 		return
 	}
 
+	// Idempotency guard (dontguess-f86): buyerAcceptToMatch is keyed by THIS
+	// buyer-accept message's own ID (set below) and is never overwritten with
+	// a differing value for a repeat application, so its presence is a
+	// reliable per-message-ID dedup check for the WHOLE handler — including
+	// brokeredAcceptedOrders++ and entryConversionCount/stats.ConversionCount
+	// below, both raw counter increments with no guard of their own. Without
+	// it a concurrent rebuildAndDispatchGapLocal state.Replay racing
+	// foldAndDispatchLocalSnapshot's unlocked incremental Apply loop
+	// double-counts them (see State.foldDenialCounted doc for the exact
+	// interleave).
+	if _, dup := s.buyerAcceptToMatch[msg.ID]; dup {
+		return
+	}
+
 	// Parse selected entry_id from buyer-accept payload.
 	var payload struct {
 		EntryID string `json:"entry_id"`
@@ -222,6 +236,20 @@ func (s *State) applySettleBuyerReject(msg *Message) {
 func (s *State) applySettleDeliver(msg *Message) {
 	if s.OperatorKey != "" && msg.Sender != s.OperatorKey {
 		s.recordFoldDenial(foldDenialNotOperator, msg)
+		return
+	}
+	// Idempotency guard (dontguess-f86): deliverToMatch is keyed by THIS
+	// deliver message's own ID (set below) and, unlike deliveredOrders /
+	// deliverTimeByMatch, is never overwritten with a differing value for a
+	// repeat application — so its presence is a reliable per-message-ID dedup
+	// check. Without it entryDeliverCount / buyerDeliverCount /
+	// entryDeliverBuyerCount (raw counter increments, no guard of their own)
+	// double-count when a concurrent rebuildAndDispatchGapLocal state.Replay
+	// races foldAndDispatchLocalSnapshot's unlocked incremental Apply loop
+	// (see State.foldDenialCounted doc for the exact interleave) — skewing the
+	// false-positive demotion signal (dontguess-046) and the dwc
+	// false-positive-expiry refinement (dontguess-1856) that reads them.
+	if _, dup := s.deliverToMatch[msg.ID]; dup {
 		return
 	}
 	if len(msg.Antecedents) == 0 {
@@ -441,6 +469,17 @@ func (s *State) applySettleSmallContentDispute(msg *Message) {
 		return
 	}
 
+	// Per-message-ID dedup guard (dontguess-f86, disputeCounted):
+	// smallContentDisputes[entryID]++ and stats.SmallContentRefundCount++ are
+	// raw counter increments with no natural per-message-ID map to dedup
+	// against. Without this guard a concurrent rebuildAndDispatchGapLocal
+	// state.Replay racing foldAndDispatchLocalSnapshot's unlocked incremental
+	// Apply loop double-applies the -3 reputation penalty (see
+	// State.foldDenialCounted doc for the exact interleave).
+	if _, dup := s.disputeCounted[msg.ID]; dup {
+		return
+	}
+
 	// Parse entry_id from payload (informational; we cross-check against chain).
 	var payload struct {
 		EntryID string `json:"entry_id"`
@@ -467,6 +506,10 @@ func (s *State) applySettleSmallContentDispute(msg *Message) {
 	if !isSmall {
 		return
 	}
+
+	// Mark this message as processed before mutating any state (mirrors
+	// applySettleComplete's completedSettlements guard placement).
+	s.disputeCounted[msg.ID] = struct{}{}
 
 	// Track the auto-refund dispute against this entry.
 	s.smallContentDisputes[chainEntryID]++
