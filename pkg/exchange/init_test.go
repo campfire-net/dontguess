@@ -369,8 +369,13 @@ func TestInit_RejectsTeamFleetWithoutRelay(t *testing.T) {
 			if !strings.Contains(msg, string(tier)) {
 				t.Errorf("error does not name the tier %q: %q", tier, msg)
 			}
-			if !strings.Contains(msg, "--relay") {
-				t.Errorf("error does not name the relay flag: %q", msg)
+			// The remedy names the REAL remedy — DONTGUESS_RELAY_URLS — not a
+			// nonexistent --relay flag on init (dontguess-4f0 b6e3 fix).
+			if !strings.Contains(msg, "DONTGUESS_RELAY_URLS") {
+				t.Errorf("error does not name the DONTGUESS_RELAY_URLS remedy: %q", msg)
+			}
+			if strings.Contains(msg, "--relay") {
+				t.Errorf("error still names a nonexistent --relay flag on init: %q", msg)
 			}
 		})
 	}

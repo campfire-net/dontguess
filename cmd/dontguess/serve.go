@@ -136,6 +136,21 @@ func resolveServeTierAndRelays(dgHome string, operatorIdentity *identity.Secp256
 	envRelays := resolveRelayURLs()
 
 	cfg, cfgErr := exchange.LoadConfig(dgHome)
+	// Distinguish config-ABSENT from config-PRESENT-but-unreadable (dontguess-4f0,
+	// CONFIRMED HIGH confidentiality-downgrade). An ABSENT config (os.ErrNotExist)
+	// is legitimately solo — a fresh/clean home keeps working. A PRESENT config
+	// that fails to load (truncated/corrupt JSON, bad perms, or the
+	// min_reputation>max validation error) is a HARD startup error: swallowing it
+	// and defaulting to solo would silently DOWNGRADE a declared team/fleet
+	// operator to a PLAINTEXT solo store — the exact inverse of the fail-closed
+	// requirement. Refuse to boot rather than downgrade. (os.ErrNotExist is
+	// matched via errors.Is because LoadConfig wraps os.ReadFile's error with %w.)
+	if cfgErr != nil && !errors.Is(cfgErr, os.ErrNotExist) {
+		return "", nil, fmt.Errorf(
+			"startup: operator config exists but is unreadable/corrupt — refusing to boot "+
+				"(a declared team/fleet operator must NEVER silently downgrade to a plaintext solo store; "+
+				"fix or remove %s): %w", exchange.ConfigPath(dgHome), cfgErr)
+	}
 	var cfgTier exchange.Tier
 	var cfgRelays []string
 	if cfgErr == nil {
@@ -218,7 +233,8 @@ func effectiveRelayURLs(envRelays, cfgRelays []string) []string {
 func assertTierHasRelay(tier exchange.Tier, relayURLs []string) error {
 	if tier.RequiresRelay() && len(relayURLs) == 0 {
 		return fmt.Errorf(
-			"declared %q tier requires a relay but none is configured — pass --relay <url> (or set DONTGUESS_RELAY_URLS), "+
+			"declared %q tier requires a relay but none is configured — set DONTGUESS_RELAY_URLS "+
+				"(or DONTGUESS_RELAY_URL) or persist relay_urls in the operator config, "+
 				"or clear the persisted tier to run solo; refusing to start SOLO under a declared %s tier "+
 				"(no silent downgrade, no default relay)", tier, tier)
 	}

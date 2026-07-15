@@ -168,6 +168,14 @@ func ConfigPath(dgHome string) string {
 }
 
 // LoadConfig reads the exchange config from dgHome.
+//
+// It distinguishes an ABSENT config from a PRESENT-but-unreadable one so callers
+// can fail-closed on corruption without treating a fresh/clean home as an error
+// (dontguess-4f0). The os.ReadFile error is wrapped with %w, so an absent config
+// is detectable with errors.Is(err, os.ErrNotExist); any OTHER non-nil error
+// (truncated/corrupt JSON, bad perms, or the min_reputation>max validation below)
+// means the config is present but cannot be trusted — the serve-time tier guard
+// MUST refuse to boot rather than silently downgrade to a plaintext solo store.
 func LoadConfig(dgHome string) (*Config, error) {
 	data, err := os.ReadFile(ConfigPath(dgHome))
 	if err != nil {
@@ -265,7 +273,8 @@ func Init(opts InitOptions) (*Config, error) {
 	// relay explicitly. Solo / undeclared tier never trips this.
 	if tier.RequiresRelay() && len(relayURLs) == 0 {
 		return nil, fmt.Errorf(
-			"init: tier %q requires at least one relay URL, but none was supplied (pass --relay <url> or set DONTGUESS_RELAY_URLS) — "+
+			"init: tier %q requires at least one relay URL, but none was supplied (set DONTGUESS_RELAY_URLS "+
+				"or DONTGUESS_RELAY_URL, or persist relay_urls in the operator config) — "+
 				"a %s operator must declare its relay at config time (no silent solo downgrade, no default relay)", tier, tier)
 	}
 

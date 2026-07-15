@@ -86,8 +86,14 @@ func TestServeTierGuard_TeamDeclaredNoRelay_HardErrorsNoHang(t *testing.T) {
 			if !strings.Contains(msg, string(tier)) {
 				t.Errorf("tier=%s: error does not name the declared tier: %q", tier, msg)
 			}
-			if !strings.Contains(msg, "--relay") {
-				t.Errorf("tier=%s: error does not name the relay flag: %q", tier, msg)
+			// The remedy text must name the REAL remedy — the DONTGUESS_RELAY_URLS
+			// env var — not a nonexistent --relay flag on init/serve (dontguess-4f0
+			// b6e3 fix: init/serve have no --relay flag; --relay lives on put/buy).
+			if !strings.Contains(msg, "DONTGUESS_RELAY_URLS") {
+				t.Errorf("tier=%s: error does not name the DONTGUESS_RELAY_URLS remedy: %q", tier, msg)
+			}
+			if strings.Contains(msg, "--relay") {
+				t.Errorf("tier=%s: error still names a nonexistent --relay flag on serve: %q", tier, msg)
 			}
 
 			// It must have failed at the guard, never reaching the engine/socket.
@@ -266,6 +272,118 @@ func TestServeTierGuard_LiveOperatorMigration_NoSoloDowngrade(t *testing.T) {
 	case <-done:
 	case <-time.After(5 * time.Second):
 		t.Fatalf("migration runServeLocalCtx did not shut down within 5s after cancel")
+	}
+}
+
+// TestServeTierGuard_CorruptConfig_HardErrorsNeverDowngrades is the ground-source
+// veracity test for dontguess-4f0 (CONFIRMED HIGH confidentiality-downgrade). A
+// would-be team operator whose PERSISTED config becomes PRESENT-but-unreadable
+// (truncated JSON, or the min_reputation>max validation error LoadConfig returns)
+// with NO env relays must produce a HARD startup error and NEVER silently boot an
+// individual-tier / plaintext-solo store. Pre-fix, resolveServeTierAndRelays read
+// tier ONLY `if cfgErr == nil` and swallowed cfgErr → effectiveTier defaulted to
+// solo → the operator booted plaintext. This drives the REAL runServeLocal
+// entrypoint bounded and asserts (a) it returns a non-nil error and (b) the
+// operator socket NEVER comes up (it never reached a serving state).
+func TestServeTierGuard_CorruptConfig_HardErrorsNeverDowngrades(t *testing.T) {
+	// Two PRESENT-but-unreadable shapes, both for a config that WOULD have carried
+	// a team tier / relay set (the exact downgrade the reject clause forbids).
+	cases := []struct {
+		name  string
+		write func(path string) // writes a corrupt config to path
+	}{
+		{
+			name: "truncated-json",
+			write: func(path string) {
+				// A team config, truncated mid-object so json.Unmarshal fails. If the
+				// resolver swallowed this it would default to solo/plaintext.
+				if err := os.WriteFile(path, []byte(`{"tier":"team","relay_urls":["wss://relay.exampl`), 0600); err != nil {
+					t.Fatalf("writing truncated config: %v", err)
+				}
+			},
+		},
+		{
+			name: "min_reputation_over_max",
+			write: func(path string) {
+				// Parses cleanly but LoadConfig rejects it (min_reputation>max). The
+				// config DECLARES team tier + a relay, so a solo/plaintext resolution
+				// here would be the confidentiality downgrade under test.
+				cfg := map[string]any{
+					"tier":           string(exchange.TierTeam),
+					"relay_urls":     []string{"wss://relay.example:7777"},
+					"operator_key":   "aabbccddeeff00112233445566778899aabbccddeeff001122334455667788",
+					"store_path":     "events.jsonl",
+					"min_reputation": int(exchange.MaxMinReputation) + 1,
+				}
+				data, merr := json.Marshal(cfg)
+				if merr != nil {
+					t.Fatalf("marshal corrupt config: %v", merr)
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatalf("writing min_reputation config: %v", err)
+				}
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			dgHome := t.TempDir()
+			// NO env relays — the tier would come purely from the (now corrupt)
+			// persisted config, so a swallowed error downgrades to plaintext solo.
+			t.Setenv("DONTGUESS_RELAY_URLS", "")
+			t.Setenv("DONTGUESS_RELAY_URL", "")
+
+			tc.write(exchange.ConfigPath(dgHome))
+
+			err := runServeLocalBounded(t, dgHome, 5*time.Second)
+			if err == nil {
+				t.Fatalf("corrupt config (%s): runServeLocal returned nil — the operator was silently DOWNGRADED to plaintext solo (confidentiality-downgrade, guard did not fire)", tc.name)
+			}
+			// The error must be the config-unreadable refusal, not some unrelated
+			// downstream failure — it names the config path and the refusal.
+			msg := err.Error()
+			if !strings.Contains(msg, "unreadable") && !strings.Contains(msg, "corrupt") {
+				t.Errorf("corrupt config (%s): error is not the fail-closed refusal: %q", tc.name, msg)
+			}
+
+			// It must have failed BEFORE serving: the operator socket never came up.
+			if _, serr := os.Stat(resolveOperatorSocketPath(dgHome)); serr == nil {
+				t.Errorf("corrupt config (%s): operator socket exists — serve reached a serving (plaintext-solo) state past the guard", tc.name)
+			}
+		})
+	}
+}
+
+// TestServeTierGuard_AbsentConfig_ResolvesSoloControl is the CONTROL for
+// dontguess-4f0: a genuinely ABSENT config (fresh home) with no env relays must
+// still resolve to the solo tier with NO error — the fix must reject only
+// PRESENT-but-corrupt configs, never a legitimately absent one. os.ErrNotExist is
+// the distinguishing signal.
+func TestServeTierGuard_AbsentConfig_ResolvesSoloControl(t *testing.T) {
+	dgHome := t.TempDir()
+	t.Setenv("DONTGUESS_RELAY_URLS", "")
+	t.Setenv("DONTGUESS_RELAY_URL", "")
+
+	// No config written — LoadConfig will hit os.ErrNotExist.
+	if _, statErr := os.Stat(exchange.ConfigPath(dgHome)); statErr == nil {
+		t.Fatalf("precondition: config unexpectedly present at %s", exchange.ConfigPath(dgHome))
+	}
+
+	operatorIdentity, err := loadOrCreateNostrOperatorIdentity(dgHome)
+	if err != nil {
+		t.Fatalf("loadOrCreateNostrOperatorIdentity: %v", err)
+	}
+	tier, relayURLs, rerr := resolveServeTierAndRelays(dgHome, operatorIdentity, discardLogger())
+	if rerr != nil {
+		t.Fatalf("absent config: resolver returned error %v — an ABSENT config must resolve solo, not fail closed", rerr)
+	}
+	if tier != exchange.TierSolo {
+		t.Errorf("absent config: tier = %q, want %q", tier, exchange.TierSolo)
+	}
+	if len(relayURLs) != 0 {
+		t.Errorf("absent config: relayURLs = %v, want empty", relayURLs)
 	}
 }
 
