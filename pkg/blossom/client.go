@@ -96,11 +96,26 @@ func (c *Client) Put(content []byte) (string, error) {
 	return ptr, nil
 }
 
+// maxFetchBytes bounds the number of bytes Fetch will read from a blob host
+// before rejecting the response (dontguess-4f8). Fetch is deliberately
+// UNAUTHENTICATED (see package doc), so a hostile/compromised blob host or a
+// network MITM can stream an arbitrary-length response; without a cap,
+// io.ReadAll would buffer it all into memory before the caller ever gets a
+// chance to check ciphertext_hash — an unauthenticated peer could OOM the
+// buyer. The cap is exchange.MaxContentBytes (the largest plaintext a put may
+// ever declare) plus generous margin for AEAD framing/nonce/tag overhead and
+// Blossom transport padding — legitimate blobs never approach it, so this
+// never rejects real content, only unbounded floods.
+const maxFetchBytes = exchange.MaxContentBytes + 64*1024 // 1 MiB + 64 KiB margin
+
 // Fetch resolves a pointer (sha256 hex) back to its bytes via GET
 // {base}/{pointer}. A 404 maps to exchange.ErrBlobNotFound; any other non-2xx
 // or transport failure is a wrapped error. Fetch does NOT verify the bytes
 // against the pointer — integrity is the caller's responsibility (it hashes the
-// ciphertext against ciphertext_hash before decrypt, settle.go).
+// ciphertext against ciphertext_hash before decrypt, settle.go). The read is
+// bounded to maxFetchBytes (dontguess-4f8): Fetch is unauthenticated, so a
+// hostile host cannot be allowed to stream unbounded bytes into memory before
+// that hash check ever runs.
 func (c *Client) Fetch(pointer string) ([]byte, error) {
 	if c.baseURL == "" {
 		return nil, fmt.Errorf("blossom: no base URL configured")
@@ -120,9 +135,16 @@ func (c *Client) Fetch(pointer string) ([]byte, error) {
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return nil, fmt.Errorf("blossom: GET blob %s: unexpected status %s", pointer, resp.Status)
 	}
-	body, err := io.ReadAll(resp.Body)
+	// Read one byte past the cap: a legitimate blob at exactly the cap size
+	// still round-trips, while any stream that keeps producing bytes past the
+	// cap is rejected instead of being read to completion.
+	limited := io.LimitReader(resp.Body, maxFetchBytes+1)
+	body, err := io.ReadAll(limited)
 	if err != nil {
 		return nil, fmt.Errorf("blossom: GET blob %s: read body: %w", pointer, err)
+	}
+	if len(body) > maxFetchBytes {
+		return nil, fmt.Errorf("blossom: GET blob %s: response exceeds max fetch size (%d bytes)", pointer, maxFetchBytes)
 	}
 	return body, nil
 }
