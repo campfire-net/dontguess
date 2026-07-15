@@ -563,6 +563,21 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		trustChecker.SetReputationFloor(eng.State().SellerReputation, minReputation)
 	}
 
+	// Wire the Blossom blob store (dontguess-0fd) so the operator's applyPut can
+	// FETCH+verify+gate an offloaded >32 KiB blob_pointer put (state_put.go drops
+	// any blob_pointer put when s.blobStore == nil), and the deliver path can
+	// reference the same content-addressed pointer. Same DONTGUESS_BLOSSOM_URL seam
+	// the seller (put.go) and buyer (buy.go) resolve — sha256 content-addressing
+	// keeps every node converged on one pointer. Unset -> nil store -> the ≤32 KiB
+	// inline path is byte-for-byte unchanged and an oversize put is dropped by
+	// applyPut's existing no-store guard rather than silently accepted.
+	if bs := blobStoreFromEnv(); bs != nil {
+		eng.State().SetBlobStore(bs)
+		logger.Printf("  blobstore: Blossom >32 KiB offload/fetch enabled via DONTGUESS_BLOSSOM_URL")
+	} else {
+		logger.Printf("  blobstore: none (DONTGUESS_BLOSSOM_URL unset) — >32 KiB blob_pointer puts are dropped by applyPut")
+	}
+
 	// Legacy operator-key migration fold (design §6, ADV-17): register the opaque
 	// pre-P3 local operator key as a wire-alias of the stable nostr operator key
 	// BEFORE the engine's startup Replay (runEngineLoop → eng.Start), so historical

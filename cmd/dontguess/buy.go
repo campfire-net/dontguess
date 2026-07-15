@@ -18,10 +18,7 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
-	"strings"
 
-	"github.com/3dl-dev/dontguess/pkg/blossom"
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/relayclient"
@@ -41,11 +38,10 @@ import (
 var newBuyerBlobStore = defaultBuyerBlobStore
 
 func defaultBuyerBlobStore() exchange.BlobStore {
-	url := strings.TrimSpace(os.Getenv("DONTGUESS_BLOSSOM_URL"))
-	if url == "" {
-		return nil
-	}
-	return blossom.NewClient(url)
+	// Single source of the Blossom transport (blobstore_env.go, dontguess-0fd) —
+	// the seller (put.go) and operator (serve.go) resolve the same env var, so an
+	// identical ciphertext converges on one content-addressed pointer everywhere.
+	return blobStoreFromEnv()
 }
 
 // newBuyCmd builds the buy cobra command. Extracted from init() so tests can

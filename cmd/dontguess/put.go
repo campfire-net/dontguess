@@ -56,6 +56,15 @@ yet wired to this command.`,
 
 var putCmd = newPutCmd()
 
+// newSellerBlobStore resolves the seller-side Blossom client that buildPutMessage
+// (pkg/relayclient) uses to offload the CIPHERTEXT of oversize (>32 KiB) content
+// at put time, emitting enc.blob_pointer instead of enc.ciphertext
+// (dontguess-640/0fd). Overridable in tests. Default: DONTGUESS_BLOSSOM_URL ->
+// blossom.Client, or a TRUE nil interface when unset — leaving the ≤32 KiB inline
+// path unchanged and forcing an oversize put with no store to LOUD-fail closed in
+// buildPutMessage rather than inline oversize bytes or store plaintext.
+var newSellerBlobStore = blobStoreFromEnv
+
 func init() {
 	rootCmd.AddCommand(putCmd)
 }
@@ -133,6 +142,11 @@ func runPut(cmd *cobra.Command, args []string) error {
 		ContentType:    contentType,
 		Domains:        domains,
 		OperatorPubKey: operatorPubKey,
+		// Seller-side Blossom offload (dontguess-0fd): >32 KiB content has its AEAD
+		// CIPHERTEXT stored via BlobStore.Put and referenced as enc.blob_pointer;
+		// ≤32 KiB stays inline (BlobStore unused). nil (DONTGUESS_BLOSSOM_URL unset)
+		// makes buildPutMessage fail closed on oversize content — never inline it.
+		BlobStore: newSellerBlobStore(),
 	})
 	if err != nil {
 		return fmt.Errorf("put failed: %w", err)
