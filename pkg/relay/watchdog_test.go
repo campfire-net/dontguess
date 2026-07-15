@@ -215,6 +215,57 @@ func TestWatchdog_ReconnectDedupAbsorbedBackfill(t *testing.T) {
 	_ = op
 }
 
+// TestWatchdog_CheckOrphansRefetchBoundsKinds directly pins the Kinds bound on
+// the CheckOrphans targeted-antecedent refetch (watchdog.go:446,
+// Query(Filter{IDs, Kinds: w.kinds})). The other 3 REQ sites (Reconnect,
+// resync audit) already have a direct Kinds assertion; this one only had
+// incidental coverage. Wires WithDontguessKinds and asserts the exact []int
+// the emitted targeted-refetch Filter carries — a regression that dropped
+// Kinds there (unbounding the refetch to all kinds) would NOT be caught
+// without this.
+func TestWatchdog_CheckOrphansRefetchBoundsKinds(t *testing.T) {
+	boundKinds := []int{nostr.KindPut, nostr.KindBuy}
+	wd, relay, _, seq, _, _, _ := newWatchdogHarness(t, WithDontguessKinds(boundKinds))
+	seller, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate seller: %v", err)
+	}
+
+	// A dangling antecedent the relay will never serve — this is the exact
+	// path that drives the CheckOrphans targeted refetch at watchdog.go:446.
+	ante := signEventAt(t, seller, nostr.KindPut, 700, nil, "root").ID
+	relay.pruned[ante] = struct{}{}
+	orphan := signEventAt(t, seller, nostr.KindBuy, 800, [][]string{eTag(ante)}, "orphan")
+	if herr := relay.intake.HandleEvent(orphan); herr != nil {
+		t.Fatalf("ingest orphan: %v", herr)
+	}
+	if seq.PendingCount() != 1 {
+		t.Fatalf("PendingCount = %d, want 1", seq.PendingCount())
+	}
+
+	if _, err := wd.CheckOrphans(context.Background()); err != nil {
+		t.Fatalf("CheckOrphans: %v", err)
+	}
+
+	var refetch *Filter
+	for i := range relay.queries {
+		if len(relay.queries[i].IDs) == 1 && relay.queries[i].IDs[0] == ante {
+			refetch = &relay.queries[i]
+		}
+	}
+	if refetch == nil {
+		t.Fatalf("no targeted REQ ids=[%s] was issued; queries=%v", ante, relay.queries)
+	}
+	if len(refetch.Kinds) != len(boundKinds) {
+		t.Fatalf("CheckOrphans refetch Kinds = %v, want %v", refetch.Kinds, boundKinds)
+	}
+	for i, k := range boundKinds {
+		if refetch.Kinds[i] != k {
+			t.Fatalf("CheckOrphans refetch Kinds = %v, want %v", refetch.Kinds, boundKinds)
+		}
+	}
+}
+
 // --- TEST 2: poison antecedent → targeted refetch empty → loud, NO quarantine -
 
 // TestWatchdog_PoisonAntecedentLoudNoQuarantine exercises §2.5a path 2: an
