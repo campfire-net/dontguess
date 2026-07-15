@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"fmt"
+	"unsafe"
 
 	btcec "github.com/btcsuite/btcd/btcec/v2"
 	"github.com/btcsuite/btcd/btcec/v2/schnorr"
@@ -14,6 +15,32 @@ import (
 // dead campfire Ed25519 identity.
 type Secp256k1Identity struct {
 	priv *btcec.PrivateKey
+
+	// memlocked records whether mlockLoadedScalar succeeded in pinning priv.Key
+	// out of swap. Best-effort (dontguess-973 C3): false is expected and
+	// non-fatal on hosts without CAP_IPC_LOCK / adequate RLIMIT_MEMLOCK.
+	memlocked bool
+}
+
+// Memlocked reports whether the in-process private scalar was successfully
+// mlock'd against swap (best-effort, platform- and privilege-dependent). This
+// narrows, but does not remove, the in-process key-material exposure window —
+// see docs/design/content-confidentiality-envelope-541.md §4.2/§3.5: only a
+// hardware-ECDH HSM removes the in-process ECDH side-channel entirely; this
+// mitigates the "swapped to disk" sub-case of that exposure, distinct from
+// at-rest/transfer custody (1Password/file permissions).
+func (i *Secp256k1Identity) Memlocked() bool {
+	return i.memlocked
+}
+
+// mlockLoadedScalar best-effort mlock(2)'s the memory backing the loaded
+// private scalar (btcec.PrivateKey.Key, a ModNScalar embedded by value) so it
+// cannot be paged to disk swap. Failure is silent-by-design at this layer
+// (non-fatal — see mlockBytes) and surfaced only via Memlocked() for callers
+// that want to log it.
+func (i *Secp256k1Identity) mlockLoadedScalar() {
+	b := scalarBytes(unsafe.Pointer(&i.priv.Key), unsafe.Sizeof(i.priv.Key))
+	i.memlocked = mlockBytes(b) == nil
 }
 
 // Generate mints a fresh secp256k1 identity from the crypto/rand CSPRNG.
@@ -27,7 +54,9 @@ func Generate() (*Secp256k1Identity, error) {
 	if err != nil {
 		return nil, fmt.Errorf("secp256k1 keygen: %w", err)
 	}
-	return &Secp256k1Identity{priv: priv}, nil
+	id := &Secp256k1Identity{priv: priv}
+	id.mlockLoadedScalar()
+	return id, nil
 }
 
 // FromPrivHex loads an identity from a 32-byte hex-encoded private key. This is
@@ -48,7 +77,9 @@ func FromPrivHex(privHex string) (*Secp256k1Identity, error) {
 		return nil, fmt.Errorf("private key is not a valid secp256k1 scalar (zero or ≥ curve order)")
 	}
 	priv, _ := btcec.PrivKeyFromBytes(raw)
-	return &Secp256k1Identity{priv: priv}, nil
+	id := &Secp256k1Identity{priv: priv}
+	id.mlockLoadedScalar()
+	return id, nil
 }
 
 // isValidScalar reports whether the 32-byte big-endian value is in [1, N-1]

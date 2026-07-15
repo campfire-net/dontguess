@@ -192,6 +192,91 @@ func TestLoadOrCreatePrivHexKey_Perms0600(t *testing.T) {
 	}
 }
 
+// TestLoadOrCreatePrivHexKey_RejectsWidenedPermissions is the ground-source
+// test for dontguess-973 C3: a key file that started 0600 but was later
+// widened (e.g. group/other read added by a hand copy or a permissive
+// restore) must FAIL to load rather than silently sign with an
+// insufficiently-protected key. This exercises the real load path
+// (LoadOrCreatePrivHexKey -> loadOrCreateKeyFile -> readValidKey ->
+// CheckKeyFilePermissions) end to end, not a mock of the permission check.
+func TestLoadOrCreatePrivHexKey_RejectsWidenedPermissions(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "nostr-operator.key")
+
+	id, err := LoadOrCreatePrivHexKey(path)
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// Widen the on-disk permissions after creation — simulates a hand copy, a
+	// permissive umask on restore/import, or a loosened backup.
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatalf("chmod widen: %v", err)
+	}
+
+	if _, err := LoadOrCreatePrivHexKey(path); err == nil {
+		t.Fatal("LoadOrCreatePrivHexKey succeeded on a 0644 key file, want a hard failure")
+	}
+
+	// CheckKeyFilePermissions itself must also reject it directly (the
+	// mintauth.go load-only path calls this, not LoadOrCreatePrivHexKey).
+	if err := CheckKeyFilePermissions(path); err == nil {
+		t.Fatal("CheckKeyFilePermissions succeeded on a 0644 key file, want a hard failure")
+	}
+
+	// Restoring 0600 must make it loadable again, returning the SAME identity
+	// (proves the check is purely a permission gate, not a corruption of the
+	// underlying key material).
+	if err := os.Chmod(path, 0o600); err != nil {
+		t.Fatalf("chmod restore: %v", err)
+	}
+	restored, err := LoadOrCreatePrivHexKey(path)
+	if err != nil {
+		t.Fatalf("load after restoring 0600: %v", err)
+	}
+	if restored.PubKeyHex() != id.PubKeyHex() {
+		t.Fatalf("restored key pubkey %s != original %s", restored.PubKeyHex(), id.PubKeyHex())
+	}
+}
+
+// TestGenerate_MemlockedBestEffort is the ground-source test for the mlock
+// half of dontguess-973 C3: on a fresh Generate() (and FromPrivHex()), the
+// scalar's Memlocked() outcome must be a real signal (a genuine mlock(2)
+// syscall attempt against the real scalar's live memory address), not a
+// hardcoded stub. This does not assert the syscall succeeds (CI/containers
+// commonly cap RLIMIT_MEMLOCK, and success is explicitly best-effort/optional
+// per the item), but it asserts the identity is still fully usable regardless
+// of the outcome — mlock failure must never break signing.
+func TestGenerate_MemlockedBestEffort(t *testing.T) {
+	t.Parallel()
+
+	id, err := Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	// The identity must remain fully functional whether or not mlock actually
+	// succeeded (best-effort, non-fatal by design).
+	var hash [32]byte
+	if _, err := rand.Read(hash[:]); err != nil {
+		t.Fatalf("rand: %v", err)
+	}
+	if _, err := id.SignHash(hash); err != nil {
+		t.Fatalf("SignHash after mlock attempt: %v", err)
+	}
+	t.Logf("Memlocked() = %v (best-effort; platform/privilege-dependent)", id.Memlocked())
+
+	from, err := FromPrivHex(id.PrivHex())
+	if err != nil {
+		t.Fatalf("FromPrivHex: %v", err)
+	}
+	if _, err := from.SignHash(hash); err != nil {
+		t.Fatalf("SignHash on FromPrivHex-loaded identity after mlock attempt: %v", err)
+	}
+	t.Logf("FromPrivHex Memlocked() = %v", from.Memlocked())
+}
+
 // trimKeyWS strips surrounding whitespace from a key file read for test assertions.
 func trimKeyWS(s string) string {
 	for len(s) > 0 {

@@ -170,6 +170,15 @@ func loadOrCreateKeyFile(path string, gen func() (string, error), validate func(
 // returns (_, false, nil) so the caller can create or retry. Only a genuine IO
 // error other than ENOENT is returned as err — a present-but-invalid file is
 // treated as "not ready" so a torn read never propagates as a hard parse error.
+//
+// dontguess-973 C3: every load of an existing key file (both the fast path and
+// the loser's retry-read) verifies the on-disk mode is not group/other
+// accessible before trusting its content. This file is written 0600 at
+// creation time (Chmod above), but "written 0600 once" is not the same
+// guarantee as "still 0600 now" — a hand copy, a permissive umask on
+// restore/import, or a loosened backup can widen it later. A widened
+// permission bit is treated as a hard load error, not a warning: this is
+// private key material.
 func readValidKey(path string, validate func(string) error) (string, bool, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -185,5 +194,27 @@ func readValidKey(path string, validate func(string) error) (string, bool, error
 	if validate(key) != nil {
 		return "", false, nil
 	}
+	if err := CheckKeyFilePermissions(path); err != nil {
+		return "", false, err
+	}
 	return key, true, nil
+}
+
+// CheckKeyFilePermissions fails loud if path is readable or writable by
+// group/other. Exported so non-keyfile.go load paths that read operator key
+// material directly (e.g. cmd/dontguess/mintauth.go's load-only
+// loadOperatorSigner) can apply the same check without going through
+// LoadOrCreatePrivHexKey.
+func CheckKeyFilePermissions(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return fmt.Errorf("stat key file %s: %w", path, err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf(
+			"key file %s has permissions %#o (group/other accessible) — private key material must be 0600; run `chmod 0600 %s` and retry",
+			path, perm, path,
+		)
+	}
+	return nil
 }

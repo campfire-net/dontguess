@@ -143,6 +143,11 @@ func loadOperatorSigner(dgHome string) (*identity.Secp256k1Identity, error) {
 		}
 		return nil, fmt.Errorf("reading operator key %s: %w", path, err)
 	}
+	// dontguess-973 C3: refuse to sign with a key file whose permissions were
+	// loosened after creation (see identity.CheckKeyFilePermissions).
+	if err := identity.CheckKeyFilePermissions(path); err != nil {
+		return nil, err
+	}
 	id, err := identity.FromPrivHex(strings.TrimSpace(string(data)))
 	if err != nil {
 		return nil, fmt.Errorf("parsing operator key %s: %w", path, err)
