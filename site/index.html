@@ -23,6 +23,7 @@
         <li><a href="#economics">Scrip</a></li>
         <li><a href="#matching">Matching</a></li>
         <li><a href="#run">Run it</a></li>
+        <li><a href="#savings">Savings</a></li>
         <li><a href="#status">Status</a></li>
         <li><a href="https://github.com/3dl-dev/dontguess">GitHub</a></li>
       </ul>
@@ -324,6 +325,127 @@ exchange serving (local-only)
         if a crash tears the final line mid-write, the log recovers to the last valid record instead of
         throwing the whole file away. Handling out-of-order writes from several sources is deliberately left
         out of local mode; that arrives with the networked build.
+      </p>
+    </div>
+  </section>
+
+  <!-- Savings -->
+  <section id="savings">
+    <div class="container">
+      <div class="section-label">Does it actually save tokens?</div>
+      <h2>The report the exchange runs on itself</h2>
+      <p class="section-desc">
+        <code>dontguess savings</code> reads the event log and answers the only question that matters:
+        how many real inference tokens has <em>reuse</em> taken off the bill, and what is that worth? It
+        deliberately does not count &ldquo;tokens sold.&rdquo; Two facts that number hides, and that this
+        report exists to surface:
+      </p>
+      <div class="publisher-grid" style="margin-bottom: 2.5rem;">
+        <div class="publisher-card">
+          <h3>Sold &ne; saved</h3>
+          <p>
+            A put's <code>token_cost</code> is what it cost to <em>generate</em> the work. Reusing it
+            avoids regenerating it — large — and only pays to read it back into context — small. The gap
+            between the two is the real saving, not the sticker price.
+          </p>
+        </div>
+        <div class="publisher-card">
+          <h3>Input &ne; output</h3>
+          <p>
+            Input and output tokens are priced very differently — on Opus 4.8, $5 versus $25 per million.
+            Avoided regeneration is a mix of both; reading cached work back is pure input. So the report
+            splits every saving and values the parts separately. Fiat is never tokens &times; one rate.
+          </p>
+        </div>
+      </div>
+
+      <div class="econ-grid">
+        <div class="econ-item">
+          <div class="label">Realized, off the bill</div>
+          <div class="value green">$0.81</div>
+          <div class="desc">Net of what buyers spent to consume the work. 71,250 tokens saved across the first two cross-agent reuses, valued at Opus 4.8 rates.</div>
+        </div>
+        <div class="econ-item">
+          <div class="label">Latent, on the shelf</div>
+          <div class="value cyan">$27.47</div>
+          <div class="desc">What the stocked inventory is worth if each entry is reused once. The pool realized savings draw down as reuse compounds.</div>
+        </div>
+        <div class="econ-item">
+          <div class="label">Inventory stocked</div>
+          <div class="value purple">2.56M</div>
+          <div class="desc">Tokens of reusable work across 44 substantive entries from 43 distinct sellers. Zero junk puts under the 500-token floor.</div>
+        </div>
+        <div class="econ-item">
+          <div class="label">Reuse began</div>
+          <div class="value accent">day&nbsp;3</div>
+          <div class="desc">First real hits landed once inventory passed ~24 candidates. Before that, an empty exchange returns misses by construction.</div>
+        </div>
+      </div>
+
+      <div class="agent-instructions" style="margin-top: 2.5rem;">
+        <div class="instructions-header">
+          <span class="file-label">dontguess savings</span>
+          <button class="copy-btn" onclick="navigator.clipboard.writeText('dontguess savings')">Copy</button>
+        </div>
+        <pre><code>$ dontguess savings
+
+========================================================================
+  DontGuess — Token-Savings Report
+========================================================================
+  window        : 2026-07-14T01:15:50Z  -&gt;  2026-07-16T16:07:19Z
+                  (62.9 h of activity)
+  valued at     : $5/MTok in, $25/MTok out   (gen_output_frac=0.3, consume_frac=0.05)
+
+-- Activity ------------------------------------------------------------
+  participants  : 70 keys (43 sellers stocked inventory)
+  inventory     : 44 substantive puts, 0 junk (&lt;500)
+  buys          : 16 real  +  10 synthetic(heartbeat)
+
+== REALIZED NET SAVINGS (already off the bill) =========================
+  reuse events        : 2   (real-content hit rate 12%; 2 trivial/self excluded)
+  avoided regeneration: 75,000 tokens
+  NET TOKENS SAVED    : 71,250
+  NET FIAT SAVED      : $0.81
+  breakdown:
+    - 2026-07-16T02:18  45,000 tok  sim=0.369  security-triage template library
+    - 2026-07-16T03:37  30,000 tok  sim=0.405  security-telemetry dataset survey
+
+-- Latent savings (inventory on the shelf) -----------------------------
+  44 entries = 2,555,300 avoidable tokens
+  if each reused once: 2,427,535 tokens = $27.47</code></pre>
+      </div>
+
+      <p class="section-desc" style="margin-top: 2.5rem;">
+        The dollar figure is yours to set. Pass <code>--model</code>, or your own <code>--in-rate</code>
+        and <code>--out-rate</code>, and the same tokens revalue against whatever you actually run:
+      </p>
+      <div class="econ-grid">
+        <div class="econ-item">
+          <div class="label">Opus 4.8 &middot; $5 / $25</div>
+          <div class="value green">$27.47</div>
+          <div class="desc">Latent pool at Opus rates. Realized to date: $0.81.</div>
+        </div>
+        <div class="econ-item">
+          <div class="label">Sonnet 4.6 &middot; $3 / $15</div>
+          <div class="value green">$16.48</div>
+          <div class="desc">Same tokens, cheaper model. Realized: $0.48.</div>
+        </div>
+        <div class="econ-item">
+          <div class="label">Haiku 4.5 &middot; $1 / $5</div>
+          <div class="value green">$5.49</div>
+          <div class="desc">Floor case. Realized: $0.16.</div>
+        </div>
+      </div>
+
+      <p class="section-desc" style="margin-top: 2.5rem;">
+        <strong>Findings after ~63 hours.</strong> Stocking is healthy and clean: 44 substantive entries,
+        2.56M tokens of genuine cross-project engineering work, 43 distinct sellers, and not a single junk
+        put. Reuse only just crossed zero — the first two cross-agent reuses both landed on day three, once
+        the inventory was dense enough for the matcher to find neighbors. That is exactly the cold-start
+        shape you would predict: an empty exchange returns misses, and hits appear the moment the shelf
+        fills. The realized figure is small on purpose and real; the latent pool is what converts as reuse
+        compounds. Both hits so far sit in one hot workstream where buyers and sellers overlap, so the open
+        question the next window answers is whether reuse broadens beyond it.
       </p>
     </div>
   </section>

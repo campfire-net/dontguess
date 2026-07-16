@@ -127,6 +127,7 @@
       <div class="sidebar-heading">Reference</div>
       <ul class="sidebar-links">
         <li><a href="/docs/cli.html" class="active">CLI Reference</a></li>
+        <li><a href="/docs/cli.html#savings">Savings Report</a></li>
         <li><a href="/docs/convention.html">Convention Spec</a></li>
         <li><a href="/docs/api.html">API Reference</a></li>
       </ul>
@@ -500,6 +501,43 @@
         <div class="cmd-line"><span class="cmd-out">cf v0.17.0</span></div>
       </div>
     </div>
+
+    <hr class="doc-divider">
+
+    <h2 id="savings">dontguess savings</h2>
+
+    <p>
+      Report <strong>net inference-token savings from reuse</strong> — not gross &ldquo;tokens sold.&rdquo;
+      Reuse avoids <em>regenerating</em> work (large) and only pays to read it back into context (small);
+      the gap is the saving. Because input and output tokens price differently (Opus 4.8: $5 vs $25 per
+      MTok), avoided regeneration is split into input and output and valued separately — fiat is never
+      tokens &times; one rate. <strong>Realized</strong> savings come from matches that delivered another
+      agent's work to a different buyer (money already off the bill); <strong>latent</strong> savings value
+      stocked inventory at one reuse each. Scrip is excluded — it is a coordination token, not an API cost.
+    </p>
+
+    <div class="cmd-block">
+      <div class="cmd-header"><span class="cmd-name">dontguess savings</span></div>
+      <div class="cmd-body">
+        <div class="cmd-line"><span class="cmd-prompt">$</span><span class="cmd-text">dontguess savings</span></div>
+        <div class="cmd-line"><span class="cmd-out">== REALIZED NET SAVINGS (already off the bill) ==</span></div>
+        <div class="cmd-line"><span class="cmd-out">  reuse events        : 2   (real-content hit rate 12%)</span></div>
+        <div class="cmd-line"><span class="cmd-out">  avoided regeneration: 75,000 tokens</span></div>
+        <div class="cmd-line"><span class="cmd-out">  NET TOKENS SAVED    : 71,250</span></div>
+        <div class="cmd-line"><span class="cmd-out">  NET FIAT SAVED      : $0.81</span></div>
+        <div class="cmd-line"><span class="cmd-out">-- Latent savings (inventory on the shelf) --</span></div>
+        <div class="cmd-line"><span class="cmd-out">  44 entries = 2,555,300 avoidable tokens</span></div>
+        <div class="cmd-line"><span class="cmd-out">  if each reused once: 2,427,535 tokens = $27.47</span></div>
+      </div>
+    </div>
+
+    <p>
+      Flags: <code>--model opus-4.8|sonnet-4.6|haiku-4.5|fable-5</code> presets in/out rates, or set
+      <code>--in-rate</code> / <code>--out-rate</code> directly. <code>--gen-output-frac</code> (default
+      0.30) is the output share of a generation; <code>--consume-frac</code> (default 0.05) is the cost to
+      read cached work back. <code>--since</code> windows the aggregation (default: all time).
+      <code>--json</code> emits the full report as a single object.
+    </p>
 
     <hr class="doc-divider">
 
