@@ -25,12 +25,29 @@ package main
 //     solo downgrade, never a hang (exchange.Init already implements this; up
 //     only has to propagate it).
 //
-// ADV-4 (FLEET = ONE operator): `up --relay` on a machine with NO local
-// operator private key MUST detect an existing operator's events already on
-// the relay and REFUSE to mint a competing sequencer, rather than silently
-// bootstrapping a second operator identity. probeExistingOperatorEvents does a
-// bounded one-shot NIP-01 read (never a write) BEFORE exchange.Init would mint
-// anything.
+// ADV-4 (FLEET = ONE operator): a machine with NO local operator private key
+// MUST detect an existing operator's events already on the relay and REFUSE to
+// mint a competing sequencer, rather than silently bootstrapping a second
+// operator identity. probeExistingOperatorEvents does a bounded one-shot NIP-01
+// read (never a write) BEFORE exchange.Init would mint anything.
+//
+// dontguess-e39 (two ADV-4 probe gaps self-flagged by the 75a impl):
+//
+//	Gap 1 — PROBE THE EFFECTIVE RESOLVED-RELAY SET, not only this-invocation's
+//	declared relays. A machine whose operator key file was lost/deleted (disk
+//	issue, accidental rm) but whose exchange config STILL persists an old
+//	team+relay, run as plain `dontguess up` (no --relay flag, no env), used to
+//	SKIP the probe entirely (declaredRelays empty) and let exchange.Init
+//	silently mint a BRAND-NEW operator key — forking the sequencer identity the
+//	fleet already trusts. The probe now runs on the RESOLVED relay set:
+//	flag/env this run, else the relays persisted in a prior team/fleet config.
+//
+//	Gap 2 — NEVER FAIL OPEN on an unreachable relay. A single probe error used
+//	to warn-and-proceed (mint). The probe now RETRIES with bounded backoff, and
+//	if it STILL cannot verify the relay, it REFUSES to mint rather than
+//	silently forking — unless the operator explicitly confirms a first-of-its-
+//	kind bootstrap with --new-operator (which never overrides a POSITIVELY
+//	detected existing operator, only an unverifiable relay).
 
 import (
 	"context"
@@ -73,15 +90,17 @@ re-prompting.`,
 }
 
 var (
-	upRelayFlag string
-	upTeamFlag  bool
-	upFleetFlag bool
+	upRelayFlag       string
+	upTeamFlag        bool
+	upFleetFlag       bool
+	upNewOperatorFlag bool
 )
 
 func init() {
 	upCmd.Flags().StringVar(&upRelayFlag, "relay", "", "relay websocket URL(s), comma-separated — promotes the operator to team tier")
 	upCmd.Flags().BoolVar(&upTeamFlag, "team", false, "declare team tier explicitly (requires a relay from --relay, env, or a prior persisted config)")
 	upCmd.Flags().BoolVar(&upFleetFlag, "fleet", false, "declare fleet tier explicitly (requires a relay from --relay, env, or a prior persisted config)")
+	upCmd.Flags().BoolVar(&upNewOperatorFlag, "new-operator", false, "confirm you are the FIRST operator bootstrapping a brand-new relay — required to mint when the ADV-4 probe cannot reach/verify the relay after retries (never overrides a positively-detected existing operator)")
 	rootCmd.AddCommand(upCmd)
 }
 
@@ -96,7 +115,7 @@ func runUp(cmd *cobra.Command, _ []string) error {
 	case upFleetFlag:
 		tier = exchange.TierFleet
 	}
-	return runUpCore(resolveDGHome(), parseRelayFlag(upRelayFlag), tier, cmd.OutOrStdout())
+	return runUpCore(resolveDGHome(), parseRelayFlag(upRelayFlag), tier, upNewOperatorFlag, cmd.OutOrStdout())
 }
 
 // parseRelayFlag splits a comma-separated --relay value into a trimmed,
@@ -132,7 +151,7 @@ var (
 
 // runUpCore is the testable core of `up`. out receives the same progress
 // lines the CLI prints, so tests can assert on them without capturing os.Stdout.
-func runUpCore(dgHome string, relayFlag []string, tier exchange.Tier, out io.Writer) error {
+func runUpCore(dgHome string, relayFlag []string, tier exchange.Tier, newOperator bool, out io.Writer) error {
 	// The relay set THIS invocation is declaring: an explicit --relay flag, else
 	// the env override (mirrors serve.go's resolveRelayURLs/effectiveRelayURLs
 	// backward-compat convention). Empty means "declare nothing new this run" —
@@ -143,19 +162,51 @@ func runUpCore(dgHome string, relayFlag []string, tier exchange.Tier, out io.Wri
 		declaredRelays = resolveRelayURLs()
 	}
 
-	// ADV-4 refuse-mint guard (design §6, §9 Gate B/P7): only relevant when a
-	// relay is being declared THIS run AND this machine has no local operator
-	// private key yet — a genuine existing operator re-running `up --relay` on
-	// its OWN machine always has the key file and skips this entirely
-	// (loadOperatorSigner succeeds). Runs BEFORE exchange.Init, which is what
-	// would otherwise mint a fresh operator identity.
-	if len(declaredRelays) > 0 {
+	// ADV-4 refuse-mint guard (design §6, §9 Gate B/P7; dontguess-e39 gap 1).
+	// The relay set to PROBE is the EFFECTIVE resolved set: the relays declared
+	// THIS run (flag/env), else — when this invocation declares nothing new —
+	// the relays persisted in a prior team/fleet config. This closes the
+	// silent-fork-on-key-loss hole: a machine whose operator key file was
+	// lost/deleted but whose config STILL persists an old team+relay, run as
+	// plain `dontguess up`, MUST still probe (its effective tier is team from
+	// the persisted config) rather than let exchange.Init mint a fresh operator
+	// key and fork the sequencer the fleet already trusts.
+	probeRelays := declaredRelays
+	if len(probeRelays) == 0 {
+		if existing, lerr := exchange.LoadConfig(dgHome); lerr == nil {
+			probeRelays = existing.RelayURLs
+		}
+	}
+
+	// Only relevant when this machine has no local operator private key yet — a
+	// genuine existing operator re-running `up` on its OWN machine always has
+	// the key file and skips this entirely (loadOperatorSigner succeeds). Runs
+	// BEFORE exchange.Init, which is what would otherwise mint a fresh operator
+	// identity.
+	if len(probeRelays) > 0 {
 		if _, keyErr := loadOperatorSigner(dgHome); keyErr != nil {
-			for _, url := range declaredRelays {
-				found, perr := upProbeRelay(context.Background(), url)
+			for _, url := range probeRelays {
+				found, perr := probeRelayWithRetry(context.Background(), url)
 				if perr != nil {
-					fmt.Fprintf(out, "up: warning: could not probe %s for an existing operator (%v) — proceeding\n", url, perr)
-					continue
+					// dontguess-e39 gap 2: the relay could not be verified even
+					// after bounded retries. NEVER fail open — a competing
+					// operator's events may be sitting on the relay, just
+					// unreadable this instant (warming, network blip). Refuse to
+					// mint against an unverifiable relay unless the operator
+					// EXPLICITLY confirms a brand-new first bootstrap. The flag
+					// only overrides an UNVERIFIABLE relay — a positive `found`
+					// below still refuses regardless.
+					if newOperator {
+						fmt.Fprintf(out, "up: warning: could not verify %s carries no existing operator (%v) — proceeding under --new-operator confirmation\n", url, perr)
+						continue
+					}
+					return fmt.Errorf(
+						"up --relay: could not verify %s carries no existing operator after %d attempts (%v) — "+
+							"refusing to mint against an unverifiable relay (ADV-4). This machine has no local "+
+							"operator key (%s absent). Fix relay reachability and retry; a second machine joins an "+
+							"existing fleet as a MEMBER (`dontguess join <invite-token>`), never as a second operator. "+
+							"If you ARE the first operator bootstrapping a brand-new relay, re-run with --new-operator to confirm",
+						url, upProbeRetries+1, perr, filepath.Join(dgHome, "nostr-operator.key"))
 				}
 				if found {
 					return fmt.Errorf(
@@ -310,10 +361,44 @@ func waitForOperatorSocket(dgHome string, timeout time.Duration) bool {
 }
 
 // upProbeTimeout bounds a single relay probe (the ADV-4 refuse-mint check) so
-// a dead/slow relay can never hang `up --relay` — a probe error is treated as
-// "cannot determine, proceed with a warning" by the caller, never a silent
-// indefinite block. Package var so tests can shrink it.
+// a dead/slow relay can never hang `up --relay` — each attempt is individually
+// bounded, and the caller RETRIES then REFUSES (never silently mints) if the
+// relay stays unverifiable. Package var so tests can shrink it.
 var upProbeTimeout = 8 * time.Second
+
+// upProbeRetries / upProbeRetryBackoff bound the ADV-4 probe's retry loop
+// (dontguess-e39 gap 2): a transiently-unreachable relay (warming, network
+// blip) must not fail the probe OPEN into a silent mint. probeRelayWithRetry
+// makes up to upProbeRetries+1 total attempts with a fixed backoff between
+// them; only if EVERY attempt errors does the caller refuse (or require
+// --new-operator). Package vars so tests can shrink them.
+var (
+	upProbeRetries      = 3
+	upProbeRetryBackoff = 500 * time.Millisecond
+)
+
+// probeRelayWithRetry wraps the single-shot upProbeRelay in a bounded retry
+// loop. A definitive answer (found/not-found, err==nil) returns immediately; a
+// probe error is retried up to upProbeRetries times with upProbeRetryBackoff
+// between attempts before the final error is surfaced to the caller, which then
+// fails CLOSED (refuse-to-mint) rather than open. Honors ctx cancellation
+// during backoff so a cancelled `up` never blocks.
+func probeRelayWithRetry(ctx context.Context, relayURL string) (found bool, err error) {
+	for attempt := 0; ; attempt++ {
+		found, err = upProbeRelay(ctx, relayURL)
+		if err == nil {
+			return found, nil
+		}
+		if attempt >= upProbeRetries {
+			return false, err
+		}
+		select {
+		case <-ctx.Done():
+			return false, err
+		case <-time.After(upProbeRetryBackoff):
+		}
+	}
+}
 
 // probeExistingOperatorEvents does a bounded, one-shot NIP-01 read (REQ with
 // Limit=1 over the dontguess kind set, waiting for the first EVENT or EOSE) —

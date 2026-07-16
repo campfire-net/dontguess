@@ -60,6 +60,12 @@ type miniRelay struct {
 	srv *httptest.Server
 	mu  sync.Mutex
 	evs []*identity.Event
+	// failFirstN rejects the first N websocket handshakes with 503 (dontguess-e39
+	// gap 2 fixture): a genuinely transiently-unreachable relay — each rejected
+	// upgrade surfaces to probeExistingOperatorEvents as a real connect error, so
+	// the retry loop is exercised end-to-end against a REAL relay, not a stub.
+	failFirstN int
+	upgrades   int
 }
 
 func newMiniRelay(t *testing.T) *miniRelay {
@@ -84,6 +90,14 @@ func (r *miniRelay) seed(ev *identity.Event) {
 }
 
 func (r *miniRelay) serveWS(w http.ResponseWriter, req *http.Request) {
+	r.mu.Lock()
+	r.upgrades++
+	reject := r.upgrades <= r.failFirstN
+	r.mu.Unlock()
+	if reject {
+		http.Error(w, "relay warming up", http.StatusServiceUnavailable)
+		return
+	}
 	conn, err := upgrader.Upgrade(w, req, nil)
 	if err != nil {
 		return
@@ -199,7 +213,7 @@ func TestUp_Solo_IdempotentBoot_NoDuplicatedState(t *testing.T) {
 	withInProcessServeLauncher(t)
 
 	var out1, out2 bytes.Buffer
-	if err := runUpCore(dgHome, nil, "", &out1); err != nil {
+	if err := runUpCore(dgHome, nil, "", false, &out1); err != nil {
 		t.Fatalf("first up (solo): %v", err)
 	}
 
@@ -223,7 +237,7 @@ func TestUp_Solo_IdempotentBoot_NoDuplicatedState(t *testing.T) {
 	// Re-run: must be idempotent — same operator key, same CreatedAt (no
 	// duplicated state), and the socket is detected as already-running rather
 	// than a second serve being spawned.
-	if err := runUpCore(dgHome, nil, "", &out2); err != nil {
+	if err := runUpCore(dgHome, nil, "", false, &out2); err != nil {
 		t.Fatalf("second up (solo, idempotent re-run): %v", err)
 	}
 	cfg2, err := exchange.LoadConfig(dgHome)
@@ -254,7 +268,7 @@ func TestUp_Relay_TeamBoot_SelfAdmitsOperatorKey(t *testing.T) {
 	calls := withStubBootService(t)
 
 	var out bytes.Buffer
-	if err := runUpCore(dgHome, []string{relayServer.wsURL()}, "", &out); err != nil {
+	if err := runUpCore(dgHome, []string{relayServer.wsURL()}, "", false, &out); err != nil {
 		t.Fatalf("up --relay: %v", err)
 	}
 
@@ -318,7 +332,7 @@ func TestUp_ExplicitTeamNoRelay_FailsClosedBounded(t *testing.T) {
 	errCh := make(chan error, 1)
 	go func() {
 		var out bytes.Buffer
-		errCh <- runUpCore(dgHome, nil, exchange.TierTeam, &out)
+		errCh <- runUpCore(dgHome, nil, exchange.TierTeam, false, &out)
 	}()
 
 	select {
@@ -369,7 +383,7 @@ func TestUp_Relay_SecondMachineNoOperatorKey_RefusesMint_ADV4(t *testing.T) {
 	t.Cleanup(func() { upServeLauncher = orig })
 
 	var out bytes.Buffer
-	err := runUpCore(dgHome, []string{relayServer.wsURL()}, "", &out)
+	err := runUpCore(dgHome, []string{relayServer.wsURL()}, "", false, &out)
 	if err == nil {
 		t.Fatalf("up --relay on a keyless second machine against a non-empty relay returned nil error, want ADV-4 refusal")
 	}
@@ -385,4 +399,205 @@ func TestUp_Relay_SecondMachineNoOperatorKey_RefusesMint_ADV4(t *testing.T) {
 	if _, cerr := exchange.LoadConfig(dgHome); cerr == nil {
 		t.Errorf("ADV-4 refusal persisted a config anyway")
 	}
+}
+
+// --- dontguess-e39 GROUND-SOURCE: ADV-4 probe gap fixes ---------------------
+
+// seedForeignOperatorEvent publishes a genuinely-signed event from a DIFFERENT
+// identity to the relay — "an existing operator's events already on the relay"
+// (the ADV-4 fixture) — so a keyless machine's probe reads a real EVENT.
+func seedForeignOperatorEvent(t *testing.T, r *miniRelay) {
+	t.Helper()
+	op, err := identity.Generate()
+	if err != nil {
+		t.Fatalf("generate existing-operator identity: %v", err)
+	}
+	ev := &identity.Event{CreatedAt: time.Now().Unix(), Kind: nostr.KindPut, Tags: [][]string{}, Content: ""}
+	if serr := identity.SignEvent(op, ev); serr != nil {
+		t.Fatalf("sign seed event: %v", serr)
+	}
+	r.seed(ev)
+}
+
+// shrinkProbeTiming makes the ADV-4 retry loop fast + deterministic for tests
+// (real defaults: 3 retries, 500ms backoff, 8s per-attempt timeout).
+func shrinkProbeTiming(t *testing.T) {
+	t.Helper()
+	origR, origB, origT := upProbeRetries, upProbeRetryBackoff, upProbeTimeout
+	upProbeRetries = 2
+	upProbeRetryBackoff = 1 * time.Millisecond
+	upProbeTimeout = 2 * time.Second
+	t.Cleanup(func() {
+		upProbeRetries, upProbeRetryBackoff, upProbeTimeout = origR, origB, origT
+	})
+}
+
+// (gap 1) PERSISTED-CONFIG PATH — silent fork on key-loss.
+//
+// A machine whose operator key file was lost/deleted but whose exchange config
+// STILL persists an old team+relay carrying ANOTHER operator's events, run as
+// plain `dontguess up` (NO --relay flag, NO env), MUST probe the persisted
+// relay and REFUSE to mint — the pre-fix code skipped the probe entirely
+// (declaredRelays empty) and let exchange.Init silently mint a fresh operator
+// key, forking the sequencer identity the fleet already trusts.
+func TestUp_PersistedConfigPath_KeyLost_RefusesMint_ADV4(t *testing.T) {
+	dgHome := t.TempDir()
+	t.Setenv("DONTGUESS_RELAY_URLS", "")
+	t.Setenv("DONTGUESS_RELAY_URL", "")
+	shrinkProbeTiming(t)
+
+	relayServer := newMiniRelay(t)
+
+	// Persist a real team+relay config (+ operator key) as if this machine had
+	// been a healthy team operator previously — exchange.Init does NOT probe,
+	// it only persists, so this legitimately stands in for the prior state.
+	if _, err := exchange.Init(exchange.InitOptions{
+		DGHome:    dgHome,
+		RelayURLs: []string{relayServer.wsURL()},
+		Tier:      exchange.TierTeam,
+	}); err != nil {
+		t.Fatalf("seed persisted team config: %v", err)
+	}
+	keyPath := filepath.Join(dgHome, "nostr-operator.key")
+	if _, statErr := os.Stat(keyPath); statErr != nil {
+		t.Fatalf("precondition: operator key was not minted by Init: %v", statErr)
+	}
+
+	// The disk incident: the operator key file is lost. The config still
+	// persists team + relay.
+	if rmErr := os.Remove(keyPath); rmErr != nil {
+		t.Fatalf("simulate key-loss: %v", rmErr)
+	}
+	// The relay meanwhile carries ANOTHER operator's events.
+	seedForeignOperatorEvent(t, relayServer)
+
+	// Refusing to mint must happen BEFORE serve is ever started.
+	orig := upServeLauncher
+	upServeLauncher = func(string) (bool, error) {
+		t.Fatalf("upServeLauncher was called — ADV-4 refuse-mint must fire before serve on the persisted-config path")
+		return false, nil
+	}
+	t.Cleanup(func() { upServeLauncher = orig })
+
+	// Plain `up`: NO flags, NO env — the pre-fix skip path.
+	var out bytes.Buffer
+	err := runUpCore(dgHome, nil, "", false, &out)
+	if err == nil {
+		t.Fatalf("plain `up` on a key-lost machine whose persisted relay carries another operator returned nil error, want ADV-4 refusal")
+	}
+	if !strings.Contains(err.Error(), "refusing to mint") {
+		t.Errorf("error does not surface the ADV-4 refuse-mint guard: %v", err)
+	}
+	// A brand-new operator key must NOT have been minted to replace the lost one.
+	if _, statErr := os.Stat(keyPath); statErr == nil {
+		t.Errorf("ADV-4 refusal minted a NEW operator key anyway at %s — the sequencer would have forked", keyPath)
+	}
+}
+
+// (gap 2) FAIL-OPEN ON UNREACHABLE RELAY — retry, then refuse.
+//
+// `up --relay <url>` where the relay is briefly UNREACHABLE on the first
+// probe(s) then becomes reachable revealing ANOTHER operator's events MUST
+// retry and ultimately REFUSE — the pre-fix code treated the first connect
+// error as "cannot determine, proceed" and minted a competing operator.
+func TestUp_Relay_TransientlyUnreachableThenAnotherOperator_RetriesThenRefuses_ADV4(t *testing.T) {
+	dgHome := t.TempDir()
+	t.Setenv("DONTGUESS_RELAY_URLS", "")
+	t.Setenv("DONTGUESS_RELAY_URL", "")
+	shrinkProbeTiming(t)
+
+	relayServer := newMiniRelay(t)
+	relayServer.failFirstN = 2 // first two handshakes 503; retries+1=3 total → 3rd connects
+	seedForeignOperatorEvent(t, relayServer)
+
+	orig := upServeLauncher
+	upServeLauncher = func(string) (bool, error) {
+		t.Fatalf("upServeLauncher was called — ADV-4 refuse-mint must fire before serve on the unreachable-relay path")
+		return false, nil
+	}
+	t.Cleanup(func() { upServeLauncher = orig })
+
+	var out bytes.Buffer
+	err := runUpCore(dgHome, []string{relayServer.wsURL()}, "", false, &out)
+	if err == nil {
+		t.Fatalf("up --relay against a transiently-unreachable relay carrying another operator returned nil, want ADV-4 refusal")
+	}
+	if !strings.Contains(err.Error(), "refusing to mint") {
+		t.Errorf("error does not surface the ADV-4 refuse-mint guard after retry: %v", err)
+	}
+	// It must actually have RETRIED past the transient failures (>=3 handshake
+	// attempts: two rejected + one that connected and read the event).
+	relayServer.mu.Lock()
+	attempts := relayServer.upgrades
+	relayServer.mu.Unlock()
+	if attempts < 3 {
+		t.Errorf("probe made only %d handshake attempts — it did not retry through the transient unreachability", attempts)
+	}
+	if _, statErr := os.Stat(filepath.Join(dgHome, "nostr-operator.key")); statErr == nil {
+		t.Errorf("ADV-4 refusal minted an operator key anyway — silent fork")
+	}
+}
+
+// (gap 2) PERMANENTLY UNVERIFIABLE RELAY — refuse by default, --new-operator to
+// override. A relay that NEVER answers the probe leaves ADV-4 unverifiable:
+// by default `up` REFUSES (never silently mints against it); the operator can
+// explicitly confirm a brand-new-relay bootstrap with --new-operator.
+func TestUp_Relay_Unverifiable_RefusesByDefault_NewOperatorOverrides_ADV4(t *testing.T) {
+	t.Setenv("DONTGUESS_RELAY_URLS", "")
+	t.Setenv("DONTGUESS_RELAY_URL", "")
+	shrinkProbeTiming(t)
+
+	relayServer := newMiniRelay(t)
+	relayServer.failFirstN = 1 << 30 // every handshake 503 — permanently unverifiable
+	url := relayServer.wsURL()
+
+	// Default (no confirmation): REFUSE, no key minted.
+	t.Run("refuses_by_default", func(t *testing.T) {
+		dgHome := t.TempDir()
+		orig := upServeLauncher
+		upServeLauncher = func(string) (bool, error) {
+			t.Fatalf("upServeLauncher was called — an unverifiable relay must refuse before serve")
+			return false, nil
+		}
+		t.Cleanup(func() { upServeLauncher = orig })
+
+		var out bytes.Buffer
+		err := runUpCore(dgHome, []string{url}, "", false, &out)
+		if err == nil {
+			t.Fatalf("up --relay against a permanently-unverifiable relay returned nil, want fail-closed refusal")
+		}
+		if !strings.Contains(err.Error(), "could not verify") {
+			t.Errorf("error does not surface the fail-closed unverifiable-relay guard: %v", err)
+		}
+		if _, statErr := os.Stat(filepath.Join(dgHome, "nostr-operator.key")); statErr == nil {
+			t.Errorf("unverifiable relay minted an operator key anyway — silent fork")
+		}
+	})
+
+	// With --new-operator: the operator explicitly confirms a first bootstrap →
+	// proceeds and mints. This is the deliberate escape hatch (never the silent
+	// default).
+	t.Run("new_operator_flag_overrides", func(t *testing.T) {
+		dgHome := t.TempDir()
+		withInProcessServeLauncher(t)
+		withStubBootService(t)
+
+		var out bytes.Buffer
+		if err := runUpCore(dgHome, []string{url}, "", true, &out); err != nil {
+			t.Fatalf("up --relay --new-operator against an unverifiable relay should proceed, got: %v", err)
+		}
+		if !strings.Contains(out.String(), "--new-operator confirmation") {
+			t.Errorf("output did not report the --new-operator override:\n%s", out.String())
+		}
+		if _, statErr := os.Stat(filepath.Join(dgHome, "nostr-operator.key")); statErr != nil {
+			t.Errorf("--new-operator confirmed bootstrap did not mint an operator key: %v", statErr)
+		}
+		cfg, cerr := exchange.LoadConfig(dgHome)
+		if cerr != nil {
+			t.Fatalf("LoadConfig after --new-operator up: %v", cerr)
+		}
+		if cfg.Tier != exchange.TierTeam {
+			t.Errorf("persisted tier = %q, want %q", cfg.Tier, exchange.TierTeam)
+		}
+	})
 }
