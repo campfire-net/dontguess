@@ -96,8 +96,18 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 
 	// (1) Persist config FIRST (restart durability, the authoritative backing). A
 	// persist failure aborts before any live mutation, so on-disk state and the
-	// live KeySet never diverge in the failure path.
-	if err := persistFleetAllowlistChange(c.dgHome, action, targetHex); err != nil {
+	// live KeySet never diverge in the failure path. The returned slice is the
+	// post-mutation config FleetAllowlist — the AUTHORITATIVE full membership this
+	// admit/remove just committed under c.mu. The republished roster is built from
+	// THIS, never from the concurrently-mutable live KeySet (dontguess-9ef): a
+	// rosterFolder.fold() on another leg runs under rf.mu (not c.mu) and can
+	// ReplaceAll the shared KeySet between our Add and a KeySet read, so reading the
+	// live KeySet to build the roster could silently omit the just-admitted member
+	// (or re-include a just-removed one) — a durable membership desync, since the
+	// roster is authoritative-on-fold. The persisted config is immune: it is the
+	// operator intent we hold c.mu across.
+	cfgMembers, err := persistFleetAllowlistChange(c.dgHome, action, targetHex)
+	if err != nil {
 		return fmt.Errorf("allowlist: persist config: %w", err)
 	}
 
@@ -109,6 +119,10 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 
 	// (2) Mutate the live KeySet — the SAME set the TrustChecker enforces, so the
 	// change is reflected on the very next dispatch trust check (<1s, no restart).
+	// This is for immediate local enforcement only; it is NOT the source the roster
+	// is built from (see (3)). Even if a concurrent stale fold momentarily clobbers
+	// this, our fresher republished roster's echo re-folds the correct config
+	// membership back onto it.
 	switch action {
 	case allowlistActionAdd:
 		c.keys.Add(targetHex)
@@ -116,12 +130,20 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 		c.keys.Remove(targetHex)
 	}
 
-	// (3) Republish the roster (best-effort). Build it from the KeySet's post-
-	// mutation FULL membership so the parameterized-replaceable (latest-wins) roster
-	// is authoritative. Its echo re-folds onto the SAME KeySet via rosterFolder —
-	// idempotent (ReplaceAll with the identical set).
+	// (3) Republish the roster (best-effort). Build it from the JUST-PERSISTED
+	// CONFIG membership (cfgMembers, normalized to lowercase hex) — the authoritative
+	// admit intent we hold c.mu across — NOT the live KeySet, which a concurrent
+	// rosterFolder.fold() under a different mutex can ReplaceAll out from under us
+	// (dontguess-9ef). Its echo re-folds this exact membership onto the shared KeySet
+	// via rosterFolder — idempotent (ReplaceAll with the committed config set).
 	if c.operatorSigner != nil && c.publishRoster != nil {
-		ev, err := c.buildRoster()
+		rosterAllow, aerr := identity.NewAllowlist(cfgMembers...)
+		if aerr != nil {
+			// Every entry in the persisted config was validated on the way in, so this
+			// is not expected; surface it rather than publishing a partial roster.
+			return fmt.Errorf("allowlist: normalize config membership for republish: %w", aerr)
+		}
+		ev, err := c.buildRoster(rosterAllow.HexKeys())
 		if err != nil {
 			// The live KeySet + config are already updated (the authoritative local
 			// effects); a roster-build failure is surfaced but does not roll them back.
@@ -132,11 +154,14 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 	return nil
 }
 
-// buildRoster signs a kind-30078 fleet roster over the KeySet's current full
-// membership. created_at strictly increases across calls so two admits within the
-// same wall-clock second do not collide into a stale-drop at the replaceable fold.
-// Caller holds c.mu.
-func (c *allowlistController) buildRoster() (*identity.Event, error) {
+// buildRoster signs a kind-30078 fleet roster over the given FULL membership
+// (lowercase hex). The caller passes the just-persisted config membership, NOT the
+// live KeySet, so a concurrent rosterFolder.fold() (which mutates the shared KeySet
+// under a different mutex) cannot corrupt the roster this admit republishes
+// (dontguess-9ef). created_at strictly increases across calls so two admits within
+// the same wall-clock second do not collide into a stale-drop at the replaceable
+// fold. Caller holds c.mu.
+func (c *allowlistController) buildRoster(members []string) (*identity.Event, error) {
 	createdAt := c.nowUnix()
 	if createdAt <= c.lastRoster {
 		createdAt = c.lastRoster + 1
@@ -146,7 +171,7 @@ func (c *allowlistController) buildRoster() (*identity.Event, error) {
 	ev := &identity.Event{
 		CreatedAt: createdAt,
 		Kind:      nostr.KindFleetRoster,
-		Tags:      nostr.FleetRosterTags(c.keys.Keys()),
+		Tags:      nostr.FleetRosterTags(members),
 		Content:   "",
 	}
 	if err := identity.SignEvent(c.operatorSigner, ev); err != nil {
@@ -161,17 +186,20 @@ func (c *allowlistController) buildRoster() (*identity.Event, error) {
 // the SAME key are recognised as one — a duplicate add is a no-op and a remove
 // drops the entry regardless of the form it was stored in. This is the server-side
 // analogue of runAllowlistAdd/runAllowlistRemove's config mutation; the CLI's
-// offline path (operator not running) still writes the config directly.
-func persistFleetAllowlistChange(dgHome, action, targetHex string) error {
+// offline path (operator not running) still writes the config directly. On success
+// it returns the post-mutation FleetAllowlist — the authoritative full membership
+// this change committed — so the caller can republish a roster from config intent
+// rather than the concurrently-mutable live KeySet (dontguess-9ef).
+func persistFleetAllowlistChange(dgHome, action, targetHex string) ([]string, error) {
 	cfg, err := exchange.LoadConfig(dgHome)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	switch action {
 	case allowlistActionAdd:
 		for _, existing := range cfg.FleetAllowlist {
 			if h, nerr := normalizeToHex(existing); nerr == nil && h == targetHex {
-				return nil // already present — no-op
+				return cfg.FleetAllowlist, nil // already present — no-op (membership unchanged)
 			}
 		}
 		cfg.FleetAllowlist = append(cfg.FleetAllowlist, targetHex)
@@ -185,9 +213,12 @@ func persistFleetAllowlistChange(dgHome, action, targetHex string) error {
 		}
 		cfg.FleetAllowlist = kept
 	default:
-		return fmt.Errorf("allowlist: unknown action %q", action)
+		return nil, fmt.Errorf("allowlist: unknown action %q", action)
 	}
-	return exchange.WriteConfig(exchange.ConfigPath(dgHome), cfg)
+	if err := exchange.WriteConfig(exchange.ConfigPath(dgHome), cfg); err != nil {
+		return nil, err
+	}
+	return cfg.FleetAllowlist, nil
 }
 
 // firstAllowlistController returns the first non-nil controller from a variadic
