@@ -348,9 +348,14 @@ func newRosterFolder(operatorKey string, keys *exchange.KeySet, cursorPath strin
 // the KeySet with the roster's exact membership (authoritative full set,
 // latest-wins). Every rejection is logged LOUD (LOCKED-5) — a forged roster reaching
 // the fold is security-relevant and never a silent drop.
-func (rf *rosterFolder) fold(ev *nostr.Event) {
+//
+// Returns true iff the event was an AUTHENTIC operator-signed roster (verification
+// passed), false for a forged/unsigned/unparseable one. runReader (dontguess-d6d)
+// uses this to gate the durable Intake-cursor advance: only an authentic event may
+// move the "how far ingested" watermark, so a rejected forgery can never poison it.
+func (rf *rosterFolder) fold(ev *nostr.Event) bool {
 	if rf == nil || rf.keys == nil || ev == nil {
-		return
+		return false
 	}
 	members, err := nostr.ParseFleetRoster(ev, rf.operatorKey)
 	if err != nil {
@@ -358,14 +363,14 @@ func (rf *rosterFolder) fold(ev *nostr.Event) {
 		// so this is a claimed-roster that FAILED verification — a forged/unsigned
 		// roster. Loud, never silent.
 		rf.logf("SECURITY: fleet-roster fold REJECTED event %s: %v", shortRosterID(ev.ID), err)
-		return
+		return false
 	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if ev.CreatedAt < rf.lastCreated {
 		rf.logf("relay/roster: ignoring stale roster %s (created_at %d < last applied %d)",
 			shortRosterID(ev.ID), ev.CreatedAt, rf.lastCreated)
-		return
+		return true // authentic (verification passed), just superseded — cursor may advance
 	}
 	// ANTI-ROLLBACK PERSIST (dontguess-61a8). Advance the durable floor BEFORE
 	// mutating the KeySet so the persisted floor is never OLDER than the applied
@@ -381,13 +386,14 @@ func (rf *rosterFolder) fold(ev *nostr.Event) {
 		if err := writeRosterCreatedAt(rf.cursorPath, ev.CreatedAt); err != nil {
 			rf.logf("SECURITY: roster anti-rollback cursor persist FAILED for %s (created_at %d): %v — NOT applying this roster (a KeySet advanced past an unpersisted floor would re-open the stale-roster-replay hole across a restart)",
 				shortRosterID(ev.ID), ev.CreatedAt, err)
-			return
+			return false // not applied + not persisted — keep the Intake cursor open so the roster is re-fetched
 		}
 	}
 	rf.lastCreated = ev.CreatedAt
 	rf.keys.ReplaceAll(members...)
 	rf.logf("relay/roster: fleet allowlist folded from operator-signed roster %s — %d member(s) admitted",
 		shortRosterID(ev.ID), len(members))
+	return true
 }
 
 // rosterCursorPath is the per-DG_HOME sidecar recording the anti-rollback floor
@@ -770,6 +776,30 @@ func identityToNostrEvent(ev *identity.Event) *nostr.Event {
 // dispatch lock: its only write is the Intake's LocalStore.BatchAppend (store
 // mutex only), which is why a backfill storm cannot serialize behind buy/match
 // (§2.4, ADV-11). pub may be nil (a read-only reader with no publish leg).
+// maxIntakeCursorDriftSeconds bounds how far into the FUTURE (relative to this
+// operator's wall clock) a relay-supplied event `created_at` may push the durable
+// Intake cursor (dontguess-d6d). NIP-22-style drift tolerance: honest events carry
+// a created_at at or slightly ahead of now (benign clock skew across fleet members),
+// so a few minutes of slack is enough. Anything beyond that is either a misconfigured
+// clock or a hostile future-dating attempt — clamped, never trusted, so it cannot
+// jump the "how far ingested" watermark past real, not-yet-ingested events. 15
+// minutes matches the historical NIP-22 upper bound.
+const maxIntakeCursorDriftSeconds = int64(15 * 60)
+
+// clampFutureCreatedAt caps a relay-supplied event created_at at now+drift before it
+// is allowed to advance the durable Intake cursor. A past/near-now created_at passes
+// through unchanged; a far-future one is clamped so it cannot poison the resync
+// window (the event-suppression DoS, security-552). Clamping DOWN is always safe:
+// the cursor is a max-climb watermark, so a clamped-lower value at worst re-reads a
+// bounded window on resync (the Sequencer's id-dedup absorbs the redelivery) — it
+// never skips real data.
+func clampFutureCreatedAt(createdAt, now int64) int64 {
+	if ceil := now + maxIntakeCursorDriftSeconds; createdAt > ceil {
+		return ceil
+	}
+	return createdAt
+}
+
 func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *demuxPublisher) {
 	for {
 		if ctx.Err() != nil {
@@ -796,6 +826,13 @@ func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *de
 			if f.Event == nil {
 				continue
 			}
+			ev := identityToNostrEvent(f.Event)
+			// accepted gates the durable Intake-cursor advance below (dontguess-d6d).
+			// It is set true ONLY when THIS event was authentic + processed — a
+			// folded roster, a verified redeem, or an accepted exchange fold. A
+			// REJECTED event (forged roster/redeem, or a dropped exchange event)
+			// leaves it false so the cursor never climbs on data we refused.
+			accepted := false
 			if f.Event.Kind == nostr.KindFleetRoster {
 				// FLEET ROSTER (design §2/P5). The roster is a SEPARATE projection —
 				// NOT an exchange message — so it must NEVER enter the Intake fold
@@ -806,7 +843,7 @@ func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *de
 				// (ADV-2: applyPut never trusts a relay gate). A nil folder (individual
 				// tier / tests) ignores the roster rather than misrouting it.
 				if w.roster != nil {
-					w.roster.fold(identityToNostrEvent(f.Event))
+					accepted = w.roster.fold(ev)
 				}
 			} else if f.Event.Kind == nostr.KindInvite {
 				// INVITE REDEEM (design §1/P8, ADV-15). A kind-3410 redeem is NOT an
@@ -818,19 +855,29 @@ func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *de
 				// a relay gated the write (ADV-2). A nil handler (individual tier /
 				// tests) ignores the redeem rather than acting on it.
 				if w.redeem != nil {
-					w.redeem.handle(identityToNostrEvent(f.Event))
+					accepted = w.redeem.handle(ev)
 				}
-			} else if herr := w.intake.HandleEvent(identityToNostrEvent(f.Event)); herr != nil {
+			} else if herr := w.intake.HandleEvent(ev); herr != nil {
 				// Counted + alarmed inside the Intake already; log and keep going.
 				log.Printf("relay/reader: intake dropped event %s: %v", f.Event.ID, herr)
+			} else {
+				accepted = true
 			}
-			// dontguess-61a: advance the durable per-relay Intake cursor to this
-			// event's created_at REGARDLESS of accept/drop — even a dropped event
-			// means the relay has served us up to this point in time, so a
-			// subsequent REQ never needs to re-request it. Advance is a max-climb,
-			// crash-safe fsync; a nil cursor (no sidecar wired) is a no-op.
-			if w.intakeCursor != nil {
-				if aerr := w.intakeCursor.Advance(f.Event.CreatedAt); aerr != nil {
+			// dontguess-d6d (was 61a): advance the durable per-relay Intake cursor
+			// ONLY for an ACCEPTED/folded event, and clamp its created_at to
+			// now+bounded-drift before advancing. The old code advanced the cursor
+			// UNCONDITIONALLY to the relay-supplied created_at — so on an OPEN relay
+			// an anonymous attacker could publish a REJECTED, FAR-FUTURE-dated event
+			// (esp. an un-allowlisted kind-3410) and jump the watermark years ahead,
+			// making the next resync REQ `since` skip EVERY real event up to then
+			// (event-suppression DoS, security-552). Two independent guards close it:
+			// (a) accepted → a rejected forgery never moves the cursor at all; and
+			// (b) clampFutureCreatedAt → even a validly-signed but future-dated event
+			// cannot push the cursor past now+drift. Advance is a max-climb, crash-safe
+			// fsync; a nil cursor (no sidecar wired) is a no-op.
+			if accepted && w.intakeCursor != nil {
+				seenAt := clampFutureCreatedAt(f.Event.CreatedAt, time.Now().Unix())
+				if aerr := w.intakeCursor.Advance(seenAt); aerr != nil {
 					log.Printf("relay/reader: intake cursor persist failed (since will be recomputed from the store watermark next restart): %v", aerr)
 				}
 			}

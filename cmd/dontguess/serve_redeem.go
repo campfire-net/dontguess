@@ -81,9 +81,16 @@ func newRedeemHandler(operatorKey string, ctrl *allowlistController, eng *exchan
 // LOUD (LOCKED-5): a forged/expired/replayed redeem reaching the operator is
 // security-relevant and never a silent drop. It is idempotent on a replay (the
 // durable redeemed-id set) and never promotes/mints on any verification failure.
-func (rh *redeemHandler) handle(ev *nostr.Event) {
+//
+// Returns true iff the event was an AUTHENTIC redeem (VerifyRedeem passed:
+// member-signed, embedded operator-signed invite, fresh), false for a
+// forged/expired/unparseable one. runReader (dontguess-d6d) uses this to gate the
+// durable Intake-cursor advance: only an authentic event may move the "how far
+// ingested" watermark, so a rejected forgery (esp. a future-dated un-allowlisted
+// kind-3410 on an open relay) can never poison the cursor and suppress real events.
+func (rh *redeemHandler) handle(ev *nostr.Event) bool {
 	if rh == nil || ev == nil {
-		return
+		return false
 	}
 
 	// AUTHORITATIVE VERIFY (ADV-2): member signature, embedded operator-signed
@@ -92,7 +99,7 @@ func (rh *redeemHandler) handle(ev *nostr.Event) {
 	redeem, err := nostr.VerifyRedeem(ev, rh.operatorKey, rh.nowUnix())
 	if err != nil {
 		rh.logf("SECURITY: invite redeem REJECTED event %s: %v", shortRedeemID(ev.ID), err)
-		return
+		return false
 	}
 	member := redeem.MemberHexKey
 	grant := redeem.Invite.GrantID
@@ -105,7 +112,7 @@ func (rh *redeemHandler) handle(ev *nostr.Event) {
 	// and NOT a reusable bearer credential.
 	if rh.redeemed.has(grant) {
 		rh.logf("invite redeem: grant %s already redeemed — rejecting replay (member %s)", shortRedeemID(grant), shortHex(member))
-		return
+		return true // authentic event (VerifyRedeem passed), just an idempotent replay — cursor may advance
 	}
 
 	// (2) PERSIST redeemed FIRST (durable) so a crash before the mint below can only
@@ -113,7 +120,7 @@ func (rh *redeemHandler) handle(ev *nostr.Event) {
 	// promoted or minted.
 	if err := rh.redeemed.add(grant); err != nil {
 		rh.logf("SECURITY: invite redeem: persist redeemed grant %s FAILED: %v — NOT promoting (a promote+mint without a durable redeemed marker would re-admit/double-mint on the replay after restart)", shortRedeemID(grant), err)
-		return
+		return true // authentic event; persist failure is a local fault, not a reason to leave the cursor open to re-poisoning
 	}
 
 	// (3) PROMOTE into both gates via the SAME operator-signed OpAllowlist path
@@ -125,18 +132,19 @@ func (rh *redeemHandler) handle(ev *nostr.Event) {
 		// Bail: an unadmitted member must NOT be funded. The redeemed marker is
 		// already durable, so this grant is consumed — the operator can admit the
 		// member manually (`allowlist add`) without re-running the mint.
-		return
+		return true // authentic event; promote failure is a local fault, cursor may advance
 	}
 
 	// (4) MINT the optional genesis grant. 0 = none.
 	if redeem.Invite.GenesisScrip > 0 {
 		if err := rh.eng.MintScrip(member, redeem.Invite.GenesisScrip); err != nil {
 			rh.logf("invite redeem: grant %s admitted member %s but genesis mint of %d failed: %v", shortRedeemID(grant), shortHex(member), redeem.Invite.GenesisScrip, err)
-			return
+			return true // authentic event; mint failure is a local fault, cursor may advance
 		}
 	}
 	rh.logf("invite redeem: grant %s ONBOARDED member %s (genesis %d scrip) — admitted to fleet KeySet + roster",
 		shortRedeemID(grant), shortHex(member), redeem.Invite.GenesisScrip)
+	return true
 }
 
 // promote admits memberHex into the live fleet via allowlistController.apply,
