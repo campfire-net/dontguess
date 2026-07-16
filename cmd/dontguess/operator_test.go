@@ -75,10 +75,7 @@ func newOpTestHarness(t *testing.T) *opTestHarness {
 // campfire convention bootstrap directly.
 func conventionDirForOpTest(t *testing.T) string {
 	t.Helper()
-	dir, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("getwd: %v", err)
-	}
+	dir := testRepoWD
 	for {
 		candidate := filepath.Join(dir, "docs", "convention")
 		if info, err := os.Stat(candidate); err == nil && info.IsDir() {

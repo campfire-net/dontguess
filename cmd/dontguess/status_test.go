@@ -499,7 +499,7 @@ func TestStatus_WrapperSchemaConsistency(t *testing.T) {
 
 	// Locate the repo root (walk up from cwd).
 	repoRoot := func() string {
-		dir, _ := os.Getwd()
+		dir := testRepoWD
 		for {
 			if _, err := os.Stat(filepath.Join(dir, "site", "install.sh")); err == nil {
 				return dir

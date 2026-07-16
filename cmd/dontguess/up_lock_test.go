@@ -47,9 +47,32 @@ import (
 
 const fakeServeMarkerEnv = "DONTGUESS_TEST_FAKE_SERVE"
 
+// testRepoWD is the working directory the test binary started in (the package
+// dir inside the repo), captured BEFORE TestMain relocates cwd for hermeticity.
+// Tests that must locate repo files (site/install.sh, docs/convention) walk up
+// from HERE instead of os.Getwd() (dontguess-884).
+var testRepoWD string
+
 func TestMain(m *testing.M) {
 	if os.Getenv(fakeServeMarkerEnv) == "1" {
 		os.Exit(runFakeServeHelper())
+	}
+	testRepoWD, _ = os.Getwd()
+	// Hermetic cwd (dontguess-884): run the whole package from an isolated dir with
+	// no .dg/ ancestor, so the client walk-up config resolution (loadAgentSigner /
+	// resolveRelayURLs / resolveOperatorNpub) can NEVER pick up an ambient repo
+	// .dg/config.json — which, when a dev/agent has provisioned a .dg/ in the
+	// checkout, would feed the real operator npub + relays into in-process
+	// put/buy tests and hang them on wrong-operator timeouts. Tests that need a
+	// specific cwd (e.g. embed-script discovery) set and restore their own; tests
+	// that need repo files walk up from testRepoWD.
+	if tmp, err := os.MkdirTemp("", "dg-test-cwd-"); err == nil {
+		if chErr := os.Chdir(tmp); chErr == nil {
+			code := m.Run()
+			_ = os.RemoveAll(tmp)
+			os.Exit(code)
+		}
+		_ = os.RemoveAll(tmp)
 	}
 	os.Exit(m.Run())
 }
