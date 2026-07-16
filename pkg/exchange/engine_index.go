@@ -10,19 +10,24 @@ func (e *Engine) rebuildMatchIndex() {
 	inventory := e.state.Inventory()
 	inputs := make([]matching.RankInput, 0, len(inventory))
 	for _, entry := range inventory {
-		// SEAM D (dontguess-d53, reload re-gate): rebuild re-indexes
-		// state.Inventory() with ZERO trust filter, and NeedsRevalidation /
-		// AcceptedProvenanceLevel are in-memory-only (reset to zero on Replay).
-		// Without this re-gate, de-allowlisting a seller is ERASED by any restart —
-		// their inventory silently re-enters the searchable index. Re-gate every
-		// entry's SellerKey against the LIVE allowlist: a seller no longer at least
-		// allowlisted (de-allowlisted → anonymous) is flagged NeedsRevalidation (so
-		// findCandidates also withholds it) and skipped from the index. Membership
-		// only — the reputation floor is a sell-side demotion enforced at promotion
-		// (Seam A) and by findCandidates' minRep filter, not a reason to drop an
-		// already-accepted allowlisted seller's inventory on reload. Nil checker
-		// (individual/no-relay tier) → no filtering, byte-for-byte unchanged.
-		if e.opts.TrustChecker != nil && e.opts.TrustChecker.Level(entry.SellerKey) < TrustAllowlisted {
+		// SEAM D (dontguess-d53, reload re-gate; retention rework dontguess-23c):
+		// rebuild re-indexes state.Inventory() with ZERO trust filter, and
+		// NeedsRevalidation / AcceptedProvenanceLevel are in-memory-only (reset to
+		// zero on Replay). The re-gate must therefore re-derive, from durable state,
+		// which entries to withhold.
+		//
+		// It gates on the REVOCATION tombstone, NOT on current allowlist membership.
+		// Every entry in state.Inventory() was already accepted (it only exists
+		// because a put-accept folded), and the exchange OWNS accepted content
+		// (publisher model). So an entry is RETAINED across restart unless its seller
+		// was de-allowlisted FOR CAUSE — which is recorded durably in the revoked set
+		// (Config.RevokedSellers, loaded into the TrustChecker at startup). This is
+		// what preserves the anti-poisoning invariant (a revoked seller's inventory
+		// stays out across restarts) WITHOUT dropping the inventory of an ephemeral
+		// seller who was simply never re-admitted to the current roster — that
+		// conflation was the data-loss bug (dontguess-23c). Nil checker
+		// (individual/no-relay tier) → no revocation, all inventory retained.
+		if e.opts.TrustChecker != nil && e.opts.TrustChecker.IsRevoked(entry.SellerKey) {
 			e.state.FlagEntryForRevalidation(entry.EntryID)
 			continue
 		}

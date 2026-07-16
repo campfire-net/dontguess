@@ -47,9 +47,12 @@ func TestAllowlist_AddListRemoveRoundTrip(t *testing.T) {
 	if err := runAllowlistAdd(dgHome, npub, &addOut); err != nil {
 		t.Fatalf("runAllowlistAdd: %v", err)
 	}
+	// Storage is canonical lowercase hex (consistent with the live IPC path, which
+	// only ever has the hex form); `list` renders it back as npub for humans.
+	wantHex := id.PubKeyHex()
 	cfgAfterAdd := readAllowlistConfig(t, dgHome)
-	if len(cfgAfterAdd.FleetAllowlist) != 1 || cfgAfterAdd.FleetAllowlist[0] != npub {
-		t.Fatalf("after add, on-disk fleet_allowlist = %v, want [%s]", cfgAfterAdd.FleetAllowlist, npub)
+	if len(cfgAfterAdd.FleetAllowlist) != 1 || cfgAfterAdd.FleetAllowlist[0] != wantHex {
+		t.Fatalf("after add, on-disk fleet_allowlist = %v, want [%s]", cfgAfterAdd.FleetAllowlist, wantHex)
 	}
 	rawAfterAdd := readAllowlistConfigRaw(t, dgHome)
 	if !strings.Contains(rawAfterAdd, "fleet_allowlist") {
@@ -75,13 +78,23 @@ func TestAllowlist_AddListRemoveRoundTrip(t *testing.T) {
 		t.Fatalf("after remove, on-disk fleet_allowlist = %v, want empty", cfgAfterRemove.FleetAllowlist)
 	}
 
-	// --- list again: empty ---
+	// --- list again: active allowlist empty, seller now shown as REVOKED ---
+	// A removed seller is de-allowlisted for cause (dontguess-23c): it leaves the
+	// active FleetAllowlist but is surfaced under the revocation tombstones so the
+	// operator can see its inventory is withheld (not merely un-admitted).
 	var listOut2 bytes.Buffer
 	if err := runAllowlistList(dgHome, &listOut2); err != nil {
 		t.Fatalf("runAllowlistList (post-remove): %v", err)
 	}
-	if strings.Contains(listOut2.String(), npub) {
-		t.Errorf("list output after remove still contains %q: %q", npub, listOut2.String())
+	if !strings.Contains(listOut2.String(), "(empty") {
+		t.Errorf("active allowlist should be empty after remove, got: %q", listOut2.String())
+	}
+	if !strings.Contains(listOut2.String(), "revoked") || !strings.Contains(listOut2.String(), npub) {
+		t.Errorf("removed seller should be listed as revoked, got: %q", listOut2.String())
+	}
+	cfgAfterRemove2 := readAllowlistConfig(t, dgHome)
+	if len(cfgAfterRemove2.RevokedSellers) != 1 || cfgAfterRemove2.RevokedSellers[0] != id.PubKeyHex() {
+		t.Errorf("remove must persist a revocation tombstone, got RevokedSellers=%v", cfgAfterRemove2.RevokedSellers)
 	}
 }
 
@@ -144,14 +157,15 @@ func TestAllowlist_AddIsIdempotent(t *testing.T) {
 	}
 
 	cfg := readAllowlistConfig(t, dgHome)
+	wantHex := id.PubKeyHex()
 	count := 0
 	for _, e := range cfg.FleetAllowlist {
-		if e == npub {
+		if e == wantHex {
 			count++
 		}
 	}
 	if count != 1 {
-		t.Errorf("fleet_allowlist has %d copies of %s after double-add, want 1: %v", count, npub, cfg.FleetAllowlist)
+		t.Errorf("fleet_allowlist has %d copies of %s after double-add, want 1: %v", count, wantHex, cfg.FleetAllowlist)
 	}
 }
 

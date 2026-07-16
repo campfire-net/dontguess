@@ -457,10 +457,12 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 	var minBuyBalance int64
 	if len(relayURLs) > 0 {
 		var fleet []string
+		var revoked []string
 		var cfgOperatorKeyHex string
 		cfg, cerr := exchange.LoadConfig(dgHome)
 		if cerr == nil {
 			fleet = cfg.FleetAllowlist
+			revoked = cfg.RevokedSellers
 			minReputation = cfg.MinReputation
 			cfgOperatorKeyHex = cfg.OperatorKeyHex
 		}
@@ -503,6 +505,22 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 			return fmt.Errorf("trust checker: %w", terr)
 		}
 		trustChecker = tc
+		// Load the durable revocation tombstones (dontguess-23c) into the live
+		// checker BEFORE the poll loop / first index rebuild, so SEAM D withholds
+		// exactly the sellers de-allowlisted for cause and RETAINS everyone else's
+		// accepted inventory across this restart. Normalize to hex (matching how the
+		// KeySet is built from FleetAllowlist) so IsRevoked's exact-match compares
+		// against the hex sender keys carried on events, regardless of stored form.
+		revokedHex := make([]string, 0, len(revoked))
+		for _, r := range revoked {
+			if h, err := normalizeToHex(r); err == nil {
+				revokedHex = append(revokedHex, h)
+			}
+		}
+		tc.SetRevoked(revokedHex...)
+		if len(revokedHex) > 0 {
+			logger.Printf("[exchange]   retention:  %d revoked seller(s) withheld; all other accepted inventory retained", len(revokedHex))
+		}
 		liveKeySet = ks // shared with the allowlist hot-reload controller (dontguess-113)
 		// Fold operator-signed fleet roster events (kind 30078) into THIS ks — the
 		// same KeySet the TrustChecker/SEAM A/B gates enforce — so an operator-signed
@@ -690,6 +708,11 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		dgHome:         dgHome,
 		publishRoster:  publishRoster,
 		nowUnix:        func() int64 { return time.Now().Unix() },
+		// Retention side of live de-admit / re-admit (dontguess-23c): revoke records
+		// the durable tombstone + withholds the seller's inventory now; re-admit
+		// clears it + re-indexes the retained inventory.
+		onRevoke:  func(sellerHex string) { eng.DeAllowlistSeller(sellerHex) },
+		onReadmit: eng.ReAllowlistSeller,
 	}
 
 	socketCleanup, err := bindOperatorSocket(ctx, dgHome, eng, logger, allowCtrl)
@@ -739,8 +762,29 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 			return fmt.Errorf("invite redeem handler: %w", rherr)
 		}
 		defer func() { _ = redeemH.redeemed.close() }()
+		// onLegUp asserts config as the authoritative fleet roster on each freshly-
+		// attached leg (dontguess-23c, #2): publish a fresh operator-signed roster
+		// built from Config.FleetAllowlist (created_at=now) so a STALE roster left on
+		// the relay cannot ReplaceAll-demote the live KeySet below config on fold.
+		onLegUp := func(pub *demuxPublisher) {
+			if pub == nil || operatorSigner == nil {
+				return
+			}
+			ev, n, rerr := allowCtrl.rosterFromConfig()
+			if rerr != nil {
+				logger.Printf("  roster: config republish skipped (%v)", rerr)
+				return
+			}
+			pctx, pcancel := context.WithTimeout(ctx, rosterPublishTimeout)
+			defer pcancel()
+			if _, _, perr := pub.PublishEvent(pctx, ev); perr != nil {
+				logger.Printf("  roster: config republish to leg failed (reconciles on next fold): %v", perr)
+				return
+			}
+			logger.Printf("  roster: asserted %d-member fleet roster from config on leg attach (supersedes any stale roster)", n)
+		}
 		attachRelayLegsAsync(ctx, &relayWG, &legsMu, &legs, relayURLs, localStore, relaySigner,
-			localStorePath, appendNotify, eng, logger, climbWatermark, rosterFold, redeemH)
+			localStorePath, appendNotify, eng, logger, climbWatermark, rosterFold, redeemH, onLegUp)
 		// Combined shutdown in the dontguess-e35 order: cancel the context FIRST
 		// (unblocks every reader/outbox and every in-flight dial/attach retry),
 		// THEN wait for the attach goroutines to exit, THEN close each attached

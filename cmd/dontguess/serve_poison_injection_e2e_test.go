@@ -128,6 +128,13 @@ func (p *relayIngestPump) injectSignedPut(seller identity.Signer, desc string, t
 // publish leg is intentionally omitted: these tests assert only on inventory / the
 // match index / degradation counters, never on what reaches the relay wire.
 func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, operator identity.Signer, allow ...string) (*exchange.Engine, *relayIngestPump, func()) {
+	return teamTierServeStackRevoked(t, ls, storePath, operator, nil, allow...)
+}
+
+// teamTierServeStackRevoked is teamTierServeStack plus a durable revocation
+// tombstone set (dontguess-23c) — mirroring how serve loads Config.RevokedSellers
+// at startup so SEAM D withholds exactly the revoked-for-cause sellers on restart.
+func teamTierServeStackRevoked(t *testing.T, ls *dgstore.Store, storePath string, operator identity.Signer, revoked []string, allow ...string) (*exchange.Engine, *relayIngestPump, func()) {
 	t.Helper()
 
 	ks := exchange.NewKeySet(allow...)
@@ -135,6 +142,7 @@ func teamTierServeStack(t *testing.T, ls *dgstore.Store, storePath string, opera
 	if err != nil {
 		t.Fatalf("NewTrustChecker: %v", err)
 	}
+	tc.SetRevoked(revoked...)
 	// Payment is enforced on the team tier; NewLocalScripStore folds the log and
 	// gates on the operator key exactly as serve.go constructs it.
 	ss, err := scrip.NewLocalScripStore(ls, operator.PubKeyHex())
@@ -322,7 +330,11 @@ func TestServeStackDeAllowlist_WithheldAcrossRestart(t *testing.T) {
 	// put re-folds into inventory (it is a real record in the log), NeedsRevalidation
 	// resets to zero on Replay — so ONLY the Seam D reload re-gate can keep it out of
 	// the searchable index.
-	eng2, _, teardown2 := teamTierServeStack(t, ls, storePath, operator /* seller NOT allowlisted */)
+	// Restart with the seller NOT allowlisted AND on the durable revocation
+	// tombstone (dontguess-23c) — exactly what serve persists+loads after a
+	// de-allowlist. SEAM D withholds a revoked seller's inventory; an ordinary
+	// unadmitted seller's inventory is retained.
+	eng2, _, teardown2 := teamTierServeStackRevoked(t, ls, storePath, operator, []string{seller.PubKeyHex()} /* revoked */)
 	defer teardown2()
 
 	// StartupReplayForTest re-folded the accepted put back into inventory AND ran the

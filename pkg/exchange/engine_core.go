@@ -801,13 +801,37 @@ func (e *Engine) DeAllowlistSeller(sellerKey string) int {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
 	if e.opts.TrustChecker != nil {
+		// Remove from the admission allowlist (no NEW puts) AND record the durable
+		// revocation tombstone (dontguess-23c) so SEAM D withholds this seller's
+		// already-accepted inventory across restarts — the anti-poisoning invariant
+		// no longer relies on mere absence from the allowlist (which an ephemeral
+		// seller also has), but on an explicit, persisted "revoked for cause" mark.
 		e.opts.TrustChecker.RemoveMember(sellerKey)
+		e.opts.TrustChecker.RevokeMember(sellerKey)
 	}
 	n := e.state.FlagSellerEntriesForRevalidation(sellerKey)
 	e.rebuildMatchIndex()
 	e.opts.log("SECURITY: de-allowlisted seller %s — %d inventory entr(y/ies) withheld pending re-validation (Seam C/D)",
 		shortKey(sellerKey), n)
 	return n
+}
+
+// ReAllowlistSeller re-admits a previously de-allowlisted seller (dontguess-23c):
+// it clears the revocation tombstone and rebuilds the match index so the seller's
+// RETAINED inventory (never purged — publisher-owned content) re-enters the
+// searchable set immediately, no restart required. The KeySet membership add
+// (admission for NEW puts) is handled by the allowlist controller; this owns the
+// retention side (revoked set + index). No-op when no TrustChecker is configured.
+// Acquires opMu, serializing against the auto-accept ticker like DeAllowlistSeller.
+func (e *Engine) ReAllowlistSeller(sellerKey string) {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	if e.opts.TrustChecker == nil {
+		return
+	}
+	e.opts.TrustChecker.UnrevokeMember(sellerKey)
+	e.rebuildMatchIndex()
+	e.opts.log("re-allowlisted seller %s — revocation cleared, retained inventory re-indexed", shortKey(sellerKey))
 }
 
 // MatchIndexLen returns the number of entries currently in the semantic match index.

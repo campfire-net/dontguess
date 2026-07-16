@@ -1414,6 +1414,7 @@ func attachRelayLegsAsync(
 	climbWatermark int64,
 	roster *rosterFolder,
 	redeem *redeemHandler,
+	onLegUp func(pub *demuxPublisher),
 ) {
 	for _, relayURL := range relayURLs {
 		relayURL := relayURL
@@ -1463,6 +1464,12 @@ func attachRelayLegsAsync(
 				*legs = append(*legs, relayLeg{conn: conn, stop: stop, publisher: legPub})
 				legsMu.Unlock()
 				logger.Printf("  relay:     %s (operator npub %s)", relayURL, relaySigner.Npub())
+				// Assert config as the authoritative roster on this freshly-attached
+				// leg so a stale roster on the relay cannot demote the live allowlist
+				// below Config.FleetAllowlist (dontguess-23c, #2).
+				if onLegUp != nil {
+					onLegUp(legPub)
+				}
 				return
 			}
 		}()

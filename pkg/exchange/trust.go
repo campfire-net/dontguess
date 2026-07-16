@@ -352,6 +352,18 @@ type TrustChecker struct {
 	opLevels     map[Operation]TrustLevel
 	settleLevels map[SettlePhase]TrustLevel
 
+	// revoked is the durable-in-effect set of sellers de-allowlisted FOR CAUSE
+	// (dontguess-23c). It is DISTINCT from `members`: `members` answers "can this
+	// seller put NEW content" (admission), while `revoked` answers "is this
+	// seller's already-accepted OLD content withheld from the index" (retention).
+	// SEAM D (rebuildMatchIndex) drops an entry iff its seller is revoked, so
+	// accepted inventory is retained across restart unless the operator explicitly
+	// revoked the seller — which is exactly the anti-poisoning invariant, now
+	// carried by an explicit tombstone set rather than by absence from `members`.
+	// Loaded from Config.RevokedSellers at startup; mutated by RevokeMember /
+	// UnrevokeMember. Never contains the operator key.
+	revoked *KeySet
+
 	// reputation, when non-nil, gates sell-side operations (put): a sender whose
 	// score is below minReputation is rejected with ErrLowReputation. nil disables
 	// reputation gating entirely.
@@ -421,6 +433,7 @@ func NewTrustChecker(operatorKey string, members Membership, opts ...TrustChecke
 		members:      members,
 		opLevels:     make(map[Operation]TrustLevel, len(defaultOperationLevels)),
 		settleLevels: make(map[SettlePhase]TrustLevel, len(defaultSettlePhaseLevels)),
+		revoked:      NewKeySet(),
 	}
 	for k, v := range defaultOperationLevels {
 		c.opLevels[k] = v
@@ -458,6 +471,39 @@ func (c *TrustChecker) RemoveMember(key string) {
 	if ks, ok := c.members.(*KeySet); ok {
 		ks.Remove(key)
 	}
+}
+
+// RevokeMember marks a seller as de-allowlisted FOR CAUSE (dontguess-23c): its
+// already-accepted inventory is withheld from the match index and stays withheld
+// across restarts (SEAM D re-gates on the revoked set). Never revokes the
+// operator key — operator authority is independent of membership. Safe for
+// concurrent use (KeySet.Add is locked). Persistence is the caller's job (the
+// serve/IPC layer writes Config.RevokedSellers); this only mutates live state.
+func (c *TrustChecker) RevokeMember(key string) {
+	if key == "" || (c.operatorKey != "" && key == c.operatorKey) {
+		return
+	}
+	c.revoked.Add(key)
+}
+
+// UnrevokeMember clears a seller's revocation tombstone — used when the operator
+// re-admits a previously-revoked seller (`allowlist add`), so their retained
+// inventory can re-enter the index. Safe for concurrent use.
+func (c *TrustChecker) UnrevokeMember(key string) {
+	c.revoked.Remove(key)
+}
+
+// IsRevoked reports whether a seller has been de-allowlisted for cause. SEAM D
+// uses this to decide retention: an entry is dropped from the index iff its
+// seller is revoked (not merely absent from the allowlist).
+func (c *TrustChecker) IsRevoked(key string) bool {
+	return c.revoked != nil && c.revoked.Allowed(key)
+}
+
+// SetRevoked replaces the revocation set atomically — used at startup to load
+// Config.RevokedSellers into the live checker before the poll loop begins.
+func (c *TrustChecker) SetRevoked(keys ...string) {
+	c.revoked.ReplaceAll(keys...)
 }
 
 // Level returns the trust tier for a sender key: operator if it is the operator

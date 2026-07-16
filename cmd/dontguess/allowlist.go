@@ -110,18 +110,15 @@ func runAllowlistAdd(dgHome, npub string, out io.Writer) error {
 		return fmt.Errorf("allowlist add: %w", err)
 	}
 
-	for _, existing := range cfg.FleetAllowlist {
-		if existingHex, nerr := normalizeToHex(existing); nerr == nil && existingHex == hexKey {
-			fmt.Fprintf(out, "already allowlisted: %s\n", npub)
-			return nil
-		}
-	}
-
-	cfg.FleetAllowlist = append(cfg.FleetAllowlist, npub)
+	changed := mutateAllowlistConfig(cfg, allowlistActionAdd, hexKey)
 	if err := exchange.WriteConfig(exchange.ConfigPath(dgHome), cfg); err != nil {
 		return fmt.Errorf("allowlist add: %w", err)
 	}
-	fmt.Fprintf(out, "allowlisted: %s\n", npub)
+	if changed {
+		fmt.Fprintf(out, "allowlisted: %s\n", npub)
+	} else {
+		fmt.Fprintf(out, "already allowlisted: %s\n", npub)
+	}
 	return nil
 }
 
@@ -165,6 +162,56 @@ func allowlistLiveRequest(conn net.Conn, dgHome, action, hexKey, display string,
 // runAllowlistRemove validates npub the same way as add (loud error, nothing
 // persisted on a malformed entry), then drops any config entry whose
 // normalized hex matches — regardless of whether it was originally stored as
+// mutateAllowlistConfig applies an add|remove to cfg, keeping FleetAllowlist and
+// the RevokedSellers tombstone (dontguess-23c) coherent as a single operator
+// intent:
+//
+//	add    -> ensure present in FleetAllowlist, clear any RevokedSellers tombstone
+//	remove -> drop from FleetAllowlist, RECORD a RevokedSellers tombstone
+//
+// The tombstone is what makes de-allowlisting durable across restart under the
+// retention model (SEAM D withholds a revoked seller's accepted inventory; an
+// absent-but-not-revoked seller's inventory is RETAINED). Comparison is by
+// normalized hex so npub- and hex-stored forms of the same key reconcile.
+// Returns whether the FleetAllowlist membership actually changed (for messaging).
+func mutateAllowlistConfig(cfg *exchange.Config, action, targetHex string) (changed bool) {
+	inList := func(list []string) bool {
+		for _, e := range list {
+			if h, err := normalizeToHex(e); err == nil && h == targetHex {
+				return true
+			}
+		}
+		return false
+	}
+	switch action {
+	case allowlistActionAdd:
+		changed = !inList(cfg.FleetAllowlist)
+		if changed {
+			cfg.FleetAllowlist = append(cfg.FleetAllowlist, targetHex)
+		}
+		cfg.RevokedSellers = dropHexEntry(cfg.RevokedSellers, targetHex)
+	case allowlistActionRemove:
+		changed = inList(cfg.FleetAllowlist)
+		cfg.FleetAllowlist = dropHexEntry(cfg.FleetAllowlist, targetHex)
+		if !inList(cfg.RevokedSellers) {
+			cfg.RevokedSellers = append(cfg.RevokedSellers, targetHex)
+		}
+	}
+	return changed
+}
+
+// dropHexEntry returns list without any entry whose normalized hex equals targetHex.
+func dropHexEntry(list []string, targetHex string) []string {
+	var kept []string
+	for _, e := range list {
+		if h, err := normalizeToHex(e); err == nil && h == targetHex {
+			continue
+		}
+		kept = append(kept, e)
+	}
+	return kept
+}
+
 // npub or hex. Removing an absent entry is a no-op, not an error.
 func runAllowlistRemove(dgHome, npub string, out io.Writer) error {
 	if _, err := identity.NewAllowlist(npub); err != nil {
@@ -187,25 +234,18 @@ func runAllowlistRemove(dgHome, npub string, out io.Writer) error {
 		return fmt.Errorf("allowlist remove: %w", err)
 	}
 
-	var kept []string
-	removed := false
-	for _, existing := range cfg.FleetAllowlist {
-		if existingHex, nerr := normalizeToHex(existing); nerr == nil && existingHex == hexKey {
-			removed = true
-			continue
-		}
-		kept = append(kept, existing)
-	}
-	if !removed {
-		fmt.Fprintf(out, "not allowlisted: %s\n", npub)
-		return nil
-	}
-
-	cfg.FleetAllowlist = kept
+	// Always record the revocation tombstone (dontguess-23c), even if the seller
+	// was not currently in FleetAllowlist — the operator intent is "withhold this
+	// seller's inventory", which must persist regardless of prior membership.
+	changed := mutateAllowlistConfig(cfg, allowlistActionRemove, hexKey)
 	if err := exchange.WriteConfig(exchange.ConfigPath(dgHome), cfg); err != nil {
 		return fmt.Errorf("allowlist remove: %w", err)
 	}
-	fmt.Fprintf(out, "removed: %s\n", npub)
+	if changed {
+		fmt.Fprintf(out, "removed (revoked): %s\n", npub)
+	} else {
+		fmt.Fprintf(out, "revoked (was not in allowlist): %s\n", npub)
+	}
 	return nil
 }
 
@@ -225,12 +265,33 @@ func runAllowlistList(dgHome string, out io.Writer) error {
 
 	if len(cfg.FleetAllowlist) == 0 {
 		fmt.Fprintln(out, "(empty — only the operator key is admitted once a TrustChecker is constructed)")
-		return nil
 	}
 	for _, e := range cfg.FleetAllowlist {
-		fmt.Fprintln(out, e)
+		fmt.Fprintln(out, displayNpub(e))
+	}
+	// Surface the revocation tombstones (dontguess-23c) so the operator can see
+	// which sellers are withheld — distinct from "simply not admitted".
+	if len(cfg.RevokedSellers) > 0 {
+		fmt.Fprintf(out, "\nrevoked (inventory withheld) — %d:\n", len(cfg.RevokedSellers))
+		for _, e := range cfg.RevokedSellers {
+			fmt.Fprintln(out, displayNpub(e))
+		}
 	}
 	return nil
+}
+
+// displayNpub renders a stored entry (canonical lowercase hex, or a legacy
+// npub-form entry) as an npub for human-facing output, falling back to the raw
+// entry if it cannot be encoded.
+func displayNpub(entry string) string {
+	hexKey, err := normalizeToHex(entry)
+	if err != nil {
+		return entry
+	}
+	if npub, err := identity.EncodeNpubHex(hexKey); err == nil {
+		return npub
+	}
+	return entry
 }
 
 // normalizeToHex converts an npub or hex pubkey entry to lowercase hex, so

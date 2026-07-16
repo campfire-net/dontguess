@@ -59,6 +59,15 @@ type allowlistController struct {
 	// the individual tier and in unit tests that assert config-only behavior.
 	publishRoster func(ev *identity.Event)
 
+	// onRevoke / onReadmit apply the RETENTION side of a de-admit / re-admit to the
+	// live engine (dontguess-23c): onRevoke records the durable revocation tombstone
+	// and withholds the seller's accepted inventory from the index NOW; onReadmit
+	// clears it and re-indexes the retained inventory. Wired to
+	// Engine.DeAllowlistSeller / Engine.ReAllowlistSeller. nil on the individual
+	// tier and in config-only unit tests.
+	onRevoke  func(sellerHex string)
+	onReadmit func(sellerHex string)
+
 	// mu serializes apply() calls so the config write, the KeySet mutation, and the
 	// roster snapshot form one atomic operator action — the republished roster
 	// always reflects the membership just persisted. lastRoster keeps each
@@ -126,8 +135,18 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 	switch action {
 	case allowlistActionAdd:
 		c.keys.Add(targetHex)
+		// Retention side: clear any revocation tombstone and re-index the seller's
+		// retained inventory immediately (dontguess-23c).
+		if c.onReadmit != nil {
+			c.onReadmit(targetHex)
+		}
 	case allowlistActionRemove:
 		c.keys.Remove(targetHex)
+		// Retention side: record the durable revocation tombstone and withhold the
+		// seller's accepted inventory from the index NOW (dontguess-23c).
+		if c.onRevoke != nil {
+			c.onRevoke(targetHex)
+		}
 	}
 
 	// (3) Republish the roster (best-effort). Build it from the JUST-PERSISTED
@@ -152,6 +171,32 @@ func (c *allowlistController) apply(action, targetHex string, auth *identity.Eve
 		c.publishRoster(ev)
 	}
 	return nil
+}
+
+// rosterFromConfig builds a fresh operator-signed roster (created_at = now) over
+// the CURRENT persisted Config.FleetAllowlist (dontguess-23c). Published on each
+// leg attach at startup so the relay's latest roster always reflects the durable
+// local config — a STALE roster left on the relay (e.g. from a prior process whose
+// republish never landed) can never demote the live KeySet below config via the
+// replaceable-event fold, because this fresher roster supersedes it. Returns the
+// signed event and the member count. Safe for concurrent use (holds c.mu).
+func (c *allowlistController) rosterFromConfig() (*identity.Event, int, error) {
+	cfg, err := exchange.LoadConfig(c.dgHome)
+	if err != nil {
+		return nil, 0, err
+	}
+	allow, err := identity.NewAllowlist(cfg.FleetAllowlist...)
+	if err != nil {
+		return nil, 0, err
+	}
+	members := allow.HexKeys()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	ev, err := c.buildRoster(members)
+	if err != nil {
+		return nil, 0, err
+	}
+	return ev, len(members), nil
 }
 
 // buildRoster signs a kind-30078 fleet roster over the given FULL membership
@@ -195,26 +240,12 @@ func persistFleetAllowlistChange(dgHome, action, targetHex string) ([]string, er
 	if err != nil {
 		return nil, err
 	}
-	switch action {
-	case allowlistActionAdd:
-		for _, existing := range cfg.FleetAllowlist {
-			if h, nerr := normalizeToHex(existing); nerr == nil && h == targetHex {
-				return cfg.FleetAllowlist, nil // already present — no-op (membership unchanged)
-			}
-		}
-		cfg.FleetAllowlist = append(cfg.FleetAllowlist, targetHex)
-	case allowlistActionRemove:
-		var kept []string
-		for _, existing := range cfg.FleetAllowlist {
-			if h, nerr := normalizeToHex(existing); nerr == nil && h == targetHex {
-				continue
-			}
-			kept = append(kept, existing)
-		}
-		cfg.FleetAllowlist = kept
-	default:
+	if action != allowlistActionAdd && action != allowlistActionRemove {
 		return nil, fmt.Errorf("allowlist: unknown action %q", action)
 	}
+	// Mutate FleetAllowlist AND the RevokedSellers tombstone coherently
+	// (dontguess-23c): remove records a tombstone, add clears it.
+	mutateAllowlistConfig(cfg, action, targetHex)
 	if err := exchange.WriteConfig(exchange.ConfigPath(dgHome), cfg); err != nil {
 		return nil, err
 	}

@@ -199,15 +199,20 @@ func TestAdmissionSeamCD_DeAllowlistWithheldAcrossRestart(t *testing.T) {
 	}
 
 	// Simulate a restart: a FRESH engine (new State, new match index) whose
-	// config-reloaded allowlist no longer contains the seller. NeedsRevalidation
-	// is in-memory-only and resets to zero on Replay — so ONLY the Seam D reload
-	// re-gate can keep the entry withheld. This is the exact "de-allowlist erased
-	// by restart" hole the seam closes.
+	// config-reloaded allowlist no longer contains the seller AND whose durable
+	// revocation tombstone (Config.RevokedSellers, dontguess-23c) DOES contain it —
+	// this is exactly what serve loads at startup. NeedsRevalidation is
+	// in-memory-only and resets to zero on Replay, so ONLY the Seam D reload re-gate
+	// (now keyed on the revoked tombstone) can keep the entry withheld. This is the
+	// "de-allowlist erased by restart" hole the seam closes — the anti-poisoning
+	// invariant now rides an explicit persisted tombstone, not mere allowlist
+	// absence, so an ephemeral seller's inventory is NOT collateral damage.
 	ks2 := exchange.NewKeySet() // persisted allowlist minus the removed seller
 	tc2, err := exchange.NewTrustChecker(h.operator.pubKeyHex, ks2)
 	if err != nil {
 		t.Fatalf("NewTrustChecker (restart): %v", err)
 	}
+	tc2.SetRevoked(seller.pubKeyHex) // startup loads Config.RevokedSellers
 	eng2 := h.newEngineWithOpts(func(o *exchange.EngineOptions) { o.TrustChecker = tc2 })
 	if err := eng2.ReplayAllForTest(); err != nil {
 		t.Fatalf("restart replay: %v", err)
@@ -220,6 +225,60 @@ func TestAdmissionSeamCD_DeAllowlistWithheldAcrossRestart(t *testing.T) {
 	}
 	if !eng2.State().EntryNeedsRevalidation(entryID) {
 		t.Errorf("Seam D FAILED (restart): entry not re-flagged NeedsRevalidation after replay")
+	}
+}
+
+// TestSeamD_RetainsUnadmittedSellerInventoryAcrossRestart is the dontguess-23c
+// retention invariant — the counterpart to the anti-poisoning test above, and the
+// data-loss bug it fixes. A seller who was admitted, had a put accepted, then is
+// simply NOT re-admitted on the next restart (ephemeral agent, roster not
+// reconstructed) but was NEVER de-allowlisted for cause, must keep their accepted
+// inventory SEARCHABLE across restart. Retention is gated on the revocation
+// tombstone, not on current allowlist membership, so a missing seller is not
+// collateral damage. (This is exactly the 55-sellers-de-indexed-on-restart live
+// incident.)
+func TestSeamD_RetainsUnadmittedSellerInventoryAcrossRestart(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	seller := h.seller
+
+	ks := exchange.NewKeySet(seller.pubKeyHex)
+	tc, err := exchange.NewTrustChecker(h.operator.pubKeyHex, ks)
+	if err != nil {
+		t.Fatalf("NewTrustChecker: %v", err)
+	}
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) { o.TrustChecker = tc })
+
+	admInjectPut(t, h, seller, "Raft leader election edge cases and lease safety", 8500)
+	replayAll(t, h, eng)
+	eng.RunAutoAccept(exchange.MaxTokenCost, time.Now(), map[string]struct{}{})
+	if eng.MatchIndexLen() != 1 {
+		t.Fatalf("precondition: accepted entry should be matchable, index len=%d", eng.MatchIndexLen())
+	}
+
+	// Restart: fresh engine whose allowlist does NOT contain the seller (ephemeral —
+	// never re-admitted) and whose revocation tombstone is EMPTY (never revoked for
+	// cause). The accepted inventory must be RETAINED and matchable.
+	ks2 := exchange.NewKeySet() // seller absent from the reconstructed allowlist
+	tc2, err := exchange.NewTrustChecker(h.operator.pubKeyHex, ks2)
+	if err != nil {
+		t.Fatalf("NewTrustChecker (restart): %v", err)
+	}
+	// NOTE: no SetRevoked — the seller was never de-allowlisted for cause.
+	eng2 := h.newEngineWithOpts(func(o *exchange.EngineOptions) { o.TrustChecker = tc2 })
+	if err := eng2.ReplayAllForTest(); err != nil {
+		t.Fatalf("restart replay: %v", err)
+	}
+
+	if eng2.MatchIndexLen() != 1 {
+		t.Errorf("RETENTION FAILED: unadmitted-but-not-revoked seller's inventory dropped on restart (index len=%d, want 1)", eng2.MatchIndexLen())
+	}
+	inv := eng2.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("expected 1 replayed entry, got %d", len(inv))
+	}
+	if eng2.State().EntryNeedsRevalidation(inv[0].EntryID) {
+		t.Errorf("RETENTION FAILED: retained entry wrongly flagged NeedsRevalidation")
 	}
 }
 

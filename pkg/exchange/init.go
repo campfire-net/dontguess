@@ -91,6 +91,16 @@ type Config struct {
 	// individual tier (no relays) never reads it.
 	// See docs/design/nostr-admission-scrip-rehome-3b8.md §6.
 	FleetAllowlist []string `json:"fleet_allowlist,omitempty"`
+	// RevokedSellers is the durable set of seller pubkeys explicitly de-allowlisted
+	// FOR CAUSE (dontguess-23c). It is the anti-poisoning tombstone: a revoked
+	// seller's already-accepted inventory stays OUT of the searchable match index
+	// across restarts (SEAM D re-gates on this set), and the seller cannot re-enter
+	// merely by having historical accepted puts. This is deliberately SEPARATE from
+	// FleetAllowlist membership: absence from FleetAllowlist means "cannot put NEW
+	// content" (admission), whereas presence here means "OLD content is withheld"
+	// (retention). Removing a seller (`allowlist remove`) adds them here; re-adding
+	// them (`allowlist add`) clears the tombstone. Empty for a fresh config.
+	RevokedSellers []string `json:"revoked_sellers,omitempty"`
 	// OperatorSocketPath is the resolved absolute path of the operator IPC
 	// unix socket, written by `serve`'s bindOperatorSocket AFTER a successful
 	// bind (dontguess-7b2, design §4/§9 Gate A/P2). A long DG_HOME can push
