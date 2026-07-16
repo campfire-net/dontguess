@@ -303,6 +303,31 @@ var upServeReadyTimeout = 15 * time.Second
 // buildLogDest already rotates dontguess.log under dgHome), writes a pidfile
 // for operator convenience, and waits (bounded) for the socket to come up.
 func spawnDetachedServe(dgHome string) (alreadyRunning bool, err error) {
+	if mkErr := os.MkdirAll(dgHome, 0o755); mkErr != nil {
+		return false, fmt.Errorf("prepare %s: %w", dgHome, mkErr)
+	}
+	lockPath := upLockFilePath(dgHome)
+	lockFile, lerr := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if lerr != nil {
+		return false, fmt.Errorf("open up lock %s: %w", lockPath, lerr)
+	}
+	defer lockFile.Close()
+
+	// Interprocess single-writer guarantee around the check-then-spawn below
+	// (dontguess-647): mirrors the shell wrapper's flock auto-start pattern
+	// (site/install.sh's dontguess.start.lock). Without this, two concurrent
+	// `up` invocations on a cold DG_HOME both observe the operator socket
+	// unreachable, both exec a detached `dontguess serve`, race to bind the
+	// same unix socket, and the loser's PID clobbers the pidfile even though
+	// only one serve process actually lives. Blocking (bounded overall wait)
+	// so the loser simply waits for the winner instead of racing it; if the
+	// winner is stuck, the loser still fails loud rather than hanging forever,
+	// matching this file's "never a silent hang" convention.
+	if ferr := lockWithTimeout(lockFile, upServeReadyTimeout); ferr != nil {
+		return false, fmt.Errorf("acquire up lock %s: %w", lockPath, ferr)
+	}
+	defer func() { _ = syscall.Flock(int(lockFile.Fd()), syscall.LOCK_UN) }()
+
 	if _, ok := dialSocketMaybe(dgHome); ok {
 		return true, nil
 	}
@@ -342,6 +367,36 @@ func spawnDetachedServe(dgHome string) (alreadyRunning bool, err error) {
 // operator convenience (e.g. `kill $(cat $DG_HOME/dontguess.pid)`).
 func pidFilePath(dgHome string) string {
 	return filepath.Join(dgHome, "dontguess.pid")
+}
+
+// upLockFilePath is the interprocess lock spawnDetachedServe holds around its
+// check-then-spawn (dontguess-647). Named to mirror the shell wrapper's own
+// flock lock (site/install.sh's dontguess.start.lock) — same single-writer
+// guarantee, now also held by `dontguess up` itself, not just the wrapper's
+// auto-start path.
+func upLockFilePath(dgHome string) string {
+	return filepath.Join(dgHome, "dontguess.start.lock")
+}
+
+// lockWithTimeout acquires an exclusive advisory flock on f, polling with a
+// non-blocking attempt every 100ms (mirrors waitForOperatorSocket's poll
+// pattern above) until it succeeds or timeout elapses. Bounded — a stuck lock
+// holder can never wedge a concurrent `up` forever.
+func lockWithTimeout(f *os.File, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ferr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		if ferr == nil {
+			return nil
+		}
+		if ferr != syscall.EWOULDBLOCK {
+			return ferr
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %s", timeout)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 }
 
 // waitForOperatorSocket polls dialSocketMaybe until it succeeds or timeout
