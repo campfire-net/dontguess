@@ -74,10 +74,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={{.ServeBinary}} serve
-Environment=DG_HOME={{.DGHome}}
+ExecStart="{{.ServeBinary}}" serve
+Environment="DG_HOME={{.DGHome}}"
 {{- if .RelayURLs}}
-Environment=DONTGUESS_RELAY_URLS={{.RelayURLs}}
+Environment="DONTGUESS_RELAY_URLS={{.RelayURLs}}"
 {{- end}}
 Restart=on-failure
 RestartSec=5
@@ -138,9 +138,9 @@ func RenderUnit(opts Options) (string, error) {
 		DGHome      string
 		RelayURLs   string
 	}{
-		ServeBinary: opts.ServeBinary,
-		DGHome:      opts.DGHome,
-		RelayURLs:   strings.Join(opts.RelayURLs, ","),
+		ServeBinary: systemdQuoteArg(opts.ServeBinary),
+		DGHome:      systemdQuoteArg(opts.DGHome),
+		RelayURLs:   systemdQuoteArg(strings.Join(opts.RelayURLs, ",")),
 	}
 
 	var buf bytes.Buffer
@@ -150,9 +150,24 @@ func RenderUnit(opts Options) (string, error) {
 	return buf.String(), nil
 }
 
+// systemdQuoteArg escapes s for embedding inside a double-quoted systemd
+// unit-file value (ExecStart= command path, Environment= assignment). The
+// unitTemplate wraps every interpolated value in literal double quotes, so a
+// path or env value containing a space is parsed as one token/one
+// assignment instead of being split on whitespace (systemd.syntax(7) C-style
+// quoting: backslash and double-quote are the only characters that must be
+// escaped inside a double-quoted token). Without this, a ServeBinary or
+// DGHome path containing a space (valid on Linux) produced a unit systemd
+// mis-parsed or rejected (dontguess-983).
+func systemdQuoteArg(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
+}
+
 // systemdUserAvailable reports whether this host can actually manage
 // systemd --user units and linger in this session: both systemctl and
-// loginctl must be on PATH AND `systemctl --user is-system-running` must
+// loginctl must be on PATH AND `systemctl --user show-environment` must
 // not error opening the user bus (e.g. no session, no user@.service, CI
 // container without a login session). Returns ok=false with a human note
 // when unavailable — never silently assumed.

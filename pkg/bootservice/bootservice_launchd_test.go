@@ -1,6 +1,9 @@
 package bootservice
 
 import (
+	"encoding/xml"
+	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -47,6 +50,68 @@ func TestRenderPlistRejectsRelativePaths(t *testing.T) {
 	for i, opts := range cases {
 		if _, err := RenderPlist(opts); err == nil {
 			t.Errorf("case %d: expected error for %+v, got nil", i, opts)
+		}
+	}
+}
+
+// TestRenderPlistEscapesXMLMetacharacters is the GROUND-SOURCE test for
+// dontguess-983: a ServeBinary/DGHome/RelayURLs value containing an XML
+// metacharacter (&, <, >) — plausible in a relay URL query string or a
+// path — must not corrupt the plist. Before the fix, RenderPlist used
+// text/template (which does not escape) so this produced malformed,
+// non-well-formed XML and returned a NIL error (silent corruption). We
+// assert well-formedness via a real encoding/xml round-trip (Decoder token
+// walk to EOF, not a mock/regex) AND that the decoded <string> element text
+// equals the original unescaped value — proving the escape/unescape pair
+// is correct, not merely that some coincidental output happens to parse.
+func TestRenderPlistEscapesXMLMetacharacters(t *testing.T) {
+	opts := Options{
+		ServeBinary: `/opt/A & B/<dontguess>`,
+		DGHome:      `/srv/op "home" & <weird>/.dontguess`,
+		RelayURLs:   []string{"wss://relay.example/path?a=1&b=2<x>"},
+	}
+	content, err := RenderPlist(opts)
+	if err != nil {
+		t.Fatalf("RenderPlist: %v", err)
+	}
+
+	// GROUND-SOURCE: real encoding/xml token walk over the full document —
+	// any malformed markup (unescaped & or < inside element text) makes
+	// the decoder return a non-EOF error.
+	dec := xml.NewDecoder(strings.NewReader(content))
+	var stringTexts []string
+	var sawStringElem bool
+	for {
+		tok, err := dec.Token()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatalf("plist is not well-formed XML: %v\ncontent:\n%s", err, content)
+		}
+		switch se := tok.(type) {
+		case xml.StartElement:
+			sawStringElem = se.Name.Local == "string"
+		case xml.CharData:
+			if sawStringElem {
+				stringTexts = append(stringTexts, string(se))
+			}
+		case xml.EndElement:
+			sawStringElem = false
+		}
+	}
+
+	wantValues := []string{opts.ServeBinary, opts.DGHome, "wss://relay.example/path?a=1&b=2<x>"}
+	for _, want := range wantValues {
+		found := false
+		for _, got := range stringTexts {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Errorf("decoded plist <string> elements do not contain the round-tripped value %q; decoded values: %q\ncontent:\n%s", want, stringTexts, content)
 		}
 	}
 }

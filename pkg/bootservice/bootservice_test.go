@@ -23,13 +23,13 @@ func TestRenderUnitResolvesPathsNotHardcoded(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderUnit: %v", err)
 	}
-	if !strings.Contains(content, "ExecStart=/opt/custom/bin/dontguess serve") {
+	if !strings.Contains(content, `ExecStart="/opt/custom/bin/dontguess" serve`) {
 		t.Errorf("unit does not reference caller-resolved ServeBinary:\n%s", content)
 	}
-	if !strings.Contains(content, "Environment=DG_HOME=/srv/weird-operator-home/.dontguess") {
+	if !strings.Contains(content, `Environment="DG_HOME=/srv/weird-operator-home/.dontguess"`) {
 		t.Errorf("unit does not reference caller-resolved DGHome:\n%s", content)
 	}
-	if !strings.Contains(content, "Environment=DONTGUESS_RELAY_URLS=ws://192.168.2.40:7777,ws://192.168.2.41:7777") {
+	if !strings.Contains(content, `Environment="DONTGUESS_RELAY_URLS=ws://192.168.2.40:7777,ws://192.168.2.41:7777"`) {
 		t.Errorf("unit does not reference caller-resolved RelayURLs:\n%s", content)
 	}
 	// No path literal from a DIFFERENT operator/home should ever appear —
@@ -51,6 +51,105 @@ func TestRenderUnitRejectsRelativePaths(t *testing.T) {
 			t.Errorf("case %d: expected error for %+v, got nil", i, opts)
 		}
 	}
+}
+
+// TestRenderUnitQuotesSpaceInPath is the GROUND-SOURCE test for
+// dontguess-983: a ServeBinary/DGHome path containing a space (valid on
+// Linux) must render as a unit systemd parses as ONE token/ONE
+// assignment — not split on the embedded whitespace. We assert this by
+// parsing the rendered ExecStart= and Environment= lines with a
+// systemd.syntax(7)-shaped quoted-token splitter (whitespace splits
+// outside double quotes, backslash/double-quote are the only escapes
+// inside quotes) rather than trusting substring containment, which would
+// pass even on unquoted, systemd-broken output.
+func TestRenderUnitQuotesSpaceInPath(t *testing.T) {
+	opts := Options{
+		ServeBinary: "/opt/my custom bin/dontguess",
+		DGHome:      "/srv/weird operator home/.dontguess",
+		RelayURLs:   []string{"ws://192.168.2.40:7777"},
+	}
+	content, err := RenderUnit(opts)
+	if err != nil {
+		t.Fatalf("RenderUnit: %v", err)
+	}
+
+	execLine := findLine(t, content, "ExecStart=")
+	tokens := splitSystemdQuoted(execLine[len("ExecStart="):])
+	if len(tokens) != 2 {
+		t.Fatalf("ExecStart tokenized to %d tokens (want 2 — binary path is being split on the embedded space): %q from line %q", len(tokens), tokens, execLine)
+	}
+	if tokens[0] != opts.ServeBinary {
+		t.Errorf("ExecStart first token = %q, want %q (space-containing ServeBinary)", tokens[0], opts.ServeBinary)
+	}
+	if tokens[1] != "serve" {
+		t.Errorf("ExecStart second token = %q, want %q", tokens[1], "serve")
+	}
+
+	dgHomeLine := findLine(t, content, "Environment=\"DG_HOME=")
+	dgTokens := splitSystemdQuoted(dgHomeLine[len("Environment="):])
+	if len(dgTokens) != 1 {
+		t.Fatalf("Environment=DG_HOME tokenized to %d tokens (want 1 — assignment is being split on the embedded space): %q from line %q", len(dgTokens), dgTokens, dgHomeLine)
+	}
+	wantAssignment := "DG_HOME=" + opts.DGHome
+	if dgTokens[0] != wantAssignment {
+		t.Errorf("Environment=DG_HOME assignment = %q, want %q", dgTokens[0], wantAssignment)
+	}
+}
+
+// findLine returns the first line of content containing prefix, or fails
+// the test.
+func findLine(t *testing.T, content, prefix string) string {
+	t.Helper()
+	for _, line := range strings.Split(content, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return line
+		}
+	}
+	t.Fatalf("no line with prefix %q in content:\n%s", prefix, content)
+	return ""
+}
+
+// splitSystemdQuoted splits s into tokens on whitespace OUTSIDE double
+// quotes, per systemd.syntax(7) C-style quoting: inside a double-quoted
+// token, backslash escapes the next character (only \\ and \" are
+// produced by systemdQuoteArg, but this splitter honors any \X per the
+// real systemd grammar) and the token ends at the next unescaped ".
+func splitSystemdQuoted(s string) []string {
+	var tokens []string
+	var cur strings.Builder
+	inQuotes := false
+	hasCur := false
+	i := 0
+	for i < len(s) {
+		c := s[i]
+		switch {
+		case inQuotes && c == '\\' && i+1 < len(s):
+			cur.WriteByte(s[i+1])
+			i += 2
+			continue
+		case c == '"':
+			inQuotes = !inQuotes
+			hasCur = true
+			i++
+			continue
+		case !inQuotes && (c == ' ' || c == '\t'):
+			if hasCur {
+				tokens = append(tokens, cur.String())
+				cur.Reset()
+				hasCur = false
+			}
+			i++
+			continue
+		default:
+			cur.WriteByte(c)
+			hasCur = true
+			i++
+		}
+	}
+	if hasCur {
+		tokens = append(tokens, cur.String())
+	}
+	return tokens
 }
 
 func TestRenderUnitOmitsRelayEnvWhenEmpty(t *testing.T) {

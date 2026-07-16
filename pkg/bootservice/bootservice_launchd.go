@@ -21,6 +21,7 @@ package bootservice
 
 import (
 	"bytes"
+	"encoding/xml"
 	"fmt"
 	"os"
 	"os/exec"
@@ -84,10 +85,10 @@ func RenderPlist(opts Options) (string, error) {
 		DGHome      string
 		RelayURLs   string
 	}{
-		Label:       LaunchAgentLabel,
-		ServeBinary: opts.ServeBinary,
-		DGHome:      opts.DGHome,
-		RelayURLs:   strings.Join(opts.RelayURLs, ","),
+		Label:       xmlEscapeText(LaunchAgentLabel),
+		ServeBinary: xmlEscapeText(opts.ServeBinary),
+		DGHome:      xmlEscapeText(opts.DGHome),
+		RelayURLs:   xmlEscapeText(strings.Join(opts.RelayURLs, ",")),
 	}
 
 	var buf bytes.Buffer
@@ -95,6 +96,20 @@ func RenderPlist(opts Options) (string, error) {
 		return "", fmt.Errorf("render plist template: %w", err)
 	}
 	return buf.String(), nil
+}
+
+// xmlEscapeText XML-escapes s for embedding as plist <string> element text
+// (RenderPlist uses text/template, which does NOT escape — unlike
+// html/template — so every value interpolated into the XML body must be
+// pre-escaped here). Without this, a ServeBinary/DGHome/RelayURLs value
+// containing an XML metacharacter (&, <, >) produced malformed plist XML
+// while RenderPlist returned a nil error — silent corruption (dontguess-983).
+func xmlEscapeText(s string) string {
+	var buf bytes.Buffer
+	// xml.EscapeText only errors if the underlying writer errors;
+	// bytes.Buffer never does.
+	_ = xml.EscapeText(&buf, []byte(s))
+	return buf.String()
 }
 
 // DefaultLaunchAgentDir returns the per-user LaunchAgent directory:
