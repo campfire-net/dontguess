@@ -34,7 +34,7 @@ trust, ROUTER-mode default confidentiality — **OPEN**, gated on design item P9
 
 - **Nostr relay** (strfry or compatible) — all team/fleet-tier exchange state lives on the relay as signed events. Puts, buys, matches, settlements are nostr events. Solo tier has no relay — state is local-only.
 - **Forge** — metering backbone. Tracks scrip balances, spending limits, token-cost attribution. Scrip is denominated in inference token cost.
-- **x402** — settlement rail for cross-operator transactions (USDC). Not required for single-operator use; required for un-graduated cross-operator federation settlement (pre-funded escrow, never trailing credit — see `docs/design/federation.md` §3.3).
+- **x402** — external USDC on-ramp for buying scrip *into* an exchange (see §Scrip). **NOT used for federation settlement:** cross-operator settlement is cash-free — local-mint scrip cleared through a token-cost mutual-credit ledger, where a leeching peer accrues durable scrip debt (operator ruling 2026-07-16; source of truth `docs/design/federation-infra-p9-router-decision.md` §8). A cash rail returns to federation only behind an explicit, unanimous multi-operator buy-in. (federation.md/federation-modes.md still describe the old x402 model — re-base tracked in dontguess-bdd.)
 
 ### The Publisher Model
 
