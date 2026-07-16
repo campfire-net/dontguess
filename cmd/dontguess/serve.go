@@ -499,7 +499,15 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		// roster on the relay log is the KeySet's source of truth (design §2/P5). The
 		// static config allowlist above seeds the initial set; the relay backfill's
 		// latest roster then reconciles it via ReplaceAll on fold.
-		rosterFold = newRosterFolder(engineOperatorKey, ks, logger.Printf)
+		// Seed the anti-rollback floor from the durable per-DG_HOME sidecar so a
+		// removed key stays removed across an operator restart independent of relay
+		// honesty (dontguess-61a8). A corrupt/unreadable floor is a fail-closed
+		// startup error rather than a silent reset to 0.
+		rf, rferr := newRosterFolder(engineOperatorKey, ks, rosterCursorPath(dgHome), logger.Printf)
+		if rferr != nil {
+			return fmt.Errorf("roster fold: %w", rferr)
+		}
+		rosterFold = rf
 		logger.Printf("  admission:  team tier — %d fleet npub(s) allowlisted, reputation floor %d", ks.Len(), minReputation)
 
 		// Scrip accounting (design §4): payment is enforced on the team/federated

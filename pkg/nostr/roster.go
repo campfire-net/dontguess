@@ -88,7 +88,7 @@ func FleetRosterTags(memberHexKeys []string) [][]string {
 // ParseFleetRoster verifies ev is an operator-signed fleet roster and returns the
 // admitted member hex keys (lowercased). It enforces, IN ORDER:
 //
-//	(1) kind == KindFleetRoster AND a ["d","fleet"] tag  → ErrNotFleetRoster
+//	(1) kind == KindFleetRoster AND the PRIMARY d-tag == "fleet" → ErrNotFleetRoster
 //	(2) author pubkey == operatorKey                     → ErrForgedFleetRoster
 //	(3) the BIP-340 signature + id integrity verify      → ErrForgedFleetRoster
 //
@@ -106,7 +106,7 @@ func ParseFleetRoster(ev *Event, operatorKey string) ([]string, error) {
 	if ev == nil {
 		return nil, fmt.Errorf("nostr: ParseFleetRoster: nil event")
 	}
-	if ev.Kind != KindFleetRoster || !hasDTag(ev.Tags, FleetRosterDTag) {
+	if ev.Kind != KindFleetRoster || !firstDTagIs(ev.Tags, FleetRosterDTag) {
 		return nil, fmt.Errorf("%w: kind=%d", ErrNotFleetRoster, ev.Kind)
 	}
 	opHex, err := normalizeOperatorKey(operatorKey)
@@ -147,11 +147,24 @@ func ParseFleetRoster(ev *Event, operatorKey string) ([]string, error) {
 	return members, nil
 }
 
-// hasDTag reports whether tags carries a ["d", want] addressable discriminator.
-func hasDTag(tags [][]string, want string) bool {
+// firstDTagIs reports whether the NIP-01-authoritative FIRST ["d", …] tag has the
+// value want. NIP-01 keys a parameterized-replaceable event by its FIRST d-tag ONLY
+// (§ addressable events): the coordinate is (kind, pubkey, first-d-value). So a fleet
+// roster is identified by its PRIMARY d-tag being "fleet" — an event whose primary
+// d-tag is something else but which carries an INCIDENTAL secondary ["d","fleet"]
+// later in the tag list is NOT a fleet roster (d-tag-confusion, dontguess-61a8). The
+// scan returns at the first d-tag regardless of match, so a non-fleet primary d-tag
+// short-circuits to false and a later ["d","fleet"] is never consulted. A bare
+// ["d"] first tag (no value) resolves to the empty d-value "" per NIP-01, ≠ "fleet".
+// An event with no d-tag at all is not a match.
+func firstDTagIs(tags [][]string, want string) bool {
 	for _, t := range tags {
-		if len(t) >= 2 && t[0] == dTagName && t[1] == want {
-			return true
+		if len(t) >= 1 && t[0] == dTagName {
+			val := ""
+			if len(t) >= 2 {
+				val = t[1]
+			}
+			return val == want
 		}
 	}
 	return false

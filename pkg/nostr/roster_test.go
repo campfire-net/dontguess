@@ -126,6 +126,39 @@ func TestParseFleetRoster_WrongKind(t *testing.T) {
 	}
 }
 
+// TestParseFleetRoster_IncidentalSecondaryDTag is the dontguess-61a8 ground-source
+// for the first-d-tag rule: a kind-30078 event whose PRIMARY (first) d-tag is NOT
+// "fleet" but which carries an INCIDENTAL secondary ["d","fleet"] later in the tag
+// list is NOT a fleet roster — NIP-01 keys a parameterized-replaceable event by its
+// FIRST d-tag only, so this is a DIFFERENT coordinate (a generic NIP-78 app-data
+// event that merely happens to also carry a fleet d-tag). The pre-fix hasDTag matched
+// ["d","fleet"] ANYWHERE and would have mis-parsed this as a roster; firstDTagIs
+// short-circuits at the non-fleet primary d-tag and returns ErrNotFleetRoster. The
+// event is validly operator-signed — the ONLY thing that disqualifies it is the
+// primary d-tag, exactly the d-tag-confusion authority hazard.
+func TestParseFleetRoster_IncidentalSecondaryDTag(t *testing.T) {
+	op, _ := identity.Generate()
+	member, _ := identity.Generate()
+
+	iev := &identity.Event{
+		CreatedAt: time.Now().Unix(),
+		Kind:      KindFleetRoster,
+		Tags: [][]string{
+			{"d", "app-settings"}, // PRIMARY (first) d-tag — NOT "fleet"
+			{"d", FleetRosterDTag}, // incidental SECONDARY d-tag NIP-01 never keys by
+			{"p", member.PubKeyHex()},
+		},
+		Content: "",
+	}
+	if err := identity.SignEvent(op, iev); err != nil {
+		t.Fatalf("SignEvent: %v", err)
+	}
+	ev := &Event{ID: iev.ID, PubKey: iev.PubKey, CreatedAt: iev.CreatedAt, Kind: iev.Kind, Tags: iev.Tags, Content: iev.Content, Sig: iev.Sig}
+	if _, err := ParseFleetRoster(ev, op.PubKeyHex()); !errors.Is(err, ErrNotFleetRoster) {
+		t.Fatalf("incidental-secondary-d-tag roster err = %v, want ErrNotFleetRoster (the first d-tag %q is authoritative, not the later fleet one)", err, "app-settings")
+	}
+}
+
 // TestParseFleetRoster_MissingDTag proves a kind-30078 event WITHOUT the
 // ["d","fleet"] discriminator is not treated as the fleet roster (it is some other
 // operator addressable event) — ErrNotFleetRoster.

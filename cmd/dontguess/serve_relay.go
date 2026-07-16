@@ -284,18 +284,41 @@ type rosterFolder struct {
 	operatorKey string           // pinned roster authority (npub or hex)
 	keys        *exchange.KeySet // the live enforcement KeySet the TrustChecker reads
 	logf        func(format string, args ...any)
+	// cursorPath is the DURABLE anti-rollback floor sidecar (dontguess-61a8): the
+	// latest applied roster created_at, persisted temp→fsync→rename so it survives an
+	// operator restart. Without it lastCreated resets to 0 on every restart and the
+	// created_at guard below re-accepts an OLD operator-signed roster a stale/lagging/
+	// malicious relay serves — RE-ADMITTING a previously-removed key and making roster
+	// freshness depend on relay honesty (the exact ADV-2 trust the design forbids).
+	// "" disables persistence (in-memory-only, prior behavior) — for tests that do not
+	// exercise restart; the serve path ALWAYS supplies a real path.
+	cursorPath string
 
 	mu          sync.Mutex
 	lastCreated int64 // latest applied roster created_at (parameterized-replaceable latest-wins)
 }
 
-// newRosterFolder builds a rosterFolder over the TrustChecker's live KeySet. A nil
-// logf defaults to a no-op sink.
-func newRosterFolder(operatorKey string, keys *exchange.KeySet, logf func(format string, args ...any)) *rosterFolder {
+// newRosterFolder builds a rosterFolder over the TrustChecker's live KeySet, seeding
+// the anti-rollback floor (lastCreated) from the durable cursorPath sidecar so a
+// restart resumes the floor from disk rather than resetting to 0 (dontguess-61a8). A
+// nil logf defaults to a no-op sink. cursorPath == "" disables persistence (tests
+// that do not exercise restart). It returns an error if a PRESENT cursor sidecar is
+// unreadable/corrupt — a fail-closed refusal to start with an unknown floor rather
+// than silently resetting the anti-rollback floor to 0 (which would re-open the
+// stale-roster-replay hole this fix closes).
+func newRosterFolder(operatorKey string, keys *exchange.KeySet, cursorPath string, logf func(format string, args ...any)) (*rosterFolder, error) {
 	if logf == nil {
 		logf = func(string, ...any) {}
 	}
-	return &rosterFolder{operatorKey: operatorKey, keys: keys, logf: logf}
+	rf := &rosterFolder{operatorKey: operatorKey, keys: keys, cursorPath: cursorPath, logf: logf}
+	if cursorPath != "" {
+		seed, err := readRosterCreatedAt(cursorPath)
+		if err != nil {
+			return nil, fmt.Errorf("roster anti-rollback cursor: %w", err)
+		}
+		rf.lastCreated = seed
+	}
+	return rf, nil
 }
 
 // fold applies one received roster event to the KeySet. A non-roster event, a
@@ -324,10 +347,105 @@ func (rf *rosterFolder) fold(ev *nostr.Event) {
 			shortRosterID(ev.ID), ev.CreatedAt, rf.lastCreated)
 		return
 	}
+	// ANTI-ROLLBACK PERSIST (dontguess-61a8). Advance the durable floor BEFORE
+	// mutating the KeySet so the persisted floor is never OLDER than the applied
+	// membership: if the process restarts, the seeded floor is at least as fresh as
+	// the roster last applied, and a stale relay re-serving an OLD (validly
+	// operator-signed) roster is rejected by the created_at guard above — the removed
+	// key stays removed independent of relay honesty. Persist only on a STRICT
+	// advance (an equal-created_at re-fold is idempotent and the on-disk value already
+	// equals it). On a persist failure we skip applying too, keeping the durable floor
+	// and the live KeySet consistent at the last successfully-persisted state rather
+	// than advancing the in-memory KeySet past a floor that would not survive a crash.
+	if rf.cursorPath != "" && ev.CreatedAt > rf.lastCreated {
+		if err := writeRosterCreatedAt(rf.cursorPath, ev.CreatedAt); err != nil {
+			rf.logf("SECURITY: roster anti-rollback cursor persist FAILED for %s (created_at %d): %v — NOT applying this roster (a KeySet advanced past an unpersisted floor would re-open the stale-roster-replay hole across a restart)",
+				shortRosterID(ev.ID), ev.CreatedAt, err)
+			return
+		}
+	}
 	rf.lastCreated = ev.CreatedAt
 	rf.keys.ReplaceAll(members...)
 	rf.logf("relay/roster: fleet allowlist folded from operator-signed roster %s — %d member(s) admitted",
 		shortRosterID(ev.ID), len(members))
+}
+
+// rosterCursorPath is the per-DG_HOME sidecar recording the anti-rollback floor
+// (dontguess-61a8): the created_at of the freshest fleet roster this operator has
+// applied. It is per-DG_HOME (NOT per-relay like relayCursorPath/intakeCursorPath)
+// because the roster is the operator's SINGLE source of truth shared across every
+// relay leg's rosterFolder — one durable floor, consistent regardless of which relay
+// served the latest roster.
+func rosterCursorPath(dgHome string) string {
+	return filepath.Join(dgHome, "roster.lastcreated")
+}
+
+// readRosterCreatedAt reads the persisted anti-rollback floor. A MISSING sidecar
+// yields 0 (a fresh operator that has applied no roster yet — correct: any first
+// operator-signed roster is fresher than 0 and folds). A PRESENT but empty/corrupt/
+// negative sidecar is a fail-closed ERROR, not a silent 0: writeRosterCreatedAt only
+// ever writes a positive created_at, so an unparseable value is external corruption,
+// and resetting the floor to 0 would re-open the stale-roster-replay hole this fix
+// closes (an old operator-signed roster would then re-fold and re-admit a removed key).
+func readRosterCreatedAt(path string) (int64, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("roster cursor %s: read: %w", path, err)
+	}
+	s := strings.TrimSpace(string(b))
+	if s == "" {
+		return 0, fmt.Errorf("roster cursor %s: empty (truncated or corrupt) — refusing to fail open and reset the anti-rollback floor to 0; restore from backup, or delete it ONLY if you intend to reset roster-replay protection", path)
+	}
+	n, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("roster cursor %s: parse %q: %w", path, s, err)
+	}
+	if n < 0 {
+		return 0, fmt.Errorf("roster cursor %s: negative value %d", path, n)
+	}
+	return n, nil
+}
+
+// writeRosterCreatedAt durably persists the anti-rollback floor (temp→fsync→rename +
+// best-effort dir fsync), the same crash discipline as the Outbox/Intake cursor
+// sidecars, so a crash immediately after a roster is applied cannot lose the floor
+// and let an OLD roster re-fold on restart.
+func writeRosterCreatedAt(path string, createdAt int64) error {
+	dir := filepath.Dir(path)
+	tmp, err := os.CreateTemp(dir, ".roster-lastcreated-*.tmp")
+	if err != nil {
+		return fmt.Errorf("roster cursor: create temp in %s: %w", dir, err)
+	}
+	tmpName := tmp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tmpName)
+		}
+	}()
+	if _, err := tmp.WriteString(strconv.FormatInt(createdAt, 10) + "\n"); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("roster cursor: write temp: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("roster cursor: fsync temp: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("roster cursor: close temp: %w", err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("roster cursor: rename into place: %w", err)
+	}
+	committed = true
+	if d, derr := os.Open(dir); derr == nil {
+		_ = d.Sync()
+		_ = d.Close()
+	}
+	return nil
 }
 
 // shortRosterID abbreviates an event id for log readability.

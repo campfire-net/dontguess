@@ -84,7 +84,10 @@ func TestRelayRosterFold_KeySetSourceOfTruth_c06(t *testing.T) {
 		Logger:            func(string, ...any) {},
 	})
 
-	rf := newRosterFolder(operator.PubKeyHex(), ks, nil)
+	rf, err := newRosterFolder(operator.PubKeyHex(), ks, "", nil)
+	if err != nil {
+		t.Fatalf("newRosterFolder: %v", err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
