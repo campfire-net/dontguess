@@ -717,8 +717,20 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		if climbWatermark > 0 {
 			logger.Printf("  climb-fence: %d pre-climb local record(s) fenced local-only (never republished in cleartext, ADV-18)", climbWatermark)
 		}
+		// Operator-side invite-redeem handler (design §1/P8, ADV-15): the server-side
+		// half of `dontguess invite`/`join`. Shared by every relay leg's reader so the
+		// durable one-time redeemed-grant-id set is consistent across relays. It
+		// promotes a redeemed member through the SAME allowlist controller `allowlist
+		// add` uses (allowCtrl) and mints the genesis grant via eng. Built here (team
+		// tier only — inside the len(relayURLs)>0 block) so a stray kind-3410 on the
+		// individual tier is ignored.
+		redeemH, rherr := newRedeemHandler(engineOperatorKey, allowCtrl, eng, redeemedInvitesPath(dgHome), logger.Printf)
+		if rherr != nil {
+			return fmt.Errorf("invite redeem handler: %w", rherr)
+		}
+		defer func() { _ = redeemH.redeemed.close() }()
 		attachRelayLegsAsync(ctx, &relayWG, &legsMu, &legs, relayURLs, localStore, relaySigner,
-			localStorePath, appendNotify, eng, logger, climbWatermark, rosterFold)
+			localStorePath, appendNotify, eng, logger, climbWatermark, rosterFold, redeemH)
 		// Combined shutdown in the dontguess-e35 order: cancel the context FIRST
 		// (unblocks every reader/outbox and every in-flight dial/attach retry),
 		// THEN wait for the attach goroutines to exit, THEN close each attached

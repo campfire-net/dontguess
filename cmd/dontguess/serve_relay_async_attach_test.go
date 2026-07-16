@@ -123,7 +123,7 @@ func TestServeStartup_OperatorSocketRespondsUnder1s_WithDeadRelayLeg(t *testing.
 	var legsMu sync.Mutex
 	var legs []relayLeg
 	attachRelayLegsAsync(ctx, &wg, &legsMu, &legs, []string{relayURL},
-		localStore, operatorIdentity, localStorePath, nil, eng, logger, 0, nil)
+		localStore, operatorIdentity, localStorePath, nil, eng, logger, 0, nil, nil)
 	// attachRelayLegsAsync itself must return immediately (it only spawns
 	// goroutines); if it were the old synchronous per-URL loop this call
 	// would already be blocked inside Conn.dialAndAuth against the black

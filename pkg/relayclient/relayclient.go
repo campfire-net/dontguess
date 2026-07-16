@@ -344,6 +344,47 @@ func Put(ctx context.Context, conn *relay.Conn, signer identity.Signer, req PutR
 	}
 }
 
+// PublishEvent sends a pre-signed nostr event over conn and waits — bounded by
+// ctx — for the relay's OK frame for that event's id. It is the minimal publish
+// primitive `dontguess join` uses to submit its kind-3410 invite-redeem event to
+// an OPEN relay (the member key publishes it freely; the operator does 100% of the
+// verification). Like Put, an OK is a TRANSPORT RECEIPT ONLY — the operator's
+// serve reader is the authority on whether the redeem admits the member (LOCKED-5);
+// a malformed frame is skipped, never treated as success. Returns (accepted,
+// relay-message, nil) once the matching OK arrives, or an error on encode/send
+// failure or a ctx-bounded timeout with no OK.
+func PublishEvent(ctx context.Context, conn *relay.Conn, ev *identity.Event) (accepted bool, message string, err error) {
+	if conn == nil {
+		return false, "", fmt.Errorf("relayclient: publish: nil conn")
+	}
+	if ev == nil {
+		return false, "", fmt.Errorf("relayclient: publish: nil event")
+	}
+	frame, err := relay.EncodeEvent(ev)
+	if err != nil {
+		return false, "", fmt.Errorf("relayclient: publish %s: encode EVENT: %w", shortID(ev.ID), err)
+	}
+	if err := conn.Send(ctx, frame); err != nil {
+		return false, "", fmt.Errorf("relayclient: publish %s: send EVENT: %w", shortID(ev.ID), err)
+	}
+	for {
+		raw, recvErr := conn.Recv(ctx)
+		if recvErr != nil {
+			if ctx.Err() != nil {
+				return false, "", fmt.Errorf("relayclient: publish %s: timed out waiting for relay OK: %w", shortID(ev.ID), ctx.Err())
+			}
+			return false, "", fmt.Errorf("relayclient: publish %s: relay connection dropped awaiting OK: %w", shortID(ev.ID), recvErr)
+		}
+		f, perr := relay.ParseFrame(raw)
+		if perr != nil {
+			continue // loud-but-skip a malformed frame; never treat garbage as success
+		}
+		if f.Type == relay.LabelOK && f.EventID == ev.ID {
+			return f.Accepted, f.Message, nil
+		}
+	}
+}
+
 // parsePutReject reports whether ev is a genuinely signed settle(put-reject)
 // referencing putID. ok=false means "not a put-reject for us" (keep reading);
 // ok=true, rejected=true is the terminal case.

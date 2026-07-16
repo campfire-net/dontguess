@@ -72,6 +72,13 @@ type relayWiring struct {
 	// site, where a roster event (if one ever arrived) is simply ignored, not
 	// misrouted into the exchange Intake pipeline.
 	roster *rosterFolder
+	// redeem handles operator-side kind-3410 invite-redeem events (design §1/P8):
+	// it re-verifies the operator-signed invite + member signature, rejects a
+	// replayed grant id (durable set), and promotes the member into the live
+	// KeySet+roster + mints the genesis grant. nil when no handler was supplied
+	// (WithRedeemHandler) — the individual tier and every pre-existing test call
+	// site, where a stray kind-3410 is ignored, not acted on.
+	redeem *redeemHandler
 }
 
 // relayWiringOption customises buildRelayWiring beyond its required core
@@ -86,6 +93,7 @@ type relayWiringConfig struct {
 	intakeCursorPath string
 	climbWatermark   int64
 	rosterFolder     *rosterFolder
+	redeemHandler    *redeemHandler
 	// legPublisherSink, when set, is invoked by attachRelayTransport with the
 	// leg's demuxPublisher (dontguess-113) so the caller can capture the publish
 	// surface for out-of-band operator events — the roster republish the live
@@ -102,6 +110,18 @@ type relayWiringConfig struct {
 // do not exercise roster admission) is a strict no-op — a roster event is ignored.
 func WithRosterFolder(rf *rosterFolder) relayWiringOption {
 	return func(c *relayWiringConfig) { c.rosterFolder = rf }
+}
+
+// WithRedeemHandler wires the operator-side kind-3410 invite-redeem handler (design
+// §1/P8, ADV-15) into this relay leg's reader: a received kind-3410 event is routed
+// to rh, which re-verifies the operator-signed invite + member signature, rejects a
+// replayed grant, and promotes the member into the live fleet + mints the genesis
+// grant. Every fleet-attached leg shares ONE redeemHandler (built in serve.go over
+// the same allowlist controller/engine the promotion path uses), so the durable
+// one-time redeemed-id set is consistent across relays. nil (individual tier, tests
+// that do not exercise onboarding) is a strict no-op — a kind-3410 is ignored.
+func WithRedeemHandler(rh *redeemHandler) relayWiringOption {
+	return func(c *relayWiringConfig) { c.redeemHandler = rh }
 }
 
 // WithLegPublisherSink (dontguess-113) hands the caller this leg's demuxPublisher
@@ -269,7 +289,7 @@ func buildRelayWiring(
 		return nil, 0, fmt.Errorf("relay wiring: outbox: %w", err)
 	}
 
-	return &relayWiring{seq: seq, intake: intake, outbox: outbox, metrics: metrics, intakeCursor: intakeCursor, roster: cfg.rosterFolder}, watermark, nil
+	return &relayWiring{seq: seq, intake: intake, outbox: outbox, metrics: metrics, intakeCursor: intakeCursor, roster: cfg.rosterFolder, redeem: cfg.redeemHandler}, watermark, nil
 }
 
 // rosterFolder folds operator-signed kind-30078 fleet roster events into the live
@@ -787,6 +807,18 @@ func (w *relayWiring) runReader(ctx context.Context, recv frameReceiver, pub *de
 				// tier / tests) ignores the roster rather than misrouting it.
 				if w.roster != nil {
 					w.roster.fold(identityToNostrEvent(f.Event))
+				}
+			} else if f.Event.Kind == nostr.KindInvite {
+				// INVITE REDEEM (design §1/P8, ADV-15). A kind-3410 redeem is NOT an
+				// exchange message — it must NEVER enter the Intake fold pipeline
+				// (FromNostrEvent would reject it as dropped_smuggled). The operator
+				// re-verifies the operator-signed invite + member signature itself
+				// (redeemHandler.handle → nostr.VerifyRedeem), rejects a replayed
+				// grant (durable set), and promotes the member — never trusting that
+				// a relay gated the write (ADV-2). A nil handler (individual tier /
+				// tests) ignores the redeem rather than acting on it.
+				if w.redeem != nil {
+					w.redeem.handle(identityToNostrEvent(f.Event))
 				}
 			} else if herr := w.intake.HandleEvent(identityToNostrEvent(f.Event)); herr != nil {
 				// Counted + alarmed inside the Intake already; log and keep going.
@@ -1333,6 +1365,7 @@ func attachRelayLegsAsync(
 	logger *log.Logger,
 	climbWatermark int64,
 	roster *rosterFolder,
+	redeem *redeemHandler,
 ) {
 	for _, relayURL := range relayURLs {
 		relayURL := relayURL
@@ -1358,6 +1391,7 @@ func attachRelayLegsAsync(
 					WithIntakeCursorPath(intakeCursorPath(localStorePath, relayURL)),
 					WithClimbWatermark(climbWatermark),
 					WithRosterFolder(roster),
+					WithRedeemHandler(redeem),
 					// Capture the leg's publish surface so the live allowlist hot-reload
 					// can republish the operator roster over this relay (dontguess-113).
 					WithLegPublisherSink(func(p *demuxPublisher) { legPub = p }))
