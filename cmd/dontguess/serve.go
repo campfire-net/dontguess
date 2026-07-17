@@ -21,6 +21,7 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
+	"github.com/3dl-dev/dontguess/pkg/nativebert"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	dgstore "github.com/3dl-dev/dontguess/pkg/store"
 	"github.com/spf13/cobra"
@@ -277,14 +278,16 @@ func intakeCursorPath(storePath, url string) string {
 	return fmt.Sprintf("%s.intakecursor.%s", storePath, hex.EncodeToString(h[:4]))
 }
 
-// newDenseEmbedder loads the pure-Go native MiniLM embedder (pkg/nativebert),
-// downloading model.safetensors + tokenizer.json once to a local cache if
-// absent. There is no python, no onnxruntime, and no shared library — the model
-// runs entirely in Go (dontguess-31a). DONTGUESS_EMBED_CACHE overrides the
-// cache directory; empty uses nativebert.DefaultCacheDir. Returns an error so
-// the caller can fall back to TF-IDF loudly rather than silently degrade.
-func newDenseEmbedder() (matching.Embedder, error) {
-	return matching.NewNativeEmbedder(os.Getenv("DONTGUESS_EMBED_CACHE"))
+// newDenseEmbedderCached loads the pure-Go native MiniLM embedder
+// (pkg/nativebert) ONLY if the model is already cached — it never downloads, so
+// serve startup never blocks on a ~87 MB fetch and the operator socket comes up
+// immediately (dontguess-31a). There is no python, no onnxruntime, and no shared
+// library — the model runs entirely in Go. Returns nativebert.ErrModelNotCached
+// when the model is absent, so the caller falls back to TF-IDF and points the
+// operator at `dontguess embed pull`. DONTGUESS_EMBED_CACHE overrides the cache
+// directory; empty uses nativebert.DefaultCacheDir.
+func newDenseEmbedderCached() (matching.Embedder, error) {
+	return matching.NewNativeEmbedderCached(os.Getenv("DONTGUESS_EMBED_CACHE"))
 }
 
 // runServeLocal runs the exchange engine in standalone local-only mode
@@ -517,18 +520,21 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		logger.Printf("  buy-bound: anonymous-buy signal bound active — min buyer balance %d scrip", minBuyBalance)
 	}
 
-	// Use pure-Go dense embeddings (all-MiniLM-L6-v2 via pkg/nativebert). The
-	// model is downloaded once to a local cache; there is no python or shared
-	// library. On any load failure the engine falls back to TF-IDF loudly.
-	// Set DONTGUESS_EMBED_TFIDF=1 to force the zero-dependency TF-IDF path
-	// (measured to win at small inventory scale — see docs/design/
-	// exchange-embedding-diagnostic-verdict-b.md).
+	// Pure-Go dense embeddings (all-MiniLM-L6-v2 via pkg/nativebert) when the
+	// model is already cached — no python, no shared library, and no blocking
+	// download at startup (the socket must come up promptly). When the model is
+	// not cached the engine uses zero-dependency TF-IDF and points the operator
+	// at `dontguess embed pull`. Force TF-IDF regardless with
+	// DONTGUESS_EMBED_TFIDF=1 (measured to win at small inventory scale — see
+	// docs/design/exchange-embedding-diagnostic-verdict-b.md).
 	var embedder matching.Embedder
 	if os.Getenv("DONTGUESS_EMBED_TFIDF") == "1" {
 		logger.Printf("  embedder:  tf-idf (forced via DONTGUESS_EMBED_TFIDF=1)")
-	} else if e, err := newDenseEmbedder(); err == nil {
+	} else if e, err := newDenseEmbedderCached(); err == nil {
 		embedder = e
 		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2, pure-Go native)")
+	} else if errors.Is(err, nativebert.ErrModelNotCached) {
+		logger.Printf("  embedder:  tf-idf — dense model not cached; run `dontguess embed pull` to enable native semantic matching")
 	} else {
 		logger.Printf("  WARNING: embedder falling back to tf-idf — native MiniLM load failed: %v", err)
 	}
