@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/3dl-dev/dontguess/pkg/embedscript"
 	"github.com/3dl-dev/dontguess/pkg/exchange"
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
@@ -278,59 +277,14 @@ func intakeCursorPath(storePath, url string) string {
 	return fmt.Sprintf("%s.intakecursor.%s", storePath, hex.EncodeToString(h[:4]))
 }
 
-// defaultEmbedScriptPath locates cmd/embed/main.py relative to the running
-// binary instead of a hardcoded dev-machine absolute path (dontguess-740).
-// It walks up from the executable's directory looking for a
-// "cmd/embed/main.py" sibling, which holds for both `go run` (binary lives
-// under a temp build dir but the repo checkout is still discoverable via
-// os.Getwd as a fallback) and an installed binary sitting at the repo root
-// or in a bin/ subdirectory. Returns "" if no candidate exists, in which
-// case the caller must warn loudly rather than silently degrade.
-func defaultEmbedScriptPath() string {
-	const rel = "cmd/embed/main.py"
-
-	candidates := []string{}
-	if exe, err := os.Executable(); err == nil {
-		if resolved, err := filepath.EvalSymlinks(exe); err == nil {
-			exe = resolved
-		}
-		dir := filepath.Dir(exe)
-		for i := 0; i < 6; i++ {
-			candidates = append(candidates, filepath.Join(dir, rel))
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-	if wd, err := os.Getwd(); err == nil {
-		dir := wd
-		for i := 0; i < 6; i++ {
-			candidates = append(candidates, filepath.Join(dir, rel))
-			parent := filepath.Dir(dir)
-			if parent == dir {
-				break
-			}
-			dir = parent
-		}
-	}
-
-	for _, c := range candidates {
-		if _, err := os.Stat(c); err == nil {
-			return c
-		}
-	}
-
-	// No on-disk cmd/embed/main.py (the normal case for an INSTALLED binary — the
-	// release ships only the binary, not the repo tree). Fall back to the copy
-	// embedded in the binary via go:embed, extracted to a stable cache path. This
-	// is what makes dense embeddings work on an installed operator instead of
-	// silently degrading to TF-IDF (dontguess-6f0).
-	if p, err := embedscript.Path(); err == nil && p != "" {
-		return p
-	}
-	return ""
+// newDenseEmbedder loads the pure-Go native MiniLM embedder (pkg/nativebert),
+// downloading model.safetensors + tokenizer.json once to a local cache if
+// absent. There is no python, no onnxruntime, and no shared library — the model
+// runs entirely in Go (dontguess-31a). DONTGUESS_EMBED_CACHE overrides the
+// cache directory; empty uses nativebert.DefaultCacheDir. Returns an error so
+// the caller can fall back to TF-IDF loudly rather than silently degrade.
+func newDenseEmbedder() (matching.Embedder, error) {
+	return matching.NewNativeEmbedder(os.Getenv("DONTGUESS_EMBED_CACHE"))
 }
 
 // runServeLocal runs the exchange engine in standalone local-only mode
@@ -563,23 +517,20 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		logger.Printf("  buy-bound: anonymous-buy signal bound active — min buyer balance %d scrip", minBuyBalance)
 	}
 
-	// Use dense embeddings if the embed script is available (same as the
-	// campfire-backed path — the matching engine has no campfire dependency
-	// either way).
+	// Use pure-Go dense embeddings (all-MiniLM-L6-v2 via pkg/nativebert). The
+	// model is downloaded once to a local cache; there is no python or shared
+	// library. On any load failure the engine falls back to TF-IDF loudly.
+	// Set DONTGUESS_EMBED_TFIDF=1 to force the zero-dependency TF-IDF path
+	// (measured to win at small inventory scale — see docs/design/
+	// exchange-embedding-diagnostic-verdict-b.md).
 	var embedder matching.Embedder
-	embedScript := os.Getenv("DONTGUESS_EMBED_SCRIPT")
-	if embedScript == "" {
-		embedScript = defaultEmbedScriptPath()
-	}
-	if embedScript != "" {
-		if _, err := os.Stat(embedScript); err == nil {
-			embedder = matching.NewDenseEmbedder(embedScript)
-			logger.Printf("  embedder:  dense (all-MiniLM-L6-v2) via %s", embedScript)
-		} else {
-			logger.Printf("  WARNING: embedder falling back to tf-idf — dense embed script not found at %q. Set DONTGUESS_EMBED_SCRIPT to the absolute path of cmd/embed/main.py to restore dense matching quality.", embedScript)
-		}
+	if os.Getenv("DONTGUESS_EMBED_TFIDF") == "1" {
+		logger.Printf("  embedder:  tf-idf (forced via DONTGUESS_EMBED_TFIDF=1)")
+	} else if e, err := newDenseEmbedder(); err == nil {
+		embedder = e
+		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2, pure-Go native)")
 	} else {
-		logger.Printf("  WARNING: embedder falling back to tf-idf — could not locate cmd/embed/main.py relative to the running binary. Set DONTGUESS_EMBED_SCRIPT to restore dense matching quality.")
+		logger.Printf("  WARNING: embedder falling back to tf-idf — native MiniLM load failed: %v", err)
 	}
 
 	// OnLocalAppend fan-out (design §3.8, H1): on the team/federated tier the

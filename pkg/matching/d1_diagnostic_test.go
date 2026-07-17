@@ -22,9 +22,13 @@ package matching
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/3dl-dev/dontguess/pkg/nativebert"
 )
 
 // fixtureEntry represents a single inventory entry as observed in the live exchange
@@ -1161,22 +1165,17 @@ func meanF(s []float64) float64 {
 // TF-IDF (current) and all-MiniLM-L6-v2 384-dim dense embeddings on the
 // D1 fixture. This test is the measurement artifact for the Track B GATE.
 //
-// The dense embedder path goes through DenseEmbedder (pkg/matching/dense_embedder.go)
-// which shells out to cmd/embed/main.py (ONNX + tokenizers). In CI and dev
-// environments without ONNX runtime installed, the DenseEmbedder cannot run.
+// The dense embedder path now goes through the pure-Go NativeEmbedder
+// (pkg/matching/native_embedder.go → pkg/nativebert), which runs all-MiniLM-L6-v2
+// entirely in Go — no python, no onnxruntime, no shared library (dontguess-31a).
+// It replaced the former DenseEmbedder subprocess that shelled out to
+// cmd/embed/main.py. The native forward pass is numerically identical to that
+// ONNX reference (cosine >= 0.9999; see pkg/nativebert/parity_test.go).
 //
-// PROOF OF INABILITY (ONNX path):
-//
-//   python3 -c "import onnxruntime" → ModuleNotFoundError: No module named 'onnxruntime' (exit 1)
-//   pip3 show onnxruntime             → WARNING: Package(s) not found: onnxruntime (exit 1)
-//   which onnxruntime                 → exit 1
-//
-// The dense measurement WAS obtained in this dispatch using sentence_transformers
-// (available in the system Python) as an equivalent dense embedding path:
-// all-MiniLM-L6-v2 loaded from HuggingFace, normalize_embeddings=True, cosine sim.
-// This is the SAME model and SAME normalization as cmd/embed/main.py — the only
-// difference is the inference backend (torch vs ONNX). Embedding outputs are
-// numerically equivalent; the ONNX path exists for production latency reasons.
+// The dense measurement below WAS obtained (2026-06-02) using sentence_transformers
+// as an equivalent dense embedding path: all-MiniLM-L6-v2, normalize_embeddings=True,
+// cosine sim. Same model, same normalization as the native path — embedding outputs
+// are numerically equivalent, so the measured verdict still stands.
 //
 // MEASURED NUMBERS (sentence_transformers, 2026-06-02, see verdict doc):
 //   junk_max (dense)  = 0.3762  (vs TF-IDF: 0.1548)
@@ -1191,24 +1190,29 @@ func meanF(s []float64) float64 {
 // VERDICT: Do NOT replace TF-IDF with dense embedder on this fixture.
 // See docs/design/exchange-embedding-diagnostic-verdict-b.md for full analysis.
 func TestD1_DenseEmbedderComparison(t *testing.T) {
-	// ── Part 1: Verify DenseEmbedder handles unavailability gracefully ──────────
-	// This tests the real DenseEmbedder code path (pkg/matching/dense_embedder.go).
-	// When ONNX runtime or cmd/embed/main.py is absent, Embed() must return nil
-	// (not panic or block) so the engine can fall back to TF-IDF cleanly.
-	dense := NewDenseEmbedder("cmd/embed/main.py")
-	result := dense.Embed("test text for dense embedder availability check")
-	if result != nil {
-		// ONNX sidecar is available — this is surprising in CI. Log it as a bonus.
-		t.Logf("DenseEmbedder available (ONNX path): returned %d-dim vector", len(result))
-		if len(result) != 384 {
-			t.Errorf("DenseEmbedder returned %d-dim vector, want 384", len(result))
+	// ── Part 1: Verify the pure-Go NativeEmbedder produces a valid 384-dim ──────
+	// vector when the model files are cached locally (dontguess-31a). No python,
+	// no onnxruntime. The test is hermetic: it only loads from an on-disk cache
+	// and never downloads, so CI without the model simply logs unavailability.
+	if stPath, tjPath, ok := cachedMiniLMFiles(); ok {
+		ne, err := NewNativeEmbedderFromFiles(stPath, tjPath)
+		if err != nil {
+			t.Fatalf("NativeEmbedder load failed with cached model present: %v", err)
 		}
+		vec := ne.Embed("test text for dense embedder availability check")
+		if len(vec) != 384 {
+			t.Errorf("NativeEmbedder returned %d-dim vector, want 384", len(vec))
+		}
+		var n2 float64
+		for _, v := range vec {
+			n2 += v * v
+		}
+		if n2 < 0.99 || n2 > 1.01 {
+			t.Errorf("NativeEmbedder vector not L2-normalized: |v|^2 = %.4f", n2)
+		}
+		t.Logf("NativeEmbedder available (pure-Go): returned normalized %d-dim vector", len(vec))
 	} else {
-		// Expected in CI: ONNX runtime not installed.
-		// This is the documented state: onnxruntime not installed,
-		// Embed() returns nil, engine falls back to TF-IDF.
-		t.Logf("DenseEmbedder unavailable (expected in CI): Embed() returned nil — ONNX runtime not installed")
-		t.Logf("Proof of inability: python3 -c 'import onnxruntime' exits 1 (ModuleNotFoundError)")
+		t.Logf("NativeEmbedder model not cached locally (expected in CI): skipping live-vector check — no network fetch in tests")
 	}
 
 	// ── Part 2: Record the quantified dense-vs-TF-IDF measurement ──────────────
@@ -1319,4 +1323,28 @@ func TestD1_DenseEmbedderComparison(t *testing.T) {
 	}
 
 	t.Logf("Verdict: TUNE (TF-IDF M1a). See docs/design/exchange-embedding-diagnostic-verdict-b.md")
+}
+
+// cachedMiniLMFiles returns the paths to a locally-cached model.safetensors +
+// tokenizer.json if present, checking the pure-Go native cache first and the
+// legacy python cache (~/.local/lib/embed) second. It never triggers a
+// download, keeping tests hermetic — CI without the model simply gets ok=false.
+func cachedMiniLMFiles() (stPath, tjPath string, ok bool) {
+	candidates := []string{nativebert.DefaultCacheDir()}
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		candidates = append(candidates, filepath.Join(home, ".local", "lib", "embed", "all-MiniLM-L6-v2"))
+	}
+	for _, dir := range candidates {
+		st := filepath.Join(dir, "model.safetensors")
+		tj := filepath.Join(dir, "tokenizer.json")
+		if fileExists(st) && fileExists(tj) {
+			return st, tj, true
+		}
+	}
+	return "", "", false
+}
+
+func fileExists(p string) bool {
+	_, err := os.Stat(p)
+	return err == nil
 }

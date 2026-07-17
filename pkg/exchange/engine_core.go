@@ -135,8 +135,8 @@ type EngineOptions struct {
 	// Logger receives diagnostic log lines. If nil, logs are suppressed.
 	Logger func(format string, args ...any)
 	// Embedder overrides the matching engine's embedding strategy.
-	// If nil, TF-IDF is used. Set to matching.NewDenseEmbedder("path")
-	// for 384-dim all-MiniLM-L6-v2 semantic matching.
+	// If nil, TF-IDF is used. Set to a matching.NativeEmbedder (pure-Go
+	// all-MiniLM-L6-v2) for 384-dim semantic matching.
 	Embedder matching.Embedder
 	// MatchIndex is the semantic matching index used to rank buy results.
 	// If nil, the engine creates an index using Embedder on startup.

@@ -1,0 +1,232 @@
+{
+ "note": "HF all-MiniLM-L6-v2 tokenizer golden; no padding; truncate 128; incl [CLS]/[SEP]",
+ "cases": [
+  {
+   "text": "migrate app to SDK 0.13",
+   "ids": [
+    101,
+    22806,
+    10439,
+    2000,
+    17371,
+    2243,
+    1014,
+    1012,
+    2410,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "migrate",
+    "app",
+    "to",
+    "sd",
+    "##k",
+    "0",
+    ".",
+    "13",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "flock contention test pattern for Go",
+   "ids": [
+    101,
+    19311,
+    18974,
+    3231,
+    5418,
+    2005,
+    2175,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "flock",
+    "contention",
+    "test",
+    "pattern",
+    "for",
+    "go",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "GateEvaluator conformance CI path filter",
+   "ids": [
+    101,
+    4796,
+    13331,
+    7630,
+    8844,
+    23758,
+    6651,
+    25022,
+    4130,
+    11307,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "gate",
+    "##eva",
+    "##lu",
+    "##ator",
+    "conform",
+    "##ance",
+    "ci",
+    "path",
+    "filter",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "Caf\u00e9 R\u00c9SUM\u00c9 na\u00efve fa\u00e7ade",
+   "ids": [
+    101,
+    7668,
+    13746,
+    15743,
+    8508,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "cafe",
+    "resume",
+    "naive",
+    "facade",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "Hello,  WORLD!! 123 tokenization$$",
+   "ids": [
+    101,
+    7592,
+    1010,
+    2088,
+    999,
+    999,
+    13138,
+    19204,
+    3989,
+    1002,
+    1002,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "hello",
+    ",",
+    "world",
+    "!",
+    "!",
+    "123",
+    "token",
+    "##ization",
+    "$",
+    "$",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "supercalifragilisticexpialidocious wordpiece splitting",
+   "ids": [
+    101,
+    3565,
+    9289,
+    10128,
+    29181,
+    24411,
+    4588,
+    10288,
+    19312,
+    21273,
+    10085,
+    6313,
+    2773,
+    11198,
+    14541,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "super",
+    "##cal",
+    "##if",
+    "##rag",
+    "##ilis",
+    "##tic",
+    "##ex",
+    "##pia",
+    "##lid",
+    "##oc",
+    "##ious",
+    "word",
+    "##piece",
+    "splitting",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "",
+   "ids": [
+    101,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "  multiple   spaces\tand\nnewlines  ",
+   "ids": [
+    101,
+    3674,
+    7258,
+    1998,
+    2047,
+    12735,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "multiple",
+    "spaces",
+    "and",
+    "new",
+    "##lines",
+    "[SEP]"
+   ]
+  },
+  {
+   "text": "\u65e5\u672c\u8a9e mixed with english \u4e2d\u6587",
+   "ids": [
+    101,
+    1864,
+    1876,
+    1950,
+    3816,
+    2007,
+    2394,
+    1746,
+    1861,
+    102
+   ],
+   "tokens": [
+    "[CLS]",
+    "\u65e5",
+    "\u672c",
+    "\u8a9e",
+    "mixed",
+    "with",
+    "english",
+    "\u4e2d",
+    "\u6587",
+    "[SEP]"
+   ]
+  }
+ ]
+}
