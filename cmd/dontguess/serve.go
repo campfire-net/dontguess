@@ -1150,6 +1150,15 @@ type operatorRequest struct {
 	Task        string   `json:"task,omitempty"`
 	Budget      int64    `json:"budget,omitempty"`
 	MaxResults  int      `json:"max_results,omitempty"`
+
+	// CallerKey (OpListAssigns, dontguess-d26) is the caller-supplied hex pubkey
+	// used to filter exclusive assigns down to ones the caller may claim
+	// (ExclusiveSender==""  or  ==CallerKey). Optional — the individual tier has
+	// no persisted per-call identity to supply here (design §3.3), so an empty
+	// CallerKey simply surfaces only the non-exclusive open tasks. This is a
+	// filter hint, never an authorization: OpListAssigns is a plain read with no
+	// signed binding to CallerKey (see OpListAssigns doc, ipc.go).
+	CallerKey string `json:"caller_key,omitempty"`
 }
 
 // serveOperatorSocket accepts connections on ln and handles operator IPC
@@ -1357,6 +1366,12 @@ func handleOperatorConn(conn net.Conn, eng *exchange.Engine, allowCtrl ...*allow
 		// deadline itself (opBuyConnDeadline) before its bounded server-side
 		// await — see individual_ops.go.
 		writeOperatorResp(conn, handleOpBuy(eng, conn, req))
+
+	case OpListAssigns:
+		// Assign-discovery (dontguess-d26, #2 AGENT DOOR): a plain read of live
+		// engine State, no signed authorization required — see OpListAssigns doc,
+		// ipc.go, and handleOpListAssigns, individual_ops.go.
+		enc.Encode(handleOpListAssigns(eng, req)) //nolint:errcheck
 
 	default:
 		writeOperatorResp(conn, map[string]any{"ok": false, "error": "unknown op: " + req.Op})

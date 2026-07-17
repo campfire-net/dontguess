@@ -1602,6 +1602,48 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 	return nil
 }
 
+// AcceptAssign emits an operator-authored exchange:assign-accept for the
+// assign-complete referenced by completeMsgID, folds it, and then
+// synchronously invokes handleAssignAccept inline — paying the bounty via
+// ClaimAssignPayment/ScripStore.AddBudget (and creating any compression
+// derivative) in this SAME call, exactly the way AutoAcceptPut inlines its own
+// put-promotion side effects rather than relying on the poll loop to dispatch
+// what it just emitted.
+//
+// This exists to close a real gap (found while wiring dontguess-d26's agent
+// CLI door and its enforcement-proof E2E test): dispatchLocalGap
+// (engine_core.go) deliberately SKIPS dispatch for every record whose
+// Sender==OperatorKey — an operator's own LOCAL emissions (e.g. AutoAcceptPut,
+// RejectPut, MintScrip) are already synchronously handled at the call site, so
+// re-dispatching them on the next poll would double-apply side effects like
+// scrip payment. But handleAssignAccept had no such call-site — it was ONLY
+// ever invoked from dispatch()'s op-switch — so it was UNREACHABLE for ANY
+// operator-authored assign-accept, local OR relay-originated: the fold
+// (State.Apply) transitions AssignCompleted -> AssignAccepted correctly, but
+// the bounty is never paid. AutoAcceptPut/RejectPut/MintScrip never hit this
+// because each does its real work inline instead of depending on dispatch
+// re-observing its own emission; assign-accept was the one operator action
+// that had a handler written but never wired to a reachable call site.
+//
+// Serializes via opMu against the auto-accept ticker and other operator god-
+// buttons, matching every other method here.
+func (e *Engine) AcceptAssign(completeMsgID string) error {
+	e.opMu.Lock()
+	defer e.opMu.Unlock()
+	if completeMsgID == "" {
+		return fmt.Errorf("engine: AcceptAssign: empty completeMsgID")
+	}
+	msg, err := e.sendOperatorMessage([]byte(`{}`), []string{TagAssignAccept}, []string{completeMsgID})
+	if err != nil {
+		return fmt.Errorf("engine: AcceptAssign: emit: %w", err)
+	}
+	e.state.Apply(msg)
+	if err := e.handleAssignAccept(msg); err != nil {
+		return fmt.Errorf("engine: AcceptAssign: handle: %w", err)
+	}
+	return nil
+}
+
 // createCompressionDerivative creates a new derivative inventory entry when a
 // compression assign task is accepted. The derivative's content_hash and
 // content_size come from the assign-complete result payload; the description,

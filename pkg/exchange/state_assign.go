@@ -117,7 +117,16 @@ func (s *State) applyAssignClaim(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	assignID := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1, dontguess-d26): a team-tier agent only
+	// ever learns the assign's WIRE (content-hash) id from the relay — the
+	// Outbox re-signs every operator-emitted record on publish — but
+	// assignByID is keyed by the pre-signature STORE id. Without this, every
+	// relay-originated assign-claim silently no-ops here forever (the exact
+	// gap state_settle.go's resolveAlias calls already close for match/
+	// deliver/buyer-accept antecedents). Identity (no-op) wherever no alias is
+	// registered — individual tier and the in-process test suites are
+	// byte-for-byte unchanged.
+	assignID := s.resolveAlias(msg.Antecedents[0])
 	rec, ok := s.assignByID[assignID]
 	if !ok || rec.Status != AssignOpen {
 		return
@@ -235,7 +244,9 @@ func (s *State) applyAssignAuctionClose(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	assignID := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1): see applyAssignClaim's doc — identity
+	// no-op wherever no wire alias is registered.
+	assignID := s.resolveAlias(msg.Antecedents[0])
 	rec, ok := s.assignByID[assignID]
 	if !ok || rec.Status != AssignOpen {
 		return
@@ -307,7 +318,10 @@ func (s *State) applyAssignComplete(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	claimMsgID := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1): see applyAssignClaim's doc — a
+	// team-tier agent's assign-complete e-tags the WIRE id of the assign-claim
+	// it is completing (the only id the relay ever exposed for that claim).
+	claimMsgID := s.resolveAlias(msg.Antecedents[0])
 	// Find the assign record via the O(1) claim-msg index.
 	assignID, ok := s.claimMsgToAssign[claimMsgID]
 	if !ok {
@@ -365,7 +379,8 @@ func (s *State) applyAssignAccept(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	completeMsgID := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1): see applyAssignClaim's doc.
+	completeMsgID := s.resolveAlias(msg.Antecedents[0])
 	rec, ok := s.pendingAssignResults[completeMsgID]
 	if !ok || rec.Status != AssignCompleted {
 		return
@@ -394,7 +409,8 @@ func (s *State) applyAssignReject(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	completeMsgID := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1): see applyAssignClaim's doc.
+	completeMsgID := s.resolveAlias(msg.Antecedents[0])
 	rec, ok := s.pendingAssignResults[completeMsgID]
 	if !ok || rec.Status != AssignCompleted {
 		return
@@ -438,7 +454,12 @@ func (s *State) applyAssignExpire(msg *Message) {
 	if len(msg.Antecedents) == 0 {
 		return
 	}
-	antecedent := msg.Antecedents[0]
+	// resolveAlias (dontguess-55c GAP 1): see applyAssignClaim's doc. This
+	// handler's antecedent is always engine-emitted (sweepExpiredClaims /
+	// sweepStalePredictionAssigns), so it is already store-form in every
+	// production path today — added for defensive consistency with every
+	// other assign handler now that the pattern is established.
+	antecedent := s.resolveAlias(msg.Antecedents[0])
 	// Claim-expiry path: antecedent is a claim-msg ID indexed to a claimed assign.
 	if assignID, ok := s.claimMsgToAssign[antecedent]; ok {
 		rec := s.assignByID[assignID]
@@ -514,6 +535,16 @@ func (s *State) PendingAuctionClose() []string {
 func (s *State) ClaimAssignPayment(completeMsgID string) *AssignRecord {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// resolveAlias (dontguess-55c GAP 1, dontguess-d26): the caller
+	// (engine_core.go handleAssignAccept) passes msg.Antecedents[0] straight
+	// through — an operator emitting a REAL accept for a team-tier agent's
+	// completion only ever knows that completion's WIRE id (the relay never
+	// exposes the pre-signature store id). Without this, a genuinely-accepted
+	// relay-originated completion could never actually pay: the fold
+	// (applyAssignAccept, itself now alias-resolved) transitions the record to
+	// AssignAccepted, but this SEPARATE payment gate would never find it via
+	// completeMsgToAssign (store-keyed) using the raw wire id.
+	completeMsgID = s.resolveAlias(completeMsgID)
 	assignID, ok := s.completeMsgToAssign[completeMsgID]
 	if !ok {
 		return nil
@@ -552,6 +583,38 @@ func (s *State) ActiveAssigns(entryID string) []*AssignRecord {
 		// Lazy expiry: if the claim TTL has elapsed, present effective status as
 		// AssignOpen so callers see the task as claimable. State mutation happens
 		// when the engine emits and applies exchange:assign-expire.
+		if cp.Status == AssignClaimed && !cp.ClaimExpiresAt.IsZero() && now.After(cp.ClaimExpiresAt) {
+			cp.Status = AssignOpen
+			cp.ClaimantKey = ""
+			cp.ClaimMsgID = ""
+		}
+		out = append(out, &cp)
+	}
+	return out
+}
+
+// AllActiveAssigns returns a snapshot of every non-terminal AssignRecord across
+// ALL entries (including entryID=="" brokered/generic assigns) — unlike
+// ActiveAssigns, which is scoped to one entryID. Mirrors ActiveAssigns's
+// terminal-state exclusion and lazy-claim-expiry presentation (a AssignClaimed
+// record whose ClaimExpiresAt has passed is presented as AssignOpen so a caller
+// sees it as claimable without waiting for the next assign-expire poll tick).
+//
+// Added for the CLI agent door (dontguess-d26): `dontguess assigns` needs to
+// discover every open/claimable task in one call, not just those tied to a
+// single inventory entry.
+//
+// Thread-safe.
+func (s *State) AllActiveAssigns() []*AssignRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	now := time.Now().UTC()
+	out := make([]*AssignRecord, 0, len(s.assignByID))
+	for _, r := range s.assignByID {
+		if r.Status == AssignAccepted || r.Status == AssignRejected || r.Status == AssignPaid || r.Status == AssignExpired {
+			continue
+		}
+		cp := *r
 		if cp.Status == AssignClaimed && !cp.ClaimExpiresAt.IsZero() && now.After(cp.ClaimExpiresAt) {
 			cp.Status = AssignOpen
 			cp.ClaimantKey = ""

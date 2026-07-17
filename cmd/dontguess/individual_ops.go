@@ -310,3 +310,78 @@ func handleOpBuy(eng *exchange.Engine, conn net.Conn, req operatorRequest) opBuy
 		Content:     base64.StdEncoding.EncodeToString(entry.Content),
 	}
 }
+
+// opListAssignsResponse is the JSON response shape for OpListAssigns.
+type opListAssignsResponse struct {
+	OK      bool               `json:"ok"`
+	Error   string             `json:"error,omitempty"`
+	Assigns []assignsListEntry `json:"assigns"`
+}
+
+// assignsListEntry is one open/claimable assign task surfaced by OpListAssigns.
+// Mirrors pkg/relayclient.OpenAssign's shape so the CLI's rendering code
+// (assign.go) is tier-agnostic.
+type assignsListEntry struct {
+	AssignID        string `json:"assign_id"`
+	EntryID         string `json:"entry_id,omitempty"`
+	TaskType        string `json:"task_type"`
+	Reward          int64  `json:"reward"`
+	Status          string `json:"status"`
+	ExclusiveSender string `json:"exclusive_sender,omitempty"`
+	Description     string `json:"description,omitempty"`
+}
+
+// handleOpListAssigns services the assign-discovery IPC request (item
+// dontguess-d26, #2 AGENT DOOR): reads eng.State() directly for every open/
+// claimable AssignRecord (State.AllActiveAssigns) and returns those the caller
+// may claim — ExclusiveSender=="" (open to anyone) or ExclusiveSender==the
+// caller's own key, when supplied. On the individual tier there is no
+// persisted per-call identity (design §3.3: OpPut/OpBuy mint a fresh random
+// sender key every call), so req.CallerKey is normally empty and only
+// non-exclusive tasks are surfaced — an individual-tier caller can never
+// present the pubkey a warm-compression assign targets. This is a plain READ:
+// the assign lifecycle it exposes is already a public operator broadcast, so
+// socket reachability alone is a sufficient trust boundary (matches
+// OpMetrics/OpListHeld — no signed authorization required, unlike OpMint/
+// OpAllowlist).
+//
+// Description is read directly off the original exchange:assign local-store
+// record's payload (not persisted on AssignRecord) by a best-effort re-read of
+// LocalStore, matched by AssignID.
+func handleOpListAssigns(eng *exchange.Engine, req operatorRequest) opListAssignsResponse {
+	active := eng.State().AllActiveAssigns()
+
+	descByAssignID := map[string]string{}
+	if eng.LocalStore() != nil {
+		if recs, err := eng.LocalStore().ReadAll(); err == nil {
+			for _, rec := range recs {
+				if !hasTag(rec.Tags, exchange.TagAssign) {
+					continue
+				}
+				var p struct {
+					Description string `json:"description"`
+				}
+				if json.Unmarshal(rec.Payload, &p) == nil && p.Description != "" {
+					descByAssignID[rec.ID] = p.Description
+				}
+			}
+		}
+	}
+
+	out := make([]assignsListEntry, 0, len(active))
+	for _, rec := range active {
+		if rec.ExclusiveSender != "" && rec.ExclusiveSender != req.CallerKey {
+			continue
+		}
+		out = append(out, assignsListEntry{
+			AssignID:        rec.AssignID,
+			EntryID:         rec.EntryID,
+			TaskType:        rec.TaskType,
+			Reward:          rec.Reward,
+			Status:          rec.Status.String(),
+			ExclusiveSender: rec.ExclusiveSender,
+			Description:     descByAssignID[rec.AssignID],
+		})
+	}
+	return opListAssignsResponse{OK: true, Assigns: out}
+}

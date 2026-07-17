@@ -447,6 +447,79 @@ func TestIndividualTier_ConcurrentOpPutOpBuy_NoFoldCursorCorruption(t *testing.T
 	}
 }
 
+// TestOpListAssigns_Individual_SurfacesOpenCompressAssign proves the
+// dontguess-d26 (#2 AGENT DOOR) individual-tier listing path: a real posted
+// compression assign (via the exported production eng.PostOpenCompressionAssign
+// — the same call the medium loop makes) is discoverable over the operator
+// socket via OpListAssigns, with reward/task_type/description intact, and an
+// EXCLUSIVE assign targeting a different key is correctly filtered out for a
+// caller that is not that key.
+func TestOpListAssigns_Individual_SurfacesOpenCompressAssign(t *testing.T) {
+	t.Parallel()
+
+	eng := newIndividualTierEngine(t)
+	sockPath, _ := startSocketServer(t, eng)
+
+	const tokenCost int64 = 15000
+	putID := randomLocalMsgID(t)
+	if err := eng.IngestLocalRecord(dgstore.Record{
+		ID:         putID,
+		CampfireID: "local",
+		Sender:     "seller-" + putID[:8],
+		Payload:    localPutPayload("assign-list fixture: python asyncio debugging guide", tokenCost),
+		Tags:       []string{exchange.TagPut, "exchange:content-type:code", "exchange:domain:python"},
+		Timestamp:  time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("IngestLocalRecord(put): %v", err)
+	}
+	if err := eng.AutoAcceptPut(putID, tokenCost*70/100, time.Now().UTC().Add(72*time.Hour)); err != nil {
+		t.Fatalf("AutoAcceptPut: %v", err)
+	}
+	inv := eng.State().Inventory()
+	if len(inv) != 1 {
+		t.Fatalf("inventory after AutoAcceptPut = %d entries, want 1", len(inv))
+	}
+	entryID := inv[0].EntryID
+
+	const wantReward = tokenCost * exchange.ColdCompressionBountyPct / 100
+	if err := eng.PostOpenCompressionAssign(entryID); err != nil {
+		t.Fatalf("PostOpenCompressionAssign: %v", err)
+	}
+
+	var resp opListAssignsResponse
+	dialAndRequest(t, sockPath, map[string]any{
+		"op":         OpListAssigns,
+		"caller_key": "anyone-not-exclusive",
+	}, &resp)
+	if !resp.OK {
+		t.Fatalf("OpListAssigns failed: %s", resp.Error)
+	}
+
+	var found *assignsListEntry
+	for i := range resp.Assigns {
+		a := &resp.Assigns[i]
+		if a.TaskType == "compress" && a.EntryID == entryID {
+			found = a
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("OpListAssigns did not surface the posted compress assign for entry %s; got %+v", short(entryID), resp.Assigns)
+	}
+	if found.Reward != wantReward {
+		t.Errorf("reward = %d, want %d (20%% of token_cost %d)", found.Reward, wantReward, tokenCost)
+	}
+	if found.ExclusiveSender != "" {
+		t.Errorf("exclusive_sender = %q, want empty (cold assign, open to anyone)", found.ExclusiveSender)
+	}
+	if found.Description == "" {
+		t.Error("description is empty — OpListAssigns should surface the original assign message's description")
+	}
+	if found.Status != "assign-open" {
+		t.Errorf("status = %q, want %q", found.Status, "assign-open")
+	}
+}
+
 func concurrentTaskDescription(i int) string {
 	tasks := []string{
 		"Rust ownership borrow checker cheat sheet",

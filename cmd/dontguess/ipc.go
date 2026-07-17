@@ -45,4 +45,25 @@ const (
 	// 0700 socket is necessary but NOT sufficient (ADV-16). Consumed by
 	// `dontguess allowlist add|remove` when the operator is running.
 	OpAllowlist = "allowlist"
+	// OpListAssigns is the assign-discovery IPC op (item dontguess-d26, #2 AGENT
+	// DOOR): reads the running engine's live State directly for every open/
+	// claimable AssignRecord (State.AllActiveAssigns, filtered to
+	// ExclusiveSender=="" or ==the caller's key). Unlike OpMint/OpAllowlist this
+	// is a plain READ with no signed authorization — the assign lifecycle it
+	// exposes is already publicly broadcast (an operator-authored exchange:assign
+	// is not confidential), so socket reachability alone is a sufficient trust
+	// boundary here, matching OpMetrics/OpListHeld. Consumed by `dontguess
+	// assigns` on the individual (zero-relay) tier; a relay-attached tier
+	// discovers the same information by subscribing the relay directly
+	// (pkg/relayclient.FetchOpenAssigns) since operator-authored assign messages
+	// are published there too (pkg/relay/outbox.go).
+	//
+	// `dontguess assign claim`/`assign complete` are NOT wired to an individual-
+	// tier IPC op: OpPut/OpBuy's "zero identity ceremony" design mints a FRESH
+	// random sender key on every call, but applyAssignComplete requires
+	// msg.Sender == the claim's ClaimantKey (state_assign.go) — a binding that
+	// cannot survive across two separate CLI invocations with no persisted
+	// identity between them. Claim/complete require a relay-attached (team) tier
+	// where the agent signs consistently from its walk-up .dg/ identity.
+	OpListAssigns = "list-assigns"
 )
