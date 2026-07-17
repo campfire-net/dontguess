@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -290,6 +291,43 @@ func newDenseEmbedderCached() (matching.Embedder, error) {
 	return matching.NewNativeEmbedderCached(os.Getenv("DONTGUESS_EMBED_CACHE"))
 }
 
+// shouldPrefetchModel decides whether serve should kick off a background model
+// download. It is a pure function so every branch is testable. Prefetch is ON
+// by default (operators get native dense automatically) but suppressed when:
+// explicitly opted out (DONTGUESS_EMBED_NO_PREFETCH=1), running under `go test`
+// (never touch the network from tests), or the model is already cached.
+func shouldPrefetchModel(underTest bool, noPrefetchEnv string, cached bool) bool {
+	if noPrefetchEnv == "1" {
+		return false
+	}
+	if underTest {
+		return false
+	}
+	return !cached
+}
+
+// maybePrefetchModel starts a non-blocking background download of the MiniLM
+// model when appropriate, so a serve that fell back to TF-IDF (model not cached)
+// activates native dense embeddings on its next restart. It never blocks serve
+// startup and never runs during tests (flag "test.v" is registered by the go
+// test harness). The download is atomic (Fetch → tmp + rename), so a serve that
+// is killed mid-download leaves no partial file.
+func maybePrefetchModel(logf func(string, ...any)) {
+	cacheDir := os.Getenv("DONTGUESS_EMBED_CACHE")
+	underTest := flag.Lookup("test.v") != nil
+	if !shouldPrefetchModel(underTest, os.Getenv("DONTGUESS_EMBED_NO_PREFETCH"), nativebert.Cached(cacheDir)) {
+		return
+	}
+	go func() {
+		logf("  embedder:  prefetching all-MiniLM-L6-v2 (~87MB) in background — native dense matching activates on next restart (set DONTGUESS_EMBED_NO_PREFETCH=1 to disable)")
+		if err := nativebert.Fetch(cacheDir); err != nil {
+			logf("  embedder:  background model prefetch failed: %v — will retry next start, or run `dontguess embed pull`", err)
+			return
+		}
+		logf("  embedder:  background model prefetch complete — restart serve to enable native dense embeddings")
+	}()
+}
+
 // runServeLocal runs the exchange engine in standalone local-only mode
 // (dontguess-275): no campfire relay, no campfire identity, no scrip network
 // dependency. Ingest and egress both go through a local pkg/store event log
@@ -534,7 +572,8 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		embedder = e
 		logger.Printf("  embedder:  dense (all-MiniLM-L6-v2, pure-Go native)")
 	} else if errors.Is(err, nativebert.ErrModelNotCached) {
-		logger.Printf("  embedder:  tf-idf — dense model not cached; run `dontguess embed pull` to enable native semantic matching")
+		logger.Printf("  embedder:  tf-idf — dense model not cached; prefetching in background (or run `dontguess embed pull`)")
+		maybePrefetchModel(logger.Printf)
 	} else {
 		logger.Printf("  WARNING: embedder falling back to tf-idf — native MiniLM load failed: %v", err)
 	}
