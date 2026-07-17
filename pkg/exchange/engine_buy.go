@@ -816,30 +816,22 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 		return nil
 	}
 
-	// Atomic dedup recheck + post (dontguess-20e). compressAssignMu makes the guard
-	// read and the compound send (which state.Applies the assign) one critical
-	// section shared with the cold poster, so a concurrent cold/warm post is always
-	// observed here and deferred to instead of double-posting.
-	e.compressAssignMu.Lock()
-	defer e.compressAssignMu.Unlock()
+	// Best-effort dedup (dontguess-8b9). This WARM poster runs inside handleBuy on
+	// the individual-tier poll-loop dispatch path, which holds neither opMu nor
+	// localMu. The dontguess-20e warm-path compressAssignMu lock here serialized the
+	// buy dispatch and regressed the concurrent OpPut/OpBuy fold cursor ~8x
+	// (TestIndividualTier_ConcurrentOpPutOpBuy: 10%->80% flake, bisected to this
+	// lock). The warm-vs-cold double-post it prevented is a LOW-severity maintenance
+	// edge (one duplicate compression bounty) — not worth an 80% regression in the
+	// core buy path — so it is deferred as a known limitation. The guard rechecks
+	// below remain as best-effort (pre-20e behavior): they collapse the common
+	// non-simultaneous interleave; only a rare exact-simultaneous warm+cold post can
+	// still double-post, which the medium loop's own guard already makes uncommon.
 	if e.state.HasCompressedVersion(entry.EntryID) {
 		return nil
 	}
-	// Defer to an active compress assign that a new WARM (buyer-exclusive) assign
-	// would double-pay against: one already targeting THIS buyer (same-buyer dedup),
-	// or an OPEN cold assign (ExclusiveSender == ""). Deferring to the open cold
-	// assign is what collapses the cold-then-warm interleave to a single assign — the
-	// buyer-scoped guard alone would not see an open cold assign and both would land.
-	// A hot assign exclusive to a DIFFERENT sender (the seller) is intentionally NOT
-	// deferred to: hot+warm coexistence is the designed two-offer path.
 	if e.hasActiveBuyerOrOpenCompressAssign(entry.EntryID, buyerKey) {
 		return nil
-	}
-	// Test-only seam (dontguess-20e Gap B): guard read is committed-to-post; the
-	// post has not happened yet. See engine_core.go compressAssignGuardHook. nil in
-	// production.
-	if compressAssignGuardHook != nil {
-		compressAssignGuardHook("warm")
 	}
 
 	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
