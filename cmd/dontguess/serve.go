@@ -35,6 +35,13 @@ import (
 // If this constant is changed, TestServeAutoAcceptMaxDefault will fail — update both together.
 const DefaultAutoAcceptMax = int64(1_000_000)
 
+// DefaultAssignAcceptInterval is the default cadence of the auto-accept-assign
+// ticker (dontguess-462). 30s balances prompt payment of completed compression
+// labor against not spamming validation/embedding work; it is well under the
+// medium loop's hourly cadence because a completed assign should be paid soon
+// after it is submitted, not up to an hour later.
+const DefaultAssignAcceptInterval = 30 * time.Second
+
 var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
@@ -42,6 +49,16 @@ var (
 	// serveLocal is a retained no-op alias flag (dontguess-b14): the default
 	// serve path is already campfire-free/local, so --local changes nothing.
 	serveLocal bool
+
+	// serveAssignAcceptInterval is how often the operator-side auto-accept-assign
+	// ticker (dontguess-462, Engine.RunAutoAcceptAssigns) scans State for completed
+	// COMPRESSION assigns, validates each (allowlist + integrity + >=30% size
+	// reduction + >=0.85 semantic similarity), and accepts+pays the ones that pass
+	// / rejects the ones that fail. This is the cold-start earn-from-labor mint: it
+	// lets a scrip-poor admitted agent do compression labor the exchange can
+	// validate and get paid with NO manual operator step. Overridable so tests
+	// don't wait the full production interval for a tick.
+	serveAssignAcceptInterval time.Duration
 
 	// serveMediumLoopInterval is how often the pricing medium loop (dontguess-ffb,
 	// restoring pkg/pricing.MediumLoop into the running serve) ticks. Each tick
@@ -98,6 +115,7 @@ func init() {
 	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", DefaultAutoAcceptMax, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
 	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "no-op alias: serve is always campfire-free/local (retained for backward compatibility)")
 	serveCmd.Flags().DurationVar(&serveMediumLoopInterval, "medium-loop-interval", pricing.DefaultMediumLoopInterval, "how often the pricing medium loop scans inventory and posts open compression assigns for high-demand uncompressed entries")
+	serveCmd.Flags().DurationVar(&serveAssignAcceptInterval, "assign-accept-interval", DefaultAssignAcceptInterval, "how often the operator validates and pays (or rejects) completed compression assigns (auto-accept-assign ticker)")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -1102,6 +1120,35 @@ func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, med
 			}
 		}()
 	}
+
+	// Auto-accept-assign goroutine (dontguess-462 — the cold-start earn-from-labor
+	// mint). It periodically validates and pays (or rejects) completed COMPRESSION
+	// assigns via Engine.RunAutoAcceptAssigns, closing the e51 gap where
+	// Engine.AcceptAssign (the accept+pay leg) had NO production caller so
+	// assign-labor earning was unreachable, and the 491f gap where the pay path did
+	// not re-check the allowlist. Gated on ctx.Done() exactly like the auto-accept
+	// PUT ticker above. It runs on every tier: on the individual/no-relay tier
+	// there are no completed assigns (claim/complete are team-tier only), so
+	// RunAutoAcceptAssigns is a cheap no-op there — the payment side only bites on
+	// the team tier where a ScripStore + TrustChecker exist. The first tick fires
+	// after one interval (a completed assign that predates startup is folded by
+	// eng.Start's replay and picked up on that first tick).
+	go func() {
+		interval := serveAssignAcceptInterval
+		if interval <= 0 {
+			interval = DefaultAssignAcceptInterval
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				eng.RunAutoAcceptAssigns()
+			}
+		}
+	}()
 
 	// Pricing medium-loop goroutine (dontguess-ffb — restore pkg/pricing into the
 	// running serve; it was imported nowhere in cmd/ before this, so the medium

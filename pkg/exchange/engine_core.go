@@ -1734,6 +1734,21 @@ func (e *Engine) handleAssignAccept(msg *Message) error {
 func (e *Engine) AcceptAssign(completeMsgID string) error {
 	e.opMu.Lock()
 	defer e.opMu.Unlock()
+	return e.acceptAssignLocked(completeMsgID)
+}
+
+// acceptAssignLocked is the opMu-HELD body of AcceptAssign. It is factored out
+// so the auto-accept-assign ticker (RunAutoAcceptAssigns, dontguess-462) can
+// validate-then-accept a whole batch of completed compression assigns under a
+// SINGLE opMu critical section — acquiring opMu once around the validation +
+// the accept/reject emit, exactly as RunAutoAccept holds opMu across its whole
+// promotion pass — instead of the public AcceptAssign re-locking opMu per
+// record (which the ticker, already holding opMu, would deadlock on: opMu is a
+// non-reentrant sync.Mutex). The lock ordering is unchanged: opMu (held here) ⊃
+// localMu (taken by sendOperatorMessage → appendLocalRecord) ⊃ State.mu.
+//
+// CALLER MUST HOLD e.opMu.
+func (e *Engine) acceptAssignLocked(completeMsgID string) error {
 	if completeMsgID == "" {
 		return fmt.Errorf("engine: AcceptAssign: empty completeMsgID")
 	}

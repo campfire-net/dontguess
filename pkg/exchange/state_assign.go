@@ -625,6 +625,35 @@ func (s *State) AllActiveAssigns() []*AssignRecord {
 	return out
 }
 
+// CompletedUnacceptedAssigns returns a snapshot (deep-copied records) of every
+// assign that is in AssignCompleted state — i.e. the claimant has submitted a
+// result and it is pending operator accept/reject. This is the work queue the
+// operator-side auto-accept-assign ticker (Engine.RunAutoAcceptAssigns,
+// dontguess-462) scans each tick to validate-and-pay completed COMPRESSION
+// labor with no manual operator step.
+//
+// It reads from pendingAssignResults, which applyAssignComplete populates and
+// applyAssignAccept / applyAssignReject remove from on the first terminal
+// transition — so a record already accepted (AssignAccepted/AssignPaid) or
+// rejected (reset to AssignOpen) is never returned, and the ticker cannot
+// re-act on it. Records are copied so a caller can validate off-lock without
+// racing a concurrent fold mutating the live record.
+//
+// Thread-safe.
+func (s *State) CompletedUnacceptedAssigns() []*AssignRecord {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make([]*AssignRecord, 0, len(s.pendingAssignResults))
+	for _, r := range s.pendingAssignResults {
+		if r == nil || r.Status != AssignCompleted {
+			continue
+		}
+		cp := *r
+		out = append(out, &cp)
+	}
+	return out
+}
+
 // sellerStats returns the SellerStats for the given key, creating if absent.
 // Caller must hold s.mu.
 func (s *State) sellerStats(sellerKey string) *SellerStats {
