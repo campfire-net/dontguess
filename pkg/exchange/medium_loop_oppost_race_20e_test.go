@@ -27,6 +27,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -239,6 +240,145 @@ func TestPostOpenCompressionAssign_WarmPollVsColdYieldsSingleAssign(t *testing.T
 		if got := countActiveCompressAssigns(eng, entryID); got != 1 {
 			t.Fatalf("iter %d: entry has %d active compress assigns after racing a POLL-LOOP WARM post (writer 4 path ii) against a COLD post (writer 3), want exactly 1 — the cross-writer compressAssignMu serialization must let exactly one land; 2 = warm+cold double-pay",
 				it, got)
+		}
+	}
+}
+
+// TestPostOpenCompressionAssign_LockSerializesSimultaneousWarmCold is the
+// dontguess-20e Gap B MUTATION-FOR-THE-LOCK proof. Its sibling
+// TestPostOpenCompressionAssign_WarmPollVsColdYieldsSingleAssign is really a mutation
+// test for the PREDICATE (hasActiveBuyerOrOpenCompressAssign), NOT the lock: the warm
+// poll pipeline (fold+match+dispatch) is far longer than the short cold post, so in a
+// free race cold almost always lands its assign FIRST and warm then defers via the
+// predicate — reverting ONLY the compressAssignMu Lock/Unlock (keeping the predicate)
+// still leaves that sibling GREEN. The one schedule the lock actually protects — BOTH
+// writers reading the guard empty, THEN both posting — has zero coverage there because
+// free scheduling never reliably produces it.
+//
+// This test forces that exact schedule DETERMINISTICALLY with the
+// compressAssignGuardHook seam (engine_core.go). The hook fires inside the
+// compressAssignMu critical section, AFTER each writer's dedup guard read returns
+// empty (committed-to-post) and BEFORE its post. A test barrier in the hook holds the
+// first arriver until the second also arrives, then releases both to post together:
+//
+//   - WITH compressAssignMu (production): only ONE writer can be inside the critical
+//     section at a time. The first arriver reaches the hook and waits on the barrier;
+//     the second is blocked on compressAssignMu.Lock() and never reaches the hook.
+//     The barrier TIMES OUT (only one arrival), the first posts and releases the lock,
+//     and the second then acquires the lock, observes the applied assign at its recheck
+//     (cold: len(ActiveAssigns)>0; warm: the open cold assign via
+//     hasActiveBuyerOrOpenCompressAssign) and DEFERS. Result: exactly 1 assign.
+//
+//   - WITHOUT compressAssignMu (the mutation): BOTH writers enter concurrently, both
+//     read the guard empty (neither has posted — each is held at the hook before its
+//     post), both reach the hook, the barrier sees two arrivals and releases them
+//     together, and BOTH post. Result: 2 assigns = warm+cold double-pay. The test FAILS.
+//
+// The barrier timeout is generous relative to the warm-poll pipeline latency, so in
+// the unlocked case the second (warm) arrival reliably beats the timeout and the
+// interleave is deterministic; in the locked case the timeout is simply the (bounded)
+// cost of proving the second writer could never reach the post window. State accessors
+// are individually State.mu-synchronized, so removing compressAssignMu yields a LOGICAL
+// double-post, not a low-level data race — the -race detector stays quiet and the
+// 2-vs-1 assertion is what fails. NOT parallel: it installs a process-global hook.
+func TestPostOpenCompressionAssign_LockSerializesSimultaneousWarmCold(t *testing.T) {
+	// Deliberately NOT t.Parallel(): compressAssignGuardHook is process-global.
+	defer exchange.SetCompressAssignGuardHookForTest(nil)
+
+	const iterations = 3
+	const tokenCost int64 = 20000
+	// Generous vs. the warm-poll pipeline latency (tens of ms under -race): in the
+	// UNLOCKED case the second arrival beats this easily so the interleave is
+	// deterministic; in the LOCKED case this is the bounded wait the sole arriver
+	// spends proving the other writer never reaches the post window.
+	const barrierTimeout = 1500 * time.Millisecond
+
+	for it := 0; it < iterations; it++ {
+		h := newTestHarness(t)
+		eng := h.newEngine()
+
+		desc := fmt.Sprintf("20e lock-mutation fixture %d: bounded worker-pool patterns", it)
+		entryID := seedAcceptedEntryNoAssign(t, h, eng, desc, tokenCost)
+
+		// Make the poll-dispatched buy semantically match THIS entry so the warm
+		// assign path (writer 4) actually engages.
+		idx := matching.NewIndex(nil, matching.RankOptions{})
+		idx.Rebuild([]matching.RankInput{{EntryID: entryID, Description: desc, TokenCost: tokenCost}})
+		eng.SetMatchIndexForTest(idx)
+
+		// Prime the poll cursors past put + put-accept (confirming no hot assign
+		// leaked) so the RACING poll dispatches ONLY the buy — an isolated warm post.
+		if err := eng.PollLocalStoreForTest(); err != nil {
+			t.Fatalf("iter %d: priming PollLocalStoreForTest: %v", it, err)
+		}
+		if n := countActiveCompressAssigns(eng, entryID); n != 0 {
+			t.Fatalf("iter %d precondition: entry has %d active compress assign(s) before the race, want 0", it, n)
+		}
+
+		// Barrier state, fresh per iteration. The hook records each writer's arrival
+		// (past its guard, before its post) and holds it until BOTH arrive or the
+		// timeout fires.
+		var arrivals int32
+		bothArrived := make(chan struct{})
+		var kindsMu sync.Mutex
+		kinds := map[string]int{}
+		exchange.SetCompressAssignGuardHookForTest(func(kind string) {
+			kindsMu.Lock()
+			kinds[kind]++
+			kindsMu.Unlock()
+			if atomic.AddInt32(&arrivals, 1) == 2 {
+				close(bothArrived) // second arrival releases both writers to post
+			}
+			select {
+			case <-bothArrived:
+			case <-time.After(barrierTimeout):
+			}
+		})
+
+		// Append the buy — never hand-dispatched — so the racing poll folds and
+		// dispatches it exactly as production's poll loop does.
+		h.sendMessage(h.buyer, buyPayload(desc, 10*tokenCost), []string{exchange.TagBuy}, nil)
+
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		wg.Add(2)
+		// Writer 4 (WARM) via the REAL poll loop — holds neither opMu nor localMu.
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := eng.PollLocalStoreForTest(); err != nil {
+				t.Errorf("iter %d: racing PollLocalStoreForTest: %v", it, err)
+			}
+		}()
+		// Writer 3 (COLD) via the medium-loop entry point — holds opMu.
+		go func() {
+			defer wg.Done()
+			<-start
+			if err := eng.PostOpenCompressionAssign(entryID); err != nil {
+				t.Errorf("iter %d: PostOpenCompressionAssign: %v", it, err)
+			}
+		}()
+		close(start) // release both simultaneously
+		wg.Wait()
+
+		exchange.SetCompressAssignGuardHookForTest(nil)
+
+		// Prove the warm path actually engaged — otherwise "exactly 1" would be
+		// trivially satisfied by the cold post alone and the lock would be untested.
+		msgs, err := h.st.ListMessages(h.cfID, 0)
+		if err != nil {
+			t.Fatalf("iter %d: ListMessages: %v", it, err)
+		}
+		if !hasMatchMessage(msgs) {
+			t.Fatalf("iter %d: no match message emitted — the poll loop did not match the buy, so the warm poster never engaged and the lock was not exercised", it)
+		}
+
+		if got := countActiveCompressAssigns(eng, entryID); got != 1 {
+			kindsMu.Lock()
+			warmN, coldN := kinds["warm"], kinds["cold"]
+			kindsMu.Unlock()
+			t.Fatalf("iter %d: entry has %d active compress assigns, want exactly 1 — with BOTH writers deterministically held past their dedup guard before either posts (warm-hook-fires=%d, cold-hook-fires=%d), only compressAssignMu can collapse the simultaneous warm+cold interleave to a single assign; 2 = the double-post/double-pay this lock prevents",
+				it, got, warmN, coldN)
 		}
 	}
 }

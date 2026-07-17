@@ -835,6 +835,12 @@ func (e *Engine) sendWarmCompressionAssign(entry *InventoryEntry, buyerKey strin
 	if e.hasActiveBuyerOrOpenCompressAssign(entry.EntryID, buyerKey) {
 		return nil
 	}
+	// Test-only seam (dontguess-20e Gap B): guard read is committed-to-post; the
+	// post has not happened yet. See engine_core.go compressAssignGuardHook. nil in
+	// production.
+	if compressAssignGuardHook != nil {
+		compressAssignGuardHook("warm")
+	}
 
 	bounty := entry.TokenCost * WarmCompressionBountyPct / 100
 	description := compressionProtocol(entry.EntryID, entry.ContentHash, entry.ContentType, bounty)
@@ -957,6 +963,12 @@ func (e *Engine) sendColdCompressionAssign(entry *InventoryEntry) error {
 	}
 	if len(e.state.ActiveAssigns(entry.EntryID)) > 0 {
 		return nil
+	}
+	// Test-only seam (dontguess-20e Gap B): guard read is committed-to-post; the
+	// post has not happened yet. See engine_core.go compressAssignGuardHook. nil in
+	// production.
+	if compressAssignGuardHook != nil {
+		compressAssignGuardHook("cold")
 	}
 
 	bounty := entry.TokenCost * ColdCompressionBountyPct / 100

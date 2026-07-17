@@ -1130,6 +1130,39 @@ func (e *Engine) PollLocalStoreForTest() error {
 	return e.pollLocalStore()
 }
 
+// compressAssignGuardHook is a test-only synchronization seam for mutation-testing
+// the compressAssignMu serialization (dontguess-20e Gap B). When non-nil it is
+// invoked INSIDE the compressAssignMu critical section of
+// sendWarmCompressionAssign / sendColdCompressionAssign, AFTER the dedup guard read
+// has returned "no active assign / no compressed version" (so the caller is
+// committed to posting) and BEFORE the compound send+Apply. kind is "warm" or
+// "cold" so a test can tell the two writers apart.
+//
+// It exists solely so a test can DETERMINISTICALLY create the one schedule
+// compressAssignMu actually protects: BOTH the warm and cold writer having read the
+// guard empty, neither having posted yet. With compressAssignMu present, only one
+// writer can be in this section at a time, so a test barrier here degrades to
+// serialized behavior (the second writer never reaches the hook — it blocks on the
+// mutex — the first times out of the barrier and posts, and the second then observes
+// the applied assign and defers). Remove compressAssignMu and BOTH writers reach the
+// hook, the barrier releases them together, and both post — the double-post the lock
+// prevents. The predicate-only test cannot force that schedule because the warm-poll
+// pipeline is far longer than the short cold post, so cold almost always posts first
+// and warm defers via the predicate, masking the lock's absence.
+//
+// nil in production (the only non-test assignment site). A nil func-value compare is
+// a single load+branch — zero measurable cost on the hot path.
+var compressAssignGuardHook func(kind string)
+
+// SetCompressAssignGuardHookForTest installs (or, with nil, clears) the
+// compress-assign guard seam. Test-support only; see compressAssignGuardHook. Not
+// safe to use from a test that runs in parallel with another test that drives a
+// compression assign — the hook is process-global, so callers must run
+// non-parallel (see TestPostOpenCompressionAssign_LockSerializesSimultaneousWarmCold).
+func SetCompressAssignGuardHookForTest(fn func(kind string)) {
+	compressAssignGuardHook = fn
+}
+
 // StartupReplayForTest runs the SYNCHRONOUS startup portion of Start — the exact
 // pre-run-loop body: replayAll (fold the full LocalStore log into State AND
 // rebuildMatchIndex, the Seam D reload re-gate), seed the dispatch cursor to the
