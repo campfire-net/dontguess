@@ -28,6 +28,18 @@ func NewNativeEmbedder(cacheDir string) (*NativeEmbedder, error) {
 	return &NativeEmbedder{e: e}, nil
 }
 
+// NewNativeEmbedderCached loads the MiniLM model only if it is already cached,
+// never downloading. It returns nativebert.ErrModelNotCached when the model is
+// absent, letting a latency-sensitive caller (serve startup) fall back to
+// TF-IDF without blocking on a ~87 MB fetch.
+func NewNativeEmbedderCached(cacheDir string) (*NativeEmbedder, error) {
+	e, err := nativebert.LoadCached(cacheDir)
+	if err != nil {
+		return nil, err
+	}
+	return &NativeEmbedder{e: e}, nil
+}
+
 // NewNativeEmbedderFromFiles loads the MiniLM model directly from on-disk
 // safetensors + tokenizer.json without any network access. Useful for tests
 // and out-of-band-provisioned model files.
