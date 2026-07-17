@@ -134,7 +134,13 @@ const MaxMinReputation = 50
 // (the exact attack) and never a funded buyer (who necessarily holds more than
 // price+fee to complete any purchase). Scrip enters only via x402 purchase or
 // labor, so requiring a positive balance is an economic cost the Sybil cannot
-// dodge. Operators may raise it. Individual tier (ScripStore nil) never applies it.
+// dodge. Individual tier (ScripStore nil) never applies it.
+//
+// NOTE (cache-warming pivot, 2026-07-17): this is the "ARMED" value, no longer the
+// fleet default. `serve` reads the bound from `--min-buy-balance` (default 0 = OFF)
+// because the allowlisted fleet has no anonymous Sybil to bound and a zero bound is
+// what warms the cache from cold. A federation/public operator re-arms with
+// `--min-buy-balance 1` (this constant). See docs/design/nostr-admission-scrip-rehome-3b8.md §8-D1.
 const DefaultMinBuyBalance int64 = 1
 
 // InitOptions controls the campfire-free Init operation.

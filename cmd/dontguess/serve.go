@@ -46,6 +46,15 @@ var (
 	servePollInterval  time.Duration
 	serveAutoAccept    bool
 	serveAutoAcceptMax int64
+	// serveMinBuyBalance is the D1 anonymous-buy demand-signal bound (§8-D1). It
+	// defaults to 0 = OFF: the cache-warming pivot (2026-07-17) turned the D1
+	// Sybil bound off for the deployed allowlisted fleet, where the admission
+	// allowlist is the anti-poisoning primitive and there is no anonymous Sybil to
+	// bound. A zero bound lets cold, scrip-poor buys fold into matching and (on a
+	// miss) form operator-underwritten bounties — how the cache warms. Operators
+	// re-arm it (e.g. --min-buy-balance 1) when opening to federation/public, where
+	// anonymous keys reappear. The engine no-ops it anyway when <=0 or ScripStore==nil.
+	serveMinBuyBalance int64
 	// serveLocal is a retained no-op alias flag (dontguess-b14): the default
 	// serve path is already campfire-free/local, so --local changes nothing.
 	serveLocal bool
@@ -116,6 +125,7 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "no-op alias: serve is always campfire-free/local (retained for backward compatibility)")
 	serveCmd.Flags().DurationVar(&serveMediumLoopInterval, "medium-loop-interval", pricing.DefaultMediumLoopInterval, "how often the pricing medium loop scans inventory and posts open compression assigns for high-demand uncompressed entries")
 	serveCmd.Flags().DurationVar(&serveAssignAcceptInterval, "assign-accept-interval", DefaultAssignAcceptInterval, "how often the operator validates and pays (or rejects) completed compression assigns (auto-accept-assign ticker)")
+	serveCmd.Flags().Int64Var(&serveMinBuyBalance, "min-buy-balance", 0, "D1 anonymous-buy signal bound: minimum scrip a buyer must hold before its buy folds into matching/demand/pricing. 0 = OFF (fleet default — allowlist is the primitive; lets cold buys form bounties to warm the cache). Arm it (e.g. 1) for federation/public where anonymous keys reappear")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -582,11 +592,17 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		scripStore = ss
 		logger.Printf("  scrip:     enabled (LocalScripStore, operator-gated) — payment enforced")
 
-		// D1 anonymous-buy demand-signal bound (design §8-D1): a buyer must hold
-		// scrip before a buy contributes to matching/demand/pricing, closing the
-		// free-Sybil ranking-gaming lever. Only meaningful with a ScripStore.
-		minBuyBalance = exchange.DefaultMinBuyBalance
-		logger.Printf("  buy-bound: anonymous-buy signal bound active — min buyer balance %d scrip", minBuyBalance)
+		// D1 anonymous-buy demand-signal bound (design §8-D1). Driven by the
+		// --min-buy-balance flag, default 0 = OFF (cache-warming pivot 2026-07-17):
+		// the allowlisted fleet has no anonymous Sybil to bound, and a zero bound
+		// lets cold buys form operator-underwritten bounties that warm the cache.
+		// Operators arm it (--min-buy-balance N) for federation/public.
+		minBuyBalance = serveMinBuyBalance
+		if minBuyBalance > 0 {
+			logger.Printf("  buy-bound: D1 anonymous-buy signal bound ARMED — min buyer balance %d scrip", minBuyBalance)
+		} else {
+			logger.Printf("  buy-bound: D1 signal bound OFF (fleet default; allowlist is the primitive — arm with --min-buy-balance for federation)")
+		}
 	}
 
 	// Pure-Go dense embeddings (all-MiniLM-L6-v2 via pkg/nativebert) when the
