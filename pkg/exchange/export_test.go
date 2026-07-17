@@ -131,6 +131,18 @@ func (s *State) CoOccurrenceCountForTest(entryA, entryB string) int {
 	return m.counts[entryB]
 }
 
+// DemandOnlySenderKeyCountForTest returns the NUMBER of distinct sender keys
+// currently retained in demandOnlySenderTimes. It is the direct memory-bound
+// witness for dontguess-4e3 finding B: a Sybil cycling many fresh sender keys
+// must NOT leave one permanent key per registration. Distinct from
+// DemandOnlyCountForSender (which counts timestamps within ONE key's window) —
+// this counts the KEYS themselves.
+func (s *State) DemandOnlySenderKeyCountForTest() int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return len(s.demandOnlySenderTimes)
+}
+
 // RecordBuyerSettlementForTest exposes recordBuyerSettlement for unit tests.
 func (e *Engine) RecordBuyerSettlementForTest(buyerKey, entryID string) {
 	e.recordBuyerSettlement(buyerKey, entryID)

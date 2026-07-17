@@ -166,6 +166,34 @@ func (s *State) applyDemandOnly(msg *Message) {
 	}
 	s.demandOnlyTaskHashes[p.TaskHash] = expiresAt
 
+	// Sweep sender keys whose ENTIRE rolling window has elapsed relative to THIS
+	// event's timestamp (dontguess-4e3 finding B — the RESOURCE-EXHAUSTION-DoS the
+	// per-key pruneDemandWindow does NOT close). pruneDemandWindow only touches the
+	// ONE key being written below; a Sybil that cycles a FRESH sender key per
+	// registration leaves each single-entry key at count=1 (< DemandOnlyPerSenderCap,
+	// so the per-sender cap never fires and never revisits it) — the key is written
+	// once and then never deleted, so demandOnlySenderTimes grows one permanent key
+	// per distinct unfunded sender, unbounded across process life and re-grown whole
+	// on every Replay. A key whose NEWEST timestamp is older than one window can only
+	// ever report 0 from DemandOnlyCountForSender going forward (every future event
+	// carries a higher timestamp, moving the window only further past it), so deleting
+	// it is loss-free. Keyed on msg.Timestamp (not wall-clock) — event-sourced-pure,
+	// so the sweep is deterministic on replay, exactly like the task-hash eviction
+	// above. The live sender being written below is re-added immediately after, so its
+	// per-sender cap is preserved.
+	senderWindowCutoff := msg.Timestamp - int64(DemandOnlyPerSenderWindow)
+	for key, times := range s.demandOnlySenderTimes {
+		newest := int64(0)
+		for _, t := range times {
+			if t > newest {
+				newest = t
+			}
+		}
+		if newest < senderWindowCutoff {
+			delete(s.demandOnlySenderTimes, key)
+		}
+	}
+
 	if p.BuyerKey != "" {
 		// Prune timestamps outside the rolling per-sender window ON WRITE so a
 		// long-lived / replayed sender key cannot grow an unbounded slice that

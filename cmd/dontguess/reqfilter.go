@@ -120,9 +120,29 @@ func buysFilter(since int64) ReqFilter {
 }
 
 // matchesFilter is the "match-results" view: all exchange:match messages
-// (both hits and buy-miss standing offers carry this kind).
+// (both hits and buy-miss standing offers carry this kind) EXCEPT demand-only
+// registrations.
+//
+// A DEMAND-ONLY registration (67e0 ruling) is a D1-dropped unfunded miss emitted
+// as [TagBuyMiss, TagMatch, TagDemandOnly] and stored under KindMatch so
+// `dontguess demand` (buyMissFilter's TagBuyMiss "x" read) still surfaces the
+// unmet demand. But it is NOT a real buyer-facing match — it moves no scrip,
+// opens no funded offer, and MUST NOT fold into any REPORTED exchange metric
+// (the load-bearing D1 anti-Sybil invariant). Both metric reporters read matches
+// through this one filter — hitrate.go (runHitRate → ComputeHitRate, whose
+// classifyMatchResult would otherwise see TagBuyMiss and count a real buyer MISS)
+// and status.go (countFilter(matchesFilter(0)) → ExchangeCounts.Matches) — so
+// excluding TagDemandOnly HERE keeps a Sybil's demand-only flood out of both
+// hit-rate and status at a single point, mirroring the in-package matchCount test
+// helper (pkg/exchange/anon_buy_signal_bound_test.go) that already strips it.
+// buyMissFilter deliberately does NOT exclude it — `demand` is the one view that
+// must see demand-only signals (dontguess-4e3 gap A).
 func matchesFilter(since int64) ReqFilter {
-	return ReqFilter{Kinds: []int{nostr.KindMatch}, Since: since}
+	return ReqFilter{
+		Kinds:       []int{nostr.KindMatch},
+		ExcludeTags: []string{exchange.TagDemandOnly},
+		Since:       since,
+	}
 }
 
 // settlementsFilter is the "settlements" view: all exchange:settle messages.
