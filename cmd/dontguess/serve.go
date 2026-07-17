@@ -23,6 +23,7 @@ import (
 	"github.com/3dl-dev/dontguess/pkg/identity"
 	"github.com/3dl-dev/dontguess/pkg/matching"
 	"github.com/3dl-dev/dontguess/pkg/nativebert"
+	"github.com/3dl-dev/dontguess/pkg/pricing"
 	"github.com/3dl-dev/dontguess/pkg/scrip"
 	dgstore "github.com/3dl-dev/dontguess/pkg/store"
 	"github.com/spf13/cobra"
@@ -41,6 +42,17 @@ var (
 	// serveLocal is a retained no-op alias flag (dontguess-b14): the default
 	// serve path is already campfire-free/local, so --local changes nothing.
 	serveLocal bool
+
+	// serveMediumLoopInterval is how often the pricing medium loop (dontguess-ffb,
+	// restoring pkg/pricing.MediumLoop into the running serve) ticks. Each tick
+	// scans inventory for high-demand uncompressed entries and posts open
+	// (non-exclusive) compression assigns via Engine.PostOpenCompressionAssign —
+	// the SAME cold-compression call path individual_ops_test.go's
+	// TestOpListAssigns_Individual_SurfacesOpenCompressAssign already proves is
+	// discoverable via `dontguess assigns` / OpListAssigns. Overridable so tests
+	// don't wait a full hour for a tick; production default is
+	// pricing.DefaultMediumLoopInterval (1h).
+	serveMediumLoopInterval time.Duration
 
 	// operatorConnDeadline is the per-connection deadline applied both initially
 	// (stall protection) and again after AutoAcceptPut (dontguess-777 reset).
@@ -85,6 +97,7 @@ func init() {
 	serveCmd.Flags().BoolVar(&serveAutoAccept, "auto-accept", true, "automatically accept all puts at token cost")
 	serveCmd.Flags().Int64Var(&serveAutoAcceptMax, "auto-accept-max-price", DefaultAutoAcceptMax, "maximum token cost to auto-accept (puts above this cap are classified as held-for-review)")
 	serveCmd.Flags().BoolVar(&serveLocal, "local", false, "no-op alias: serve is always campfire-free/local (retained for backward compatibility)")
+	serveCmd.Flags().DurationVar(&serveMediumLoopInterval, "medium-loop-interval", pricing.DefaultMediumLoopInterval, "how often the pricing medium loop scans inventory and posts open compression assigns for high-demand uncompressed entries")
 	rootCmd.AddCommand(serveCmd)
 }
 
@@ -595,6 +608,16 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 	// on the individual tier they are nil, which means "skip these checks" (see
 	// their EngineOptions doc). Payment enforcement and admission fall out of the
 	// relays-attached branch above.
+	// mediumLoopReady is closed by OnStarted (below) the instant Engine.Start has
+	// finished its synchronous startup replay + dispatch-cursor seed +
+	// dispatchPendingOrders — i.e. the moment State reflects the full persisted
+	// log, immediately before the steady-state poll loop. The medium-loop
+	// goroutine (started in runEngineLoop, dontguess-ffb) blocks on this before
+	// its first Tick so a restart with pre-existing hot inventory is seen on that
+	// first tick, instead of racing Start's replay and silently no-op'ing until
+	// the next hourly tick.
+	mediumLoopReady := make(chan struct{})
+
 	eng := exchange.NewEngine(exchange.EngineOptions{
 		CampfireID:        "local",
 		LocalStore:        localStore,
@@ -613,6 +636,36 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 		// never moves. Individual tier (scripStore == nil) leaves it false — and
 		// handleSettleBuyerAcceptScrip never runs there anyway.
 		AutoDeliverOnBuyerAccept: scripStore != nil,
+		OnStarted:                func() { close(mediumLoopReady) },
+		Logger: func(format string, args ...any) {
+			logger.Printf(format, args...)
+		},
+	})
+
+	// Wire the pricing medium loop (dontguess-ffb, restoring pkg/pricing into the
+	// running serve — previously imported nowhere in cmd/, so it never ran in
+	// production). Compression-assigns ONLY: MediumLoop.Tick's PostAssign
+	// callback posts nothing but "compress" tasks (no validate/freshen task type
+	// exists yet — those stay DESIGNED-ONLY / manual-post per item scope). Runs
+	// on BOTH tiers — PostOpenCompressionAssign is a plain operator broadcast
+	// (no ScripStore dependency), same call individual_ops_test.go's
+	// TestOpListAssigns_Individual_SurfacesOpenCompressAssign already proves on
+	// the individual tier. ScripStore/VigStore stay nil on the individual tier
+	// (no relay) — MediumLoop treats nil as "skip residuals"/"zero vig", so the
+	// other three Tick corrections (cluster dampening, residual settlement,
+	// reputation floor) degrade to no-ops there instead of erroring.
+	vigStore, _ := scripStore.(pricing.VigReader)
+	mediumLoop := pricing.NewMediumLoop(pricing.MediumLoopOptions{
+		State:      eng.State(),
+		ScripStore: scripStore,
+		VigStore:   vigStore,
+		Interval:   serveMediumLoopInterval,
+		// Engine.PostOpenCompressionAssign re-derives the bounty from the entry's
+		// own TokenCost (ColdCompressionBountyPct) rather than trusting
+		// spec.Reward, so only spec.EntryID is threaded through.
+		PostAssign: func(spec pricing.AssignSpec) error {
+			return eng.PostOpenCompressionAssign(spec.EntryID)
+		},
 		Logger: func(format string, args ...any) {
 			logger.Printf(format, args...)
 		},
@@ -817,7 +870,7 @@ func runServeLocalCtx(parentCtx context.Context, dgHome string) error {
 	fmt.Printf("STORE=%s\n", localStorePath)
 	fmt.Printf("OPERATOR_KEY=%s\n\n", engineOperatorKey)
 
-	return runEngineLoop(ctx, dgHome, eng, logger)
+	return runEngineLoop(ctx, dgHome, eng, mediumLoop, mediumLoopReady, logger)
 }
 
 // loadLegacyLocalOperatorKey reads the opaque pre-P3 local-operator.key under
@@ -999,14 +1052,21 @@ func bindOperatorSocket(ctx context.Context, dgHome string, eng *exchange.Engine
 }
 
 // runEngineLoop wires the operator-facing plumbing shared by both serve
-// paths — the auto-accept ticker and the engine event loop itself — around an
-// already-configured Engine. Used by both runServe (campfire-backed) and
-// runServeLocal (dontguess-275, campfire-free) so the two entrypoints differ
-// only in how the Engine's ingest/egress are wired (campfire
-// ReadClient/WriteClient vs. LocalStore). The operator IPC socket is bound
-// separately by bindOperatorSocket (dontguess-347, called BEFORE the
-// relay-attach loop) rather than here.
-func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, logger *log.Logger) error {
+// paths — the auto-accept ticker, the pricing medium loop, and the engine
+// event loop itself — around an already-configured Engine. Used by both
+// runServe (campfire-backed) and runServeLocal (dontguess-275, campfire-free)
+// so the two entrypoints differ only in how the Engine's ingest/egress are
+// wired (campfire ReadClient/WriteClient vs. LocalStore). The operator IPC
+// socket is bound separately by bindOperatorSocket (dontguess-347, called
+// BEFORE the relay-attach loop) rather than here.
+//
+// mediumLoop/mediumLoopReady (dontguess-ffb) restore pkg/pricing.MediumLoop
+// into the running serve: mediumLoop.Run blocks until mediumLoopReady closes
+// (Engine.Start's OnStarted hook, fired after startup replay so the first tick
+// sees the full persisted inventory, not a race against replay), then ticks on
+// mediumLoop's own interval for the remainder of ctx's lifetime, exactly
+// mirroring the auto-accept ticker's ctx.Done()-gated lifecycle below.
+func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, mediumLoop *pricing.MediumLoop, mediumLoopReady <-chan struct{}, logger *log.Logger) error {
 	// Auto-accept goroutine.
 	//
 	// Dual-map design — two separate maps track over-cap puts, serving different consumers:
@@ -1042,6 +1102,28 @@ func runEngineLoop(ctx context.Context, dgHome string, eng *exchange.Engine, log
 			}
 		}()
 	}
+
+	// Pricing medium-loop goroutine (dontguess-ffb — restore pkg/pricing into the
+	// running serve; it was imported nowhere in cmd/ before this, so the medium
+	// loop that scans inventory and posts open compression assigns for
+	// high-demand uncompressed entries never ran in production). Waits for
+	// mediumLoopReady (Engine.Start's OnStarted, fired once startup replay +
+	// dispatch-cursor seed complete) so the first tick sees the fully-replayed
+	// inventory rather than racing eng.Start below. Signs as the operator — same
+	// authority as every other operator-authored broadcast (auto-accept, warm
+	// compression on buy) — no new signal lever (D1/anti-Sybil posture unchanged:
+	// a compression assign's completion is verifiable labor, see
+	// compress_protocol.go acceptance criteria).
+	go func() {
+		select {
+		case <-mediumLoopReady:
+		case <-ctx.Done():
+			return
+		}
+		if err := mediumLoop.Run(ctx); err != nil && ctx.Err() == nil {
+			logger.Printf("medium loop: unexpected exit: %v", err)
+		}
+	}()
 
 	if err := eng.Start(ctx); err != nil && ctx.Err() == nil {
 		return fmt.Errorf("engine error: %w", err)
