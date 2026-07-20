@@ -126,6 +126,7 @@ type buyFakeConn struct {
 	respondOnReq     bool                               // deliver buildResp when a REQ arrives (buy id read from the #e filter) — models a reconnect replaying stored events on a fresh socket that never saw the buy
 	replayOnSinceREQ bool                               // on THIS conn (that saw the buy), replay buildResp when a REQ carries a `since` covering the buy — models strfry replaying a stored match to a late/re-subscriber
 	dropAfterOK      bool                               // after the buy OK, inject a transport drop instead of a response
+	failEventWrite   bool                               // fail the publish EVENT write (models a mid-flow send failure that forces Conn.Send to drop+reconnect); the subscribe REQ still succeeds
 
 	subID string
 	buyID string
@@ -188,6 +189,15 @@ func (c *buyFakeConn) WriteMessage(_ int, data []byte) error {
 	case relay.LabelEVENT:
 		if f.Event == nil {
 			return nil
+		}
+		c.mu.Lock()
+		fail := c.failEventWrite
+		c.mu.Unlock()
+		if fail {
+			// Model a publish write that fails on this socket: Conn.Send will drop
+			// this conn and reconnect to the next dialed one, replaying ONLY the
+			// EVENT (never the earlier subscribe REQ) — the dontguess-989 orphan.
+			return fmt.Errorf("fake relay: forced publish EVENT write failure")
 		}
 		c.mu.Lock()
 		c.buyID = f.Event.ID
@@ -482,6 +492,65 @@ func TestBuy_ConnDropMidAwait_ReSubscribeRecoversMatch(t *testing.T) {
 	dialer.mu.Unlock()
 	if dials < 2 {
 		t.Fatalf("expected a reconnect (>=2 dials), got %d — the re-subscribe path was not exercised", dials)
+	}
+}
+
+// TestBuy_PublishReconnectBeforeFirstRecv_ReSubscribeRecoversMatch proves the
+// dontguess-989 regression. The buy ordering is subscribe(Send#1) -> publish
+// (Send#2) -> Recv. If the publish write FAILS on the subscribed socket, Conn.Send
+// drops it and reconnects to a fresh socket, replaying ONLY the buy EVENT — the
+// subscription REQ from Send#1 is lost. The first Recv then reads that fresh,
+// UNSUBSCRIBED socket: because no Recv had yet claimed a generation (readerGen == 0),
+// the send-triggered-reconnect guard (conn.go generation guard) did NOT fire, so the
+// reader blocked on a REQ-less socket until the ctx timeout -> AMBIGUOUS, even though
+// the operator's match was on the relay. The fix pins the reader generation at
+// subscribe time so the guard fires on the FIRST Recv; the client then re-subscribes
+// on the fresh socket and recovers the match strfry stored.
+//
+// TEETH: without the fix conn2 withholds real-time delivery (its subscription was
+// not live when the buy was published there — liveAtPublish=false) and the client
+// never re-subscribes, so the buy times out AMBIGUOUS and this test fails.
+func TestBuy_PublishReconnectBeforeFirstRecv_ReSubscribeRecoversMatch(t *testing.T) {
+	agent := newSigner(t)
+	operator := newSigner(t)
+
+	// conn1 accepts the subscribe REQ but FAILS the publish EVENT write, forcing
+	// Conn.Send to drop conn1 and reconnect to conn2 BEFORE the first Recv.
+	conn1 := newBuyFakeConn()
+	conn1.failEventWrite = true
+
+	// conn2 is the reconnect target: Conn.Send retries the EVENT here (so conn2
+	// "saw the buy"), and conn2 replays the stored match when the client
+	// re-subscribes with a `since` covering the buy — exactly strfry's replay to a
+	// re-subscriber. It never delivers real-time (its REQ arrives after the EVENT),
+	// so ONLY a correct re-subscribe recovers the match.
+	conn2 := newBuyFakeConn()
+	conn2.okOnBuy = true
+	conn2.replayOnSinceREQ = true
+	conn2.buildResp = func(buyID string) *identity.Event { return signedMatch(operator, buyID) }
+
+	dialer := &seqDialer{conns: []relay.WSConn{conn1, conn2}}
+	conn := NewConn("ws://fake", agent, WithDialer(dialer), WithBackoff(testBackoff()))
+	defer conn.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	res, err := Buy(ctx, conn, agent, BuyRequest{Task: "khatru go-nostr azcosmos live-test gotchas", Budget: 1000})
+	if err != nil {
+		t.Fatalf("Buy: %v", err)
+	}
+	if res.Outcome != BuyOutcomeMatch {
+		t.Fatalf("outcome = %v, want match (recovered after publish-triggered reconnect + re-subscribe)", res.Outcome)
+	}
+	if res.Match() == nil || res.Match().EntryID != "entry-1" {
+		t.Fatalf("expected recovered match entry-1, got %+v", res.Match())
+	}
+	dialer.mu.Lock()
+	dials := dialer.i
+	dialer.mu.Unlock()
+	if dials < 2 {
+		t.Fatalf("expected a publish-triggered reconnect (>=2 dials), got %d", dials)
 	}
 }
 
