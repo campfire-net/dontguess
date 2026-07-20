@@ -225,6 +225,11 @@ func Buy(ctx context.Context, conn *relay.Conn, signer identity.Signer, req BuyR
 	if err := sendReq(ctx, conn, subID, baseFilter); err != nil {
 		return nil, fmt.Errorf("relayclient: buy %s: subscribe-first REQ: %w", shortID(buyID), err)
 	}
+	// Pin the reader generation to the just-subscribed connection so that if the
+	// publish below drops+reconnects the socket (Send replays only its EVENT, not
+	// this REQ), the FIRST Recv detects the generation advance and re-subscribes
+	// instead of blocking forever on a REQ-less socket (dontguess-989).
+	conn.MarkReaderGen()
 
 	// 2. PUBLISH the buy. A relay OK is a transport receipt only (§3.1); the
 	//    answer is the operator's match, awaited below.
@@ -282,6 +287,10 @@ func awaitBuyResponse(
 					}
 					return nil, fmt.Errorf("relayclient: buy %s: re-subscribe after conn drop: %w", shortID(buyID), err)
 				}
+				// Re-pin the reader generation to the connection the re-subscribe
+				// REQ landed on, so the next Recv reads it as the claimed generation
+				// (and a further reconnect is detected again) — dontguess-989.
+				conn.MarkReaderGen()
 				continue
 			}
 			return nil, fmt.Errorf("relayclient: buy %s: await response: %w", shortID(buyID), recvErr)

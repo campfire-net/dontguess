@@ -213,6 +213,25 @@ func (c *Conn) setReaderGen(gen uint64) {
 	c.readerGen = gen
 }
 
+// MarkReaderGen pins the reader's generation to the connection's CURRENT
+// generation. A subscribe-first caller MUST call it immediately after issuing
+// its subscription REQ (and after every re-subscribe) so Recv's generation guard
+// can detect a Send-triggered reconnect that happened BETWEEN the subscribe and
+// the first Recv — the dontguess-989 orphan. Without it readerGen stays 0 until
+// the first Recv, so the guard's `last != 0` precondition can't fire on that
+// first read: a publish (Send) that dropped+redialed after the subscribe would
+// leave the reader blocking forever on a fresh, REQ-less socket (Send replays
+// only its own EVENT, never the reader's REQ). Pinning the generation at
+// subscribe time makes the existing guard fire on the first Recv, so the caller
+// re-subscribes on the new connection instead of hanging. It is idempotent and
+// safe to call even when no reconnect occurred (readerGen == gen is a no-op for
+// the guard).
+func (c *Conn) MarkReaderGen() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.readerGen = c.gen
+}
+
 // Send writes a frame to the relay, connecting first if necessary. On a write
 // failure it drops the dead connection, reconnects once (with backoff), and
 // retries the write a single time. A persistent failure is returned loudly.
