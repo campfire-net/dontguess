@@ -256,38 +256,56 @@ func handleOpBuy(eng *exchange.Engine, conn net.Conn, req operatorRequest) opBuy
 		time.Sleep(opBuyPollInterval)
 	}
 
-	recs, err := eng.LocalStore().ReadAll()
-	if err != nil {
-		return opBuyResponse{OK: false, Error: fmt.Sprintf("buy: read local store: %v", err)}
-	}
+	// The order is matched; now resolve the match record and its entry mapping.
+	// IsOrderMatched (matchedOrders) and the entry mapping (matchToEntry) are both
+	// set inside applyMatch, but under a concurrent OpPut/OpBuy storm the match
+	// RECORD reaching the store and the State fold that populates matchToEntry can
+	// lag the matchedOrders flag by a fold tick. So poll the resolution — bounded
+	// by the SAME deadline — rather than reading it once: a genuine lag resolves on
+	// a later tick, while true fold-cursor corruption (the mapping never appears)
+	// still fails LOUD after the deadline. Reading it once raced with the fold and
+	// spuriously reported "resolved to no entry" (dontguess-3cc: faster matching
+	// widened the window that exposed this pre-existing race).
 	var matchMsgID string
 	var miss bool
-	for i := len(recs) - 1; i >= 0; i-- {
-		rec := recs[i]
-		if len(rec.Antecedents) == 0 || rec.Antecedents[0] != buyID {
-			continue
+	var entryID string
+	for {
+		recs, err := eng.LocalStore().ReadAll()
+		if err != nil {
+			return opBuyResponse{OK: false, Error: fmt.Sprintf("buy: read local store: %v", err)}
 		}
-		if !hasTag(rec.Tags, exchange.TagMatch) {
-			continue
+		matchMsgID, miss = "", false
+		for i := len(recs) - 1; i >= 0; i-- {
+			rec := recs[i]
+			if len(rec.Antecedents) == 0 || rec.Antecedents[0] != buyID {
+				continue
+			}
+			if !hasTag(rec.Tags, exchange.TagMatch) {
+				continue
+			}
+			matchMsgID = rec.ID
+			miss = hasTag(rec.Tags, exchange.TagBuyMiss)
+			break
 		}
-		matchMsgID = rec.ID
-		miss = hasTag(rec.Tags, exchange.TagBuyMiss)
-		break
-	}
-	if matchMsgID == "" {
-		// IsOrderMatched was true but the corresponding record could not be
-		// located — should not happen (matchedOrders and the store fold from the
-		// same log), but never silently claim a hit with no evidence backing it
-		// (LOUD-EVERYWHERE, design §0/§5).
-		return opBuyResponse{OK: false, Error: fmt.Sprintf("buy %s: matched but no match/miss record found in local store", short(buyID))}
-	}
-	if miss {
-		return opBuyResponse{OK: true, BuyID: buyID, Matched: false, Miss: true}
-	}
-
-	entryID := eng.State().MatchEntryID(matchMsgID)
-	if entryID == "" {
-		return opBuyResponse{OK: false, Error: fmt.Sprintf("buy %s: match %s resolved to no entry", short(buyID), short(matchMsgID))}
+		if matchMsgID != "" {
+			if miss {
+				return opBuyResponse{OK: true, BuyID: buyID, Matched: false, Miss: true}
+			}
+			if entryID = eng.State().MatchEntryID(matchMsgID); entryID != "" {
+				break
+			}
+		}
+		if time.Now().After(deadline) {
+			if matchMsgID == "" {
+				// matchedOrders was set but the record never landed — never silently
+				// claim a hit with no evidence backing it (LOUD-EVERYWHERE, design §0/§5).
+				return opBuyResponse{OK: false, Error: fmt.Sprintf("buy %s: matched but no match/miss record found in local store", short(buyID))}
+			}
+			// The record exists but its entry mapping never folded within the bound:
+			// this is the genuine fold-cursor-corruption signal, still surfaced LOUD.
+			return opBuyResponse{OK: false, Error: fmt.Sprintf("buy %s: match %s resolved to no entry", short(buyID), short(matchMsgID))}
+		}
+		time.Sleep(opBuyPollInterval)
 	}
 	entry := eng.State().GetInventoryEntry(entryID)
 	if entry == nil {
