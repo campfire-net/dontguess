@@ -1382,10 +1382,23 @@ func (e *Engine) dispatch(msg *Message) error {
 				reason := e.recordTrustDenial(trustOp, phase, err)
 				e.opts.log("engine: trust rejected msg=%s op=%s sender=%s reason=%s: %v",
 					msg.ID, op, shortKey(msg.Sender), reason, err)
-				// Counted + alarmed above (§2.4a D4) — the message is dropped
-				// pre-fold and dispatch returns nil (not an error) so the poll
-				// loop doesn't treat a routine trust rejection as a transport
-				// fault, but the rejection itself is never a silent nil-drop.
+				// A denied PUT that never folded (applyPut dropped it — the common
+				// not-allowlisted case) is invisible to the SEAM-A auto-accept
+				// reject, so emit the put-reject here or the client waits out its
+				// whole timeout and reports a phantom "transient" error
+				// (dontguess-39d). A put that DID fold is left to SEAM-A, which also
+				// purges the content-hash poison; purge=false here since a dropped
+				// put owns no hash to release.
+				if op == TagPut {
+					if _, pending := e.state.GetPendingPut(msg.ID); !pending {
+						if rerr := e.emitPutReject(msg.ID, "trust-gate: "+reason, false); rerr != nil {
+							e.opts.log("engine: put-reject after dispatch trust block failed put=%s err=%v", shortKey(msg.ID), rerr)
+						}
+					}
+				}
+				// Counted + alarmed above (§2.4a D4); dispatch returns nil (not an
+				// error) so a routine trust rejection isn't treated as a transport
+				// fault.
 				return nil
 			}
 		}

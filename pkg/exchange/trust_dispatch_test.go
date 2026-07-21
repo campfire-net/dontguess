@@ -10,6 +10,8 @@ package exchange_test
 import (
 	"encoding/base64"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -121,6 +123,93 @@ func TestTrustDispatch_AnonymousPutRejected(t *testing.T) {
 
 	if matchCount := countMatchMessages(t, h); matchCount != 0 {
 		t.Errorf("expected 0 match messages after anonymous put rejection, got %d", matchCount)
+	}
+}
+
+// TestTrustDispatch_DroppedAnonPut_EmitsPutReject is the dontguess-39d regression:
+// a not-allowlisted put that applyPut drops at fold (never pending) must still
+// produce an observable settle(put-reject). Before the fix the dispatch gate
+// dropped it silently, so the client — waiting on that settle — timed out into a
+// phantom "transient" error instead of a clear "REJECTED: not-allowlisted".
+func TestTrustDispatch_DroppedAnonPut_EmitsPutReject(t *testing.T) {
+	t.Parallel()
+	h := newTestHarness(t)
+	operator, seller, _ := useSecpIdentities(t, h)
+
+	// Team tier: OperatorSigner arms encryptedRequired (plaintext puts are
+	// dropped at fold). The TrustChecker admits `seller` but NOT the anon sender.
+	ks := exchange.NewKeySet(seller.PubKeyHex())
+	tc, err := exchange.NewTrustChecker(operator.PubKeyHex(), ks)
+	if err != nil {
+		t.Fatalf("NewTrustChecker: %v", err)
+	}
+	eng := h.newEngineWithOpts(func(o *exchange.EngineOptions) {
+		o.OperatorPublicKey = operator.PubKeyHex()
+		o.OperatorSigner = operator
+		o.TrustChecker = tc
+	})
+
+	// An un-admitted sender publishes a plaintext put: dropped at fold
+	// (encryptedRequired) AND trust-denied at dispatch.
+	anon := newTestAgent(t)
+	anonPut := h.sendMessage(anon,
+		putPayload("gRPC retry-budget worked example", "sha256:"+fmt.Sprintf("%064x", 7), "code", 6000, 2048),
+		[]string{exchange.TagPut, "exchange:content-type:code"}, nil)
+
+	all, _ := h.st.ListMessages(h.cfID, 0)
+	eng.State().Replay(exchange.FromStoreRecords(all))
+
+	// Precondition: the put was DROPPED at fold — not pending. (If it were
+	// pending, SEAM-A would own the reject and this test would be vacuous.)
+	if _, pending := eng.State().GetPendingPut(anonPut.ID); pending {
+		t.Fatalf("precondition: plaintext put on a team-tier engine must be dropped at fold, but it is pending")
+	}
+
+	// Dispatch: the trust gate denies the un-admitted sender and, because the put
+	// never folded, emits an explicit settle(put-reject).
+	if err := eng.DispatchForTest(anonPut); err != nil {
+		t.Errorf("dispatch returned error, want nil (routine trust reject): %v", err)
+	}
+
+	// Assert: an operator-signed settle(put-reject) referencing the anon put now
+	// exists on the log — the signal the put client REQ-subscribes for.
+	settles, err := h.st.ListMessages(h.cfID, 0, store.MessageFilter{Tags: []string{exchange.TagSettle}})
+	if err != nil {
+		t.Fatalf("listing settle messages: %v", err)
+	}
+	var found bool
+	for _, s := range settles {
+		var p struct {
+			Phase   string `json:"phase"`
+			EntryID string `json:"entry_id"`
+			Reason  string `json:"reason"`
+		}
+		if json.Unmarshal(s.Payload, &p) != nil {
+			continue
+		}
+		if p.Phase != exchange.SettlePhaseStrPutReject || p.EntryID != anonPut.ID {
+			continue
+		}
+		found = true
+		if s.Sender != operator.PubKeyHex() {
+			t.Errorf("put-reject sender=%s, want operator %s", s.Sender, operator.PubKeyHex())
+		}
+		if !strings.Contains(p.Reason, "not-allowlisted") {
+			t.Errorf("put-reject reason=%q, want it to name not-allowlisted", p.Reason)
+		}
+		// The antecedent must e-tag the put id so the client's REQ #e filter delivers it.
+		if len(s.Antecedents) == 0 || s.Antecedents[0] != anonPut.ID {
+			t.Errorf("put-reject antecedents=%v, want [%s] so the client REQ #e filter matches", s.Antecedents, anonPut.ID)
+		}
+		break
+	}
+	if !found {
+		t.Fatalf("no settle(put-reject) emitted for dropped anon put %s — client would time out into the phantom transient error (dontguess-39d)", anonPut.ID)
+	}
+
+	// The drop still holds: nothing entered inventory.
+	if inv := eng.State().Inventory(); len(inv) != 0 {
+		t.Errorf("dropped anon put must not enter inventory, got %d entries", len(inv))
 	}
 }
 

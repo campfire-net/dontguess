@@ -374,7 +374,18 @@ func (e *Engine) rejectPutLocked(putMsgID string, reason string, purgeContentHas
 	if !pending {
 		return fmt.Errorf("put %s is not pending", putMsgID)
 	}
+	return e.emitPutReject(putMsgID, reason, purgeContentHash)
+}
 
+// emitPutReject sends and applies an operator-signed settle(put-reject) for
+// putMsgID — the emit half of rejectPutLocked, split out so the dispatch trust
+// gate can reject a put that applyPut dropped at fold (never pending), which the
+// client is waiting on and otherwise times out against (dontguess-39d). It is
+// idempotent for a non-pending put (applySettlePutReject guards its purge and
+// no-ops its delete). It takes no opMu: it only touches LocalStore + State (each
+// self-locked), like handleBuy's match emit — and opMu here would deadlock the
+// refresh->dispatch reentrancy path.
+func (e *Engine) emitPutReject(putMsgID string, reason string, purgeContentHash bool) error {
 	fields := map[string]any{
 		"phase":    SettlePhaseStrPutReject,
 		"entry_id": putMsgID,
